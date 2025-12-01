@@ -88,7 +88,7 @@
 @pop intro_subtitle text=_**Easy, text-based slideshows for Hackers, now with**_
 @pop intro_authors text=_@renerocksai_
 
-@box img=assets/raylib_96x96.png x=1280 y=680 w=96 h=96
+@box img=assets/raylib_96x96.png x=1280 y=680 scale=2.5 ratio=1.5
 
 @pop rightbox x=1200 y=75
 <#0000ffff>_~~https://github.com/renerocksai/slides~~_</>

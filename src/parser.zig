@@ -657,6 +657,24 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.img_path = imgpath;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "scale")) {
+                    if (attr_it.next()) |scalestr| {
+                        const scale_val = std.fmt.parseFloat(f32, scalestr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse scale=");
+                            continue;
+                        };
+                        item_context.scale = scale_val;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "ratio")) {
+                    if (attr_it.next()) |ratiostr| {
+                        const ratio_val = std.fmt.parseFloat(f32, ratiostr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse ratio=");
+                            continue;
+                        };
+                        item_context.ratio = ratio_val;
+                    }
+                }
             }
         } else {
             try text_words.append(context.allocator, word);
@@ -692,10 +710,15 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     if (parsing_item_context.fontSize == null) parsing_item_context.fontSize = item_context.fontSize;
     if (parsing_item_context.color == null) parsing_item_context.color = item_context.color;
     if (parsing_item_context.position == null) parsing_item_context.position = item_context.position;
-    if (parsing_item_context.size == null) parsing_item_context.size = item_context.size;
+    // Don't inherit size for image boxes - let renderer use auto-dimensions
+    if (parsing_item_context.size == null and parsing_item_context.img_path == null) {
+        parsing_item_context.size = item_context.size;
+    }
     if (parsing_item_context.underline_width == null) parsing_item_context.underline_width = item_context.underline_width;
     if (parsing_item_context.line_height_factor == null) parsing_item_context.line_height_factor = item_context.line_height_factor;
     if (parsing_item_context.bullet_color == null) parsing_item_context.bullet_color = item_context.bullet_color;
+    if (parsing_item_context.scale == null) parsing_item_context.scale = item_context.scale;
+    if (parsing_item_context.ratio == null) parsing_item_context.ratio = item_context.ratio;
 }
 
 fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {

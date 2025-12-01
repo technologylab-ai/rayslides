@@ -132,8 +132,20 @@ Example of the current text format - see [test_public.sld](./testslides/test_pub
 # -------------------------------------------------------------
 @popslide content
 
-# some image on the slide would look like this:
+# Images can be placed with explicit dimensions:
 # @box img=some_image.png x=800 y=100 w=320 h=200
+
+# Or use auto-dimensions (uses the image's natural size):
+# @box img=some_image.png x=800 y=100
+
+# Scale the auto-dimensions:
+# @box img=some_image.png x=800 y=100 scale=0.5
+
+# Adjust aspect ratio (w/h) after scaling:
+# @box img=some_image.png x=800 y=100 scale=0.5 ratio=0.5
+
+# Only specify width (height auto-calculated to preserve aspect ratio):
+# @box img=some_image.png x=800 y=100 w=320
 
 @box x=100 y=100 w=1720 h=880 color=#FFFFFFFF
 Here come the bullets:

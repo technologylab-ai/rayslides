@@ -108,6 +108,10 @@ pub const SlideItem = struct {
     bullet_color: ?rl.Color = null,
     bullet_symbol: ?[]const u8 = null,
 
+    // Image auto-dimension parameters
+    scale: ?f32 = null,
+    ratio: ?f32 = null,
+
     pub fn new(a: std.mem.Allocator) !*SlideItem {
         const self = try a.create(SlideItem);
         self.* = .{};
@@ -129,6 +133,8 @@ pub const SlideItem = struct {
         if (context.bullet_color) |color| self.bullet_color = color;
         if (context.bullet_symbol) |symbol| self.bullet_symbol = symbol;
         if (context.line_height_factor) |lhf| self.line_height_factor = lhf;
+        if (context.scale) |s| self.scale = s;
+        if (context.ratio) |r| self.ratio = r;
     }
     pub fn applySlideDefaultsIfNecessary(self: *SlideItem, slide: *Slide) void {
         if (self.fontSize == null) self.fontSize = slide.fontsize;
@@ -220,6 +226,10 @@ pub const ItemContext = struct {
     line_number: usize = 0,
     line_offset: usize = 0,
 
+    // Image auto-dimension parameters
+    scale: ?f32 = null,
+    ratio: ?f32 = null,
+
     pub fn applyOtherIfNull(self: *ItemContext, other: ItemContext) void {
         if (self.text == null) {
             if (other.text) |text| self.text = text;
@@ -252,6 +262,12 @@ pub const ItemContext = struct {
 
         if (self.line_height_factor == null) {
             if (other.line_height_factor) |lhf| self.line_height_factor = lhf;
+        }
+        if (self.scale == null) {
+            if (other.scale) |s| self.scale = s;
+        }
+        if (self.ratio == null) {
+            if (other.ratio) |r| self.ratio = r;
         }
     }
 };

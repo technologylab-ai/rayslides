@@ -118,9 +118,9 @@ pub const SlideshowRenderer = struct {
     fn createBg(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
         log.info("pre-rendering bg {}", .{item});
         if (item.img_path) |p| {
-            const texptr = try self.texture_cache.getImageTexture(p, slideshow_filp);
-            if (texptr) |t| {
-                try renderSlide.elements.append(self.allocator, RenderElement{ .kind = .background, .texture = t });
+            const result = try self.texture_cache.getImageTexture(p, slideshow_filp);
+            if (result) |tex_info| {
+                try renderSlide.elements.append(self.allocator, RenderElement{ .kind = .background, .texture = tex_info.texture });
             }
         } else {
             if (item.color) |color| {
@@ -601,13 +601,53 @@ pub const SlideshowRenderer = struct {
 
     fn createImg(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
         if (item.img_path) |p| {
-            const texture = self.texture_cache.getImageTexture(p, slideshow_filp) catch null;
-            if (texture) |t| {
+            const result = self.texture_cache.getImageTexture(p, slideshow_filp) catch |err| {
+                log.warn("Could not load image {s}: {}", .{ p, err });
+                return; // Skip element
+            };
+
+            if (result) |tex_info| {
+                var final_size = item.size;
+
+                // Calculate dimensions if needed
+                const natural_w: f32 = @floatFromInt(tex_info.natural_width);
+                const natural_h: f32 = @floatFromInt(tex_info.natural_height);
+                const aspect_ratio = natural_w / natural_h;
+
+                const has_w = item.size.x > 0;
+                const has_h = item.size.y > 0;
+
+                if (!has_w and !has_h) {
+                    // Neither specified: use natural dimensions with scale and ratio
+                    var w = natural_w;
+                    var h = natural_h;
+
+                    // Apply scale
+                    if (item.scale) |scale| {
+                        w *= scale;
+                        h *= scale;
+                    }
+
+                    // Apply ratio: w/h = ratio, so h = w/ratio
+                    if (item.ratio) |ratio| {
+                        h = w / ratio;
+                    }
+
+                    final_size = .{ .x = w, .y = h };
+                } else if (has_w and !has_h) {
+                    // Only width specified: calculate height from aspect ratio
+                    final_size.y = final_size.x / aspect_ratio;
+                } else if (!has_w and has_h) {
+                    // Only height specified: calculate width from aspect ratio
+                    final_size.x = final_size.y * aspect_ratio;
+                }
+                // else: both specified, use as-is
+
                 try renderSlide.elements.append(self.allocator, RenderElement{
                     .kind = .image,
                     .position = item.position,
-                    .size = item.size,
-                    .texture = t,
+                    .size = final_size,
+                    .texture = tex_info.texture,
                 });
             }
         }
