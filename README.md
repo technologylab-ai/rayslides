@@ -168,7 +168,8 @@ Bullet list:
 
 # Building it
 
-Just `zig build`.
+Just `zig build`. See [`build.zig.zon`](./build.zig.zon) for minimum required
+zig version.
 
 ```console
 $ zig build run -- testslides/test_public.sld
