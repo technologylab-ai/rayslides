@@ -635,6 +635,54 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.color = color;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "shadow")) {
+                    if (attr_it.next()) |shadowstr| {
+                        var shadow = item_context.text_shadow orelse slides.TextShadow{};
+                        if (std.mem.eql(u8, shadowstr, "none")) {
+                            shadow.enabled = false;
+                        } else {
+                            shadow.color = parseColorLiteral(shadowstr, context) catch |err| {
+                                reportErrorInContext(err, context, "cannot parse shadow=");
+                                continue;
+                            };
+                            shadow.enabled = true;
+                        }
+                        item_context.text_shadow = shadow;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "shadow_offset")) {
+                    if (attr_it.next()) |offsetstr| {
+                        const offset = std.fmt.parseFloat(f32, offsetstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse shadow_offset=");
+                            continue;
+                        };
+                        var shadow = item_context.text_shadow orelse slides.TextShadow{};
+                        shadow.offset = .{ .x = offset, .y = offset };
+                        item_context.text_shadow = shadow;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "shadow_x")) {
+                    if (attr_it.next()) |offsetstr| {
+                        const offset = std.fmt.parseFloat(f32, offsetstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse shadow_x=");
+                            continue;
+                        };
+                        var shadow = item_context.text_shadow orelse slides.TextShadow{};
+                        shadow.offset.x = offset;
+                        item_context.text_shadow = shadow;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "shadow_y")) {
+                    if (attr_it.next()) |offsetstr| {
+                        const offset = std.fmt.parseFloat(f32, offsetstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse shadow_y=");
+                            continue;
+                        };
+                        var shadow = item_context.text_shadow orelse slides.TextShadow{};
+                        shadow.offset.y = offset;
+                        item_context.text_shadow = shadow;
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "bullet_color")) {
                     if (attr_it.next()) |colorstr| {
                         const color = parseColorLiteral(colorstr, context) catch |err| {
@@ -814,6 +862,7 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     if (parsing_item_context.ratio == null) parsing_item_context.ratio = item_context.ratio;
     if (parsing_item_context.animation == null) parsing_item_context.animation = item_context.animation;
     if (parsing_item_context.transition == null) parsing_item_context.transition = item_context.transition;
+    if (parsing_item_context.text_shadow == null) parsing_item_context.text_shadow = item_context.text_shadow;
 }
 
 fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
@@ -1028,4 +1077,36 @@ test "animation annotations and slide transitions are parsed" {
     const inline_animation = second_slide.items.?.items[1].animation.?;
     try std.testing.expectEqual(animation.Effect.slide_right, inline_animation.effect);
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), inline_animation.duration, 0.0001);
+}
+
+test "text shadows inherit from item templates and can be disabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push title x=100 y=100 w=800 h=200 shadow=#01020380 shadow_offset=2 shadow_y=3
+        \\@slide
+        \\@pop title text=Shadowed
+        \\@pop title shadow=none text=Plain
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), slideshow.slides.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+
+    const inherited = items[0].text_shadow.?;
+    try std.testing.expect(inherited.enabled);
+    try std.testing.expectEqual(@as(u8, 1), inherited.color.r);
+    try std.testing.expectEqual(@as(u8, 2), inherited.color.g);
+    try std.testing.expectEqual(@as(u8, 3), inherited.color.b);
+    try std.testing.expectEqual(@as(u8, 128), inherited.color.a);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), inherited.offset.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), inherited.offset.y, 0.0001);
+    try std.testing.expect(!items[1].text_shadow.?.enabled);
 }

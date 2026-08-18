@@ -73,6 +73,34 @@ _**Bold italic**_ text.
 <#rrggbbaa>Colored with alpha</> text. E.g. <#ff0000ff>red full opacity</>
 ```
 
+### Text shadows
+
+Text boxes can draw a solid drop shadow without duplicating and offsetting the
+same text manually. Set its color with `shadow=`; the default offset is four
+pixels down and right:
+
+```text
+@push slide_title x=110 y=71 w=1712 h=100 fontsize=52 color=#eeeeeeff shadow=#000000a0
+
+@pop slide_title text=A title with a drop shadow
+```
+
+Use `shadow_offset=` to set both coordinates, or `shadow_x=` and `shadow_y=`
+for different offsets. Negative offsets are allowed. Shadow attributes inherit
+through `@push`/`@pop`, and an inherited shadow can be disabled with
+`shadow=none`:
+
+```text
+@box x=100 y=100 w=1700 h=200 fontsize=96 color=#f7a41dff shadow=#000000ff shadow_x=3 shadow_y=5 text=Shadowed text
+
+@pop slide_title shadow=none text=No shadow on this instance
+```
+
+The shadow uses the same font, wrapping, markdown spans, reveal state, opacity,
+and motion as its text. It is deliberately a crisp duplicate-text shadow, not
+a blurred raster effect. As with other box attributes, place shadow attributes
+before `text=` on an inline `@box` or `@pop` directive.
+
 ## Slideshow Format
 
 Internal render buffer resolution is 1920x1080. So always use coordinates in this range.

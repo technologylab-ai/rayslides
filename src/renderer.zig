@@ -43,6 +43,7 @@ const RenderElement = struct {
     texture: ?rl.Texture2D = null,
     bullet_symbol: [*:0]const u8 = "",
     reveal_step: usize = 0,
+    text_shadow: ?slides.TextShadow = null,
 };
 
 const RenderedSlide = struct {
@@ -262,6 +263,7 @@ pub const SlideshowRenderer = struct {
                 .current_line_height = line_height_bullet_width.y * line_height_factor, // will be overridden immediately but needed if text starts with empty line(s)
                 .current_line_height_factor = line_height_factor,
                 .reveal_step = item_reveal_step,
+                .text_shadow = item.text_shadow,
             };
 
             // slide number
@@ -309,6 +311,7 @@ pub const SlideshowRenderer = struct {
                         .text = bulletSymbol,
                         .color = bulletColor,
                         .reveal_step = line_reveal_step,
+                        .text_shadow = item.text_shadow,
                     });
                     // 2. increase indent by 1 and add indented text block
                     available_width -= line_height_bullet_width.x;
@@ -350,6 +353,7 @@ pub const SlideshowRenderer = struct {
         color: rl.Color = .blank,
         text: []const u8 = undefined,
         reveal_step: usize = 0,
+        text_shadow: ?slides.TextShadow = null,
     };
 
     fn renderMdBlock(self: *SlideshowRenderer, renderSlide: *RenderedSlide, layoutContext: *TextLayoutContext) !void {
@@ -386,6 +390,7 @@ pub const SlideshowRenderer = struct {
                 .fontSize = layoutContext.fontSize,
                 .underline_width = @intCast(layoutContext.underline_width),
                 .reveal_step = layoutContext.reveal_step,
+                .text_shadow = layoutContext.text_shadow,
             };
 
             for (spans.items) |span| {
@@ -847,6 +852,13 @@ pub const SlideshowRenderer = struct {
         const startpos = translated(slidePosToRenderPos(item.position, slide_tl, slide_size, internal_render_size), transform.offset);
         const color = colorWithOpacity(col.?, transform.opacity);
 
+        if (item.text_shadow) |shadow| {
+            if (shadow.enabled) {
+                const shadow_offset = slideSizeToRenderSize(shadow.offset, slide_size, internal_render_size);
+                const shadow_pos = translated(startpos, shadow_offset);
+                rl.drawTextEx(font, @as([:0]const u8, t), shadow_pos, fsize, 0.0, colorWithOpacity(shadow.color, transform.opacity));
+            }
+        }
         rl.drawTextEx(font, @as([:0]const u8, t), startpos, fsize, 0.0, color);
 
         // imgui.igPushStyleColor_Vec4(imgui.ImGuiCol_Text, col.?);

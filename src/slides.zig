@@ -104,6 +104,12 @@ pub const SlideItemError = error{
     BulletSymbolNull,
 };
 
+pub const TextShadow = struct {
+    enabled: bool = true,
+    color: rl.Color = .black,
+    offset: rl.Vector2 = .{ .x = 4.0, .y = 4.0 },
+};
+
 pub const SlideItem = struct {
     kind: SlideItemKind = .background,
     text: ?[]const u8 = null,
@@ -122,6 +128,7 @@ pub const SlideItem = struct {
     scale: ?f32 = null,
     ratio: ?f32 = null,
     animation: ?animation.ItemSpec = null,
+    text_shadow: ?TextShadow = null,
 
     pub fn new(a: std.mem.Allocator) !*SlideItem {
         const self = try a.create(SlideItem);
@@ -147,6 +154,7 @@ pub const SlideItem = struct {
         if (context.scale) |s| self.scale = s;
         if (context.ratio) |r| self.ratio = r;
         if (context.animation) |anim| self.animation = anim;
+        if (context.text_shadow) |shadow| self.text_shadow = shadow;
     }
     pub fn applySlideDefaultsIfNecessary(self: *SlideItem, slide: *Slide) void {
         if (self.fontSize == null) self.fontSize = slide.fontsize;
@@ -216,6 +224,7 @@ pub const SlideItem = struct {
                 log.info(indent ++ "bcolor: {any}", .{self.bullet_color});
                 log.info(indent ++ "bsymbl: {any}", .{self.bullet_symbol});
                 log.info(indent ++ "  line_height_factor: {any}", .{self.line_height_factor});
+                log.info(indent ++ " shadow: {any}", .{self.text_shadow});
             },
         }
         log.info(indent ++ "-----------------------", .{});
@@ -243,6 +252,7 @@ pub const ItemContext = struct {
     ratio: ?f32 = null,
     animation: ?animation.ItemSpec = null,
     transition: ?animation.Transition = null,
+    text_shadow: ?TextShadow = null,
 
     pub fn applyOtherIfNull(self: *ItemContext, other: ItemContext) void {
         if (self.text == null) {
@@ -288,6 +298,9 @@ pub const ItemContext = struct {
         }
         if (self.transition == null) {
             if (other.transition) |transition| self.transition = transition;
+        }
+        if (self.text_shadow == null) {
+            if (other.text_shadow) |shadow| self.text_shadow = shadow;
         }
     }
 };

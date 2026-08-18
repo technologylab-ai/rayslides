@@ -35,8 +35,7 @@
 # -- intro slide template
 # -------------------------------------------------------------
 @bg img=assets/bgwater.jpg
-@push intro_title    x=150 y=400 w=1700 h=223 fontsize=96 color=#7A7A7AFF
-@push intro_title_shadow    x=154 y=404 w=1700 h=223 fontsize=96 color=#000000FF
+@push intro_title    x=150 y=400 w=1700 h=223 fontsize=96 color=#7A7A7AFF shadow=#000000FF
 @push intro_subtitle x=219 y=728 w=1400 h=246 fontsize=45 color=#cd0f2dff
 @push intro_authors  x=219 y=818 w=836 h=246 fontsize=45 color=#993366ff
 # the following pushslide will the slide cause to be pushed, not rendered
@@ -66,11 +65,9 @@
 # -- thankyou slide template
 # -------------------------------------------------------------
 @bg img=assets/bgwater.jpg
-@box                    x=221  y=252  w=1750  h=223 fontsize=144 color=#000000FF text=**THANK YOU FOR YOUR ATTENTION**
-@box                    x=219  y=250  w=1750  h=223 fontsize=144 color=#cd0f2dff text=**THANK YOU FOR YOUR ATTENTION**
+@box                    x=219  y=250  w=1750  h=223 fontsize=144 color=#cd0f2dff shadow=#000000FF shadow_offset=2 text=**THANK YOU FOR YOUR ATTENTION**
 #@box                    x=219  y=250  w=1750  h=223 fontsize=144 color=#606060FF text=**THANK YOU FOR YOUR ATTENTION**
-@push thankyou_title    x=219  y=655  w=918  h=223 fontsize=52 color=#000000ff
-@push thankyou_title_shadow    x=221  y=657  w=918  h=223 fontsize=52 color=#000000ff
+@push thankyou_title    x=219  y=655  w=918  h=223 fontsize=52 color=#000000ff shadow=#000000ff shadow_offset=2
 @push thankyou_subtitle x=219  y=749  w=836  h=246 fontsize=45 color=#000000ff
 @push thankyou_authors  x=219  y=836  w=836  h=243 fontsize=45 color=#993366ff
 @pushslide thankyou
@@ -83,7 +80,6 @@
 
 # -------------------------------------------------------------
 @popslide intro
-@pop intro_title_shadow text=!Slideshows in ZIG!
 @pop intro_title text=!Slideshows in <$ZIGCOLOR$>ZIG</>!
 @pop intro_subtitle text=_**Easy, text-based slideshows for Hackers, now with**_
 @pop intro_authors text=_@renerocksai_
@@ -211,7 +207,6 @@ _
 
 # -------------------------------------------------------------
 @popslide thankyou
-@pop thankyou_title_shadow color=#000000FF text=!Slideshows in ZIG!
 @pop thankyou_title color=#7A7A7AFF text=!Slideshows in ZIG!
 @pop thankyou_subtitle color=#202020FF text=_Slideshows for Hackers_
 @pop thankyou_authors text=_@renerocksai_
