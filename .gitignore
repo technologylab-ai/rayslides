@@ -2,6 +2,7 @@
 .jj/
 .zig-cache/
 zig-out/
+zig-pkg/
 ,rayslides-export/
 **/.DS_Store/
 .DS_Store/

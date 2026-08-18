@@ -19,7 +19,7 @@ zig build run -- testslides/test_public.sld
 zig build test
 ```
 
-**Requirements:** Zig 0.15.1 or later (specified in build.zig.zon)
+**Requirements:** Zig 0.16.x (minimum 0.16.0, specified in build.zig.zon)
 
 ## Architecture
 

@@ -71,7 +71,7 @@ pub const MdLineParser = struct {
     pub fn parseLine(self: *MdLineParser, line: []const u8) !void {
         var pos: usize = 0;
 
-        if (std.mem.startsWith(u8, std.mem.trimLeft(u8, line, " \t"), "-")) {
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "-")) {
             self.currentSpan.styleflags |= StyleFlags.line_bulleted;
         }
 

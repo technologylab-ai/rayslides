@@ -168,8 +168,8 @@ Bullet list:
 
 # Building it
 
-Just `zig build`. See [`build.zig.zon`](./build.zig.zon) for minimum required
-zig version.
+Requires Zig 0.16.x (minimum 0.16.0). Just `zig build`; see
+[`build.zig.zon`](./build.zig.zon) for the minimum required Zig version.
 
 ```console
 $ zig build run -- testslides/test_public.sld

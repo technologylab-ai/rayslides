@@ -248,7 +248,7 @@ pub const SlideshowRenderer = struct {
                     layoutContext.origin_pos.x += line_height_bullet_width.x;
                     layoutContext.current_pos.x = layoutContext.origin_pos.x;
                     layoutContext.available_size.x = available_width;
-                    layoutContext.text = std.mem.trimLeft(u8, line, " \t->");
+                    layoutContext.text = std.mem.trimStart(u8, line, " \t->");
                 }
 
                 try self.renderMdBlock(renderSlide, &layoutContext);

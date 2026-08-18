@@ -25,9 +25,9 @@ const ExportController = struct {
     exported_imgs: ?std.ArrayListUnmanaged([]const u8) = null,
     final_messagebox_message: ?[:0]const u8 = null,
 
-    pub fn init(gpa: std.mem.Allocator, export_dir: ?[]const u8) !ExportController {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, export_dir: ?[]const u8) !ExportController {
         const ex_dir = export_dir orelse ",rayslides-export";
-        std.fs.cwd().makePath(ex_dir) catch |err| {
+        std.Io.Dir.cwd().createDirPath(io, ex_dir) catch |err| {
             std.process.fatal("Could not prepare export dir {s} : {any}", .{ ex_dir, err });
         };
 
@@ -312,30 +312,21 @@ const Banner = struct {
     }
 };
 
-pub fn main() anyerror!void {
-    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+pub fn main(init: std.process.Init) anyerror!void {
+    const gpa = init.gpa;
+    const io = init.io;
 
     //--------------------------------------------------------------------------------------
 
     // get arg
     const slideshow_to_load = blk: {
-        const args = try std.process.argsAlloc(gpa);
-        defer std.process.argsFree(gpa, args);
-        if (args.len > 1) {
-            log.debug("loading... {s}", .{args[1]});
-            break :blk try std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{args[1]});
-        } else {
-            std.process.fatal("No slideshow arg given!", .{});
-        }
+        var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+        defer args_it.deinit();
+        _ = args_it.skip();
+        const slideshow_arg = args_it.next() orelse std.process.fatal("No slideshow arg given!", .{});
+        log.debug("loading... {s}", .{slideshow_arg});
+        break :blk try std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{slideshow_arg});
     };
-
-    // Initialization
-    //--------------------------------------------------------------------------------------
-    try G.init(gpa);
-    defer G.deinit();
-    G.slideshow_filp_to_load = slideshow_to_load;
 
     const windowWidth: i32 = if (rl.getScreenWidth() >= 1920) 1920 else 1280;
     const windowHeight: i32 = if (rl.getScreenHeight() >= 1080) 1080 else 720;
@@ -346,12 +337,18 @@ pub fn main() anyerror!void {
     rl.initWindow(screenWidth, screenHeight, "rayslides");
     var first: bool = true;
     defer rl.closeWindow(); // Close window and OpenGL context
+
+    // Initialize GPU-backed resources after the window and unload them before it closes.
+    try G.init(gpa, io);
+    defer G.deinit();
+    G.slideshow_filp_to_load = slideshow_to_load;
+
     rl.setTargetFPS(61);
     var beast_mode: bool = false;
 
     // Main game loop
     var is_pre_rendered: bool = false;
-    var export_controller: ExportController = try .init(gpa, null);
+    var export_controller: ExportController = try .init(gpa, io, null);
     defer export_controller.deinit();
     var laser_pointer: LaserPointer = try .init(gpa);
     defer laser_pointer.deinit();
@@ -582,11 +579,11 @@ fn checkAutoReload() !bool {
             if (G.hot_reload_next_time <= rl.getTime()) {
                 std.log.debug("Checking for auto-reload of `{s}`", .{filp});
                 G.hot_reload_next_time += G.hot_reload_interval_seconds;
-                var f = try std.fs.cwd().openFile(filp, .{});
-                defer f.close();
-                const x = try f.stat();
+                const f = try std.Io.Dir.cwd().openFile(G.io, filp, .{});
+                defer f.close(G.io);
+                const x = try f.stat(G.io);
                 if (G.hot_reload_last_stat) |last| {
-                    if (x.mtime != last.mtime) {
+                    if (x.mtime.nanoseconds != last.mtime.nanoseconds) {
                         std.log.debug("RELOAD {s}", .{filp});
                         return true;
                     }
@@ -601,6 +598,7 @@ fn checkAutoReload() !bool {
 
 const AppData = struct {
     allocator: std.mem.Allocator = undefined,
+    io: std.Io = undefined,
     slideshow_arena: std.heap.ArenaAllocator = undefined,
     slideshow_allocator: std.mem.Allocator = undefined,
     fonts: fonts.AvailableFonts = .{},
@@ -617,10 +615,11 @@ const AppData = struct {
     current_slide: i32 = 0,
     hot_reload_next_time: f64 = 0.0,
     hot_reload_interval_seconds: f64 = 1.0,
-    hot_reload_last_stat: ?std.fs.File.Stat = undefined,
+    hot_reload_last_stat: ?std.Io.File.Stat = undefined,
 
-    fn init(self: *AppData, gpa: std.mem.Allocator) !void {
+    fn init(self: *AppData, gpa: std.mem.Allocator, io: std.Io) !void {
         self.allocator = gpa;
+        self.io = io;
 
         self.slideshow_arena = std.heap.ArenaAllocator.init(gpa);
         self.slideshow_allocator = self.slideshow_arena.allocator();
@@ -644,7 +643,7 @@ const AppData = struct {
 
     fn reinit(self: *AppData) !void {
         self.deinit();
-        try self.init(self.allocator);
+        try self.init(self.allocator, self.io);
     }
 };
 
@@ -666,11 +665,13 @@ fn sliceToC(input: []const u8) [:0]u8 {
 fn loadSlideshow(filp: []const u8) !void {
     std.log.debug("LOAD {s}", .{filp});
     defer G.slideshow_filp_to_load = null;
-    if (std.fs.cwd().openFile(filp, .{})) |f| {
-        defer f.close();
-        G.hot_reload_last_stat = try f.stat();
+    if (std.Io.Dir.cwd().openFile(G.io, filp, .{})) |f| {
+        defer f.close(G.io);
+        G.hot_reload_last_stat = try f.stat(G.io);
 
-        const input = try f.readToEndAlloc(G.allocator, G.editor_memory.len);
+        var read_buffer: [4096]u8 = undefined;
+        var file_reader = f.reader(G.io, &read_buffer);
+        const input = try file_reader.interface.allocRemaining(G.allocator, .limited(G.editor_memory.len));
         defer G.allocator.free(input);
 
         log.info("Read {d} bytes", .{input.len});

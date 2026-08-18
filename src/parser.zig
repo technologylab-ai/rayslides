@@ -193,7 +193,7 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
 
     while (it.next()) |line_untrimmed| {
         {
-            const line_unprocessed = std.mem.trimRight(u8, line_untrimmed, " \t\r");
+            const line_unprocessed = std.mem.trimEnd(u8, line_untrimmed, " \t\r");
             log.info("the line {d} is : len={d} {s}", .{ context.parsed_line_number, line_unprocessed.len, line_unprocessed });
             context.parsed_line_number += 1;
             defer context.parsed_line_offset += line_untrimmed.len + 1;
