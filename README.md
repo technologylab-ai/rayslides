@@ -76,6 +76,27 @@ _**Bold italic**_ text.
 <#rrggbbaa>Colored with alpha</> text. E.g. <#ff0000ff>red full opacity</>
 ```
 
+Inline code uses an optical size correction derived from the active body and
+`font_extra` glyph metrics. A blocky display face therefore stays distinctive
+without overpowering adjacent prose. Its baseline is aligned from the same
+metrics, and measurement, wrapping, shadows, rendering, and morphing all use
+the corrected geometry. At a mixed-font boundary, whitespace uses the wider
+space advance of its two neighbors, so neither body-to-code nor code-to-body
+spacing becomes cramped.
+
+### Symbols and emoji
+
+Rayslides includes portable monochrome fallbacks for common presentation
+symbols, even when a selected custom font does not contain them. They inherit
+the surrounding text color, opacity, shadow, and animation.
+
+The curated set includes directional arrows (`← ↑ → ↓ ↔ ↖ ↗ ↘ ↙`), media
+controls (`▶ ◀ ⏩ ⏪ ⏸ ⏹ ⏺`), status marks (`✅ ✔ ❌ ⚠ ℹ ❓ ❗`), and useful
+visual accents such as `✨ ⭐ ❤ 🎉 🎯 🏆 👍 👀 👏 💡 📈 📉 📌 🔥 🚀 🛠 🤖 🧠`.
+Emoji variation selectors are accepted and ignored safely. Complex joined
+emoji sequences are rendered as their supported individual glyphs rather than
+as a single color ligature.
+
 ### Text shadows
 
 Text boxes can draw a solid drop shadow without duplicating and offsetting the
@@ -140,7 +161,12 @@ in normal z-order, item animations, and slide transitions. A poll supports up
 to eight choices; a deck supports up to 32 polls and 512 active participants.
 Use one Crowdplay item per slide and unique poll IDs containing only letters,
 digits, `-`, or `_`. IDs are limited to 48 bytes, prompts to 192 bytes, and
-choice labels to 64 bytes.
+choice labels to 64 bytes. Omitted panel geometry defaults to
+`x=100 y=80 w=1720 h=920`.
+
+A Crowdplay `id=` is also a semantic-morph target. Declare the Crowdplay item
+before the first `@state(morph)` and use `@set`, `@show`, or `@hide` to move,
+resize, or fade the live panel while keeping its audience state intact.
 
 The default audience address is `http://<computer-name>.local:7331/`. Override
 the advertised hostname or port when mDNS is unavailable:
@@ -235,6 +261,86 @@ each logical slide, so builds still produce one PDF page per source slide. A
 transition lasts 0.4 seconds by default, automatically reverses direction when
 navigating backwards, and can be disabled for one slide with
 `transition=none`.
+
+## Semantic morph states
+
+Morph states let one logical slide change layout without copying the whole
+slide. Give objects stable `id=` values, start a new state with
+`@state(morph)`, and describe only what changes:
+
+```text
+@box id=hero img=assets/diagram.png x=1250 y=180 w=520 h=320
+@box id=title x=120 y=180 w=1000 h=120 fontsize=72 shadow=#00000080 text=One object, many states
+
+@state(morph) duration=0.8 ease=spring
+@set hero x=0 y=0 w=1920 h=1080
+@set title x=80 y=55 fontsize=48 color=#f7a41dff shadow_offset=7
+```
+
+Everything before the first state is the slide's initial state. Each
+`@state(morph)` adds one forward/backward presentation step and begins a
+cumulative patch over the previous state. Unspecified objects and properties
+carry forward. The default duration is 0.6 seconds and the default easing is
+`smooth`; the available easing modes are `linear`, `smooth`, and `spring`.
+Bare `@state` is accepted as shorthand for `@state(morph)`.
+
+Use the state directives to manipulate objects:
+
+- `@set name ...` changes only the supplied properties.
+- `@hide name ...` hides an object, optionally moving or restyling it while it
+  fades out.
+- `@show name ...` restores a hidden object, again allowing property changes.
+- A normal `@box`, `@pop`, or `@bg` inside a state creates an object beginning
+  in that state. It fades in automatically.
+
+For example:
+
+```text
+@box id=caption x=120 y=900 w=1600 h=90 visible=false text=Initially hidden
+
+@state(morph) duration=0.5
+@show caption y=800
+
+@state(morph) after=1.2 duration=0.5
+@hide caption x=-1600
+@box id=replacement x=120 y=800 w=1600 h=90 text=Born in this state
+```
+
+`after=` has the same meaning as it does for reveal animations: after the
+previous step settles, wait that many seconds and start automatically. Going
+backward pauses automatic progression and reverses the same interpolation.
+Changing direction during a morph continues from the current frame.
+
+Morphable properties include position and size (`x`, `y`, `w`, `h`),
+`fontsize`, `color`, `bullet_color`, `line_height`, `underline_width`, image
+`scale` and `ratio`, text-shadow properties, and `opacity` from `0` to `1`.
+Text content and an existing image object's `img=` path may also change.
+Rayslides interpolates geometry, font size, colors, opacity, and shadows when
+the rendered content is compatible. Changed text, changed images, wrapping
+changes, new objects, and removed objects use a cross-fade instead, avoiding
+scrambled text fragments.
+
+IDs are local to one logical slide and must be unique on any slide that uses
+morph states. A named `@pop` automatically uses its template name as its ID,
+unless an explicit `id=` overrides it:
+
+```text
+@push slide_title x=100 y=70 w=1700 h=100 fontsize=52
+@slide
+@pop slide_title text=This can be targeted as slide_title
+@state(morph)
+@set slide_title x=500 color=#f7a41dff
+```
+
+Ordinary `@anim` reveals belong before the first morph state; they run first.
+Objects born inside a morph state already animate as part of that state, so
+`@anim`/`anim=` is intentionally rejected there. PDF export renders the final
+state while still producing one page per logical slide. Reusable
+`@pushslide` templates must remain static; add morph states to the logical slide
+after `@popslide`. See the semantic morphing slide in
+[`test_public.sld`](./testslides/test_public.sld) for image takeover, title
+restyling, moving exits, automatic states, and bullets rearranging into a
+flowchart.
 
 Example of the current text format - see [test_public.sld](./testslides/test_public.sld) for a more realistic example:
 
