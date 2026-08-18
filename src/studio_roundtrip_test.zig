@@ -272,3 +272,89 @@ test "promoted Studio item remains reusable on another slide" {
     try std.testing.expectEqual(@as(f32, 480), second_items[1].size.x);
     try std.testing.expectEqual(@as(f32, 120), second_items[1].size.y);
 }
+
+test "Studio template-instance overrides stay local and feed later morph states" {
+    const allocator = std.testing.allocator;
+    var source = try allocator.dupe(
+        u8,
+        "@box id=hero x=10 y=20 w=300 h=120 color=#ffffffff text=Shared hero\n" ++
+            "@pushslide layout\n" ++
+            "@popslide layout\n" ++
+            "@state(morph)\n" ++
+            "@set hero y=700\n" ++
+            "@popslide layout\n",
+    );
+    defer allocator.free(source);
+
+    const first_instance = std.mem.indexOf(u8, source, "@popslide layout").?;
+    adoptPatch(allocator, &source, try source_editor.insertSlideTemplateOverride(
+        allocator,
+        source,
+        first_instance,
+        "@set hero x=320",
+    ));
+
+    const local_set = std.mem.indexOf(u8, source, "@set hero x=320").?;
+    adoptPatch(allocator, &source, try source_editor.patchSlideTemplateOverrideGeometry(
+        allocator,
+        source,
+        first_instance,
+        local_set,
+        "hero",
+        .{ .x = 360, .y = 240, .w = 520, .h = 180 },
+    ));
+    adoptPatch(allocator, &source, try source_editor.patchSlideTemplateOverrideAttributes(
+        allocator,
+        source,
+        first_instance,
+        local_set,
+        "hero",
+        &.{.{ .key = "color", .value = "#50d7ffff" }},
+    ));
+    adoptPatch(allocator, &source, try source_editor.patchSlideTemplateOverrideText(
+        allocator,
+        source,
+        first_instance,
+        local_set,
+        "hero",
+        "Only on this slide\nStill the same template",
+    ));
+    adoptPatch(allocator, &source, try source_editor.insertSlideTemplateOverride(
+        allocator,
+        source,
+        first_instance,
+        "@hide hero",
+    ));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+
+    const local_base = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 360), local_base.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 240), local_base.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 520), local_base.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 180), local_base.size.y, 0.0001);
+    try std.testing.expectEqualStrings("Only on this slide\nStill the same template", local_base.text.?);
+    try std.testing.expectEqual(@as(u8, 0x50), local_base.color.?.r);
+    try std.testing.expect(!local_base.visible);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, local_base.source.scope);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, local_base.instance_source.?.scope);
+
+    const local_morph = slideshow.slides.items[0].morph_states.items[0].items.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 360), local_morph.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 700), local_morph.position.y, 0.0001);
+    try std.testing.expect(!local_morph.visible);
+
+    const shared_second = slideshow.slides.items[1].items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 10), shared_second.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), shared_second.position.y, 0.0001);
+    try std.testing.expectEqualStrings("Shared hero", shared_second.text.?);
+    try std.testing.expect(shared_second.visible);
+    try std.testing.expect(shared_second.instance_source == null);
+}

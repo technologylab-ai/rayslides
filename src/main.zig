@@ -827,7 +827,10 @@ pub fn main(init: std.process.Init) anyerror!void {
                     .edit_text => |target| {
                         const initial = studioItemByIdentity(studio_items, target.item_identity) orelse null;
                         pending_semantic_command = command;
-                        property_prompt.begin(.text, if (initial) |item| item.text orelse "" else "");
+                        property_prompt.begin(
+                            if (target.edit_scope == .shared_template) .shared_text else .text,
+                            if (initial) |item| item.text orelse "" else "",
+                        );
                     },
                     .promote_to_reusable => |target| {
                         var suggested_name: [96]u8 = undefined;
@@ -1023,7 +1026,10 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_mode.setNotice(.none);
             } else |err| {
                 studio_mode.setNotice(switch (err) {
-                    error.AmbiguousSlideTemplateLayout, error.UnsafeSlideGlobalDirective => .structural_source_locked,
+                    error.AmbiguousSlideTemplateLayout,
+                    error.UnsafeSlideGlobalDirective,
+                    error.UnsupportedSlideTemplateOverride,
+                    => .structural_source_locked,
                     error.NameCollision => .library_name_conflict,
                     error.SlideTemplateNameCollision => .library_name_conflict,
                     error.LiveUses => .library_entry_in_use,
@@ -1721,6 +1727,19 @@ fn morphItemEditTarget(slide: *const slides.Slide, state_index: usize, item: *co
     return .insert_local;
 }
 
+fn insertStudioTemplateOverride(
+    history: *StudioHistory,
+    slide: *const slides.Slide,
+    snippet: []const u8,
+) !void {
+    return recordStudioPatch(history, try source_editor.insertSlideTemplateOverride(
+        G.allocator,
+        G.editor_memory[0..G.source_len],
+        slide.pos_in_editor,
+        snippet,
+    ));
+}
+
 fn applyStudioGeometryEdit(
     history: *StudioHistory,
     command: studio.GeometryCommand,
@@ -1761,6 +1780,45 @@ fn applyStudioGeometryEdit(
                 ));
             },
         }
+    } else if (command.edit_scope == .local_instance) {
+        const slide = slide_opt orelse return error.NoStudioSlide;
+        const item = studioItemByIdentity(items, command.item_identity) orelse return error.StudioItemMissing;
+        const id = item.id orelse return error.TemplateInstanceItemNeedsId;
+        if (item.instance_source) |instance_source| {
+            if (instance_source.patchable) {
+                return recordStudioPatch(history, try source_editor.patchSlideTemplateOverrideGeometry(
+                    G.allocator,
+                    G.editor_memory[0..G.source_len],
+                    slide.pos_in_editor,
+                    instance_source.line_offset,
+                    id,
+                    .{
+                        .x = command.after_position.x,
+                        .y = command.after_position.y,
+                        .w = if (command.resized) command.after_size.x else null,
+                        .h = if (command.resized) command.after_size.y else null,
+                    },
+                ));
+            }
+        }
+
+        var directive_buffer: [512]u8 = undefined;
+        const directive = if (command.resized)
+            try std.fmt.bufPrint(
+                &directive_buffer,
+                "@set {s} x={d} y={d} w={d} h={d}",
+                .{ id, command.after_position.x, command.after_position.y, command.after_size.x, command.after_size.y },
+            )
+        else
+            try std.fmt.bufPrint(
+                &directive_buffer,
+                "@set {s} x={d} y={d}",
+                .{ id, command.after_position.x, command.after_position.y },
+            );
+        return insertStudioTemplateOverride(history, slide, directive);
+    } else if (command.edit_scope == .shared_template) {
+        const item = studioItemByIdentity(items, command.item_identity) orelse return error.StudioItemMissing;
+        source_ref = item.source;
     }
     if (source_ref.scope == .none or !source_ref.patchable) return error.StudioItemHasNoPatchableSource;
 
@@ -1987,6 +2045,7 @@ fn applyStudioLiteralAttribute(
     slide: *const slides.Slide,
     morph_state: ?usize,
     item: *const slides.SlideItem,
+    edit_scope: studio.EditScope,
     key: []const u8,
     value: []const u8,
 ) !void {
@@ -2001,6 +2060,26 @@ fn applyStudioLiteralAttribute(
                 return insertStudioSnippet(history, slide, morph_state, directive);
             },
         }
+    } else if (edit_scope == .local_instance) {
+        const id = item.id orelse return error.TemplateInstanceItemNeedsId;
+        if (item.instance_source) |instance_source| {
+            if (instance_source.patchable) {
+                const patches = [_]source_editor.LiteralAttributePatch{.{ .key = key, .value = value }};
+                return recordStudioPatch(history, try source_editor.patchSlideTemplateOverrideAttributes(
+                    G.allocator,
+                    G.editor_memory[0..G.source_len],
+                    slide.pos_in_editor,
+                    instance_source.line_offset,
+                    id,
+                    &patches,
+                ));
+            }
+        }
+        const directive = try std.fmt.allocPrint(G.allocator, "@set {s} {s}={s}", .{ id, key, value });
+        defer G.allocator.free(directive);
+        return insertStudioTemplateOverride(history, slide, directive);
+    } else if (edit_scope == .shared_template) {
+        source_ref = item.source;
     }
     if (!source_ref.patchable) return error.StudioItemHasNoPatchableSource;
     const patches = [_]source_editor.LiteralAttributePatch{.{ .key = key, .value = value }};
@@ -2017,6 +2096,7 @@ fn applyStudioText(
     slide: *const slides.Slide,
     morph_state: ?usize,
     item: *const slides.SlideItem,
+    edit_scope: studio.EditScope,
     text_value: []const u8,
 ) !void {
     var source_ref = item.source;
@@ -2032,6 +2112,27 @@ fn applyStudioText(
                 return insertStudioSnippet(history, slide, morph_state, snippet);
             },
         }
+    } else if (edit_scope == .local_instance) {
+        const id = item.id orelse return error.TemplateInstanceItemNeedsId;
+        if (item.instance_source) |instance_source| {
+            if (instance_source.patchable) {
+                return recordStudioPatch(history, try source_editor.patchSlideTemplateOverrideText(
+                    G.allocator,
+                    G.editor_memory[0..G.source_len],
+                    slide.pos_in_editor,
+                    instance_source.line_offset,
+                    id,
+                    text_value,
+                ));
+            }
+        }
+        const directive = try std.fmt.allocPrint(G.allocator, "@set {s}", .{id});
+        defer G.allocator.free(directive);
+        const snippet = try itemTextSnippet(G.allocator, directive, text_value);
+        defer G.allocator.free(snippet);
+        return insertStudioTemplateOverride(history, slide, snippet);
+    } else if (edit_scope == .shared_template) {
+        source_ref = item.source;
     }
     if (!source_ref.patchable) return error.StudioItemHasNoPatchableSource;
     return recordStudioPatch(history, try source_editor.patchItemText(
@@ -2110,23 +2211,40 @@ fn applyStudioSemanticEdit(
                     try insertStudioSnippet(history, slide, morph_state, directive);
                 }
             } else {
-                try deleteStudioItem(history, item, target.source.line_offset);
+                switch (target.edit_scope) {
+                    .direct => try deleteStudioItem(history, item, target.source.line_offset),
+                    .shared_template => try deleteStudioItem(history, item, item.source.line_offset),
+                    .local_instance => {
+                        const id = item.id orelse return error.TemplateInstanceItemNeedsId;
+                        const directive = try std.fmt.allocPrint(G.allocator, "@hide {s}", .{id});
+                        defer G.allocator.free(directive);
+                        try insertStudioTemplateOverride(history, slide, directive);
+                    },
+                }
             }
         },
         .edit_text => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
             if (item.kind != .textbox and item.kind != .crowd) return error.ItemHasNoEditableText;
-            try applyStudioText(history, slide, morph_state, item, prompted_text orelse return error.StudioPromptMissing);
+            try applyStudioText(
+                history,
+                slide,
+                morph_state,
+                item,
+                target.edit_scope,
+                prompted_text orelse return error.StudioPromptMissing,
+            );
         },
         .set_foreground => |change| {
             const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
             if (item.kind != .textbox) return error.ItemHasNoForegroundColor;
             var color_buffer: [9]u8 = undefined;
             const color = colorLiteral(&color_buffer, studio.paletteColor(change.color));
-            try applyStudioLiteralAttribute(history, slide, morph_state, item, "color", color);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "color", color);
         },
         .set_background => |change| {
             if (morph_state != null) return error.MorphBackgroundUnsupported;
+            if (change.target.edit_scope == .local_instance) return error.TemplateInstanceBackgroundUnsupported;
             const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
             const geometry = studio.itemGeometry(item.*, resolved_bounds);
             var color_buffer: [9]u8 = undefined;
@@ -2139,9 +2257,13 @@ fn applyStudioSemanticEdit(
                 .{ id, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y, color },
             );
             defer G.allocator.free(directive);
+            const source_ref = if (change.target.edit_scope == .shared_template)
+                item.source
+            else
+                change.target.source;
             const insertion_offset = try source_editor.itemInsertionOffsetBeforeAnimations(
                 G.editor_memory[0..G.source_len],
-                change.target.source.line_offset,
+                source_ref.line_offset,
             );
             try recordStudioPatch(history, try source_editor.insertDirectiveAt(
                 G.allocator,

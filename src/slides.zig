@@ -179,6 +179,7 @@ pub const SourceScope = enum(u8) {
     direct,
     component_instance,
     slide_template,
+    slide_instance_override,
     morph_item,
 };
 
@@ -204,6 +205,12 @@ pub const SlideItem = struct {
     id: ?[]const u8 = null,
     /// Location and authoring scope of the directive that created this item.
     source: SourceRef = .{},
+    /// Location of the most recent instance-local @set/@show/@hide directive
+    /// applied to a slide-template item in the authored base scene. The
+    /// creation source above deliberately remains the shared @pushslide item,
+    /// so editors can distinguish and target the local override without
+    /// changing every instance of the template.
+    instance_source: ?SourceRef = null,
     /// Location of the most recent @set/@show/@hide directive that produced
     /// this item in a semantic-morph snapshot. The creation source above is
     /// deliberately retained, so an editor can target either the base item or
@@ -242,10 +249,17 @@ pub const SlideItem = struct {
         return self;
     }
 
+    /// Source to patch when editing this item's authored base scene. A local
+    /// slide-template override wins over the shared creation directive.
+    pub fn effectiveBaseSource(self: *const SlideItem) SourceRef {
+        return self.instance_source orelse self.source;
+    }
+
     /// Source to patch when editing this item's currently displayed morph
-    /// state. Base editing should continue to use `source` directly.
+    /// state. State-local overrides win over instance-local base overrides,
+    /// which in turn win over the shared creation directive.
     pub fn effectiveSource(self: *const SlideItem) SourceRef {
-        return self.state_source orelse self.source;
+        return self.state_source orelse self.instance_source orelse self.source;
     }
     pub fn deinit(_: *Slide) void {
         // empty
@@ -275,6 +289,7 @@ pub const SlideItem = struct {
 
     pub fn applyPatch(self: *SlideItem, context: ItemContext) void {
         if (context.text) |text| self.text = text;
+        if (context.crowd) |crowd| self.crowd = crowd;
         if (context.img_path) |img_path| self.img_path = img_path;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
         if (context.color) |color| self.color = color;
@@ -543,6 +558,7 @@ test "slide cloning preserves morph source provenance" {
     try original.items.?.append(allocator, .{
         .identity = 1,
         .source = .{ .scope = .direct, .line_number = 2, .line_offset = 7, .patchable = true },
+        .instance_source = .{ .scope = .slide_instance_override, .line_number = 3, .line_offset = 21, .patchable = true },
     });
     const state_index = try original.beginMorphState(
         .{},
@@ -560,7 +576,10 @@ test "slide cloning preserves morph source provenance" {
 
     const clone = try Slide.fromSlide(original, allocator);
     try std.testing.expectEqual(@as(usize, 1), clone.morph_states.items.len);
+    try std.testing.expectEqual(@as(usize, 21), clone.items.?.items[0].effectiveBaseSource().line_offset);
+    try std.testing.expectEqual(SourceScope.slide_instance_override, clone.items.?.items[0].effectiveBaseSource().scope);
     try std.testing.expectEqual(@as(usize, 42), clone.morph_states.items[0].source.line_offset);
+    try std.testing.expectEqual(@as(usize, 21), clone.morph_states.items[0].items.items[0].effectiveBaseSource().line_offset);
     try std.testing.expectEqual(@as(usize, 56), clone.morph_states.items[0].items.items[0].effectiveSource().line_offset);
     try std.testing.expectEqual(@as(?usize, 0), clone.morph_states.items[0].items.items[0].state_source_state);
     try std.testing.expectEqual(@as(?usize, 0), clone.morph_states.items[0].items.items[0].creation_morph_state);

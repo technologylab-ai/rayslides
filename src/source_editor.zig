@@ -39,6 +39,7 @@ pub const PatchError = error{
     NotPromotableDirective,
     SlideTemplateNameCollision,
     SourceTooLarge,
+    UnsupportedSlideTemplateOverride,
     UnsupportedSlidePromotion,
     UnsafeSlideGlobalDirective,
 };
@@ -327,6 +328,79 @@ pub fn insertSnippet(
 ) (std.mem.Allocator.Error || PatchError)!PatchResult {
     const insertion_offset = try slideItemInsertionOffset(source, slide_offset);
     return insertSnippetAt(allocator, source, insertion_offset, snippet);
+}
+
+/// Add an instance-local mutation to the base scene of a slide created by a
+/// literal `@popslide` directive.
+///
+/// Unlike `insertSnippet`, this deliberately refuses direct `@slide` and
+/// implicit-slide anchors: writing `@set` there would be an ordinary base
+/// mutation, not an override of a reusable slide template. The snippet must
+/// begin with a literal `@set`, `@show`, or `@hide` and a literal item ID. It is
+/// inserted after all existing base content and before the first morph state,
+/// so the parser can apply it to the cloned template items without moving it
+/// into a semantic-morph snapshot.
+pub fn insertSlideTemplateOverride(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    snippet: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    _ = try slideTemplateInstanceBaseRegion(source, slide_offset);
+    try validateSlideTemplateOverrideSnippet(snippet);
+    const insertion_offset = try slideItemInsertionOffset(source, slide_offset);
+    return insertSnippetAt(allocator, source, insertion_offset, snippet);
+}
+
+/// Patch attributes on an already-authored instance-local override.
+///
+/// `override_offset` must identify a literal `@set`/`@show`/`@hide` for
+/// `item_id` in the selected `@popslide` instance's base region. In particular,
+/// a similarly named mutation in a later morph state or another slide cannot
+/// be patched accidentally. `id=` remains read-only; callers must also honor
+/// the parser provenance's `patchable` flag before editing an existing line.
+pub fn patchSlideTemplateOverrideAttributes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    override_offset: usize,
+    item_id: []const u8,
+    patches: []const LiteralAttributePatch,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateSlideTemplateOverrideLocation(source, slide_offset, override_offset, item_id);
+    for (patches) |patch| {
+        if (std.mem.eql(u8, patch.key, "id")) return error.InvalidLiteralValue;
+    }
+    return patchLiteralAttributes(allocator, source, override_offset, patches);
+}
+
+/// Patch geometry on an already-authored instance-local override. This is the
+/// scoped counterpart to `patchGeometry`: it prevents a stale provenance
+/// offset from editing a mutation in a morph state or another slide.
+pub fn patchSlideTemplateOverrideGeometry(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    override_offset: usize,
+    item_id: []const u8,
+    geometry: GeometryPatch,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateSlideTemplateOverrideLocation(source, slide_offset, override_offset, item_id);
+    return patchGeometry(allocator, source, override_offset, geometry);
+}
+
+/// Patch semantic text on an already-authored instance-local override while
+/// retaining the same source-scope checks as attribute edits.
+pub fn patchSlideTemplateOverrideText(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    override_offset: usize,
+    item_id: []const u8,
+    text_value: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateSlideTemplateOverrideLocation(source, slide_offset, override_offset, item_id);
+    return patchItemText(allocator, source, override_offset, text_value);
 }
 
 /// Find the end of a slide's base scene: its first morph state, next slide
@@ -1360,6 +1434,111 @@ fn validateNoDanglingAnimation(source: []const u8, start: usize, end: usize) Pat
     if (pending_animation) return error.UnsupportedSlidePromotion;
 }
 
+const SlideTemplateInstanceBaseRegion = struct {
+    anchor: DirectiveLine,
+    end: usize,
+};
+
+fn slideTemplateInstanceBaseRegion(
+    source: []const u8,
+    slide_offset: usize,
+) PatchError!SlideTemplateInstanceBaseRegion {
+    const anchor = directiveLine(source, slide_offset) catch
+        return error.UnsupportedSlideTemplateOverride;
+    const anchor_text = source[anchor.start..anchor.content_end];
+    const name = directiveName(anchor_text);
+    if (!std.mem.eql(u8, name, "@popslide")) return error.UnsupportedSlideTemplateOverride;
+    const template_name = directiveContextName(anchor_text, name.len) orelse
+        return error.UnsupportedSlideTemplateOverride;
+    if (!isReusableName(template_name)) return error.UnsupportedSlideTemplateOverride;
+
+    return .{
+        .anchor = anchor,
+        .end = findSlideBoundary(source, slide_offset, true) catch
+            return error.UnsupportedSlideTemplateOverride,
+    };
+}
+
+fn validateSlideTemplateOverrideSnippet(snippet: []const u8) PatchError!void {
+    try validateSnippet(snippet);
+
+    const content = std.mem.trimEnd(u8, snippet, "\n");
+    const first_line_end = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
+    const directive = content[0..first_line_end];
+    _ = try validateSlideTemplateOverrideDirectiveLine(directive);
+}
+
+fn validateSlideTemplateOverrideDirectiveLine(line: []const u8) PatchError![]const u8 {
+    const name = directiveName(line);
+    if (!isMorphMutationDirective(name)) return error.UnsupportedSlideTemplateOverride;
+
+    var cursor = name.len;
+    while (cursor < line.len and isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+    if (cursor == line.len) return error.InvalidLiteralValue;
+    const target_start = cursor;
+    while (cursor < line.len and !isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+    const target = line[target_start..cursor];
+    if (!isLiteralItemId(target)) return error.InvalidLiteralValue;
+
+    while (cursor < line.len) {
+        while (cursor < line.len and isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+        if (cursor == line.len) break;
+        const token_start = cursor;
+        while (cursor < line.len and !isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+        const token = line[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse return error.InvalidLiteralValue;
+        const key = token[0..equals];
+        if (std.mem.eql(u8, key, "id")) return error.InvalidLiteralValue;
+        if (std.mem.eql(u8, key, "text")) {
+            try validateLiteralPatch(.{ .key = key, .value = line[token_start + equals + 1 ..] });
+            break;
+        }
+        try validateLiteralPatch(.{ .key = key, .value = token[equals + 1 ..] });
+    }
+    return target;
+}
+
+fn validateSlideTemplateOverrideLocation(
+    source: []const u8,
+    slide_offset: usize,
+    override_offset: usize,
+    item_id: []const u8,
+) PatchError!void {
+    if (!isLiteralItemId(item_id)) return error.InvalidLiteralValue;
+    const region = try slideTemplateInstanceBaseRegion(source, slide_offset);
+    if (override_offset < region.anchor.full_end or override_offset >= region.end) {
+        return error.UnsupportedSlideTemplateOverride;
+    }
+    const line = directiveLine(source, override_offset) catch
+        return error.UnsupportedSlideTemplateOverride;
+    if (line.content_end > region.end) return error.UnsupportedSlideTemplateOverride;
+    const target = validateSlideTemplateOverrideDirectiveLine(source[line.start..line.content_end]) catch |err| switch (err) {
+        error.InvalidLiteralValue => return error.InvalidLiteralValue,
+        else => return error.UnsupportedSlideTemplateOverride,
+    };
+    if (!std.mem.eql(u8, target, item_id)) return error.UnsupportedSlideTemplateOverride;
+
+    // Provenance should always point at the parser-effective mutation. Refuse
+    // a stale earlier line instead of reporting success for an edit that a
+    // later @set/@show/@hide would continue to mask.
+    var latest_matching_offset: ?usize = null;
+    var cursor = region.anchor.full_end;
+    while (cursor < region.end) {
+        const candidate_line = physicalLineAt(source, cursor);
+        if (cursor < candidate_line.content_end and source[cursor] == '@') {
+            const candidate = source[cursor..candidate_line.content_end];
+            const candidate_name = directiveName(candidate);
+            if (isMorphMutationDirective(candidate_name)) {
+                if (directiveContextName(candidate, candidate_name.len)) |candidate_target| {
+                    if (std.mem.eql(u8, candidate_target, item_id)) latest_matching_offset = cursor;
+                }
+            }
+        }
+        cursor = candidate_line.full_end;
+    }
+    if (latest_matching_offset != override_offset) return error.UnsupportedSlideTemplateOverride;
+}
+
 fn findSlideBoundary(source: []const u8, slide_offset: usize, stop_at_state: bool) PatchError!usize {
     var cursor: usize = undefined;
     if (directiveLine(source, slide_offset)) |slide_line| {
@@ -1557,6 +1736,10 @@ fn isAttributeName(key: []const u8) bool {
 
 fn isReusableName(name: []const u8) bool {
     return isAttributeName(name);
+}
+
+fn isLiteralItemId(id: []const u8) bool {
+    return id.len > 0 and std.mem.indexOfAny(u8, id, " \t\r\n=$") == null;
 }
 
 fn isColorAttribute(key: []const u8) bool {
@@ -2035,6 +2218,246 @@ test "slide insertion appends before first morph state" {
         "@box id=new x=20 y=30 text=Topmost",
     );
     try expectSourceResult(result, source, expected);
+}
+
+test "slide template override insertion targets the literal instance base and preserves CRLF" {
+    const source =
+        "\xEF\xBB\xBF@box id=hero text=Template\r\n" ++
+        "@pushslide layout\r\n" ++
+        "@popslide layout transition=fade\r\n" ++
+        "@set hero x=10\r\n" ++
+        "@box id=local text=Instance-only item\r\n" ++
+        "# base note stays before the override\r\n" ++
+        "@state(morph) duration=0.5\r\n" ++
+        "@hide hero\r\n";
+    const expected =
+        "\xEF\xBB\xBF@box id=hero text=Template\r\n" ++
+        "@pushslide layout\r\n" ++
+        "@popslide layout transition=fade\r\n" ++
+        "@set hero x=10\r\n" ++
+        "@box id=local text=Instance-only item\r\n" ++
+        "# base note stays before the override\r\n" ++
+        "@set hero color=#102030ff text=Local hero costs $20\r\n" ++
+        "@state(morph) duration=0.5\r\n" ++
+        "@hide hero\r\n";
+    const slide_offset = std.mem.indexOf(u8, source, "@popslide").?;
+    const result = try insertSlideTemplateOverride(
+        std.testing.allocator,
+        source,
+        slide_offset,
+        "@set hero color=#102030ff text=Local hero costs $20",
+    );
+
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const hero = deck.slides.items[0].items.?.items[0];
+    try std.testing.expectEqualStrings("Local hero costs $20", hero.text.?);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, hero.source.scope);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, hero.instance_source.?.scope);
+    try std.testing.expectEqual(std.mem.indexOf(u8, result.source, "@set hero color").?, hero.instance_source.?.line_offset);
+
+    try expectSourceResult(result, source, expected);
+}
+
+test "slide template override insertion rejects direct dynamic and nonliteral edits" {
+    const direct = "@slide\n@box id=hero text=Direct\n";
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        insertSlideTemplateOverride(std.testing.allocator, direct, 0, "@hide hero"),
+    );
+
+    const implicit = "@box id=hero text=Implicit\n";
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        insertSlideTemplateOverride(std.testing.allocator, implicit, 0, "@hide hero"),
+    );
+
+    const dynamic = "@popslide $layout$\n";
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        insertSlideTemplateOverride(std.testing.allocator, dynamic, 0, "@hide hero"),
+    );
+
+    const dynamic_attribute = "@popslide layout duration=$duration$\n";
+    const inserted = try insertSlideTemplateOverride(
+        std.testing.allocator,
+        dynamic_attribute,
+        0,
+        "@hide hero",
+    );
+    try expectSourceResult(
+        inserted,
+        dynamic_attribute,
+        "@popslide layout duration=$duration$\n@hide hero\n",
+    );
+
+    const instance = "@popslide layout\n";
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        insertSlideTemplateOverride(std.testing.allocator, instance, 0, "@let x=20"),
+    );
+    try std.testing.expectError(
+        error.InvalidLiteralValue,
+        insertSlideTemplateOverride(std.testing.allocator, instance, 0, "@set hero=card x=20"),
+    );
+    try std.testing.expectError(
+        error.InvalidLiteralValue,
+        insertSlideTemplateOverride(std.testing.allocator, instance, 0, "@set hero id=renamed"),
+    );
+    try std.testing.expectError(
+        error.InvalidLiteralValue,
+        insertSlideTemplateOverride(std.testing.allocator, instance, 0, "@set $hero$ x=20"),
+    );
+    try std.testing.expectError(
+        error.InvalidLiteralValue,
+        insertSlideTemplateOverride(std.testing.allocator, instance, 0, "@hide hero accidental"),
+    );
+}
+
+test "slide template override patch stays inside the selected instance base" {
+    const source =
+        "@popslide layout\r\n" ++
+        "@set hero  x=10 text=Old local text\r\n" ++
+        "@state(morph)\r\n" ++
+        "@set hero x=200\r\n" ++
+        "@popslide layout\r\n" ++
+        "@set hero x=300\r\n";
+    const slide_offset = std.mem.indexOf(u8, source, "@popslide").?;
+    const base_override = std.mem.indexOf(u8, source, "@set hero  x=10").?;
+    const state_override = std.mem.indexOf(u8, source, "@set hero x=200").?;
+    const next_override = std.mem.indexOf(u8, source, "@set hero x=300").?;
+
+    const result = try patchSlideTemplateOverrideGeometry(
+        std.testing.allocator,
+        source,
+        slide_offset,
+        base_override,
+        "hero",
+        .{ .x = 40, .y = 50 },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@popslide layout\r\n" ++
+            "@set hero  x=40 y=50 text=Old local text\r\n" ++
+            "@state(morph)\r\n" ++
+            "@set hero x=200\r\n" ++
+            "@popslide layout\r\n" ++
+            "@set hero x=300\r\n",
+        result.source,
+    );
+
+    const color_result = try patchSlideTemplateOverrideAttributes(
+        std.testing.allocator,
+        source,
+        slide_offset,
+        base_override,
+        "hero",
+        &.{.{ .key = "color", .value = "#abcdef80" }},
+    );
+    defer color_result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        color_result.source,
+        "@set hero  x=10 color=#abcdef80 text=Old local text\r\n",
+    ) != null);
+
+    const text_result = try patchSlideTemplateOverrideText(
+        std.testing.allocator,
+        source,
+        slide_offset,
+        base_override,
+        "hero",
+        "Price $20",
+    );
+    defer text_result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_result.source,
+        "@set hero  x=10 text=Price $20\r\n",
+    ) != null);
+
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        patchSlideTemplateOverrideAttributes(
+            std.testing.allocator,
+            source,
+            slide_offset,
+            state_override,
+            "hero",
+            &.{.{ .key = "x", .value = "40" }},
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        patchSlideTemplateOverrideAttributes(
+            std.testing.allocator,
+            source,
+            slide_offset,
+            next_override,
+            "hero",
+            &.{.{ .key = "x", .value = "40" }},
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        patchSlideTemplateOverrideAttributes(
+            std.testing.allocator,
+            source,
+            slide_offset,
+            base_override,
+            "other",
+            &.{.{ .key = "x", .value = "40" }},
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidLiteralValue,
+        patchSlideTemplateOverrideAttributes(
+            std.testing.allocator,
+            source,
+            slide_offset,
+            base_override,
+            "hero",
+            &.{.{ .key = "id", .value = "renamed" }},
+        ),
+    );
+}
+
+test "slide template override patch rejects a parser-masked earlier mutation" {
+    const source =
+        "@popslide layout\n" ++
+        "@set hero x=10\n" ++
+        "@show hero x=20\n" ++
+        "@state(morph)\n";
+    const first = std.mem.indexOf(u8, source, "@set hero").?;
+    const latest = std.mem.indexOf(u8, source, "@show hero").?;
+
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        patchSlideTemplateOverrideGeometry(
+            std.testing.allocator,
+            source,
+            0,
+            first,
+            "hero",
+            .{ .x = 30, .y = 40 },
+        ),
+    );
+    const result = try patchSlideTemplateOverrideGeometry(
+        std.testing.allocator,
+        source,
+        0,
+        latest,
+        "hero",
+        .{ .x = 30, .y = 40 },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@show hero x=30 y=40\n") != null);
 }
 
 test "slide boundaries distinguish base insertion from complete slide end" {

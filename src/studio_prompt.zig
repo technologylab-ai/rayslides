@@ -5,6 +5,7 @@ pub const max_input_bytes = 8192;
 
 pub const Kind = enum {
     text,
+    shared_text,
     bullets,
     image_path,
     reusable_name,
@@ -97,7 +98,7 @@ pub const Prompt = struct {
 
         if (rl.isKeyPressed(.backspace) or rl.isKeyPressedRepeat(.backspace)) self.removeLastCodepoint();
 
-        const multiline = self.kind == .text or self.kind == .bullets;
+        const multiline = self.kind == .text or self.kind == .shared_text or self.kind == .bullets;
         if (rl.isKeyPressed(.enter)) {
             const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
             if (multiline and shift) {
@@ -221,6 +222,7 @@ fn lastLine(value: []const u8) [:0]const u8 {
 fn promptTitle(kind: Kind) [:0]const u8 {
     return switch (kind) {
         .text => "Edit text",
+        .shared_text => "Edit shared template text",
         .bullets => "Edit bullet list",
         .image_path => "Choose image",
         .reusable_name => "Name reusable or template",
@@ -230,6 +232,7 @@ fn promptTitle(kind: Kind) [:0]const u8 {
 fn promptHint(kind: Kind) [:0]const u8 {
     return switch (kind) {
         .text => "Enter commits · Shift-Enter adds a line · Cmd/Ctrl-V pastes · Esc cancels",
+        .shared_text => "This changes every uncustomized instance · Enter commits · Esc cancels",
         .bullets => "One item per line; '-' is added when needed · Shift-Enter adds a line",
         .image_path => "Path relative to the slide file · Enter commits · Esc cancels",
         .reusable_name => "Use letters, numbers, '_' or '-' · Enter commits · Esc cancels",
@@ -243,6 +246,13 @@ test "prompt edits UTF-8 without splitting the final codepoint" {
     try std.testing.expectEqualStrings("hello ", prompt.text());
     try std.testing.expectEqual(InputResult.accepted, prompt.append("world"));
     try std.testing.expectEqualStrings("hello world", prompt.text());
+}
+
+test "shared template text uses an explicit multiline prompt kind" {
+    var prompt = Prompt{};
+    try std.testing.expectEqual(InputResult.accepted, prompt.tryBegin(.shared_text, "Shared\ntext"));
+    try std.testing.expectEqualStrings("Shared\ntext", prompt.text());
+    try std.testing.expectEqualStrings("Edit shared template text", promptTitle(prompt.kind));
 }
 
 test "oversized initial text is refused without replacing existing input" {

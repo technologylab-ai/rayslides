@@ -45,10 +45,21 @@ pub const Geometry = struct {
     }
 };
 
+/// Describes where an emitted edit should be applied. This is deliberately
+/// separate from `SourceRef.scope`: an item cloned from a slide template keeps
+/// the template directive as its source, while an ordinary Studio edit should
+/// usually create or update an override beside the current `@popslide`.
+pub const EditScope = enum {
+    direct,
+    local_instance,
+    shared_template,
+};
+
 /// A complete, allocation-free description of one undoable source edit.
 pub const GeometryCommand = struct {
     item_identity: usize,
     source: slides.SourceRef,
+    edit_scope: EditScope = .direct,
     before_position: rl.Vector2,
     before_size: rl.Vector2,
     after_position: rl.Vector2,
@@ -189,6 +200,7 @@ fn sourceScopeLabel(scope: slides.SourceScope) []const u8 {
         .direct => "direct item",
         .component_instance => "component instance",
         .slide_template => "shared layout item",
+        .slide_instance_override => "local template override",
         .morph_item => "morph item",
     };
 }
@@ -215,7 +227,10 @@ pub const Notice = enum {
     source_changed_on_disk,
     edit_failed,
     undo_failed,
-    shared_template_locked,
+    shared_template_masked,
+    shared_template_delete_unsupported,
+    local_override_needs_unique_id,
+    template_background_local_unsupported,
     generated_source_read_only,
     property_unavailable,
     base_scene_only,
@@ -274,6 +289,7 @@ pub fn paletteColor(value: PaletteColor) rl.Color {
 pub const CommandTarget = struct {
     item_identity: usize,
     source: slides.SourceRef,
+    edit_scope: EditScope = .direct,
 };
 
 pub const AddItemCommand = struct {
@@ -802,6 +818,7 @@ const Drag = struct {
         .position = .{ .x = 0, .y = 0 },
         .size = .{ .x = 0, .y = 0 },
     },
+    edit_scope: EditScope = .direct,
 };
 
 pub const Studio = struct {
@@ -1087,12 +1104,13 @@ pub const Studio = struct {
                 if (self.resizeHandleRect(viewport, selected_geometry)) |handle| {
                     if (pointInRectangle(input.pointer_screen, handle)) {
                         const selected_index = self.selectedIndex(items) orelse return null;
-                        if (!self.canEditItem(items[selected_index], input.allow_shared_edit)) return null;
+                        const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
                         self.beginInteraction(
                             .resizing,
                             selected_geometry,
                             Geometry.fromItem(items[selected_index]),
                             pointer_logical orelse return null,
+                            edit_scope,
                         );
                     } else {
                         self.selectAndBeginMove(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical, input.allow_shared_edit);
@@ -1115,16 +1133,20 @@ pub const Studio = struct {
 
         if (self.interaction == .idle and (input.nudge.x != 0 or input.nudge.y != 0)) {
             const selected_index = self.selectedIndex(items) orelse return null;
-            if (!self.canEditItem(items[selected_index], input.allow_shared_edit)) return null;
-            return self.applyNudge(items, resolved_bounds, input.nudge);
+            const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
+            return self.applyNudge(items, resolved_bounds, input.nudge, edit_scope);
         }
 
         return null;
     }
 
-    fn selectedTarget(self: Studio, items: []const slides.SlideItem) ?CommandTarget {
+    fn selectedTarget(self: Studio, items: []const slides.SlideItem, edit_scope: EditScope) ?CommandTarget {
         const index = self.selectedIndex(items) orelse return null;
-        return .{ .item_identity = items[index].identity, .source = items[index].source };
+        return .{
+            .item_identity = items[index].identity,
+            .source = self.commandSource(items[index], edit_scope),
+            .edit_scope = edit_scope,
+        };
     }
 
     const TargetCommandKind = enum { delete_item, edit_text, promote_to_reusable };
@@ -1137,7 +1159,7 @@ pub const Studio = struct {
     ) bool {
         const index = self.selectedIndex(items) orelse return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
-        if (!self.canEditItem(items[index], allow_shared_edit)) return true;
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         if (kind == .edit_text and items[index].kind != .textbox and items[index].kind != .crowd) {
             self.notice = .property_unavailable;
             return true;
@@ -1154,7 +1176,11 @@ pub const Studio = struct {
             self.notice = .property_unavailable;
             return true;
         }
-        const target = self.selectedTarget(items) orelse return true;
+        if (kind == .delete_item and edit_scope == .shared_template) {
+            self.notice = .shared_template_delete_unsupported;
+            return true;
+        }
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
         self.pending_semantic_command = switch (kind) {
             .delete_item => .{ .delete_item = target },
             .edit_text => .{ .edit_text = target },
@@ -1172,7 +1198,7 @@ pub const Studio = struct {
     ) bool {
         const index = self.selectedIndex(items) orelse return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
-        if (!self.canEditItem(items[index], allow_shared_edit)) return true;
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         if (!background and items[index].kind != .textbox) {
             self.notice = .property_unavailable;
             return true;
@@ -1181,8 +1207,15 @@ pub const Studio = struct {
             self.notice = .base_scene_only;
             return true;
         }
+        // The background action creates a sibling rectangle behind the item;
+        // an override after @popslide cannot place that rectangle behind the
+        // inherited template content. Alt still permits the shared edit.
+        if (background and edit_scope == .local_instance and items[index].source.scope == .slide_template) {
+            self.notice = .template_background_local_unsupported;
+            return true;
+        }
         const command: ColorCommand = .{
-            .target = self.selectedTarget(items) orelse return true,
+            .target = self.selectedTarget(items, edit_scope) orelse return true,
             .color = color,
         };
         self.pending_semantic_command = if (background)
@@ -1697,26 +1730,87 @@ pub const Studio = struct {
         };
         self.selected_identity = items[hit_index].identity;
         self.selected_source = if (items[hit_index].source.scope == .none) null else items[hit_index].source;
-        if (!self.canEditItem(items[hit_index], allow_shared_edit)) return;
+        const edit_scope = self.editScopeForItem(items, hit_index, allow_shared_edit) orelse return;
         self.beginInteraction(
             .moving,
             itemGeometry(items[hit_index], resolved_bounds),
             Geometry.fromItem(items[hit_index]),
             pointer,
+            edit_scope,
         );
     }
 
-    fn canEditItem(self: *Studio, item: slides.SlideItem, allow_shared_edit: bool) bool {
-        if (!self.itemEditableInScene(item)) {
-            self.notice = .generated_source_read_only;
-            return false;
-        }
-        if (self.active_morph_state != null) return true;
-        if (item.source.scope == .slide_template and !allow_shared_edit) {
-            self.notice = .shared_template_locked;
-            return false;
+    fn itemIdIsUnique(items: []const slides.SlideItem, item_index: usize) bool {
+        const id = items[item_index].id orelse return false;
+        for (items, 0..) |other, other_index| {
+            if (other_index == item_index) continue;
+            if (other.id) |other_id| {
+                if (std.mem.eql(u8, id, other_id)) return false;
+            }
         }
         return true;
+    }
+
+    /// Resolves an action to its source-edit destination. Template clones with
+    /// unique IDs default to a current-slide override; Alt deliberately opts
+    /// into changing the shared template definition instead.
+    fn editScopeForItem(
+        self: *Studio,
+        items: []const slides.SlideItem,
+        item_index: usize,
+        allow_shared_edit: bool,
+    ) ?EditScope {
+        const item = items[item_index];
+        if (self.active_morph_state) |state_index| {
+            if (item.state_source_state != null and item.state_source_state.? == state_index) {
+                if (item.state_source != null and item.state_source.?.patchable) return .direct;
+                self.notice = .generated_source_read_only;
+                return null;
+            }
+            if (item.creation_morph_state != null and item.creation_morph_state.? == state_index) {
+                if (item.source.patchable) return .direct;
+                self.notice = .generated_source_read_only;
+                return null;
+            }
+            // Morph-state placement remains under the integration layer's
+            // existing state-local targeting; EditScope distinguishes only
+            // base template-instance edits from shared template edits.
+            if (itemIdIsUnique(items, item_index)) return .direct;
+            self.notice = .local_override_needs_unique_id;
+            return null;
+        }
+
+        if (item.source.scope == .slide_template) {
+            if (allow_shared_edit) {
+                // The displayed geometry/text may already include a local
+                // override. Writing those effective absolute values back to
+                // the shared directive would make other instances jump and
+                // can leave this instance masked. Use an uncustomized
+                // instance until Studio retains both authored value layers.
+                if (item.instance_source != null) {
+                    self.notice = .shared_template_masked;
+                    return null;
+                }
+                if (item.source.patchable) return .shared_template;
+                self.notice = .generated_source_read_only;
+                return null;
+            }
+            if (itemIdIsUnique(items, item_index)) return .local_instance;
+            self.notice = .local_override_needs_unique_id;
+            return null;
+        }
+
+        if (item.source.scope != .none and item.source.patchable) return .direct;
+        self.notice = .generated_source_read_only;
+        return null;
+    }
+
+    fn commandSource(self: Studio, item: slides.SlideItem, edit_scope: EditScope) slides.SourceRef {
+        return switch (edit_scope) {
+            .shared_template => item.source,
+            .local_instance => item.effectiveBaseSource(),
+            .direct => if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource(),
+        };
     }
 
     fn itemEditableInScene(self: Studio, item: slides.SlideItem) bool {
@@ -1734,7 +1828,28 @@ pub const Studio = struct {
             // or shared-template directive need not itself be writable.
             return item.id != null;
         }
+        if (item.source.scope == .slide_template) return item.id != null or item.source.patchable;
         return item.source.scope != .none and item.source.patchable;
+    }
+
+    fn editDestinationLabel(self: Studio, item: slides.SlideItem) []const u8 {
+        if (self.interaction != .idle) {
+            return switch (self.drag.edit_scope) {
+                .direct => sourceScopeLabel(if (self.active_morph_state != null) item.effectiveSource().scope else item.effectiveBaseSource().scope),
+                .local_instance => "editing local instance override",
+                .shared_template => "editing shared template (Alt)",
+            };
+        }
+        if (self.active_morph_state == null and item.source.scope == .slide_template) {
+            if (item.id != null) {
+                if (item.source.patchable) return "local instance override; Alt edits shared template";
+                return "local instance override; shared source is generated/read-only";
+            }
+            if (item.source.patchable) return "shared template; add id for local edit (Alt edits shared)";
+            return "generated shared template; add a literal id for local editing";
+        }
+        const source = if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource();
+        return sourceScopeLabel(source.scope);
     }
 
     fn beginInteraction(
@@ -1743,12 +1858,14 @@ pub const Studio = struct {
         geometry: Geometry,
         authored_geometry: Geometry,
         pointer: rl.Vector2,
+        edit_scope: EditScope,
     ) void {
         self.interaction = interaction;
         self.drag = .{
             .pointer_start = pointer,
             .before = geometry,
             .authored_before = authored_geometry,
+            .edit_scope = edit_scope,
         };
         self.preview = geometry;
     }
@@ -1783,7 +1900,8 @@ pub const Studio = struct {
         self.copy_is_current = false;
         return .{
             .item_identity = identity,
-            .source = items[index].source,
+            .source = self.commandSource(items[index], self.drag.edit_scope),
+            .edit_scope = self.drag.edit_scope,
             .before_position = self.drag.before.position,
             .before_size = self.drag.before.size,
             .after_position = after.position,
@@ -1807,6 +1925,7 @@ pub const Studio = struct {
         items: []slides.SlideItem,
         resolved_bounds: []const ResolvedBounds,
         delta: rl.Vector2,
+        edit_scope: EditScope,
     ) ?GeometryCommand {
         const identity = self.selected_identity orelse return null;
         const index = itemIndexByIdentity(items, identity) orelse return null;
@@ -1817,7 +1936,8 @@ pub const Studio = struct {
         self.copy_is_current = false;
         return .{
             .item_identity = identity,
-            .source = items[index].source,
+            .source = self.commandSource(items[index], edit_scope),
+            .edit_scope = edit_scope,
             .before_position = before.position,
             .before_size = before.size,
             .after_position = after.position,
@@ -2049,11 +2169,12 @@ pub const Studio = struct {
         const status_text = if (self.selected_identity) |identity| selected: {
             const geometry = self.selectedGeometry(items, resolved_bounds) orelse break :selected "STUDIO · selection unavailable";
             const index = self.selectedIndex(items) orelse break :selected "STUDIO · selection unavailable";
-            const source = if (self.active_morph_state != null) items[index].effectiveSource() else items[index].source;
+            const item = items[index];
+            const source = if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource();
             break :selected std.fmt.bufPrintZ(
                 &status_buffer,
                 "STUDIO{s} · item #{d} · {s}, line {d} · x {d:.0} y {d:.0} w {d:.0} h {d:.0}",
-                .{ if (self.dirty) " *" else "", identity, sourceScopeLabel(source.scope), source.line_number, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
+                .{ if (self.dirty) " *" else "", identity, self.editDestinationLabel(item), source.line_number, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
             ) catch "STUDIO · selected item";
         } else if (self.dirty) "STUDIO * · click an item to select it" else "STUDIO · click an item to select it";
 
@@ -2080,7 +2201,10 @@ pub const Studio = struct {
             .source_changed_on_disk => "Original changed on disk - use Save Copy to preserve this version",
             .edit_failed => "Edit rejected - the original source is unchanged",
             .undo_failed => "Undo/redo failed - see the log for details",
-            .shared_template_locked => "Shared layout item: hold Alt to edit every slide that uses it",
+            .shared_template_masked => "This slide already overrides the item; edit the shared template from an uncustomized instance",
+            .shared_template_delete_unsupported => "Shared template deletion needs dependency cleanup and is not available yet",
+            .local_override_needs_unique_id => "Add a unique id=... to create a local override; Alt edits an uncustomized shared item",
+            .template_background_local_unsupported => "Background insertion cannot be local to a template instance; hold Alt to edit the shared template",
             .generated_source_read_only => "Read-only in Studio: this item directive is produced with @let",
             .property_unavailable => "That property does not apply to this kind of item",
             .base_scene_only => "That action is available in the BASE scene",
@@ -2303,10 +2427,13 @@ test "move drag emits before and after geometry with layout clone provenance" {
     const command = studio.update(&items, &.{}, viewport, .{
         .pointer_screen = .{ .x = 170, .y = 250 },
         .pointer_released = true,
-        .allow_shared_edit = true,
+        // The scope is captured when the gesture begins; releasing Alt before
+        // the mouse button must not redirect a shared edit into the instance.
+        .allow_shared_edit = false,
     }).?;
     try std.testing.expect(!command.resized);
     try std.testing.expectEqual(SourceScope.slide_template, command.source.scope);
+    try std.testing.expectEqual(EditScope.shared_template, command.edit_scope);
     try std.testing.expectEqual(@as(usize, 812), command.source.line_offset);
     try expectVector(.{ .x = 100, .y = 200 }, command.before_position);
     try expectVector(.{ .x = 150, .y = 230 }, command.after_position);
@@ -2441,7 +2568,7 @@ test "cancelled auto-image resize restores authored zero size" {
     try std.testing.expectEqual(Interaction.idle, studio.interaction);
 }
 
-test "shared template geometry requires an explicit Alt gesture" {
+test "idless template geometry is local-read-only but Alt edits shared" {
     var items = [_]slides.SlideItem{testItem(71, .textbox, 100, 100, 300, 100)};
     items[0].source = .{ .scope = .slide_template, .line_number = 5, .line_offset = 44, .patchable = true };
     const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
@@ -2454,14 +2581,118 @@ test "shared template geometry requires an explicit Alt gesture" {
     }) == null);
     try std.testing.expectEqual(@as(?usize, 71), studio.selected_identity);
     try std.testing.expectEqual(Interaction.idle, studio.interaction);
-    try std.testing.expectEqual(Notice.shared_template_locked, studio.notice);
+    try std.testing.expectEqual(Notice.local_override_needs_unique_id, studio.notice);
 
     const command = studio.update(&items, &.{}, viewport, .{
         .nudge = .{ .x = 10, .y = 0 },
         .allow_shared_edit = true,
     }).?;
     try std.testing.expectEqual(slides.SourceScope.slide_template, command.source.scope);
+    try std.testing.expectEqual(EditScope.shared_template, command.edit_scope);
     try expectVector(.{ .x = 110, .y = 100 }, command.after_position);
+}
+
+test "identified template geometry defaults to a local instance override" {
+    var items = [_]slides.SlideItem{testItem(73, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .slide_template, .line_number = 5, .line_offset = 44, .patchable = true };
+    items[0].id = "hero";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 73 };
+
+    const nudge = studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 4, .y = -2 } }).?;
+    try std.testing.expectEqual(EditScope.local_instance, nudge.edit_scope);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, nudge.source.scope);
+    try expectVector(.{ .x = 104, .y = 98 }, nudge.after_position);
+
+    items[0].position = .{ .x = 100, .y = 100 };
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 400, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(Interaction.resizing, studio.interaction);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 440, .y = 230 },
+        .pointer_down = true,
+    });
+    const resize = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 440, .y = 230 },
+        .pointer_released = true,
+    }).?;
+    try std.testing.expect(resize.resized);
+    try std.testing.expectEqual(EditScope.local_instance, resize.edit_scope);
+    try expectVector(.{ .x = 340, .y = 130 }, resize.after_size);
+}
+
+test "duplicate template IDs cannot create an ambiguous local override" {
+    var items = [_]slides.SlideItem{
+        testItem(731, .textbox, 100, 100, 300, 100),
+        testItem(732, .textbox, 500, 100, 300, 100),
+    };
+    for (&items) |*item| {
+        item.source = .{ .scope = .slide_template, .line_number = 5, .line_offset = 44, .patchable = true };
+        item.id = "hero";
+    }
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 731 };
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 4, .y = 0 } }) == null);
+    try std.testing.expectEqual(Notice.local_override_needs_unique_id, studio.notice);
+    try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+}
+
+test "local template geometry targets an existing instance override" {
+    var items = [_]slides.SlideItem{testItem(74, .textbox, 100, 100, 300, 100)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 12, .line_offset = 180, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 74 };
+
+    const command = studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } }).?;
+    try std.testing.expectEqual(EditScope.local_instance, command.edit_scope);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, command.source.scope);
+    try std.testing.expectEqual(@as(usize, 180), command.source.line_offset);
+}
+
+test "an existing local override blocks ambiguous Alt shared edits" {
+    var items = [_]slides.SlideItem{testItem(76, .textbox, 500, 100, 300, 100)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 12, .line_offset = 180, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 76 };
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+        .nudge = .{ .x = 10, .y = 0 },
+        .allow_shared_edit = true,
+    }) == null);
+    try expectVector(.{ .x = 500, .y = 100 }, items[0].position);
+    try std.testing.expectEqual(Notice.shared_template_masked, studio.notice);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .edit_text_pressed = true,
+        .allow_shared_edit = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.shared_template_masked, studio.notice);
+}
+
+test "template status labels distinguish local and shared destinations" {
+    var item = testItem(75, .textbox, 100, 100, 300, 100);
+    item.source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    item.id = "hero";
+    var studio: Studio = .{ .enabled = true };
+
+    try std.testing.expectEqualStrings("local instance override; Alt edits shared template", studio.editDestinationLabel(item));
+    item.id = null;
+    try std.testing.expectEqualStrings("shared template; add id for local edit (Alt edits shared)", studio.editDestinationLabel(item));
+
+    studio.interaction = .moving;
+    studio.drag.edit_scope = .shared_template;
+    try std.testing.expectEqualStrings("editing shared template (Alt)", studio.editDestinationLabel(item));
+    studio.drag.edit_scope = .local_instance;
+    try std.testing.expectEqualStrings("editing local instance override", studio.editDestinationLabel(item));
 }
 
 test "let-expanded source stays selectable but cannot emit an edit" {
@@ -2600,21 +2831,92 @@ test "property hit targets emit delete and color commands" {
     try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
 }
 
-test "keyboard property commands respect shared template lock" {
+test "identified template text edits default local and Alt selects shared" {
     var items = [_]slides.SlideItem{testItem(82, .textbox, 100, 100, 300, 100)};
     items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
+    items[0].id = "hero";
     const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
     var studio: Studio = .{ .enabled = true, .selected_identity = 82 };
 
     _ = studio.update(&items, &.{}, viewport, .{ .edit_text_pressed = true });
-    try std.testing.expect(studio.takeSemanticCommand() == null);
-    try std.testing.expectEqual(Notice.shared_template_locked, studio.notice);
+    switch (studio.takeSemanticCommand().?) {
+        .edit_text => |target| {
+            try std.testing.expectEqual(@as(usize, 82), target.item_identity);
+            try std.testing.expectEqual(EditScope.local_instance, target.edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
 
     _ = studio.update(&items, &.{}, viewport, .{ .edit_text_pressed = true, .allow_shared_edit = true });
     switch (studio.takeSemanticCommand().?) {
-        .edit_text => |target| try std.testing.expectEqual(@as(usize, 82), target.item_identity),
+        .edit_text => |target| {
+            try std.testing.expectEqual(@as(usize, 82), target.item_identity);
+            try std.testing.expectEqual(EditScope.shared_template, target.edit_scope);
+        },
         else => return error.UnexpectedSemanticCommand,
     }
+}
+
+test "identified template delete and foreground color emit local targets" {
+    var items = [_]slides.SlideItem{testItem(89, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
+    items[0].id = "hero";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 89 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .delete_item => |target| {
+            try std.testing.expectEqual(EditScope.local_instance, target.edit_scope);
+            try std.testing.expectEqual(@as(usize, 89), target.item_identity);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.update(&items, &.{}, viewport, .{ .foreground_color = .orange });
+    switch (studio.takeSemanticCommand().?) {
+        .set_foreground => |command| {
+            try std.testing.expectEqual(PaletteColor.orange, command.color);
+            try std.testing.expectEqual(EditScope.local_instance, command.target.edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "template background insertion is unavailable locally but allowed shared" {
+    var items = [_]slides.SlideItem{testItem(90, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
+    items[0].id = "hero";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 90 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .background_color = .blue });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.template_background_local_unsupported, studio.notice);
+
+    _ = studio.update(&items, &.{}, viewport, .{ .background_color = .blue, .allow_shared_edit = true });
+    switch (studio.takeSemanticCommand().?) {
+        .set_background => |command| {
+            try std.testing.expectEqual(PaletteColor.blue, command.color);
+            try std.testing.expectEqual(EditScope.shared_template, command.target.edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "idless template semantic actions need IDs and shared delete stays guarded" {
+    var items = [_]slides.SlideItem{testItem(91, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 91 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.local_override_needs_unique_id, studio.notice);
+
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true, .allow_shared_edit = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.shared_template_delete_unsupported, studio.notice);
 }
 
 test "promotion is offered only for direct base box items" {
@@ -2725,10 +3027,11 @@ test "idless morph births are editable only in their creation state" {
     var inherited: Studio = .{ .enabled = true, .active_morph_state = 1, .morph_state_count = 2, .selected_identity = 86 };
     try std.testing.expect(inherited.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } }) == null);
     try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
-    try std.testing.expectEqual(Notice.generated_source_read_only, inherited.notice);
+    try std.testing.expectEqual(Notice.local_override_needs_unique_id, inherited.notice);
 
     items[0].id = "born";
     const inherited_command = inherited.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } }).?;
+    try std.testing.expectEqual(EditScope.direct, inherited_command.edit_scope);
     try expectVector(.{ .x = 101, .y = 100 }, inherited_command.after_position);
 }
 

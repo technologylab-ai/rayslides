@@ -104,12 +104,19 @@ source.
 Studio edits the `.sld` document rather than maintaining a separate opaque
 scene. It changes only the source owned by the selected object and preserves
 unrelated spacing, comments, text, and line endings. Objects instantiated with
-`@pop` are edited at that instance; objects inherited from `@pushslide`
-deliberately edit their shared template definition. Shared items use an amber
-outline and require holding <kbd>Alt</kbd> while moving, resizing, nudging, or
-changing properties so a deck-wide change cannot happen accidentally. Items
-whose directive is produced through `@let` remain selectable but read-only
-until Studio has token-to-source mapping.
+`@pop` are edited at that instance. Named objects inherited from `@pushslide`
+are also edited locally by default: Studio creates or updates an `@set` beside
+the current `@popslide`, and Delete adds `@hide`. Hold <kbd>Alt</kbd> while
+moving, resizing, nudging, or changing a property to edit the shared template
+definition instead. Shared deletion is deliberately unavailable until Studio
+can clean up dependent local and morph mutations safely. Template items use an
+amber outline and the status bar states whether an operation is local or
+shared. An inherited object without a unique `id=` cannot receive a local
+override; add an ID or use <kbd>Alt</kbd> for an intentional shared edit. A
+generated shared directive produced through `@let` remains read-only, but an
+identified inherited item can still receive a later literal local override.
+The background-swatch action remains shared-only for template items because a
+locally appended rectangle could not retain its behind-the-item z-order.
 
 **Reuse** (or <kbd>P</kbd>) promotes a direct box to a named `@push` definition
 and leaves an equivalent `@pop` instance in place. The Library tool creates
@@ -124,6 +131,7 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
 | <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |
 | <kbd>Backspace</kbd> | Delete the selected object |
+| Hold <kbd>Alt</kbd> while editing a template item | Edit its shared definition instead of this instance |
 | <kbd>Enter</kbd> | Edit the selected object's text |
 | <kbd>P</kbd> | Promote the selected object for reuse |
 | <kbd>Enter</kbd> | Use the selected library entry when no canvas object is selected |
@@ -290,6 +298,42 @@ for a future WebSocket transport.
 Internal render buffer resolution is 1920x1080. So always use coordinates in this range.
 
 More documentation to follow.
+
+## Slide-template instance overrides
+
+Items in a reusable `@pushslide` template can be changed on one slide without
+copying or detaching the template. Give the template item a stable `id=`, then
+put `@set`, `@show`, or `@hide` after the corresponding `@popslide` and before
+its first morph state:
+
+```text
+@box id=title x=100 y=70 w=1700 h=100 fontsize=52 text=Shared title
+@box id=page_number x=1780 y=1010 w=80 h=40 text=$slide_number
+@pushslide content
+
+@popslide content
+@set title x=180 color=#f7a41dff text=Local title for this slide
+@hide page_number
+
+@state(morph)
+@set title y=500
+```
+
+The shared template remains unchanged. The base-scene override affects only
+that `@popslide` instance, and subsequent morph states inherit it before
+applying their own mutations. Targets must uniquely identify inherited
+template items; ordinary direct slides still require an `@state(morph)` before
+using these mutation directives. Studio writes this syntax automatically for
+local geometry, text, foreground-color, and deletion edits. Holding
+<kbd>Alt</kbd> explicitly edits an uncustomized shared template item instead.
+Once an instance has a local override, Studio asks you to use an uncustomized
+instance for shared edits so effective local values cannot accidentally be
+written into the global definition. Shared template deletion is not yet
+offered because existing local and morph mutations may depend on that item.
+
+For nested reusable elements, give `@pop` an explicit `id=` when local slide
+overrides refer to it. That ID remains stable if the reusable definition is
+renamed; relying on the component name as its implicit ID does not.
 
 ## Animations and slide states
 
