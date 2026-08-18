@@ -2,12 +2,12 @@
 
 @slide transition=fade duration=0.4
 @bg color=#070b18ff
-@crowd join x=100 y=80 w=1720 h=920 anim=fade duration=0.5
+@crowd join x=100 y=80 w=1720 h=920
 Scan to join Crowdplay
 
 @slide transition=slide-left duration=0.4
 @bg color=#070b18ff
-@crowd poll id=next-big-thing open=true x=100 y=80 w=1720 h=920 anim=fade duration=0.35
+@crowd poll id=next-big-thing open=true x=100 y=80 w=1720 h=920
 What should we build next?
 - A tiny compiler
 - A moon base
