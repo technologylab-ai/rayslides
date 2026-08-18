@@ -37,7 +37,9 @@ pub const PatchError = error{
     InvalidSnippet,
     NoAdjacentSlide,
     NotPromotableDirective,
+    SlideTemplateNameCollision,
     SourceTooLarge,
+    UnsupportedSlidePromotion,
     UnsafeSlideGlobalDirective,
 };
 
@@ -530,6 +532,77 @@ pub fn moveSlide(
             return replaceRange(allocator, source, selected.start, following.end, replacement.items);
         },
     }
+}
+
+/// Promote one complete rendered slide to a named slide template and leave an
+/// equivalent `@popslide` instance at the selected deck position.
+///
+/// Rayslides' `@pushslide` syntax captures the slide authored immediately
+/// before it. For an explicit deck the captured base scene is therefore moved
+/// ahead of the first rendered anchor, where templates can be declared without
+/// emitting an extra blank slide. The selected `@slide` becomes `@popslide`;
+/// semantic morph states stay at the instance so they remain independently
+/// editable and are not captured by the template.
+///
+/// This operation is deliberately conservative. It rejects name collisions,
+/// template-backed instances, slide-level item defaults, dynamic directives,
+/// dangling animations, dirty pre-deck parser state, and global/context
+/// directives whose relocation could alter parsing. The returned source is
+/// only produced when the physical rewrite is semantically local.
+pub fn promoteSlideToTemplate(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    name: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (!isReusableName(name)) return error.InvalidReusableName;
+    if (hasSlideTemplateNamed(source, name)) return error.SlideTemplateNameCollision;
+
+    const layout = try inspectSlideLayout(source);
+    const selected = try logicalSlideRange(source, slide_offset);
+    if (!selected.explicit_anchor) {
+        try validateStructuralSlideRange(source, selected);
+        const base_end = firstMorphStateOffset(source, selected.start, selected.end) orelse selected.end;
+        try validatePromotableBase(source, selected.start, base_end);
+        return promoteImplicitSlideToTemplate(allocator, source, base_end, name);
+    }
+    std.debug.assert(layout.explicit_count > 0);
+
+    const anchor = try directiveLine(source, selected.anchor_offset);
+    const anchor_name = directiveName(source[anchor.start..anchor.content_end]);
+    // Flattening a @popslide instance would require expanding and dependency-
+    // resolving the earlier template. Keep the source primitive exact instead.
+    if (!std.mem.eql(u8, anchor_name, "@slide")) return error.UnsupportedSlidePromotion;
+    try validatePromotableSlideAnchor(source, anchor);
+    try validateStructuralSlideRange(source, selected);
+
+    const template_insertion = firstRenderedSlideAnchor(source) orelse
+        return error.InvalidSlideOffset;
+    try validateTemplateInsertionContext(source, template_insertion);
+    if (template_insertion < selected.start) {
+        try validateStructuralSlideRange(source, .{
+            .start = template_insertion,
+            .end = selected.start,
+            .anchor_offset = template_insertion,
+            .explicit_anchor = true,
+        });
+        try validateNoDynamicDirectives(source, template_insertion, selected.start);
+        try validateNoDanglingAnimation(source, template_insertion, selected.start);
+    }
+
+    const base_start = anchor.full_end;
+    const base_end = firstMorphStateOffset(source, base_start, selected.end) orelse selected.end;
+    try validatePromotableBase(source, base_start, base_end);
+    return promoteExplicitSlideToTemplate(
+        allocator,
+        source,
+        selected,
+        anchor,
+        template_insertion,
+        base_start,
+        base_end,
+        name,
+    );
 }
 
 /// Find the boundary after one morph state: the next `@state(morph)`, next
@@ -1065,6 +1138,226 @@ fn appendSwappedSlideRanges(
         left_content_end = separator_start;
     }
     try output.appendSlice(allocator, source[left.start..left_content_end]);
+}
+
+fn promoteImplicitSlideToTemplate(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    base_end: usize,
+    name: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const newline = lineEndingNear(source, base_end);
+    const content_start = sourceStart(source);
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.ensureTotalCapacity(allocator, source.len + name.len * 2 + 32);
+    try output.appendSlice(allocator, source[0..base_end]);
+    if (base_end > content_start and source[base_end - 1] != '\n') {
+        try output.appendSlice(allocator, newline);
+    }
+    try output.appendSlice(allocator, "@pushslide ");
+    try output.appendSlice(allocator, name);
+    try output.appendSlice(allocator, newline);
+    try output.appendSlice(allocator, "@popslide ");
+    try output.appendSlice(allocator, name);
+    try output.appendSlice(allocator, newline);
+    try output.appendSlice(allocator, source[base_end..]);
+    return finishResult(allocator, &output, source.len);
+}
+
+fn promoteExplicitSlideToTemplate(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    selected: LogicalSlideRange,
+    anchor: DirectiveLine,
+    template_insertion: usize,
+    base_start: usize,
+    base_end: usize,
+    name: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    std.debug.assert(template_insertion <= selected.start);
+    std.debug.assert(anchor.start == selected.start);
+    const newline = lineEndingNear(source, anchor.start);
+    const slide_directive = "@slide";
+
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.ensureTotalCapacity(allocator, source.len + name.len * 2 + 32);
+    try output.appendSlice(allocator, source[0..template_insertion]);
+    try output.appendSlice(allocator, source[base_start..base_end]);
+    if (base_end > base_start and source[base_end - 1] != '\n') {
+        try output.appendSlice(allocator, newline);
+    }
+    try output.appendSlice(allocator, "@pushslide ");
+    try output.appendSlice(allocator, name);
+    try output.appendSlice(allocator, newline);
+
+    try output.appendSlice(allocator, source[template_insertion..selected.start]);
+    try output.appendSlice(allocator, "@popslide ");
+    try output.appendSlice(allocator, name);
+    // Preserve every byte after the original directive token, including
+    // transition attributes, horizontal formatting, and its line ending.
+    try output.appendSlice(allocator, source[anchor.start + slide_directive.len .. anchor.full_end]);
+    try output.appendSlice(allocator, source[base_end..]);
+    return finishResult(allocator, &output, source.len);
+}
+
+fn hasSlideTemplateNamed(source: []const u8, sought: []const u8) bool {
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const directive = directiveName(source[cursor..line.content_end]);
+            if (std.mem.eql(u8, directive, "@pushslide")) {
+                const existing = directiveContextName(source[cursor..line.content_end], directive.len);
+                if (existing != null and std.mem.eql(u8, existing.?, sought)) return true;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return false;
+}
+
+fn firstRenderedSlideAnchor(source: []const u8) ?usize {
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            if (isRenderedSlideAnchor(directiveName(source[cursor..line.content_end]))) return cursor;
+        }
+        cursor = line.full_end;
+    }
+    return null;
+}
+
+fn firstMorphStateOffset(source: []const u8, start: usize, end: usize) ?usize {
+    var cursor = start;
+    while (cursor < end) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            if (isMorphStateDirective(directiveName(source[cursor..line.content_end]))) return cursor;
+        }
+        cursor = line.full_end;
+    }
+    return null;
+}
+
+fn validatePromotableSlideAnchor(source: []const u8, line: DirectiveLine) PatchError!void {
+    if (std.mem.indexOfScalar(u8, source[line.start..line.content_end], '$') != null) {
+        return error.UnsupportedSlidePromotion;
+    }
+    const name = directiveName(source[line.start..line.content_end]);
+    var cursor = line.start + name.len;
+    while (cursor < line.content_end) {
+        while (cursor < line.content_end and isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        if (cursor == line.content_end) break;
+        const token_start = cursor;
+        while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token = source[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals];
+        if (std.mem.eql(u8, key, "text")) break;
+        if (isSlideItemDefaultAttribute(key)) return error.UnsupportedSlidePromotion;
+    }
+}
+
+fn isSlideItemDefaultAttribute(key: []const u8) bool {
+    return std.mem.eql(u8, key, "fontsize") or
+        std.mem.eql(u8, key, "color") or
+        std.mem.eql(u8, key, "bullet_color") or
+        std.mem.eql(u8, key, "bullet_symbol") or
+        std.mem.eql(u8, key, "underline_width") or
+        std.mem.eql(u8, key, "line_height");
+}
+
+/// The parser discards an orphan pre-deck current slide when the first
+/// `@slide` is encountered. Inserting a template there would capture it
+/// instead, so require the current slide and pending animation to have been
+/// reset by the most recent `@pushslide` (or to have remained untouched).
+fn validateTemplateInsertionContext(source: []const u8, insertion: usize) PatchError!void {
+    var dirty_slide = false;
+    var pending_animation = false;
+    var cursor = sourceStart(source);
+    while (cursor < insertion) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const content = source[cursor..line.content_end];
+            if (std.mem.indexOfScalar(u8, content, '$') != null) return error.UnsupportedSlidePromotion;
+            const name = directiveName(content);
+            if (std.mem.eql(u8, name, "@pushslide")) {
+                dirty_slide = false;
+                pending_animation = false;
+            } else if (isAnimationDirective(name)) {
+                pending_animation = true;
+            } else if (directiveEmitsSlideItem(name)) {
+                dirty_slide = true;
+                pending_animation = false;
+            } else if (isMorphStateDirective(name) or isMorphMutationDirective(name)) {
+                dirty_slide = true;
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (dirty_slide or pending_animation) return error.UnsupportedSlidePromotion;
+}
+
+fn directiveEmitsSlideItem(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@box") or
+        std.mem.eql(u8, name, "@bg") or
+        std.mem.eql(u8, name, "@crowd") or
+        std.mem.eql(u8, name, "@pop");
+}
+
+fn validatePromotableBase(source: []const u8, start: usize, end: usize) PatchError!void {
+    try validateNoDynamicDirectives(source, start, end);
+
+    // Body text immediately after a slide anchor belongs to that anchor and
+    // would acquire a different owner when the anchor is replaced by moved
+    // template bytes. Comments and blank formatting are ownership-neutral.
+    var cursor = start;
+    while (cursor < end) {
+        const line = physicalLineAt(source, cursor);
+        const content = source[cursor..line.content_end];
+        if (content.len == 0 or content[0] == '#') {
+            cursor = line.full_end;
+            continue;
+        }
+        if (content[0] != '@') return error.UnsupportedSlidePromotion;
+        break;
+    }
+
+    try validateNoDanglingAnimation(source, start, end);
+}
+
+fn validateNoDynamicDirectives(source: []const u8, start: usize, end: usize) PatchError!void {
+    var cursor = start;
+    while (cursor < end) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@' and
+            std.mem.indexOfScalar(u8, source[cursor..line.content_end], '$') != null)
+        {
+            return error.UnsupportedSlidePromotion;
+        }
+        cursor = line.full_end;
+    }
+}
+
+fn validateNoDanglingAnimation(source: []const u8, start: usize, end: usize) PatchError!void {
+    var pending_animation = false;
+    var cursor = start;
+    while (cursor < end) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isAnimationDirective(name)) {
+                pending_animation = true;
+            } else if (directiveEmitsSlideItem(name)) {
+                pending_animation = false;
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (pending_animation) return error.UnsupportedSlidePromotion;
 }
 
 fn findSlideBoundary(source: []const u8, slide_offset: usize, stop_at_state: bool) PatchError!usize {
@@ -2185,6 +2478,264 @@ test "logical slide range rejects non-anchor offsets" {
     const item = std.mem.indexOf(u8, source, "@box").?;
     try std.testing.expectError(error.InvalidSlideOffset, logicalSlideRange(source, item));
     try std.testing.expectError(error.InvalidSlideOffset, logicalSlideRange(source, source.len));
+}
+
+test "promote explicit slide moves its base to the library and preserves morph instance" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide transition=fade duration=0.6\n" ++
+        "@box id=hero x=100 y=200 text=Hero\n" ++
+        "# base explanation\n" ++
+        "@state(morph) duration=0.5\n" ++
+        "@set hero x=440\n" ++
+        "# state explanation\n" ++
+        "@slide\n" ++
+        "@box text=Second\n";
+    const expected =
+        "@box id=hero x=100 y=200 text=Hero\n" ++
+        "# base explanation\n" ++
+        "@pushslide feature\n" ++
+        "@popslide feature transition=fade duration=0.6\n" ++
+        "@state(morph) duration=0.5\n" ++
+        "@set hero x=440\n" ++
+        "# state explanation\n" ++
+        "@slide\n" ++
+        "@box text=Second\n";
+
+    const promoted = try promoteSlideToTemplate(std.testing.allocator, source, 0, "feature");
+    defer promoted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, promoted.source);
+    try std.testing.expectEqual(try signedLengthDelta(expected.len, source.len), promoted.byte_delta);
+
+    var original_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer original_arena.deinit();
+    const original_deck = try slides.SlideShow.new(original_arena.allocator());
+    const original_context = try parser.constructSlidesFromBuf(source, original_deck, original_arena.allocator());
+    defer original_context.deinit();
+
+    var promoted_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer promoted_arena.deinit();
+    const promoted_deck = try slides.SlideShow.new(promoted_arena.allocator());
+    const promoted_context = try parser.constructSlidesFromBuf(promoted.source, promoted_deck, promoted_arena.allocator());
+    defer promoted_context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), original_context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 0), promoted_context.parser_errors.items.len);
+    try std.testing.expectEqual(original_deck.slides.items.len, promoted_deck.slides.items.len);
+    try std.testing.expectEqual(@as(usize, 2), promoted_deck.slides.items.len);
+    const original_first = original_deck.slides.items[0];
+    const promoted_first = promoted_deck.slides.items[0];
+    try std.testing.expectEqual(original_first.transition.effect, promoted_first.transition.effect);
+    try std.testing.expectApproxEqAbs(original_first.transition.duration, promoted_first.transition.duration, 0.0001);
+    try std.testing.expectEqual(original_first.items.?.items.len, promoted_first.items.?.items.len);
+    try std.testing.expectEqualStrings(original_first.items.?.items[0].text.?, promoted_first.items.?.items[0].text.?);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, promoted_first.items.?.items[0].source.scope);
+    try std.testing.expectEqual(@as(usize, 1), promoted_first.morph_states.items.len);
+    try std.testing.expectApproxEqAbs(
+        original_first.morph_states.items[0].spec.duration,
+        promoted_first.morph_states.items[0].spec.duration,
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(
+        original_first.morph_states.items[0].items.items[0].position.x,
+        promoted_first.morph_states.items[0].items.items[0].position.x,
+        0.0001,
+    );
+}
+
+test "promote middle slide preserves BOM CRLF prefix and deck order" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@box id=old x=5 y=6 text=Old template\r\n" ++
+        "@pushslide old\r\n" ++
+        "# deck begins\r\n" ++
+        "@slide\r\n" ++
+        "@box text=First\r\n" ++
+        "@slide transition=slide-left duration=0.4\r\n" ++
+        "@box x=30 y=40 text=Promoted\r\n" ++
+        "@slide\r\n" ++
+        "@box text=Third";
+    const selected = std.mem.indexOf(u8, source, "@slide transition").?;
+    const expected =
+        "\xEF\xBB\xBF@box id=old x=5 y=6 text=Old template\r\n" ++
+        "@pushslide old\r\n" ++
+        "# deck begins\r\n" ++
+        "@box x=30 y=40 text=Promoted\r\n" ++
+        "@pushslide middle\r\n" ++
+        "@slide\r\n" ++
+        "@box text=First\r\n" ++
+        "@popslide middle transition=slide-left duration=0.4\r\n" ++
+        "@slide\r\n" ++
+        "@box text=Third";
+
+    const promoted = try promoteSlideToTemplate(std.testing.allocator, source, selected, "middle");
+    defer promoted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, promoted.source);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, promoted.source, utf8_bom));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(promoted.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 3), deck.slides.items.len);
+    try std.testing.expectEqualStrings("First", deck.slides.items[0].items.?.items[0].text.?);
+    try std.testing.expectEqualStrings("Promoted", deck.slides.items[1].items.?.items[0].text.?);
+    try std.testing.expectEqualStrings("Third", deck.slides.items[2].items.?.items[0].text.?);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, deck.slides.items[1].items.?.items[0].source.scope);
+}
+
+test "promote implicit BOM CRLF slide preserves one slide and morph semantics" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@box id=hero x=10 y=20 text=Implicit\r\n" ++
+        "@state(morph) duration=0.3\r\n" ++
+        "@set hero y=240";
+    const expected =
+        "\xEF\xBB\xBF@box id=hero x=10 y=20 text=Implicit\r\n" ++
+        "@pushslide implicit_card\r\n" ++
+        "@popslide implicit_card\r\n" ++
+        "@state(morph) duration=0.3\r\n" ++
+        "@set hero y=240";
+    const promoted = try promoteSlideToTemplate(std.testing.allocator, source, 0, "implicit_card");
+    defer promoted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, promoted.source);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(promoted.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deck.slides.items.len);
+    try std.testing.expectEqualStrings("Implicit", deck.slides.items[0].items.?.items[0].text.?);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, deck.slides.items[0].items.?.items[0].source.scope);
+    try std.testing.expectEqual(@as(usize, 1), deck.slides.items[0].morph_states.items.len);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 240),
+        deck.slides.items[0].morph_states.items[0].items.items[0].position.y,
+        0.0001,
+    );
+}
+
+test "promoted slide keeps reusable component dependencies resolved from prefix" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@push card x=10 y=20 w=300 h=80 text=Shared component\n" ++
+        "@slide\n" ++
+        "@pop card id=hero\n";
+    const expected =
+        "@push card x=10 y=20 w=300 h=80 text=Shared component\n" ++
+        "@pop card id=hero\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n";
+    const selected = std.mem.indexOf(u8, source, "@slide").?;
+    const promoted = try promoteSlideToTemplate(std.testing.allocator, source, selected, "layout");
+    defer promoted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, promoted.source);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(promoted.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deck.slides.items.len);
+    try std.testing.expectEqualStrings("Shared component", deck.slides.items[0].items.?.items[0].text.?);
+    try std.testing.expectEqualStrings("hero", deck.slides.items[0].items.?.items[0].id.?);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, deck.slides.items[0].items.?.items[0].source.scope);
+}
+
+test "slide promotion rejects collisions template instances defaults and unsafe context" {
+    const collision =
+        "@box text=Existing\n" ++
+        "@pushslide feature\n" ++
+        "@slide\n" ++
+        "@box text=Selected\n";
+    const selected = std.mem.indexOf(u8, collision, "@slide").?;
+    try std.testing.expectError(
+        error.SlideTemplateNameCollision,
+        promoteSlideToTemplate(std.testing.allocator, collision, selected, "feature"),
+    );
+    try std.testing.expectError(
+        error.InvalidReusableName,
+        promoteSlideToTemplate(std.testing.allocator, collision, selected, "not valid"),
+    );
+
+    const template_backed =
+        "@box text=Template\n" ++
+        "@pushslide old\n" ++
+        "@popslide old\n";
+    const pop = std.mem.indexOf(u8, template_backed, "@popslide").?;
+    try std.testing.expectError(
+        error.UnsupportedSlidePromotion,
+        promoteSlideToTemplate(std.testing.allocator, template_backed, pop, "new"),
+    );
+
+    const item_defaults = "@slide fontsize=72 color=#ffffffff\n@box text=Inherited\n";
+    try std.testing.expectError(
+        error.UnsupportedSlidePromotion,
+        promoteSlideToTemplate(std.testing.allocator, item_defaults, 0, "styled"),
+    );
+
+    const global_between =
+        "@slide\n" ++
+        "@box text=First\n" ++
+        "@color #112233ff\n" ++
+        "@slide\n" ++
+        "@box text=Second\n";
+    const second = std.mem.lastIndexOf(u8, global_between, "@slide").?;
+    try std.testing.expectError(
+        error.UnsafeSlideGlobalDirective,
+        promoteSlideToTemplate(std.testing.allocator, global_between, second, "second"),
+    );
+}
+
+test "slide promotion rejects dirty prefix raw prose dynamic source and dangling animation" {
+    const dirty_prefix =
+        "@box text=Discarded before deck\n" ++
+        "@slide\n" ++
+        "@box text=Selected\n";
+    const selected = std.mem.indexOf(u8, dirty_prefix, "@slide").?;
+    try std.testing.expectError(
+        error.UnsupportedSlidePromotion,
+        promoteSlideToTemplate(std.testing.allocator, dirty_prefix, selected, "clean"),
+    );
+
+    const raw_prose = "@slide\nThis is anchor body text\n@box text=Selected\n";
+    try std.testing.expectError(
+        error.UnsupportedSlidePromotion,
+        promoteSlideToTemplate(std.testing.allocator, raw_prose, 0, "raw"),
+    );
+
+    const dynamic = "@slide\n@box x=$hero_x$ text=Selected\n";
+    try std.testing.expectError(
+        error.UnsupportedSlidePromotion,
+        promoteSlideToTemplate(std.testing.allocator, dynamic, 0, "dynamic"),
+    );
+
+    const dangling_animation = "@slide\n@box text=Selected\n@anim(fade) duration=0.4\n";
+    try std.testing.expectError(
+        error.UnsupportedSlidePromotion,
+        promoteSlideToTemplate(std.testing.allocator, dangling_animation, 0, "animated"),
+    );
+
+    const inherited_animation =
+        "@slide\n" ++
+        "@box text=First\n" ++
+        "@anim(fade) duration=0.4\n" ++
+        "@slide\n" ++
+        "@box text=Would consume pending animation\n";
+    const second = std.mem.lastIndexOf(u8, inherited_animation, "@slide").?;
+    try std.testing.expectError(
+        error.UnsupportedSlidePromotion,
+        promoteSlideToTemplate(std.testing.allocator, inherited_animation, second, "animated_second"),
+    );
 }
 
 test "promotion preserves inline item formatting comments BOM and CRLF" {

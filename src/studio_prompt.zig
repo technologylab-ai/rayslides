@@ -223,7 +223,7 @@ fn promptTitle(kind: Kind) [:0]const u8 {
         .text => "Edit text",
         .bullets => "Edit bullet list",
         .image_path => "Choose image",
-        .reusable_name => "Name reusable element",
+        .reusable_name => "Name reusable or template",
     };
 }
 

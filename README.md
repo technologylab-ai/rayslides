@@ -83,10 +83,18 @@ cards contain live rendered thumbnails and can select, add, duplicate, delete,
 or move complete slides while preserving their base content, morph states,
 comments, and line endings. The library lists the effective `@push` elements
 and `@pushslide` templates available at the current source position. Click an
-element and then the canvas to place an instance at its authored size; click a
-slide template to create the next slide from it. Later or shadowed definitions
-are intentionally absent because they would not resolve at that insertion
-point.
+entry to select it, then choose **Use**: reusable elements become a one-shot
+canvas placement tool at their authored size, while slide templates create the
+next slide. **Ren** changes that definition and its source-order-resolved uses;
+**Del** removes only unused element definitions. Slide-template deletion and
+deleting elements with live uses are deliberately refused. Later or shadowed
+definitions are absent because they would not resolve at that insertion point.
+
+The organizer's **Tpl** action promotes an eligible direct slide into a named
+`@pushslide` definition while leaving an equivalent `@popslide` instance in
+its original deck position. Promotion is intentionally conservative: Studio
+refuses template-backed slides or source whose global/default context cannot
+be moved without changing semantics.
 
 Text, bullet, image, and reusable-name actions open a small modal editor.
 <kbd>Enter</kbd> commits, <kbd>Shift-Enter</kbd> inserts a line in text fields,
@@ -118,7 +126,11 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Backspace</kbd> | Delete the selected object |
 | <kbd>Enter</kbd> | Edit the selected object's text |
 | <kbd>P</kbd> | Promote the selected object for reuse |
+| <kbd>Enter</kbd> | Use the selected library entry when no canvas object is selected |
+| <kbd>F2</kbd> | Rename the selected library definition and its resolved uses |
+| <kbd>Shift</kbd> + <kbd>Delete</kbd> | Delete the selected library definition when it is unused |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>N</kbd> | Insert a new slide after this slide |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd> | Promote the current slide to a reusable slide template |
 | <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Select the previous or next slide in Studio |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>D</kbd> | Duplicate the current slide |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Backspace</kbd> | Delete the current slide (except the only slide) |

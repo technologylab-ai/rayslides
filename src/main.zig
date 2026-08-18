@@ -835,6 +835,25 @@ pub fn main(init: std.process.Init) anyerror!void {
                         pending_semantic_command = command;
                         property_prompt.begin(.reusable_name, name);
                     },
+                    .promote_slide_to_template => |slide_index| {
+                        var suggested_name: [96]u8 = undefined;
+                        const name = std.fmt.bufPrint(&suggested_name, "slide_template_{d}", .{slide_index + 1}) catch "slide_template";
+                        pending_semantic_command = command;
+                        property_prompt.begin(.reusable_name, name);
+                    },
+                    .rename_library_entry => |library_index| {
+                        if (studioLibraryEntry(
+                            frame_studio_catalog,
+                            studio_library_catalog_indices.items,
+                            library_index,
+                        )) |entry| {
+                            pending_semantic_command = command;
+                            property_prompt.begin(.reusable_name, entry.name);
+                        } else {
+                            studio_mode.setNotice(.edit_failed);
+                        }
+                    },
+                    .delete_library_entry => semantic_to_apply = command,
                     .add_reusable => |add| {
                         if (add.library_entry_index) |library_index| {
                             if (studioLibraryName(
@@ -990,6 +1009,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_mode.active_morph_state,
                 studio_items,
                 studio_bounds.items,
+                frame_studio_catalog,
+                studio_library_catalog_indices.items,
             )) |new_slide_index| {
                 studio_mode.selected_identity = null;
                 studio_mode.selected_source = null;
@@ -1003,6 +1024,12 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else |err| {
                 studio_mode.setNotice(switch (err) {
                     error.AmbiguousSlideTemplateLayout, error.UnsafeSlideGlobalDirective => .structural_source_locked,
+                    error.NameCollision => .library_name_conflict,
+                    error.SlideTemplateNameCollision => .library_name_conflict,
+                    error.LiveUses => .library_entry_in_use,
+                    error.UnsafeSlideTemplateDelete => .library_delete_unsupported,
+                    error.DynamicContextName => .structural_source_locked,
+                    error.UnsupportedSlidePromotion => .slide_template_promotion_locked,
                     else => .edit_failed,
                 });
                 log.err("Studio property edit failed: {any}", .{err});
@@ -1669,6 +1696,13 @@ fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult)
     };
 }
 
+fn recordStudioCatalogPatch(history: *StudioHistory, result: studio_catalog.EditResult) !void {
+    return recordStudioPatch(history, .{
+        .source = result.source,
+        .byte_delta = result.byte_delta,
+    });
+}
+
 const MorphItemEditTarget = union(enum) {
     patch: slides.SourceRef,
     insert_local,
@@ -1818,6 +1852,8 @@ fn collectStudioLibraryEntries(
             },
             .name = entry.name,
             .available = entry.placeable,
+            .use_count = entry.use_count,
+            .deletable = entry.kind == .element and entry.use_count == 0,
         });
         errdefer _ = output.pop();
         try catalog_indices.append(allocator, catalog_index);
@@ -1830,13 +1866,23 @@ fn studioLibraryName(
     workspace_index: usize,
     expected_kind: studio_catalog.Kind,
 ) ?[]const u8 {
+    const entry = studioLibraryEntry(catalog_opt, catalog_indices, workspace_index) orelse return null;
+    if (entry.kind != expected_kind) return null;
+    return entry.name;
+}
+
+fn studioLibraryEntry(
+    catalog_opt: ?studio_catalog.Catalog,
+    catalog_indices: []const usize,
+    workspace_index: usize,
+) ?studio_catalog.Entry {
     const catalog = catalog_opt orelse return null;
     if (workspace_index >= catalog_indices.len) return null;
     const catalog_index = catalog_indices[workspace_index];
     if (catalog_index >= catalog.entries.len) return null;
     const entry = catalog.entries[catalog_index];
-    if (!entry.placeable or entry.kind != expected_kind) return null;
-    return entry.name;
+    if (!entry.placeable) return null;
+    return entry;
 }
 
 fn reusableNameDefined(name: []const u8) bool {
@@ -2004,6 +2050,8 @@ fn applyStudioSemanticEdit(
     morph_state: ?usize,
     items: []const slides.SlideItem,
     resolved_bounds: []const studio.ResolvedBounds,
+    catalog_opt: ?studio_catalog.Catalog,
+    catalog_indices: []const usize,
 ) !?usize {
     const slide = slide_opt orelse return error.NoStudioSlide;
     switch (command) {
@@ -2112,6 +2160,40 @@ fn applyStudioSemanticEdit(
                 G.editor_memory[0..G.source_len],
                 target.source.line_offset,
                 name,
+            ));
+        },
+        .promote_slide_to_template => |slide_index| {
+            if (slide_index >= G.slideshow.slides.items.len) return error.NoStudioSlide;
+            const name = prompted_text orelse return error.StudioPromptMissing;
+            if (!validReusableName(name)) return error.InvalidReusableName;
+            const target = G.slideshow.slides.items[slide_index];
+            try recordStudioPatch(history, try source_editor.promoteSlideToTemplate(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                target.pos_in_editor,
+                name,
+            ));
+            return slide_index;
+        },
+        .rename_library_entry => |workspace_index| {
+            const entry = studioLibraryEntry(catalog_opt, catalog_indices, workspace_index) orelse
+                return error.StudioLibraryEntryMissing;
+            const new_name = prompted_text orelse return error.StudioPromptMissing;
+            if (std.mem.eql(u8, entry.name, new_name)) return null;
+            try recordStudioCatalogPatch(history, try studio_catalog.renameDefinition(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                entry,
+                new_name,
+            ));
+        },
+        .delete_library_entry => |workspace_index| {
+            const entry = studioLibraryEntry(catalog_opt, catalog_indices, workspace_index) orelse
+                return error.StudioLibraryEntryMissing;
+            try recordStudioCatalogPatch(history, try studio_catalog.deleteDefinition(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                entry,
             ));
         },
         .add_reusable => |add| {

@@ -220,6 +220,10 @@ pub const Notice = enum {
     property_unavailable,
     base_scene_only,
     structural_source_locked,
+    library_name_conflict,
+    library_entry_in_use,
+    library_delete_unsupported,
+    slide_template_promotion_locked,
 };
 
 /// The active canvas tool. Creation tools are deliberately one-shot: after a
@@ -332,6 +336,8 @@ pub const LibraryEntry = struct {
     kind: LibraryEntryKind,
     name: []const u8,
     available: bool = true,
+    use_count: usize = 0,
+    deletable: bool = false,
 };
 
 /// Optional deck-level UI supplied by the integration layer. The legacy
@@ -360,8 +366,17 @@ pub const SemanticCommand = union(enum) {
     duplicate_slide: usize,
     delete_slide: usize,
     move_slide: SlideMoveCommand,
+    /// Promotes the indexed authored slide to a reusable `@pushslide`
+    /// definition. The integration layer chooses and validates its name.
+    promote_slide_to_template: usize,
     /// Creates a new slide using the indexed `slide_template` library entry.
     new_slide_from_template: usize,
+    /// Renames the indexed source definition. The integration layer prompts
+    /// for and validates the new name before applying the source edit.
+    rename_library_entry: usize,
+    /// Requests safe deletion of the indexed source definition. The source
+    /// layer remains responsible for rejecting live or unsafe uses.
+    delete_library_entry: usize,
     /// The integration layer prompts for an existing @push name and inserts
     /// the corresponding @pop instance at this visual placement.
     add_reusable: AddReusableCommand,
@@ -384,7 +399,7 @@ pub const UiLayout = struct {
     background_swatches: [palette.len]rl.Rectangle,
 };
 
-pub const organizer_action_count = 5;
+pub const organizer_action_count = 6;
 pub const slide_card_height: f32 = 88;
 pub const slide_card_gap: f32 = 7;
 pub const library_row_height: f32 = 46;
@@ -402,6 +417,9 @@ pub const WorkspaceLayout = struct {
     slide_page_previous: rl.Rectangle,
     slide_page_next: rl.Rectangle,
     library: rl.Rectangle,
+    library_use: rl.Rectangle,
+    library_rename: rl.Rectangle,
+    library_delete: rl.Rectangle,
     library_rows_clip: rl.Rectangle,
     library_page_previous: rl.Rectangle,
     library_page_next: rl.Rectangle,
@@ -468,6 +486,26 @@ pub fn workspaceLayout(viewport: Viewport) WorkspaceLayout {
         .width = sidebar.width,
         .height = @max(92, sidebar.y + sidebar.height - library_y),
     };
+    const library_action_gap: f32 = 4;
+    const library_action_width: f32 = 40;
+    const library_delete: rl.Rectangle = .{
+        .x = library.x + library.width - 12 - library_action_width,
+        .y = library.y + 5,
+        .width = library_action_width,
+        .height = 26,
+    };
+    const library_rename: rl.Rectangle = .{
+        .x = library_delete.x - library_action_gap - library_action_width,
+        .y = library_delete.y,
+        .width = library_action_width,
+        .height = library_delete.height,
+    };
+    const library_use: rl.Rectangle = .{
+        .x = library_rename.x - library_action_gap - library_action_width,
+        .y = library_delete.y,
+        .width = library_action_width,
+        .height = library_delete.height,
+    };
     const library_pager_y = library.y + library.height - 29;
     const library_page_previous: rl.Rectangle = .{
         .x = library.x + library.width - 12 - pager_width * 2 - action_gap,
@@ -483,9 +521,9 @@ pub fn workspaceLayout(viewport: Viewport) WorkspaceLayout {
     };
     const library_rows_clip: rl.Rectangle = .{
         .x = library.x + 8,
-        .y = library.y + 36,
+        .y = library.y + 40,
         .width = library.width - 16,
-        .height = @max(0, library_pager_y - 5 - (library.y + 36)),
+        .height = @max(0, library_pager_y - 5 - (library.y + 40)),
     };
     return .{
         .sidebar = sidebar,
@@ -495,6 +533,9 @@ pub fn workspaceLayout(viewport: Viewport) WorkspaceLayout {
         .slide_page_previous = slide_page_previous,
         .slide_page_next = slide_page_next,
         .library = library,
+        .library_use = library_use,
+        .library_rename = library_rename,
+        .library_delete = library_delete,
         .library_rows_clip = library_rows_clip,
         .library_page_previous = library_page_previous,
         .library_page_next = library_page_next,
@@ -667,6 +708,12 @@ pub const FrameInput = struct {
     delete_slide_pressed: bool = false,
     /// Negative moves the current slide up, positive moves it down.
     move_slide: i8 = 0,
+    promote_slide_to_template_pressed: bool = false,
+    /// Activates the selected library definition. Elements enter placement;
+    /// slide templates create a slide.
+    use_library_pressed: bool = false,
+    rename_library_pressed: bool = false,
+    delete_library_pressed: bool = false,
     /// Positive/negative wheel delta; routed to the panel under the pointer.
     workspace_scroll: f32 = 0,
 
@@ -710,7 +757,7 @@ pub const FrameInput = struct {
             .choose_tool = choose_tool,
             .delete_pressed = !shortcut_modifier and rl.isKeyPressed(.backspace),
             .edit_text_pressed = rl.isKeyPressed(.enter),
-            .promote_pressed = rl.isKeyPressed(.p),
+            .promote_pressed = !shortcut_modifier and rl.isKeyPressed(.p),
             .new_slide_pressed = shortcut_modifier and rl.isKeyPressed(.n),
             .cycle_morph_scene = if (rl.isKeyPressed(.left_bracket))
                 -1
@@ -732,6 +779,10 @@ pub const FrameInput = struct {
                 1
             else
                 0,
+            .promote_slide_to_template_pressed = shortcut_modifier and shift and rl.isKeyPressed(.p),
+            .use_library_pressed = rl.isKeyPressed(.enter),
+            .rename_library_pressed = rl.isKeyPressed(.f2),
+            .delete_library_pressed = shift and rl.isKeyPressed(.delete),
             .workspace_scroll = rl.getMouseWheelMove(),
         };
     }
@@ -1238,15 +1289,35 @@ pub const Studio = struct {
             library_capacity,
         );
         if (self.selected_library_index) |index| {
-            if (index >= workspace.library.len or workspace.library[index].kind != .element or
-                !workspace.library[index].available)
-            {
+            if (index >= workspace.library.len or !workspace.library[index].available) {
                 self.selected_library_index = null;
             }
         }
     }
 
     fn handleWorkspaceKeyboard(self: *Studio, items: []slides.SlideItem, workspace: Workspace, input: FrameInput) bool {
+        if (input.rename_library_pressed) {
+            self.emitLibraryAction(items, workspace, .rename);
+            return true;
+        }
+        if (input.delete_library_pressed) {
+            self.emitLibraryAction(items, workspace, .delete);
+            return true;
+        }
+        // Enter keeps its established edit-text meaning whenever a canvas
+        // item is selected. With no canvas selection it becomes the natural
+        // activation key for the persistent library selection.
+        if (input.use_library_pressed and self.selected_identity == null and self.selected_library_index != null) {
+            self.emitLibraryAction(items, workspace, .use);
+            return true;
+        }
+        if (input.promote_slide_to_template_pressed) {
+            if (summaryOffsetForSlide(workspace.slides, workspace.current_slide) != null) {
+                self.prepareDeckCommand(items);
+                self.pending_semantic_command = .{ .promote_slide_to_template = workspace.current_slide };
+            }
+            return true;
+        }
         if (input.select_slide_delta != 0) {
             const current = summaryOffsetForSlide(workspace.slides, workspace.current_slide) orelse return true;
             const movement: isize = if (input.select_slide_delta < 0) -1 else 1;
@@ -1350,6 +1421,10 @@ pub const Studio = struct {
                             } };
                         }
                     },
+                    5 => if (summaryOffsetForSlide(workspace.slides, workspace.current_slide) != null) {
+                        self.prepareDeckCommand(items);
+                        self.pending_semantic_command = .{ .promote_slide_to_template = workspace.current_slide };
+                    },
                     else => unreachable,
                 }
                 return true;
@@ -1384,6 +1459,18 @@ pub const Studio = struct {
             return true;
         }
 
+        if (pointInRectangle(pointer, layout.library_use)) {
+            self.emitLibraryAction(items, workspace, .use);
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.library_rename)) {
+            self.emitLibraryAction(items, workspace, .rename);
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.library_delete)) {
+            self.emitLibraryAction(items, workspace, .delete);
+            return true;
+        }
         if (pointInRectangle(pointer, layout.library_page_previous)) {
             self.library_first_visible = pageFirstVisible(
                 self.library_first_visible,
@@ -1412,20 +1499,62 @@ pub const Studio = struct {
                 self.notice = .property_unavailable;
                 return true;
             }
-            switch (entry.kind) {
-                .element => {
-                    self.selected_library_index = entry_index;
-                    self.setTool(.add_reusable, items);
-                },
-                .slide_template => {
-                    self.prepareDeckCommand(items);
-                    self.pending_semantic_command = .{ .new_slide_from_template = entry_index };
-                },
-            }
+            self.selected_library_index = entry_index;
+            self.tool = .select;
+            self.notice = .none;
             return true;
         }
         // Empty sidebar space is an input shield, never a canvas click.
         return true;
+    }
+
+    const LibraryAction = enum { use, rename, delete };
+
+    fn emitLibraryAction(
+        self: *Studio,
+        items: []slides.SlideItem,
+        workspace: Workspace,
+        action: LibraryAction,
+    ) void {
+        const entry_index = self.selected_library_index orelse {
+            self.notice = .property_unavailable;
+            return;
+        };
+        if (entry_index >= workspace.library.len or !workspace.library[entry_index].available) {
+            self.selected_library_index = null;
+            self.tool = .select;
+            self.notice = .property_unavailable;
+            return;
+        }
+        const entry = workspace.library[entry_index];
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.clearSelection(items);
+        self.notice = .none;
+        switch (action) {
+            .use => switch (entry.kind) {
+                .element => self.tool = .add_reusable,
+                .slide_template => {
+                    self.tool = .select;
+                    self.active_morph_state = null;
+                    self.pending_semantic_command = .{ .new_slide_from_template = entry_index };
+                },
+            },
+            .rename => {
+                self.tool = .select;
+                self.pending_semantic_command = .{ .rename_library_entry = entry_index };
+            },
+            .delete => {
+                self.tool = .select;
+                if (!entry.deletable) {
+                    self.notice = if (entry.kind == .slide_template)
+                        .library_delete_unsupported
+                    else
+                        .library_entry_in_use;
+                } else {
+                    self.pending_semantic_command = .{ .delete_library_entry = entry_index };
+                }
+            },
+        }
     }
 
     fn emitSlideSelection(self: *Studio, items: []slides.SlideItem, slide_index: usize) void {
@@ -1783,7 +1912,7 @@ pub const Studio = struct {
         const layout = workspaceLayout(viewport);
         if (layout.sidebar.height < workspace_min_height) return;
         rl.drawText("SLIDES", @intFromFloat(layout.organizer.x + 12), @intFromFloat(layout.organizer.y + 10), 15, .white);
-        const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down" };
+        const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down", "Tpl" };
         for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(button, label);
         drawCompactButton(layout.slide_page_previous, "Prev");
         drawCompactButton(layout.slide_page_next, "Next");
@@ -1819,6 +1948,9 @@ pub const Studio = struct {
         }
 
         rl.drawText("LIBRARY", @intFromFloat(layout.library.x + 12), @intFromFloat(layout.library.y + 10), 15, .white);
+        drawCompactButton(layout.library_use, "Use");
+        drawCompactButton(layout.library_rename, "Ren");
+        drawCompactButton(layout.library_delete, "Del");
         drawCompactButton(layout.library_page_previous, "Prev");
         drawCompactButton(layout.library_page_next, "Next");
         for (0..libraryRowCapacity(layout)) |visible_slot| {
@@ -1843,10 +1975,19 @@ pub const Studio = struct {
             var name_buffer: [128]u8 = undefined;
             const name = textForDraw(&name_buffer, entry.name);
             rl.drawText(badge, @intFromFloat(badge_rect.x + 7), @intFromFloat(badge_rect.y + 7), 11, .white);
-            rl.drawText(name, @intFromFloat(row.x + 64), @intFromFloat(row.y + 15), 14, if (entry.available)
+            rl.drawText(name, @intFromFloat(row.x + 64), @intFromFloat(row.y + 8), 14, if (entry.available)
                 .white
             else
                 .{ .r = 130, .g = 136, .b = 149, .a = 255 });
+            var usage_buffer: [48]u8 = undefined;
+            const usage: [:0]const u8 = if (entry.use_count == 0)
+                "unused"
+            else
+                std.fmt.bufPrintZ(&usage_buffer, "{d} use{s}", .{ entry.use_count, if (entry.use_count == 1) "" else "s" }) catch "used";
+            rl.drawText(usage, @intFromFloat(row.x + 64), @intFromFloat(row.y + 27), 10, if (entry.deletable)
+                .{ .r = 126, .g = 231, .b = 177, .a = 255 }
+            else
+                .{ .r = 168, .g = 179, .b = 198, .a = 255 });
         }
     }
 
@@ -1944,6 +2085,10 @@ pub const Studio = struct {
             .property_unavailable => "That property does not apply to this kind of item",
             .base_scene_only => "That action is available in the BASE scene",
             .structural_source_locked => "Slide structure is source-scoped here; no changes were made",
+            .library_name_conflict => "That library name is already defined",
+            .library_entry_in_use => "Cannot delete: later source instances still use this reusable",
+            .library_delete_unsupported => "Slide-template deletion is not source-safe yet",
+            .slide_template_promotion_locked => "This slide cannot be promoted without changing its source semantics",
         };
         if (notice_text) |message| {
             const notice_color: rl.Color = switch (self.notice) {
@@ -2715,6 +2860,15 @@ test "organizer actions emit duplicate delete and bounded move commands" {
         .delete_slide => |index| try std.testing.expectEqual(@as(usize, 20), index),
         else => return error.UnexpectedSemanticCommand,
     }
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.organizer_actions[5]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .promote_slide_to_template => |index| try std.testing.expectEqual(@as(usize, 20), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
 }
 
 test "organizer paging and wheel scrolling expose later summaries" {
@@ -2743,7 +2897,7 @@ test "organizer paging and wheel scrolling expose later summaries" {
     try std.testing.expectEqual(page_start - 1, studio.organizer_first_visible);
 }
 
-test "library item selects a named placement while slide template creates directly" {
+test "library selection persists while Use places elements or creates template slides" {
     var items: [0]slides.SlideItem = .{};
     const summaries = [_]SlideSummary{.{ .index = 0 }};
     const entries = [_]LibraryEntry{
@@ -2757,6 +2911,14 @@ test "library item selects a named placement while slide template creates direct
 
     _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
         .pointer_screen = rectangleCenter(libraryRowRect(layout, 0).?),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(Tool.select, studio.tool);
+    try std.testing.expectEqual(@as(?usize, 0), studio.selected_library_index);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.library_use),
         .pointer_pressed = true,
     });
     try std.testing.expectEqual(Tool.add_reusable, studio.tool);
@@ -2779,10 +2941,113 @@ test "library item selects a named placement while slide template creates direct
         .pointer_screen = rectangleCenter(libraryRowRect(layout, 1).?),
         .pointer_pressed = true,
     });
+    try std.testing.expectEqual(@as(?usize, 1), studio.selected_library_index);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.library_use),
+        .pointer_pressed = true,
+    });
     switch (studio.takeSemanticCommand().?) {
         .new_slide_from_template => |entry_index| try std.testing.expectEqual(@as(usize, 1), entry_index),
         else => return error.UnexpectedSemanticCommand,
     }
+}
+
+test "library management buttons and shortcuts target the persistent selection" {
+    var items = [_]slides.SlideItem{testItem(130, .textbox, 100, 100, 200, 80)};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const entries = [_]LibraryEntry{
+        .{ .kind = .element, .name = "card", .deletable = true },
+        .{ .kind = .slide_template, .name = "chapter" },
+    };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0, .library = &entries };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = workspaceLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .selected_identity = 130 };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 1).?),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 1), studio.selected_library_index);
+    try std.testing.expectEqual(@as(?usize, 130), studio.selected_identity);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.library_rename),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
+    try std.testing.expectEqual(@as(?usize, 1), studio.selected_library_index);
+    switch (studio.takeSemanticCommand().?) {
+        .rename_library_entry => |entry_index| try std.testing.expectEqual(@as(usize, 1), entry_index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .delete_library_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.library_delete_unsupported, studio.notice);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 0).?),
+        .pointer_pressed = true,
+    });
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .delete_library_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .delete_library_entry => |entry_index| try std.testing.expectEqual(@as(usize, 0), entry_index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .rename_library_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .rename_library_entry => |entry_index| try std.testing.expectEqual(@as(usize, 0), entry_index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "library Enter activation yields to selected canvas item editing" {
+    var items = [_]slides.SlideItem{testItem(131, .textbox, 100, 100, 200, 80)};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const entries = [_]LibraryEntry{.{ .kind = .element, .name = "card" }};
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0, .library = &entries };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 131, .selected_library_index = 0, .last_workspace_slide = 0 };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .use_library_pressed = true,
+        .edit_text_pressed = true,
+    });
+    try std.testing.expectEqual(Tool.select, studio.tool);
+    switch (studio.takeSemanticCommand().?) {
+        .edit_text => |target| try std.testing.expectEqual(@as(usize, 131), target.item_identity),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.selected_identity = null;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .use_library_pressed = true,
+        .edit_text_pressed = true,
+    });
+    try std.testing.expectEqual(Tool.add_reusable, studio.tool);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "used reusable definitions cannot emit a delete command" {
+    var items: [0]slides.SlideItem = .{};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const entries = [_]LibraryEntry{.{
+        .kind = .element,
+        .name = "card",
+        .use_count = 2,
+        .deletable = false,
+    }};
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .library = &entries };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_library_index = 0, .last_workspace_slide = 0 };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .delete_library_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.library_entry_in_use, studio.notice);
 }
 
 test "library selection cannot drift across slides or source rewrites" {

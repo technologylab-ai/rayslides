@@ -27,6 +27,9 @@ pub const Entry = struct {
     full_end: usize,
     /// False for names Studio cannot safely write back or instantiate.
     placeable: bool,
+    /// Literal source-order-resolved uses owned by this definition, stopping
+    /// at the next same-kind definition with the same name.
+    use_count: usize = 0,
 };
 
 pub const Catalog = struct {
@@ -166,11 +169,42 @@ pub fn discover(allocator: std.mem.Allocator, source: []const u8) std.mem.Alloca
         cursor = line.full_end;
     }
 
+    for (0..entries.items.len) |entry_index| {
+        const use_count = countDefinitionUses(source, entries.items, entry_index);
+        entries.items[entry_index].use_count = use_count;
+    }
+
     return .{
         .entries = try entries.toOwnedSlice(allocator),
         .source_len = source.len,
         .allocator = allocator,
     };
+}
+
+fn countDefinitionUses(source: []const u8, entries: []const Entry, entry_index: usize) usize {
+    const entry = entries[entry_index];
+    var end = source.len;
+    for (entries[entry_index + 1 ..]) |later| {
+        if (sameDefinition(entry, later)) {
+            end = later.directive_offset;
+            break;
+        }
+    }
+
+    var count: usize = 0;
+    var cursor = entry.full_end;
+    while (cursor < end) {
+        const line = physicalLineAt(source, cursor);
+        if (parseContextDirective(source, line)) |directive| {
+            if (directive.role == .use and directive.kind == entry.kind and
+                std.mem.eql(u8, directive.name, entry.name))
+            {
+                count += 1;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return count;
 }
 
 /// Rename one definition and precisely those later uses that resolve to it:
@@ -502,6 +536,9 @@ test "source-order visibility returns only the latest same-kind definition" {
     try std.testing.expect(!catalog.isVisibleAt(0, eof));
     try std.testing.expect(catalog.isVisibleAt(2, eof));
     try std.testing.expectEqual(@as(?usize, 2), catalog.findVisible(.element, "card", eof));
+    try std.testing.expectEqual(@as(usize, 1), catalog.entries[0].use_count);
+    try std.testing.expectEqual(@as(usize, 0), catalog.entries[1].use_count);
+    try std.testing.expectEqual(@as(usize, 0), catalog.entries[2].use_count);
 
     var indices: [1]usize = undefined;
     try std.testing.expectEqual(@as(usize, 2), catalog.writeVisibleIndices(eof, &indices));
