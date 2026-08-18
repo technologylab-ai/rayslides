@@ -219,6 +219,7 @@ pub const Notice = enum {
     generated_source_read_only,
     property_unavailable,
     base_scene_only,
+    structural_source_locked,
 };
 
 /// The active canvas tool. Creation tools are deliberately one-shot: after a
@@ -294,6 +295,53 @@ pub const MorphSceneCommand = struct {
 pub const AddReusableCommand = struct {
     position: rl.Vector2,
     suggested_size: rl.Vector2,
+    /// Index in the caller-provided Workspace.library slice. Null preserves
+    /// the original prompt-driven `U` tool workflow.
+    library_entry_index: ?usize = null,
+};
+
+pub const SlideMoveDirection = enum {
+    up,
+    down,
+};
+
+pub const SlideMoveCommand = struct {
+    slide_index: usize,
+    direction: SlideMoveDirection,
+};
+
+/// Compact, renderer-independent metadata for one organizer card. `index` is
+/// the caller's stable slide index and need not match the summary's array
+/// offset (although dense, ordered summaries are the natural representation).
+pub const SlideSummary = struct {
+    index: usize,
+    title: []const u8 = "",
+    item_count: usize = 0,
+    morph_count: usize = 0,
+};
+
+pub const LibraryEntryKind = enum {
+    element,
+    slide_template,
+};
+
+/// A named, source-defined reusable shown in the Studio library. Studio never
+/// retains `name`; commands use `library_entry_index`, so caller-owned strings
+/// can safely be replaced after a reparse.
+pub const LibraryEntry = struct {
+    kind: LibraryEntryKind,
+    name: []const u8,
+    available: bool = true,
+};
+
+/// Optional deck-level UI supplied by the integration layer. The legacy
+/// update/draw entry points use an invisible workspace, preserving the canvas-
+/// only API for tests and alternate frontends.
+pub const Workspace = struct {
+    visible: bool = false,
+    slides: []const SlideSummary = &.{},
+    current_slide: usize = 0,
+    library: []const LibraryEntry = &.{},
 };
 
 /// Source-level intentions emitted by the visual controls. Unlike
@@ -308,6 +356,12 @@ pub const SemanticCommand = union(enum) {
     promote_to_reusable: CommandTarget,
     select_morph_scene: MorphSceneCommand,
     new_slide: void,
+    select_slide: usize,
+    duplicate_slide: usize,
+    delete_slide: usize,
+    move_slide: SlideMoveCommand,
+    /// Creates a new slide using the indexed `slide_template` library entry.
+    new_slide_from_template: usize,
     /// The integration layer prompts for an existing @push name and inserts
     /// the corresponding @pop instance at this visual placement.
     add_reusable: AddReusableCommand,
@@ -329,6 +383,164 @@ pub const UiLayout = struct {
     foreground_swatches: [palette.len]rl.Rectangle,
     background_swatches: [palette.len]rl.Rectangle,
 };
+
+pub const organizer_action_count = 5;
+pub const slide_card_height: f32 = 88;
+pub const slide_card_gap: f32 = 7;
+pub const library_row_height: f32 = 46;
+pub const library_row_gap: f32 = 6;
+pub const workspace_min_height: f32 = 260;
+
+/// Geometry for the deck-level sidebar. Dynamic card/row rectangles are
+/// derived with slideCardRect/libraryRowRect so the layout remains allocation-
+/// free even for very large decks.
+pub const WorkspaceLayout = struct {
+    sidebar: rl.Rectangle,
+    organizer: rl.Rectangle,
+    organizer_actions: [organizer_action_count]rl.Rectangle,
+    slide_cards_clip: rl.Rectangle,
+    slide_page_previous: rl.Rectangle,
+    slide_page_next: rl.Rectangle,
+    library: rl.Rectangle,
+    library_rows_clip: rl.Rectangle,
+    library_page_previous: rl.Rectangle,
+    library_page_next: rl.Rectangle,
+};
+
+pub const SlidePreviewSlot = struct {
+    /// Offset into Workspace.slides.
+    summary_index: usize,
+    /// Caller-defined slide index carried by that summary.
+    slide_index: usize,
+    rect: rl.Rectangle,
+};
+
+pub fn workspaceLayout(viewport: Viewport) WorkspaceLayout {
+    const margin: f32 = 12;
+    const gap: f32 = 8;
+    const toolbar = uiLayout(viewport).toolbar;
+    const status = statusPanel(viewport);
+    const available_height = @max(0, status.y - gap - (toolbar.y + toolbar.height + gap));
+    const sidebar_width = @min(@max(228, viewport.slide_size.x * 0.255), 304);
+    const sidebar: rl.Rectangle = .{
+        .x = viewport.slide_top_left.x + margin,
+        .y = toolbar.y + toolbar.height + gap,
+        .width = @min(sidebar_width, @max(120, viewport.slide_size.x - margin * 2)),
+        .height = available_height,
+    };
+    const organizer_height = @min(@max(190, @floor(sidebar.height * 0.61)), @max(130, sidebar.height - 126));
+    const organizer: rl.Rectangle = .{ .x = sidebar.x, .y = sidebar.y, .width = sidebar.width, .height = organizer_height };
+
+    const action_gap: f32 = 4;
+    const action_width = (organizer.width - 24 - action_gap * (organizer_action_count - 1)) / organizer_action_count;
+    var organizer_actions: [organizer_action_count]rl.Rectangle = undefined;
+    for (&organizer_actions, 0..) |*button, index| button.* = .{
+        .x = organizer.x + 12 + @as(f32, @floatFromInt(index)) * (action_width + action_gap),
+        .y = organizer.y + 34,
+        .width = action_width,
+        .height = 28,
+    };
+    const pager_width: f32 = 56;
+    const pager_y = organizer.y + organizer.height - 29;
+    const slide_page_previous: rl.Rectangle = .{
+        .x = organizer.x + organizer.width - 12 - pager_width * 2 - action_gap,
+        .y = pager_y,
+        .width = pager_width,
+        .height = 22,
+    };
+    const slide_page_next: rl.Rectangle = .{
+        .x = slide_page_previous.x + pager_width + action_gap,
+        .y = pager_y,
+        .width = pager_width,
+        .height = 22,
+    };
+    const slide_cards_clip: rl.Rectangle = .{
+        .x = organizer.x + 8,
+        .y = organizer.y + 70,
+        .width = organizer.width - 16,
+        .height = @max(0, pager_y - 5 - (organizer.y + 70)),
+    };
+
+    const library_y = organizer.y + organizer.height + gap;
+    const library: rl.Rectangle = .{
+        .x = sidebar.x,
+        .y = library_y,
+        .width = sidebar.width,
+        .height = @max(92, sidebar.y + sidebar.height - library_y),
+    };
+    const library_pager_y = library.y + library.height - 29;
+    const library_page_previous: rl.Rectangle = .{
+        .x = library.x + library.width - 12 - pager_width * 2 - action_gap,
+        .y = library_pager_y,
+        .width = pager_width,
+        .height = 22,
+    };
+    const library_page_next: rl.Rectangle = .{
+        .x = library_page_previous.x + pager_width + action_gap,
+        .y = library_pager_y,
+        .width = pager_width,
+        .height = 22,
+    };
+    const library_rows_clip: rl.Rectangle = .{
+        .x = library.x + 8,
+        .y = library.y + 36,
+        .width = library.width - 16,
+        .height = @max(0, library_pager_y - 5 - (library.y + 36)),
+    };
+    return .{
+        .sidebar = sidebar,
+        .organizer = organizer,
+        .organizer_actions = organizer_actions,
+        .slide_cards_clip = slide_cards_clip,
+        .slide_page_previous = slide_page_previous,
+        .slide_page_next = slide_page_next,
+        .library = library,
+        .library_rows_clip = library_rows_clip,
+        .library_page_previous = library_page_previous,
+        .library_page_next = library_page_next,
+    };
+}
+
+pub fn slideCardCapacity(layout: WorkspaceLayout) usize {
+    return rowsThatFit(layout.slide_cards_clip.height, slide_card_height, slide_card_gap);
+}
+
+pub fn libraryRowCapacity(layout: WorkspaceLayout) usize {
+    return rowsThatFit(layout.library_rows_clip.height, library_row_height, library_row_gap);
+}
+
+pub fn slideCardRect(layout: WorkspaceLayout, visible_slot: usize) ?rl.Rectangle {
+    if (visible_slot >= slideCardCapacity(layout)) return null;
+    return .{
+        .x = layout.slide_cards_clip.x,
+        .y = layout.slide_cards_clip.y + @as(f32, @floatFromInt(visible_slot)) * (slide_card_height + slide_card_gap),
+        .width = layout.slide_cards_clip.width,
+        .height = slide_card_height,
+    };
+}
+
+/// The 16:9 area reserved inside a slide card. Callers may render a true slide
+/// thumbnail here between drawWorkspaceBackground and drawWorkspaceOverlay.
+pub fn slidePreviewRect(card: rl.Rectangle) rl.Rectangle {
+    const height = @min(card.height - 12, (card.width * 0.54) * 9 / 16);
+    const width = height * 16 / 9;
+    return .{ .x = card.x + 6, .y = card.y + (card.height - height) / 2, .width = width, .height = height };
+}
+
+pub fn libraryRowRect(layout: WorkspaceLayout, visible_slot: usize) ?rl.Rectangle {
+    if (visible_slot >= libraryRowCapacity(layout)) return null;
+    return .{
+        .x = layout.library_rows_clip.x,
+        .y = layout.library_rows_clip.y + @as(f32, @floatFromInt(visible_slot)) * (library_row_height + library_row_gap),
+        .width = layout.library_rows_clip.width,
+        .height = library_row_height,
+    };
+}
+
+fn rowsThatFit(height: f32, row_height: f32, gap: f32) usize {
+    if (height < row_height) return 0;
+    return @intFromFloat(@floor((height + gap) / (row_height + gap)));
+}
 
 pub fn uiLayout(viewport: Viewport) UiLayout {
     const margin: f32 = 12;
@@ -449,17 +661,29 @@ pub const FrameInput = struct {
     new_slide_pressed: bool = false,
     /// Negative selects the previous base/morph scene, positive the next.
     cycle_morph_scene: i8 = 0,
+    /// Negative selects the previous slide, positive the next slide.
+    select_slide_delta: i8 = 0,
+    duplicate_slide_pressed: bool = false,
+    delete_slide_pressed: bool = false,
+    /// Negative moves the current slide up, positive moves it down.
+    move_slide: i8 = 0,
+    /// Positive/negative wheel delta; routed to the panel under the pointer.
+    workspace_scroll: f32 = 0,
 
     pub fn fromRaylib() FrameInput {
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
         const shortcut_modifier = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control) or
             rl.isKeyDown(.left_super) or rl.isKeyDown(.right_super);
+        const alt = rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt);
+        const moving_slide = alt and shift;
         const amount: f32 = if (shift) 10 else 1;
         var nudge: rl.Vector2 = .{ .x = 0, .y = 0 };
-        if (keyPressedOrRepeated(.left)) nudge.x -= amount;
-        if (keyPressedOrRepeated(.right)) nudge.x += amount;
-        if (keyPressedOrRepeated(.up)) nudge.y -= amount;
-        if (keyPressedOrRepeated(.down)) nudge.y += amount;
+        if (!moving_slide) {
+            if (keyPressedOrRepeated(.left)) nudge.x -= amount;
+            if (keyPressedOrRepeated(.right)) nudge.x += amount;
+            if (keyPressedOrRepeated(.up)) nudge.y -= amount;
+            if (keyPressedOrRepeated(.down)) nudge.y += amount;
+        }
         const choose_tool: ?Tool = if (rl.isKeyPressed(.v))
             .select
         else if (rl.isKeyPressed(.t))
@@ -482,9 +706,9 @@ pub const FrameInput = struct {
             .pointer_down = rl.isMouseButtonDown(.left),
             .pointer_released = rl.isMouseButtonReleased(.left),
             .nudge = nudge,
-            .allow_shared_edit = rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt),
+            .allow_shared_edit = alt,
             .choose_tool = choose_tool,
-            .delete_pressed = rl.isKeyPressed(.backspace),
+            .delete_pressed = !shortcut_modifier and rl.isKeyPressed(.backspace),
             .edit_text_pressed = rl.isKeyPressed(.enter),
             .promote_pressed = rl.isKeyPressed(.p),
             .new_slide_pressed = shortcut_modifier and rl.isKeyPressed(.n),
@@ -494,6 +718,21 @@ pub const FrameInput = struct {
                 1
             else
                 0,
+            .select_slide_delta = if (rl.isKeyPressed(.page_up))
+                -1
+            else if (rl.isKeyPressed(.page_down))
+                1
+            else
+                0,
+            .duplicate_slide_pressed = shortcut_modifier and rl.isKeyPressed(.d),
+            .delete_slide_pressed = shortcut_modifier and rl.isKeyPressed(.backspace),
+            .move_slide = if (moving_slide and rl.isKeyPressed(.up))
+                -1
+            else if (moving_slide and rl.isKeyPressed(.down))
+                1
+            else
+                0,
+            .workspace_scroll = rl.getMouseWheelMove(),
         };
     }
 };
@@ -535,6 +774,10 @@ pub const Studio = struct {
         .size = .{ .x = 0, .y = 0 },
     },
     pending_semantic_command: ?SemanticCommand = null,
+    organizer_first_visible: usize = 0,
+    library_first_visible: usize = 0,
+    selected_library_index: ?usize = null,
+    last_workspace_slide: ?usize = null,
 
     pub fn capturesInput(self: Studio) bool {
         return self.enabled;
@@ -561,6 +804,10 @@ pub const Studio = struct {
 
     pub fn markSourceChanged(self: *Studio) void {
         self.copy_is_current = false;
+        // Library commands retain only a workspace index. Any source rewrite
+        // can reorder the catalog, so a prior selection must not silently
+        // resolve to a different reusable afterward.
+        self.selected_library_index = null;
     }
 
     pub fn setNotice(self: *Studio, notice: Notice) void {
@@ -603,6 +850,8 @@ pub const Studio = struct {
         if (self.active_morph_state == normalized) return;
         self.clearSelection(items);
         self.active_morph_state = normalized;
+        self.selected_library_index = null;
+        self.tool = .select;
     }
 
     /// Cycles base -> state 1 ... state N -> base and emits the scene choice
@@ -616,6 +865,8 @@ pub const Studio = struct {
         const next_state: ?usize = if (next_scene == 0) null else @intCast(next_scene - 1);
         self.clearSelection(items);
         self.active_morph_state = next_state;
+        self.selected_library_index = null;
+        self.tool = .select;
         self.pending_semantic_command = .{ .select_morph_scene = .{ .active_state = next_state } };
     }
 
@@ -631,6 +882,7 @@ pub const Studio = struct {
             self.active_morph_state = null;
             self.selected_identity = null;
             self.selected_source = null;
+            self.selected_library_index = null;
         }
     }
 
@@ -641,6 +893,7 @@ pub const Studio = struct {
         self.active_morph_state = null;
         self.selected_identity = null;
         self.selected_source = null;
+        self.selected_library_index = null;
     }
 
     pub fn clearSelection(self: *Studio, items: []slides.SlideItem) void {
@@ -690,6 +943,20 @@ pub const Studio = struct {
         viewport: Viewport,
         input: FrameInput,
     ) ?GeometryCommand {
+        return self.updateWithWorkspace(items, resolved_bounds, viewport, .{}, input);
+    }
+
+    /// Extended update path for the organizer and reusable library. Workspace
+    /// slices are borrowed only for this call; Studio retains indexes, never
+    /// caller-owned strings or slice pointers.
+    pub fn updateWithWorkspace(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        workspace: Workspace,
+        input: FrameInput,
+    ) ?GeometryCommand {
         if (input.pointer_pressed or input.nudge.x != 0 or input.nudge.y != 0) self.notice = .none;
         if (input.toggle_pressed) {
             self.toggle(items);
@@ -698,6 +965,12 @@ pub const Studio = struct {
         if (!self.enabled) return null;
 
         self.validateSelection(items, resolved_bounds);
+
+        if (workspace.visible) {
+            self.normalizeWorkspace(viewport, workspace);
+            if (self.handleWorkspaceKeyboard(items, workspace, input)) return null;
+            self.handleWorkspaceScroll(viewport, workspace, input);
+        }
 
         if (input.choose_tool) |tool| self.setTool(tool, items);
 
@@ -745,13 +1018,15 @@ pub const Studio = struct {
             return null;
         }
 
+        if (input.pointer_pressed and workspace.visible and
+            self.handleWorkspaceClick(items, viewport, workspace, input.pointer_screen)) return null;
         if (input.pointer_pressed and self.handleUiClick(items, viewport, input.pointer_screen, input.allow_shared_edit)) return null;
 
         const pointer_logical = screenToLogical(viewport, input.pointer_screen);
 
         if (input.pointer_pressed and self.interaction == .idle and self.tool != .select) {
             if (viewport.containsScreenPoint(input.pointer_screen)) {
-                if (pointer_logical) |pointer| self.emitAddCommand(pointer);
+                if (pointer_logical) |pointer| self.emitAddCommand(pointer, workspace);
             }
             return null;
         }
@@ -866,11 +1141,17 @@ pub const Studio = struct {
         return true;
     }
 
-    fn emitAddCommand(self: *Studio, pointer: rl.Vector2) void {
+    fn emitAddCommand(self: *Studio, pointer: rl.Vector2, workspace: Workspace) void {
         if (self.tool == .add_reusable) {
+            const selected_entry = if (self.selected_library_index) |index|
+                if (index < workspace.library.len and workspace.library[index].available and
+                    workspace.library[index].kind == .element) index else null
+            else
+                null;
             self.pending_semantic_command = .{ .add_reusable = .{
                 .position = roundVector(pointer),
                 .suggested_size = .{ .x = 600, .y = 200 },
+                .library_entry_index = selected_entry,
             } };
             self.tool = .select;
             return;
@@ -895,6 +1176,268 @@ pub const Studio = struct {
             .suggested_color = if (kind == .shape) .blue else null,
         } };
         self.tool = .select;
+    }
+
+    pub fn visibleSlidePreview(
+        self: Studio,
+        viewport: Viewport,
+        workspace: Workspace,
+        visible_slot: usize,
+    ) ?SlidePreviewSlot {
+        if (!workspace.visible) return null;
+        const layout = workspaceLayout(viewport);
+        if (layout.sidebar.height < workspace_min_height) return null;
+        const card = slideCardRect(layout, visible_slot) orelse return null;
+        const summary_index = self.organizer_first_visible + visible_slot;
+        if (summary_index >= workspace.slides.len) return null;
+        return .{
+            .summary_index = summary_index,
+            .slide_index = workspace.slides[summary_index].index,
+            .rect = slidePreviewRect(card),
+        };
+    }
+
+    pub fn visibleLibraryIndex(
+        self: Studio,
+        viewport: Viewport,
+        workspace: Workspace,
+        visible_slot: usize,
+    ) ?usize {
+        const layout = workspaceLayout(viewport);
+        if (!workspace.visible or layout.sidebar.height < workspace_min_height or libraryRowRect(layout, visible_slot) == null) return null;
+        const index = self.library_first_visible + visible_slot;
+        return if (index < workspace.library.len) index else null;
+    }
+
+    fn normalizeWorkspace(self: *Studio, viewport: Viewport, workspace: Workspace) void {
+        const layout = workspaceLayout(viewport);
+        const slide_capacity = slideCardCapacity(layout);
+        self.organizer_first_visible = clampFirstVisible(
+            self.organizer_first_visible,
+            workspace.slides.len,
+            slide_capacity,
+        );
+        if (self.last_workspace_slide == null or self.last_workspace_slide.? != workspace.current_slide) {
+            if (summaryOffsetForSlide(workspace.slides, workspace.current_slide)) |offset| {
+                self.organizer_first_visible = revealIndex(
+                    self.organizer_first_visible,
+                    offset,
+                    workspace.slides.len,
+                    slide_capacity,
+                );
+            }
+            self.last_workspace_slide = workspace.current_slide;
+            self.selected_library_index = null;
+            self.tool = .select;
+        }
+
+        const library_capacity = libraryRowCapacity(layout);
+        self.library_first_visible = clampFirstVisible(
+            self.library_first_visible,
+            workspace.library.len,
+            library_capacity,
+        );
+        if (self.selected_library_index) |index| {
+            if (index >= workspace.library.len or workspace.library[index].kind != .element or
+                !workspace.library[index].available)
+            {
+                self.selected_library_index = null;
+            }
+        }
+    }
+
+    fn handleWorkspaceKeyboard(self: *Studio, items: []slides.SlideItem, workspace: Workspace, input: FrameInput) bool {
+        if (input.select_slide_delta != 0) {
+            const current = summaryOffsetForSlide(workspace.slides, workspace.current_slide) orelse return true;
+            const movement: isize = if (input.select_slide_delta < 0) -1 else 1;
+            const desired: isize = @as(isize, @intCast(current)) + movement;
+            if (desired >= 0 and desired < @as(isize, @intCast(workspace.slides.len))) {
+                self.emitSlideSelection(items, workspace.slides[@intCast(desired)].index);
+            }
+            return true;
+        }
+        if (input.duplicate_slide_pressed) {
+            if (summaryOffsetForSlide(workspace.slides, workspace.current_slide) != null) {
+                self.prepareDeckCommand(items);
+                self.pending_semantic_command = .{ .duplicate_slide = workspace.current_slide };
+            }
+            return true;
+        }
+        if (input.delete_slide_pressed) {
+            if (workspace.slides.len <= 1) {
+                self.notice = .property_unavailable;
+            } else if (summaryOffsetForSlide(workspace.slides, workspace.current_slide) != null) {
+                self.prepareDeckCommand(items);
+                self.pending_semantic_command = .{ .delete_slide = workspace.current_slide };
+            }
+            return true;
+        }
+        if (input.move_slide != 0) {
+            const offset = summaryOffsetForSlide(workspace.slides, workspace.current_slide) orelse return true;
+            const direction: SlideMoveDirection = if (input.move_slide < 0) .up else .down;
+            if ((direction == .up and offset > 0) or (direction == .down and offset + 1 < workspace.slides.len)) {
+                self.prepareDeckCommand(items);
+                self.pending_semantic_command = .{ .move_slide = .{
+                    .slide_index = workspace.current_slide,
+                    .direction = direction,
+                } };
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn handleWorkspaceScroll(self: *Studio, viewport: Viewport, workspace: Workspace, input: FrameInput) void {
+        if (input.workspace_scroll == 0) return;
+        const layout = workspaceLayout(viewport);
+        if (layout.sidebar.height < workspace_min_height) return;
+        if (pointInRectangle(input.pointer_screen, layout.organizer)) {
+            self.organizer_first_visible = scrollFirstVisible(
+                self.organizer_first_visible,
+                workspace.slides.len,
+                slideCardCapacity(layout),
+                if (input.workspace_scroll > 0) -1 else 1,
+            );
+        } else if (pointInRectangle(input.pointer_screen, layout.library)) {
+            self.library_first_visible = scrollFirstVisible(
+                self.library_first_visible,
+                workspace.library.len,
+                libraryRowCapacity(layout),
+                if (input.workspace_scroll > 0) -1 else 1,
+            );
+        }
+    }
+
+    fn handleWorkspaceClick(
+        self: *Studio,
+        items: []slides.SlideItem,
+        viewport: Viewport,
+        workspace: Workspace,
+        pointer: rl.Vector2,
+    ) bool {
+        const layout = workspaceLayout(viewport);
+        if (layout.sidebar.height < workspace_min_height) return false;
+        const in_organizer = pointInRectangle(pointer, layout.organizer);
+        const in_library = pointInRectangle(pointer, layout.library);
+        if (!in_organizer and !in_library) return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+
+        if (in_organizer) {
+            for (layout.organizer_actions, 0..) |button, action| {
+                if (!pointInRectangle(pointer, button)) continue;
+                switch (action) {
+                    0 => {
+                        self.prepareDeckCommand(items);
+                        self.pending_semantic_command = .{ .new_slide = {} };
+                    },
+                    1 => if (workspace.slides.len > 0) {
+                        self.prepareDeckCommand(items);
+                        self.pending_semantic_command = .{ .duplicate_slide = workspace.current_slide };
+                    },
+                    2 => if (workspace.slides.len > 1) {
+                        self.prepareDeckCommand(items);
+                        self.pending_semantic_command = .{ .delete_slide = workspace.current_slide };
+                    } else {
+                        self.notice = .property_unavailable;
+                    },
+                    3, 4 => if (summaryOffsetForSlide(workspace.slides, workspace.current_slide)) |offset| {
+                        const direction: SlideMoveDirection = if (action == 3) .up else .down;
+                        if ((direction == .up and offset > 0) or (direction == .down and offset + 1 < workspace.slides.len)) {
+                            self.prepareDeckCommand(items);
+                            self.pending_semantic_command = .{ .move_slide = .{
+                                .slide_index = workspace.current_slide,
+                                .direction = direction,
+                            } };
+                        }
+                    },
+                    else => unreachable,
+                }
+                return true;
+            }
+            if (pointInRectangle(pointer, layout.slide_page_previous)) {
+                self.organizer_first_visible = pageFirstVisible(
+                    self.organizer_first_visible,
+                    workspace.slides.len,
+                    slideCardCapacity(layout),
+                    false,
+                );
+                return true;
+            }
+            if (pointInRectangle(pointer, layout.slide_page_next)) {
+                self.organizer_first_visible = pageFirstVisible(
+                    self.organizer_first_visible,
+                    workspace.slides.len,
+                    slideCardCapacity(layout),
+                    true,
+                );
+                return true;
+            }
+            for (0..slideCardCapacity(layout)) |visible_slot| {
+                const card = slideCardRect(layout, visible_slot) orelse continue;
+                if (!pointInRectangle(pointer, card)) continue;
+                const summary_index = self.organizer_first_visible + visible_slot;
+                if (summary_index < workspace.slides.len) {
+                    self.emitSlideSelection(items, workspace.slides[summary_index].index);
+                }
+                return true;
+            }
+            return true;
+        }
+
+        if (pointInRectangle(pointer, layout.library_page_previous)) {
+            self.library_first_visible = pageFirstVisible(
+                self.library_first_visible,
+                workspace.library.len,
+                libraryRowCapacity(layout),
+                false,
+            );
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.library_page_next)) {
+            self.library_first_visible = pageFirstVisible(
+                self.library_first_visible,
+                workspace.library.len,
+                libraryRowCapacity(layout),
+                true,
+            );
+            return true;
+        }
+        for (0..libraryRowCapacity(layout)) |visible_slot| {
+            const row = libraryRowRect(layout, visible_slot) orelse continue;
+            if (!pointInRectangle(pointer, row)) continue;
+            const entry_index = self.library_first_visible + visible_slot;
+            if (entry_index >= workspace.library.len) return true;
+            const entry = workspace.library[entry_index];
+            if (!entry.available) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            switch (entry.kind) {
+                .element => {
+                    self.selected_library_index = entry_index;
+                    self.setTool(.add_reusable, items);
+                },
+                .slide_template => {
+                    self.prepareDeckCommand(items);
+                    self.pending_semantic_command = .{ .new_slide_from_template = entry_index };
+                },
+            }
+            return true;
+        }
+        // Empty sidebar space is an input shield, never a canvas click.
+        return true;
+    }
+
+    fn emitSlideSelection(self: *Studio, items: []slides.SlideItem, slide_index: usize) void {
+        self.prepareDeckCommand(items);
+        self.pending_semantic_command = .{ .select_slide = slide_index };
+    }
+
+    fn prepareDeckCommand(self: *Studio, items: []slides.SlideItem) void {
+        self.clearSelection(items);
+        self.tool = .select;
+        self.active_morph_state = null;
+        self.notice = .none;
     }
 
     fn handleUiClick(
@@ -956,6 +1499,16 @@ pub const Studio = struct {
         viewport: Viewport,
     ) ?GeometryCommand {
         return self.update(items, resolved_bounds, viewport, FrameInput.fromRaylib());
+    }
+
+    pub fn updateWithWorkspaceFromRaylib(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        workspace: Workspace,
+    ) ?GeometryCommand {
+        return self.updateWithWorkspace(items, resolved_bounds, viewport, workspace, FrameInput.fromRaylib());
     }
 
     fn validateSelection(self: *Studio, items: []slides.SlideItem, resolved_bounds: []const ResolvedBounds) void {
@@ -1184,6 +1737,119 @@ pub const Studio = struct {
         self.drawStatus(items, resolved_bounds, viewport);
     }
 
+    /// Convenience draw path with placeholder thumbnail wells. Integrations
+    /// that render true previews should instead call draw(), then
+    /// drawWorkspaceBackground(), render each visibleSlidePreview(), and finish
+    /// with drawWorkspaceOverlay().
+    pub fn drawWithWorkspace(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        workspace: Workspace,
+    ) void {
+        self.draw(items, resolved_bounds, viewport);
+        self.drawWorkspaceBackground(viewport, workspace);
+        self.drawWorkspaceOverlay(viewport, workspace);
+    }
+
+    pub fn drawWorkspaceBackground(self: Studio, viewport: Viewport, workspace: Workspace) void {
+        if (!self.enabled or !workspace.visible) return;
+        const layout = workspaceLayout(viewport);
+        if (layout.sidebar.height < workspace_min_height) return;
+        drawStudioPanel(layout.organizer);
+        drawStudioPanel(layout.library);
+        for (0..slideCardCapacity(layout)) |visible_slot| {
+            const summary_index = self.organizer_first_visible + visible_slot;
+            if (summary_index >= workspace.slides.len) break;
+            const card = slideCardRect(layout, visible_slot) orelse break;
+            rl.drawRectangleRec(card, .{ .r = 25, .g = 31, .b = 45, .a = 250 });
+            rl.drawRectangleRec(slidePreviewRect(card), .{ .r = 4, .g = 7, .b = 13, .a = 255 });
+        }
+        for (0..libraryRowCapacity(layout)) |visible_slot| {
+            const entry_index = self.library_first_visible + visible_slot;
+            if (entry_index >= workspace.library.len) break;
+            const row = libraryRowRect(layout, visible_slot) orelse break;
+            const entry = workspace.library[entry_index];
+            rl.drawRectangleRec(row, if (entry.available)
+                .{ .r = 25, .g = 31, .b = 45, .a = 250 }
+            else
+                .{ .r = 22, .g = 25, .b = 32, .a = 245 });
+        }
+    }
+
+    pub fn drawWorkspaceOverlay(self: Studio, viewport: Viewport, workspace: Workspace) void {
+        if (!self.enabled or !workspace.visible) return;
+        const layout = workspaceLayout(viewport);
+        if (layout.sidebar.height < workspace_min_height) return;
+        rl.drawText("SLIDES", @intFromFloat(layout.organizer.x + 12), @intFromFloat(layout.organizer.y + 10), 15, .white);
+        const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down" };
+        for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(button, label);
+        drawCompactButton(layout.slide_page_previous, "Prev");
+        drawCompactButton(layout.slide_page_next, "Next");
+
+        for (0..slideCardCapacity(layout)) |visible_slot| {
+            const summary_index = self.organizer_first_visible + visible_slot;
+            if (summary_index >= workspace.slides.len) break;
+            const summary = workspace.slides[summary_index];
+            const card = slideCardRect(layout, visible_slot) orelse break;
+            const active = summary.index == workspace.current_slide;
+            const border: rl.Color = if (active)
+                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            else
+                .{ .r = 103, .g = 117, .b = 140, .a = 210 };
+            rl.drawRectangleLinesEx(card, if (active) 3 else 1, border);
+            rl.drawRectangleLinesEx(slidePreviewRect(card), 1, .{ .r = 145, .g = 158, .b = 180, .a = 220 });
+
+            const preview = slidePreviewRect(card);
+            const text_x = preview.x + preview.width + 9;
+            var line_buffer: [96]u8 = undefined;
+            const slide_number = std.fmt.bufPrintZ(&line_buffer, "SLIDE {d}", .{summary.index + 1}) catch "SLIDE";
+            rl.drawText(slide_number, @intFromFloat(text_x), @intFromFloat(card.y + 9), 12, if (active) border else .white);
+            var title_buffer: [96]u8 = undefined;
+            const title = textForDraw(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title);
+            rl.drawText(title, @intFromFloat(text_x), @intFromFloat(card.y + 30), 14, .white);
+            var metadata_buffer: [96]u8 = undefined;
+            const metadata = std.fmt.bufPrintZ(
+                &metadata_buffer,
+                "{d} items · {d} states",
+                .{ summary.item_count, summary.morph_count },
+            ) catch "slide details";
+            rl.drawText(metadata, @intFromFloat(text_x), @intFromFloat(card.y + 57), 11, .{ .r = 168, .g = 179, .b = 198, .a = 255 });
+        }
+
+        rl.drawText("LIBRARY", @intFromFloat(layout.library.x + 12), @intFromFloat(layout.library.y + 10), 15, .white);
+        drawCompactButton(layout.library_page_previous, "Prev");
+        drawCompactButton(layout.library_page_next, "Next");
+        for (0..libraryRowCapacity(layout)) |visible_slot| {
+            const entry_index = self.library_first_visible + visible_slot;
+            if (entry_index >= workspace.library.len) break;
+            const entry = workspace.library[entry_index];
+            const row = libraryRowRect(layout, visible_slot) orelse break;
+            const selected = self.selected_library_index != null and self.selected_library_index.? == entry_index;
+            const border: rl.Color = if (selected)
+                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            else if (!entry.available)
+                .{ .r = 85, .g = 90, .b = 102, .a = 180 }
+            else
+                .{ .r = 103, .g = 117, .b = 140, .a = 210 };
+            rl.drawRectangleLinesEx(row, if (selected) 2 else 1, border);
+            const badge: [:0]const u8 = if (entry.kind == .element) "ITEM" else "SLIDE";
+            const badge_rect: rl.Rectangle = .{ .x = row.x + 7, .y = row.y + 9, .width = 48, .height = 28 };
+            rl.drawRectangleRec(badge_rect, if (entry.kind == .element)
+                .{ .r = 43, .g = 123, .b = 151, .a = if (entry.available) 255 else 100 }
+            else
+                .{ .r = 116, .g = 83, .b = 160, .a = if (entry.available) 255 else 100 });
+            var name_buffer: [128]u8 = undefined;
+            const name = textForDraw(&name_buffer, entry.name);
+            rl.drawText(badge, @intFromFloat(badge_rect.x + 7), @intFromFloat(badge_rect.y + 7), 11, .white);
+            rl.drawText(name, @intFromFloat(row.x + 64), @intFromFloat(row.y + 15), 14, if (entry.available)
+                .white
+            else
+                .{ .r = 130, .g = 136, .b = 149, .a = 255 });
+        }
+    }
+
     fn drawToolbar(self: Studio, viewport: Viewport) void {
         const layout = uiLayout(viewport);
         drawStudioPanel(layout.toolbar);
@@ -1277,6 +1943,7 @@ pub const Studio = struct {
             .generated_source_read_only => "Read-only in Studio: this item directive is produced with @let",
             .property_unavailable => "That property does not apply to this kind of item",
             .base_scene_only => "That action is available in the BASE scene",
+            .structural_source_locked => "Slide structure is source-scoped here; no changes were made",
         };
         if (notice_text) |message| {
             const notice_color: rl.Color = switch (self.notice) {
@@ -1318,6 +1985,35 @@ fn drawActionButton(rect: rl.Rectangle, label: [:0]const u8) void {
     );
 }
 
+fn drawCompactButton(rect: rl.Rectangle, label: [:0]const u8) void {
+    rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
+    rl.drawRectangleLinesEx(rect, 1, .{ .r = 105, .g = 120, .b = 143, .a = 210 });
+    const font_size: i32 = 11;
+    const width = rl.measureText(label, font_size);
+    rl.drawText(
+        label,
+        @intFromFloat(rect.x + (rect.width - @as(f32, @floatFromInt(width))) / 2),
+        @intFromFloat(rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2),
+        font_size,
+        .white,
+    );
+}
+
+fn textForDraw(buffer: []u8, value: []const u8) [:0]const u8 {
+    std.debug.assert(buffer.len >= 5);
+    if (value.len < buffer.len) {
+        @memcpy(buffer[0..value.len], value);
+        buffer[value.len] = 0;
+        return buffer[0..value.len :0];
+    }
+    var end = buffer.len - 4;
+    while (end > 0 and value[end] & 0xc0 == 0x80) end -= 1;
+    @memcpy(buffer[0..end], value[0..end]);
+    @memcpy(buffer[end .. end + 3], "...");
+    buffer[end + 3] = 0;
+    return buffer[0 .. end + 3 :0];
+}
+
 fn drawSwatches(rects: [palette.len]rl.Rectangle) void {
     for (rects, palette) |rect, value| {
         rl.drawRectangleRec(rect, paletteColor(value));
@@ -1328,6 +2024,43 @@ fn drawSwatches(rects: [palette.len]rl.Rectangle) void {
 fn pointInRectangle(point: rl.Vector2, rect: rl.Rectangle) bool {
     return point.x >= rect.x and point.y >= rect.y and
         point.x <= rect.x + rect.width and point.y <= rect.y + rect.height;
+}
+
+fn summaryOffsetForSlide(summaries: []const SlideSummary, slide_index: usize) ?usize {
+    for (summaries, 0..) |summary, offset| {
+        if (summary.index == slide_index) return offset;
+    }
+    return null;
+}
+
+fn maxFirstVisible(item_count: usize, capacity: usize) usize {
+    if (capacity == 0 or item_count <= capacity) return 0;
+    return item_count - capacity;
+}
+
+fn clampFirstVisible(first: usize, item_count: usize, capacity: usize) usize {
+    return @min(first, maxFirstVisible(item_count, capacity));
+}
+
+fn revealIndex(first: usize, index: usize, item_count: usize, capacity: usize) usize {
+    if (capacity == 0) return 0;
+    if (index < first) return index;
+    if (index >= first + capacity) return @min(index - capacity + 1, maxFirstVisible(item_count, capacity));
+    return clampFirstVisible(first, item_count, capacity);
+}
+
+fn scrollFirstVisible(first: usize, item_count: usize, capacity: usize, direction: i8) usize {
+    const maximum = maxFirstVisible(item_count, capacity);
+    if (direction < 0) return first -| 1;
+    if (direction > 0) return @min(first + 1, maximum);
+    return @min(first, maximum);
+}
+
+fn pageFirstVisible(first: usize, item_count: usize, capacity: usize, forward: bool) usize {
+    if (capacity == 0) return 0;
+    const maximum = maxFirstVisible(item_count, capacity);
+    if (forward) return @min(first + capacity, maximum);
+    return first -| capacity;
 }
 
 fn add(a: rl.Vector2, b: rl.Vector2) rl.Vector2 {
@@ -1763,12 +2496,19 @@ test "promotion is offered only for direct base box items" {
 test "morph scene cycles through states and base while clearing selection" {
     var items = [_]slides.SlideItem{testItem(83, .textbox, 100, 100, 300, 100)};
     const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
-    var studio: Studio = .{ .enabled = true, .selected_identity = 83 };
+    var studio: Studio = .{
+        .enabled = true,
+        .selected_identity = 83,
+        .tool = .add_reusable,
+        .selected_library_index = 0,
+    };
     studio.setMorphStateCount(2);
 
     _ = studio.update(&items, &.{}, viewport, .{ .cycle_morph_scene = 1 });
     try std.testing.expectEqual(@as(?usize, 0), studio.active_morph_state);
     try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_library_index);
+    try std.testing.expectEqual(Tool.select, studio.tool);
     switch (studio.takeSemanticCommand().?) {
         .select_morph_scene => |command| try std.testing.expectEqual(@as(?usize, 0), command.active_state),
         else => return error.UnexpectedSemanticCommand,
@@ -1885,6 +2625,213 @@ test "semantic keyboard and panel actions cancel active geometry first" {
     try std.testing.expectEqual(Interaction.idle, studio.interaction);
     try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
     try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .delete_item);
+}
+
+test "workspace layout exposes bounded slide thumbnail slots" {
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = workspaceLayout(viewport);
+    try std.testing.expect(slideCardCapacity(layout) >= 2);
+    try std.testing.expect(libraryRowCapacity(layout) >= 1);
+    const first = slideCardRect(layout, 0).?;
+    const second = slideCardRect(layout, 1).?;
+    const preview = slidePreviewRect(first);
+    try std.testing.expect(pointInRectangle(.{ .x = preview.x, .y = preview.y }, first));
+    try std.testing.expect(pointInRectangle(.{ .x = preview.x + preview.width, .y = preview.y + preview.height }, first));
+    try std.testing.expect(first.y + first.height < second.y);
+    try std.testing.expect(!pointInRectangle(rectangleCenter(layout.library), layout.organizer));
+
+    const short_viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = .{ .x = 900, .y = 360 } };
+    const short_layout = workspaceLayout(short_viewport);
+    try std.testing.expect(short_layout.sidebar.height < workspace_min_height);
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const short_workspace: Workspace = .{ .visible = true, .slides = &summaries };
+    const short_studio: Studio = .{ .enabled = true };
+    try std.testing.expect(short_studio.visibleSlidePreview(short_viewport, short_workspace, 0) == null);
+}
+
+test "organizer card selects a slide and shields the canvas beneath it" {
+    var items = [_]slides.SlideItem{testItem(120, .textbox, 0, 0, 600, 800)};
+    const summaries = [_]SlideSummary{
+        .{ .index = 2, .title = "Opening" },
+        .{ .index = 4, .title = "Details" },
+        .{ .index = 9, .title = "Finish" },
+    };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 2 };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const second_card = slideCardRect(workspaceLayout(viewport), 1).?;
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(second_card),
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
+    switch (studio.takeSemanticCommand().?) {
+        .select_slide => |index| try std.testing.expectEqual(@as(usize, 4), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "organizer actions emit duplicate delete and bounded move commands" {
+    var items: [0]slides.SlideItem = .{};
+    const summaries = [_]SlideSummary{
+        .{ .index = 10 },
+        .{ .index = 20 },
+        .{ .index = 30 },
+    };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 20 };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = workspaceLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.organizer_actions[1]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_slide => |index| try std.testing.expectEqual(@as(usize, 20), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.organizer_actions[3]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .move_slide => |command| {
+            try std.testing.expectEqual(@as(usize, 20), command.slide_index);
+            try std.testing.expectEqual(SlideMoveDirection.up, command.direction);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.organizer_actions[2]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .delete_slide => |index| try std.testing.expectEqual(@as(usize, 20), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "organizer paging and wheel scrolling expose later summaries" {
+    var items: [0]slides.SlideItem = .{};
+    var summaries: [18]SlideSummary = undefined;
+    for (&summaries, 0..) |*summary, index| summary.* = .{ .index = index };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0 };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = workspaceLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.slide_page_next),
+        .pointer_pressed = true,
+    });
+    const page_start = studio.organizer_first_visible;
+    try std.testing.expect(page_start > 0);
+    const preview = studio.visibleSlidePreview(viewport, workspace, 0).?;
+    try std.testing.expectEqual(page_start, preview.summary_index);
+    try std.testing.expectEqual(page_start, preview.slide_index);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.organizer),
+        .workspace_scroll = 1,
+    });
+    try std.testing.expectEqual(page_start - 1, studio.organizer_first_visible);
+}
+
+test "library item selects a named placement while slide template creates directly" {
+    var items: [0]slides.SlideItem = .{};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const entries = [_]LibraryEntry{
+        .{ .kind = .element, .name = "page_number" },
+        .{ .kind = .slide_template, .name = "chapter" },
+    };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0, .library = &entries };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = workspaceLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 0).?),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(Tool.add_reusable, studio.tool);
+    try std.testing.expectEqual(@as(?usize, 0), studio.selected_library_index);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = .{ .x = 850, .y = 500 },
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .add_reusable => |command| {
+            try std.testing.expectEqual(@as(?usize, 0), command.library_entry_index);
+            try expectVector(.{ .x = 850, .y = 500 }, command.position);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 1).?),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .new_slide_from_template => |entry_index| try std.testing.expectEqual(@as(usize, 1), entry_index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "library selection cannot drift across slides or source rewrites" {
+    var items = [_]slides.SlideItem{};
+    const summaries = [_]SlideSummary{ .{ .index = 0 }, .{ .index = 1 } };
+    const entries = [_]LibraryEntry{.{ .kind = .element, .name = "card" }};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{
+        .enabled = true,
+        .tool = .add_reusable,
+        .selected_library_index = 0,
+        .last_workspace_slide = 0,
+    };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, .{
+        .visible = true,
+        .slides = &summaries,
+        .current_slide = 1,
+        .library = &entries,
+    }, .{});
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_library_index);
+    try std.testing.expectEqual(Tool.select, studio.tool);
+
+    studio.selected_library_index = 0;
+    studio.markSourceChanged();
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_library_index);
+}
+
+test "workspace keyboard navigation and reorder do not nudge canvas items" {
+    var items = [_]slides.SlideItem{testItem(121, .textbox, 100, 100, 200, 80)};
+    const summaries = [_]SlideSummary{ .{ .index = 1 }, .{ .index = 2 }, .{ .index = 3 } };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 2 };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 121 };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .select_slide_delta = 1 });
+    switch (studio.takeSemanticCommand().?) {
+        .select_slide => |index| try std.testing.expectEqual(@as(usize, 3), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+
+    studio.selected_identity = 121;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .move_slide = -1 });
+    switch (studio.takeSemanticCommand().?) {
+        .move_slide => |command| try std.testing.expectEqual(SlideMoveDirection.up, command.direction),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
 }
 
 fn rectangleCenter(rect: rl.Rectangle) rl.Vector2 {

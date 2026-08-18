@@ -15,6 +15,7 @@ const playback = @import("playback.zig");
 const crowdplay = @import("crowdplay.zig");
 const source_editor = @import("source_editor.zig");
 const studio = @import("studio.zig");
+const studio_catalog = @import("studio_catalog.zig");
 const studio_prompt = @import("studio_prompt.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const SlideShow = slides.SlideShow;
@@ -27,6 +28,7 @@ test {
     std.testing.refAllDecls(slides);
     std.testing.refAllDecls(source_editor);
     std.testing.refAllDecls(studio);
+    std.testing.refAllDecls(studio_catalog);
     std.testing.refAllDecls(studio_prompt);
     std.testing.refAllDecls(studio_roundtrip_test);
 }
@@ -41,6 +43,13 @@ const CrowdOptions = struct {
 const SourceChange = struct {
     before: []u8,
     after: []u8,
+    before_slide: i32,
+    after_slide: i32,
+};
+
+const SourceRestore = struct {
+    source: []const u8,
+    slide: i32,
 };
 
 const StudioHistory = struct {
@@ -75,30 +84,59 @@ const StudioHistory = struct {
     }
 
     /// Takes ownership of both source snapshots.
-    fn record(self: *StudioHistory, before: []u8, after: []u8) !void {
+    fn record(self: *StudioHistory, before: []u8, after: []u8, before_slide: i32, after_slide: i32) !void {
         self.clearStack(&self.redo_stack);
         if (self.undo_stack.items.len == max_entries) {
             const oldest = self.undo_stack.orderedRemove(0);
             self.allocator.free(oldest.before);
             self.allocator.free(oldest.after);
         }
-        try self.undo_stack.append(self.allocator, .{ .before = before, .after = after });
+        try self.undo_stack.append(self.allocator, .{
+            .before = before,
+            .after = after,
+            .before_slide = before_slide,
+            .after_slide = after_slide,
+        });
     }
 
-    fn undo(self: *StudioHistory) !?[]const u8 {
+    fn setLatestAfterSlide(self: *StudioHistory, slide: usize) void {
+        if (self.undo_stack.items.len == 0) return;
+        self.undo_stack.items[self.undo_stack.items.len - 1].after_slide = @intCast(slide);
+    }
+
+    fn undo(self: *StudioHistory) !?SourceRestore {
         const entry = self.undo_stack.pop() orelse return null;
         errdefer self.undo_stack.append(self.allocator, entry) catch {};
         try self.redo_stack.append(self.allocator, entry);
-        return entry.before;
+        return .{ .source = entry.before, .slide = entry.before_slide };
     }
 
-    fn redo(self: *StudioHistory) !?[]const u8 {
+    fn redo(self: *StudioHistory) !?SourceRestore {
         const entry = self.redo_stack.pop() orelse return null;
         errdefer self.redo_stack.append(self.allocator, entry) catch {};
         try self.undo_stack.append(self.allocator, entry);
-        return entry.after;
+        return .{ .source = entry.after, .slide = entry.after_slide };
     }
 };
+
+test "Studio history restores structural edit slide positions" {
+    const allocator = std.testing.allocator;
+    var history = StudioHistory.init(allocator);
+    defer history.deinit();
+    const before = try allocator.dupe(u8, "@slide\n@slide\n");
+    errdefer allocator.free(before);
+    const after = try allocator.dupe(u8, "@slide\n@slide\n@slide\n");
+    errdefer allocator.free(after);
+    try history.record(before, after, 0, 0);
+    history.setLatestAfterSlide(1);
+
+    const undo = (try history.undo()).?;
+    try std.testing.expectEqual(@as(i32, 0), undo.slide);
+    try std.testing.expectEqualStrings("@slide\n@slide\n", undo.source);
+    const redo = (try history.redo()).?;
+    try std.testing.expectEqual(@as(i32, 1), redo.slide);
+    try std.testing.expectEqualStrings("@slide\n@slide\n@slide\n", redo.source);
+}
 
 fn defaultCrowdHost(buffer: *[256]u8) []const u8 {
     if (comptime builtin.os.tag == .windows) return "localhost";
@@ -506,6 +544,12 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer studio_history.deinit();
     var studio_bounds = std.ArrayList(studio.ResolvedBounds).empty;
     defer studio_bounds.deinit(gpa);
+    var studio_slide_summaries = std.ArrayList(studio.SlideSummary).empty;
+    defer studio_slide_summaries.deinit(gpa);
+    var studio_library_entries = std.ArrayList(studio.LibraryEntry).empty;
+    defer studio_library_entries.deinit(gpa);
+    var studio_library_catalog_indices = std.ArrayList(usize).empty;
+    defer studio_library_catalog_indices.deinit(gpa);
 
     var manual_fullscreen: bool = false;
     var window_close_seen = false;
@@ -705,8 +749,42 @@ pub fn main(init: std.process.Init) anyerror!void {
             .logical_size = internal_render_size,
         };
 
+        studio_slide_summaries.clearRetainingCapacity();
+        studio_library_entries.clearRetainingCapacity();
+        studio_library_catalog_indices.clearRetainingCapacity();
+        var frame_studio_catalog: ?studio_catalog.Catalog = null;
+        defer if (frame_studio_catalog) |catalog| catalog.deinit();
+        var studio_workspace: studio.Workspace = .{};
+        if (studio_mode.capturesInput()) {
+            try collectStudioSlideSummaries(&studio_slide_summaries, gpa, G.slideshow);
+            frame_studio_catalog = try studio_catalog.discover(gpa, G.editor_memory[0..G.source_len]);
+            const item_insertion_offset = if (current_slide) |slide|
+                studioItemInsertionOffset(slide, studio_mode.active_morph_state) catch slide.pos_in_editor
+            else
+                0;
+            const slide_insertion_offset = if (current_slide) |slide|
+                source_editor.slideEndOffset(G.editor_memory[0..G.source_len], slide.pos_in_editor) catch item_insertion_offset
+            else
+                item_insertion_offset;
+            try collectStudioLibraryEntries(
+                &studio_library_entries,
+                &studio_library_catalog_indices,
+                gpa,
+                frame_studio_catalog.?,
+                item_insertion_offset,
+                slide_insertion_offset,
+            );
+            studio_workspace = .{
+                .visible = true,
+                .slides = studio_slide_summaries.items,
+                .current_slide = if (G.current_slide >= 0) @intCast(G.current_slide) else 0,
+                .library = studio_library_entries.items,
+            };
+        }
+
         var semantic_to_apply: ?studio.SemanticCommand = null;
         var semantic_text: ?[]const u8 = null;
+        var studio_slide_to_select: ?usize = null;
         const prompt_was_active = property_prompt.active;
         if (prompt_was_active) {
             switch (property_prompt.updateFromRaylib()) {
@@ -725,7 +803,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
 
         const studio_command: ?studio.GeometryCommand = if (!export_controller.running and !prompt_was_active)
-            studio_mode.updateFromRaylib(studio_items, studio_bounds.items, studio_viewport)
+            studio_mode.updateWithWorkspaceFromRaylib(studio_items, studio_bounds.items, studio_viewport, studio_workspace)
         else
             null;
         if (!prompt_was_active) {
@@ -757,10 +835,38 @@ pub fn main(init: std.process.Init) anyerror!void {
                         pending_semantic_command = command;
                         property_prompt.begin(.reusable_name, name);
                     },
-                    .add_reusable => {
-                        pending_semantic_command = command;
-                        property_prompt.begin(.reusable_name, "");
+                    .add_reusable => |add| {
+                        if (add.library_entry_index) |library_index| {
+                            if (studioLibraryName(
+                                frame_studio_catalog,
+                                studio_library_catalog_indices.items,
+                                library_index,
+                                .element,
+                            )) |name| {
+                                semantic_to_apply = command;
+                                semantic_text = name;
+                            } else {
+                                studio_mode.setNotice(.edit_failed);
+                            }
+                        } else {
+                            pending_semantic_command = command;
+                            property_prompt.begin(.reusable_name, "");
+                        }
                     },
+                    .new_slide_from_template => |library_index| {
+                        if (studioLibraryName(
+                            frame_studio_catalog,
+                            studio_library_catalog_indices.items,
+                            library_index,
+                            .slide,
+                        )) |name| {
+                            semantic_to_apply = command;
+                            semantic_text = name;
+                        } else {
+                            studio_mode.setNotice(.edit_failed);
+                        }
+                    },
+                    .select_slide => |slide_index| studio_slide_to_select = slide_index,
                     .select_morph_scene => {},
                     else => semantic_to_apply = command,
                 }
@@ -829,7 +935,27 @@ pub fn main(init: std.process.Init) anyerror!void {
             previous_crowd_snapshot,
             crowd_runtime.public_url.slice(),
         );
-        if (!export_controller.running) studio_mode.draw(studio_items, studio_bounds.items, studio_viewport);
+        if (!export_controller.running) {
+            studio_mode.draw(studio_items, studio_bounds.items, studio_viewport);
+            studio_mode.drawWorkspaceBackground(studio_viewport, studio_workspace);
+            var preview_slot: usize = 0;
+            while (studio_mode.visibleSlidePreview(studio_viewport, studio_workspace, preview_slot)) |preview| : (preview_slot += 1) {
+                rl.beginScissorMode(
+                    @intFromFloat(preview.rect.x),
+                    @intFromFloat(preview.rect.y),
+                    @intFromFloat(preview.rect.width),
+                    @intFromFloat(preview.rect.height),
+                );
+                G.slide_renderer.renderStudioThumbnail(
+                    @intCast(preview.slide_index),
+                    .{ .x = preview.rect.x, .y = preview.rect.y },
+                    .{ .x = preview.rect.width, .y = preview.rect.height },
+                    internal_render_size,
+                ) catch |err| log.err("Studio thumbnail render failed: {any}", .{err});
+                rl.endScissorMode();
+            }
+            studio_mode.drawWorkspaceOverlay(studio_viewport, studio_workspace);
+        }
         property_prompt.draw(window_size);
         if (studio_command) |command| {
             if (applyStudioGeometryEdit(&studio_history, command, current_slide, studio_mode.active_morph_state, studio_items)) |_| {} else |err| {
@@ -839,6 +965,20 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
             studio_mode.dirty = editorSourceDirty();
             is_pre_rendered = false;
+        }
+
+        if (studio_slide_to_select) |slide_index| {
+            if (slide_index < G.slideshow.slides.items.len) {
+                studio_mode.cancelActiveInteraction(studio_items);
+                studio_mode.selected_identity = null;
+                studio_mode.selected_source = null;
+                studio_mode.active_morph_state = null;
+                G.current_slide = @intCast(slide_index);
+                G.playback.enterSlide(null, 0, 0, .{}, 1, rl.getTime());
+                studio_mode.setNotice(.none);
+            } else {
+                studio_mode.setNotice(.edit_failed);
+            }
         }
 
         if (semantic_to_apply) |command| {
@@ -854,13 +994,17 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_mode.selected_identity = null;
                 studio_mode.selected_source = null;
                 if (new_slide_index) |slide_index| {
+                    studio_history.setLatestAfterSlide(slide_index);
                     G.current_slide = @intCast(slide_index);
                     studio_mode.active_morph_state = null;
                 }
                 studio_mode.markSourceChanged();
                 studio_mode.setNotice(.none);
             } else |err| {
-                studio_mode.setNotice(.edit_failed);
+                studio_mode.setNotice(switch (err) {
+                    error.AmbiguousSlideTemplateLayout, error.UnsafeSlideGlobalDirective => .structural_source_locked,
+                    else => .edit_failed,
+                });
                 log.err("Studio property edit failed: {any}", .{err});
                 reparseEditorSource() catch {};
             }
@@ -1510,6 +1654,7 @@ fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult)
     const before = try G.allocator.dupe(u8, G.editor_memory[0..G.source_len]);
     errdefer G.allocator.free(before);
     errdefer result.deinit(G.allocator);
+    const before_slide = G.current_slide;
 
     try replaceEditorSource(result.source);
     reparseEditorSource() catch |err| {
@@ -1517,7 +1662,7 @@ fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult)
         reparseEditorSource() catch {};
         return err;
     };
-    history.record(before, result.source) catch |err| {
+    history.record(before, result.source, before_slide, G.current_slide) catch |err| {
         replaceEditorSource(before) catch {};
         reparseEditorSource() catch {};
         return err;
@@ -1615,6 +1760,83 @@ fn validReusableName(name: []const u8) bool {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
     }
     return true;
+}
+
+fn studioSlideTitle(slide: *const slides.Slide) []const u8 {
+    var title: []const u8 = "";
+    var largest_font: i32 = std.math.minInt(i32);
+    if (slide.items) |items| {
+        for (items.items) |item| {
+            if (item.kind != .textbox or !item.visible or item.opacity <= 0) continue;
+            const text = item.text orelse continue;
+            const first_line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+            const first_line = std.mem.trim(u8, text[0..first_line_end], " \t\r");
+            if (first_line.len == 0) continue;
+            const font_size = item.fontSize orelse 0;
+            if (title.len == 0 or font_size > largest_font) {
+                title = first_line;
+                largest_font = font_size;
+            }
+        }
+    }
+    return title;
+}
+
+fn collectStudioSlideSummaries(
+    output: *std.ArrayList(studio.SlideSummary),
+    allocator: std.mem.Allocator,
+    slideshow: *const slides.SlideShow,
+) !void {
+    for (slideshow.slides.items, 0..) |slide, index| {
+        try output.append(allocator, .{
+            .index = index,
+            .title = studioSlideTitle(slide),
+            .item_count = if (slide.items) |items| items.items.len else 0,
+            .morph_count = slide.morph_states.items.len,
+        });
+    }
+}
+
+fn collectStudioLibraryEntries(
+    output: *std.ArrayList(studio.LibraryEntry),
+    catalog_indices: *std.ArrayList(usize),
+    allocator: std.mem.Allocator,
+    catalog: studio_catalog.Catalog,
+    item_insertion_offset: usize,
+    slide_insertion_offset: usize,
+) !void {
+    for (catalog.entries, 0..) |entry, catalog_index| {
+        const insertion_offset = switch (entry.kind) {
+            .element => item_insertion_offset,
+            .slide => slide_insertion_offset,
+        };
+        if (!catalog.isVisibleAt(catalog_index, insertion_offset)) continue;
+        try output.append(allocator, .{
+            .kind = switch (entry.kind) {
+                .element => .element,
+                .slide => .slide_template,
+            },
+            .name = entry.name,
+            .available = entry.placeable,
+        });
+        errdefer _ = output.pop();
+        try catalog_indices.append(allocator, catalog_index);
+    }
+}
+
+fn studioLibraryName(
+    catalog_opt: ?studio_catalog.Catalog,
+    catalog_indices: []const usize,
+    workspace_index: usize,
+    expected_kind: studio_catalog.Kind,
+) ?[]const u8 {
+    const catalog = catalog_opt orelse return null;
+    if (workspace_index >= catalog_indices.len) return null;
+    const catalog_index = catalog_indices[workspace_index];
+    if (catalog_index >= catalog.entries.len) return null;
+    const entry = catalog.entries[catalog_index];
+    if (!entry.placeable or entry.kind != expected_kind) return null;
+    return entry.name;
 }
 
 fn reusableNameDefined(name: []const u8) bool {
@@ -1895,24 +2117,94 @@ fn applyStudioSemanticEdit(
         .add_reusable => |add| {
             const name = prompted_text orelse return error.StudioPromptMissing;
             if (!validReusableName(name)) return error.InvalidReusableName;
-            if (!reusableNameDefined(name)) return error.ReusableNameNotFound;
+            const insertion_offset = try studioItemInsertionOffset(slide, morph_state);
+            const catalog = try studio_catalog.discover(G.allocator, G.editor_memory[0..G.source_len]);
+            defer catalog.deinit();
+            if (catalog.findVisible(.element, name, insertion_offset) == null) return error.ReusableNameNotFound;
             var id_buffer: [64]u8 = undefined;
             const id = try nextStudioItemId(&id_buffer);
-            const directive = try std.fmt.allocPrint(
-                G.allocator,
-                "@pop {s} id={s} x={d} y={d} w={d} h={d}",
-                .{ name, id, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y },
-            );
+            const directive = if (add.library_entry_index != null)
+                try std.fmt.allocPrint(
+                    G.allocator,
+                    "@pop {s} id={s} x={d} y={d}",
+                    .{ name, id, add.position.x, add.position.y },
+                )
+            else
+                try std.fmt.allocPrint(
+                    G.allocator,
+                    "@pop {s} id={s} x={d} y={d} w={d} h={d}",
+                    .{ name, id, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y },
+                );
             defer G.allocator.free(directive);
-            try insertStudioSnippet(history, slide, morph_state, directive);
+            try recordStudioPatch(history, try source_editor.insertSnippetAt(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                insertion_offset,
+                directive,
+            ));
         },
         .new_slide => {
+            try recordStudioPatch(history, try source_editor.insertBlankSlideAfter(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+            ));
+            return @intCast(@as(usize, @intCast(G.current_slide)) + 1);
+        },
+        .select_slide => return error.NonSourceStudioCommand,
+        .duplicate_slide => |slide_index| {
+            if (slide_index >= G.slideshow.slides.items.len) return error.NoStudioSlide;
+            const target = G.slideshow.slides.items[slide_index];
+            try recordStudioPatch(history, try source_editor.duplicateSlide(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                target.pos_in_editor,
+            ));
+            return slide_index + 1;
+        },
+        .delete_slide => |slide_index| {
+            if (slide_index >= G.slideshow.slides.items.len) return error.NoStudioSlide;
+            const slide_count = G.slideshow.slides.items.len;
+            const target = G.slideshow.slides.items[slide_index];
+            try recordStudioPatch(history, try source_editor.deleteSlide(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                target.pos_in_editor,
+            ));
+            return if (slide_index + 1 < slide_count) slide_index else slide_index - 1;
+        },
+        .move_slide => |move| {
+            if (move.slide_index >= G.slideshow.slides.items.len) return error.NoStudioSlide;
+            const target = G.slideshow.slides.items[move.slide_index];
+            const direction: source_editor.SlideMoveDirection = switch (move.direction) {
+                .up => .earlier,
+                .down => .later,
+            };
+            try recordStudioPatch(history, try source_editor.moveSlide(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                target.pos_in_editor,
+                direction,
+            ));
+            return switch (move.direction) {
+                .up => move.slide_index - 1,
+                .down => move.slide_index + 1,
+            };
+        },
+        .new_slide_from_template => {
+            const name = prompted_text orelse return error.StudioPromptMissing;
+            if (!validReusableName(name)) return error.InvalidReusableName;
             const insertion_offset = try source_editor.slideEndOffset(G.editor_memory[0..G.source_len], slide.pos_in_editor);
+            const catalog = try studio_catalog.discover(G.allocator, G.editor_memory[0..G.source_len]);
+            defer catalog.deinit();
+            if (catalog.findVisible(.slide, name, insertion_offset) == null) return error.ReusableNameNotFound;
+            const directive = try std.fmt.allocPrint(G.allocator, "@popslide {s}", .{name});
+            defer G.allocator.free(directive);
             try recordStudioPatch(history, try source_editor.insertDirectiveAt(
                 G.allocator,
                 G.editor_memory[0..G.source_len],
                 insertion_offset,
-                "@slide",
+                directive,
             ));
             return @intCast(@as(usize, @intCast(G.current_slide)) + 1);
         },
@@ -1922,17 +2214,29 @@ fn applyStudioSemanticEdit(
 }
 
 fn undoStudioEdit(history: *StudioHistory) !bool {
-    const source = try history.undo() orelse return false;
-    try replaceEditorSource(source);
+    const restore = try history.undo() orelse return false;
+    try replaceEditorSource(restore.source);
     try reparseEditorSource();
+    restoreStudioSlide(restore.slide);
     return true;
 }
 
 fn redoStudioEdit(history: *StudioHistory) !bool {
-    const source = try history.redo() orelse return false;
-    try replaceEditorSource(source);
+    const restore = try history.redo() orelse return false;
+    try replaceEditorSource(restore.source);
     try reparseEditorSource();
+    restoreStudioSlide(restore.slide);
     return true;
+}
+
+fn restoreStudioSlide(requested: i32) void {
+    if (G.slideshow.slides.items.len == 0) {
+        G.current_slide = 0;
+        return;
+    }
+    const last: i32 = @intCast(G.slideshow.slides.items.len - 1);
+    G.current_slide = std.math.clamp(requested, 0, last);
+    G.playback.enterSlide(null, 0, 0, .{}, 1, rl.getTime());
 }
 
 fn collectStudioBounds(

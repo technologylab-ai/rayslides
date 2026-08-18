@@ -21,6 +21,8 @@ pub const PatchResult = struct {
 };
 
 pub const PatchError = error{
+    AmbiguousSlideTemplateLayout,
+    CannotDeleteOnlySlide,
     DuplicateAttribute,
     InvalidAttribute,
     InvalidColorLiteral,
@@ -33,8 +35,31 @@ pub const PatchError = error{
     InvalidReusableName,
     InvalidSlideOffset,
     InvalidSnippet,
+    NoAdjacentSlide,
     NotPromotableDirective,
     SourceTooLarge,
+    UnsafeSlideGlobalDirective,
+};
+
+/// Exact physical bytes owned by one rendered slide.
+///
+/// For an explicitly authored slide, `start` is the `@slide` or `@popslide`
+/// directive identified by `Slide.pos_in_editor`. For the sole implicit slide,
+/// it is the first byte after an optional UTF-8 BOM. `end` is the next rendered
+/// slide anchor or EOF, so base items, semantic morph states, comments, and
+/// formatting travel together during organizer operations.
+pub const LogicalSlideRange = struct {
+    start: usize,
+    end: usize,
+    anchor_offset: usize,
+    explicit_anchor: bool,
+};
+
+pub const SlideMoveDirection = enum {
+    /// Put the selected slide immediately before its preceding slide.
+    earlier,
+    /// Put the selected slide immediately after its following slide.
+    later,
 };
 
 /// One literal directive attribute to replace or insert. `text` is special:
@@ -313,6 +338,198 @@ pub fn slideItemInsertionOffset(source: []const u8, slide_offset: usize) PatchEr
 /// the selected one instead of appending it to the whole file.
 pub fn slideEndOffset(source: []const u8, slide_offset: usize) PatchError!usize {
     return findSlideBoundary(source, slide_offset, false);
+}
+
+/// Insert a blank rendered slide immediately after the selected slide.
+///
+/// A legacy implicit one-slide document has no physical anchor to insert
+/// after. In that case this operation makes both slides explicit in one
+/// atomic rewrite, preserving the original as slide one. Implicit documents
+/// containing reusable definitions remain conservatively unsupported because
+/// moving their definition boundary could change parser scoping.
+pub fn insertBlankSlideAfter(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const layout = try inspectSlideLayout(source);
+    const range = try logicalSlideRange(source, slide_offset);
+    if (range.explicit_anchor) {
+        return insertDirectiveAt(allocator, source, range.end, "@slide");
+    }
+    if (layout.has_component_definition or layout.has_slide_template_definition) {
+        return error.AmbiguousSlideTemplateLayout;
+    }
+
+    const newline = lineEndingNear(source, range.end);
+    const payload = source[range.start..range.end];
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.ensureTotalCapacity(allocator, source.len + "@slide".len * 2 + newline.len * 3);
+    try output.appendSlice(allocator, source[0..range.start]);
+    try output.appendSlice(allocator, "@slide");
+    try output.appendSlice(allocator, newline);
+    try output.appendSlice(allocator, payload);
+    if (payload.len > 0 and payload[payload.len - 1] != '\n') try output.appendSlice(allocator, newline);
+    try output.appendSlice(allocator, "@slide");
+    try output.appendSlice(allocator, newline);
+    return finishResult(allocator, &output, source.len);
+}
+
+/// Resolve a parser `Slide.pos_in_editor` anchor to the exact physical source
+/// range owned by that rendered slide.
+///
+/// Slide-template definitions before the first rendered slide remain outside
+/// every range. A `@pushslide` after rendered-slide authoring has begun makes
+/// raw range manipulation ambiguous: depending on parser state it can capture
+/// rather than emit the apparent slide. Such layouts are rejected instead of
+/// risking a semantic rewrite.
+pub fn logicalSlideRange(source: []const u8, slide_offset: usize) PatchError!LogicalSlideRange {
+    const layout = try inspectSlideLayout(source);
+    if (layout.explicit_count == 0) {
+        if (slide_offset != 0) return error.InvalidSlideOffset;
+        return .{
+            .start = sourceStart(source),
+            .end = source.len,
+            .anchor_offset = 0,
+            .explicit_anchor = false,
+        };
+    }
+
+    const anchor = directiveLine(source, slide_offset) catch return error.InvalidSlideOffset;
+    const name = directiveName(source[anchor.start..anchor.content_end]);
+    if (!isRenderedSlideAnchor(name)) return error.InvalidSlideOffset;
+
+    var cursor = anchor.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const candidate = directiveName(source[cursor..line.content_end]);
+            if (isRenderedSlideAnchor(candidate)) {
+                return .{
+                    .start = anchor.start,
+                    .end = cursor,
+                    .anchor_offset = anchor.start,
+                    .explicit_anchor = true,
+                };
+            }
+            // inspectSlideLayout already rejects this after the first anchor,
+            // but retain the local guard so this routine stays conservative if
+            // layout inspection is later relaxed.
+            if (std.mem.eql(u8, candidate, "@pushslide")) {
+                return error.AmbiguousSlideTemplateLayout;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return .{
+        .start = anchor.start,
+        .end = source.len,
+        .anchor_offset = anchor.start,
+        .explicit_anchor = true,
+    };
+}
+
+/// Duplicate the complete selected slide immediately after itself.
+///
+/// An implicit one-slide document is first made explicit by adding `@slide`
+/// anchors to the original and the copy. The optional BOM is never duplicated.
+pub fn duplicateSlide(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const layout = try inspectSlideLayout(source);
+    const range = try logicalSlideRange(source, slide_offset);
+    const newline = lineEndingNear(source, range.end);
+
+    if (!range.explicit_anchor) {
+        // Duplicating a whole implicit document would also duplicate reusable
+        // definitions. A repeated @push can change which definition later
+        // @pop instances resolve to, while @pushslide can mean the parser's
+        // default final slide is not the apparent source block at all.
+        if (layout.has_component_definition or layout.has_slide_template_definition) {
+            return error.AmbiguousSlideTemplateLayout;
+        }
+        const payload = source[range.start..range.end];
+        var output = std.ArrayList(u8).empty;
+        errdefer output.deinit(allocator);
+        try output.ensureTotalCapacity(allocator, source.len * 2 + newline.len * 4 + "@slide".len * 2);
+        try output.appendSlice(allocator, source[0..range.start]);
+        try output.appendSlice(allocator, "@slide");
+        try output.appendSlice(allocator, newline);
+        try output.appendSlice(allocator, payload);
+        if (payload.len > 0 and payload[payload.len - 1] != '\n') try output.appendSlice(allocator, newline);
+        try output.appendSlice(allocator, "@slide");
+        try output.appendSlice(allocator, newline);
+        try output.appendSlice(allocator, payload);
+        return finishResult(allocator, &output, source.len);
+    }
+
+    try validateStructuralSlideRange(source, range);
+
+    const selected = source[range.start..range.end];
+    var insertion = std.ArrayList(u8).empty;
+    defer insertion.deinit(allocator);
+    if (range.end == source.len and selected.len > 0 and source[range.end - 1] != '\n') {
+        try insertion.appendSlice(allocator, newline);
+    }
+    try insertion.appendSlice(allocator, selected);
+    return replaceRange(allocator, source, range.end, range.end, insertion.items);
+}
+
+/// Delete one complete rendered slide while guaranteeing that the result still
+/// contains at least one slide. Deleting the sole implicit or explicit slide
+/// returns `error.CannotDeleteOnlySlide` without producing source.
+pub fn deleteSlide(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const layout = try inspectSlideLayout(source);
+    const range = try logicalSlideRange(source, slide_offset);
+    if (!range.explicit_anchor or layout.explicit_count <= 1) return error.CannotDeleteOnlySlide;
+    try validateStructuralSlideRange(source, range);
+    return replaceRange(allocator, source, range.start, range.end, "");
+}
+
+/// Move the complete selected slide across one adjacent rendered slide.
+/// Template definitions before the deck remain fixed and byte-identical.
+pub fn moveSlide(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    direction: SlideMoveDirection,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const selected = try logicalSlideRange(source, slide_offset);
+    if (!selected.explicit_anchor) return error.NoAdjacentSlide;
+
+    switch (direction) {
+        .earlier => {
+            const previous_start = previousRenderedSlideAnchor(source, selected.start) orelse
+                return error.NoAdjacentSlide;
+            const previous = try logicalSlideRange(source, previous_start);
+            if (previous.end != selected.start) return error.AmbiguousSlideTemplateLayout;
+            try validateStructuralSlideRange(source, previous);
+            try validateStructuralSlideRange(source, selected);
+
+            var replacement = std.ArrayList(u8).empty;
+            defer replacement.deinit(allocator);
+            try appendSwappedSlideRanges(allocator, &replacement, source, previous, selected);
+            return replaceRange(allocator, source, previous.start, selected.end, replacement.items);
+        },
+        .later => {
+            if (selected.end == source.len) return error.NoAdjacentSlide;
+            const following = try logicalSlideRange(source, selected.end);
+            try validateStructuralSlideRange(source, selected);
+            try validateStructuralSlideRange(source, following);
+
+            var replacement = std.ArrayList(u8).empty;
+            defer replacement.deinit(allocator);
+            try appendSwappedSlideRanges(allocator, &replacement, source, selected, following);
+            return replaceRange(allocator, source, selected.start, following.end, replacement.items);
+        },
+    }
 }
 
 /// Find the boundary after one morph state: the next `@state(morph)`, next
@@ -739,6 +956,117 @@ pub fn patchItemText(
 
 const utf8_bom = "\xEF\xBB\xBF";
 
+const SlideLayout = struct {
+    explicit_count: usize = 0,
+    has_component_definition: bool = false,
+    has_slide_template_definition: bool = false,
+};
+
+/// Validate the subset of slide layouts that can be rearranged purely by
+/// physical source ranges. `@pushslide` definitions are safe before the first
+/// rendered anchor. Once rendered slides begin, another push can capture the
+/// apparent current slide and makes textual adjacency diverge from parser
+/// adjacency, so organizer operations must decline the edit.
+fn inspectSlideLayout(source: []const u8) PatchError!SlideLayout {
+    var layout = SlideLayout{};
+    var saw_rendered_anchor = false;
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isRenderedSlideAnchor(name)) {
+                saw_rendered_anchor = true;
+                layout.explicit_count += 1;
+            } else if (std.mem.eql(u8, name, "@pushslide")) {
+                layout.has_slide_template_definition = true;
+                if (saw_rendered_anchor) return error.AmbiguousSlideTemplateLayout;
+            } else if (std.mem.eql(u8, name, "@push")) {
+                layout.has_component_definition = true;
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (layout.explicit_count == 0 and layout.has_slide_template_definition) {
+        return error.AmbiguousSlideTemplateLayout;
+    }
+    return layout;
+}
+
+/// Physical slide ranges are safe to duplicate/delete/reorder only when every
+/// directive they own is local scene content. Parser context definitions and
+/// defaults (`@push`, `@let`, fonts, colors, and unknown future directives)
+/// can affect later slides even when a rewritten deck still parses, so the
+/// organizer must leave those layouts untouched until it has dependency-aware
+/// ownership analysis.
+fn validateStructuralSlideRange(source: []const u8, range: LogicalSlideRange) PatchError!void {
+    var cursor = range.start;
+    while (cursor < range.end) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (!isSlideOwnedStructuralDirective(name)) return error.UnsafeSlideGlobalDirective;
+        }
+        cursor = line.full_end;
+    }
+}
+
+fn isSlideOwnedStructuralDirective(name: []const u8) bool {
+    return isRenderedSlideAnchor(name) or
+        std.mem.eql(u8, name, "@box") or
+        std.mem.eql(u8, name, "@crowd") or
+        std.mem.eql(u8, name, "@bg") or
+        std.mem.eql(u8, name, "@pop") or
+        std.mem.eql(u8, name, "@anim") or
+        (std.mem.startsWith(u8, name, "@anim(") and std.mem.endsWith(u8, name, ")")) or
+        isMorphStateDirective(name) or
+        std.mem.eql(u8, name, "@set") or
+        std.mem.eql(u8, name, "@show") or
+        std.mem.eql(u8, name, "@hide");
+}
+
+fn previousRenderedSlideAnchor(source: []const u8, before: usize) ?usize {
+    var previous: ?usize = null;
+    var cursor = sourceStart(source);
+    while (cursor < before) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isRenderedSlideAnchor(name)) previous = cursor;
+        }
+        cursor = line.full_end;
+    }
+    return previous;
+}
+
+/// Append adjacent `left` then `right` ranges in swapped order. If the source
+/// ends without a line terminator, the left range's final line ending is moved
+/// between the newly leading right range and left range. This keeps the result
+/// valid without inventing a byte or leaving an extra terminator at EOF.
+fn appendSwappedSlideRanges(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    source: []const u8,
+    left: LogicalSlideRange,
+    right: LogicalSlideRange,
+) std.mem.Allocator.Error!void {
+    std.debug.assert(left.end == right.start);
+    try output.ensureTotalCapacity(allocator, right.end - left.start);
+    try output.appendSlice(allocator, source[right.start..right.end]);
+
+    var left_content_end = left.end;
+    if (right.end == source.len and right.end > right.start and source[right.end - 1] != '\n') {
+        std.debug.assert(left_content_end > left.start and source[left_content_end - 1] == '\n');
+        const separator_start = if (left_content_end >= 2 and source[left_content_end - 2] == '\r')
+            left_content_end - 2
+        else
+            left_content_end - 1;
+        try output.appendSlice(allocator, source[separator_start..left_content_end]);
+        left_content_end = separator_start;
+    }
+    try output.appendSlice(allocator, source[left.start..left_content_end]);
+}
+
 fn findSlideBoundary(source: []const u8, slide_offset: usize, stop_at_state: bool) PatchError!usize {
     var cursor: usize = undefined;
     if (directiveLine(source, slide_offset)) |slide_line| {
@@ -790,9 +1118,12 @@ fn isMorphMutationDirective(name: []const u8) bool {
 }
 
 fn isSlideBoundaryDirective(name: []const u8) bool {
-    return std.mem.eql(u8, name, "@slide") or
-        std.mem.eql(u8, name, "@popslide") or
+    return isRenderedSlideAnchor(name) or
         std.mem.eql(u8, name, "@pushslide");
+}
+
+fn isRenderedSlideAnchor(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@slide") or std.mem.eql(u8, name, "@popslide");
 }
 
 fn directiveContextName(line: []const u8, directive_name_len: usize) ?[]const u8 {
@@ -1493,6 +1824,367 @@ test "unambiguous implicit slide supports base item and new slide boundaries" {
 
     const ambiguous = "@pushslide template\n@box text=Implicit after a template\n";
     try std.testing.expectError(error.InvalidSlideOffset, slideItemInsertionOffset(ambiguous, 0));
+}
+
+test "logical slide range owns base morph formatting and comments" {
+    const source =
+        "\xEF\xBB\xBF# template preface\r\n" ++
+        "@box text=Template\r\n" ++
+        "@pushslide base\r\n" ++
+        "# deck preface\r\n" ++
+        "@popslide base transition=fade\r\n" ++
+        "@box id=hero text=First\r\n" ++
+        "@state(morph) duration=0.5\r\n" ++
+        "@set hero x=400\r\n" ++
+        "# belongs to first\r\n" ++
+        "@slide\r\n" ++
+        "@box text=Second\r\n";
+    const first = std.mem.indexOf(u8, source, "@popslide").?;
+    const second = std.mem.indexOfPos(u8, source, first, "@slide").?;
+    const range = try logicalSlideRange(source, first);
+
+    try std.testing.expect(range.explicit_anchor);
+    try std.testing.expectEqual(first, range.start);
+    try std.testing.expectEqual(second, range.end);
+    try std.testing.expectEqual(first, range.anchor_offset);
+    try std.testing.expectEqualStrings(
+        "@popslide base transition=fade\r\n" ++
+            "@box id=hero text=First\r\n" ++
+            "@state(morph) duration=0.5\r\n" ++
+            "@set hero x=400\r\n" ++
+            "# belongs to first\r\n",
+        source[range.start..range.end],
+    );
+
+    const implicit = "\xEF\xBB\xBF# only\r\n@box text=Implicit";
+    const implicit_range = try logicalSlideRange(implicit, 0);
+    try std.testing.expect(!implicit_range.explicit_anchor);
+    try std.testing.expectEqual(@as(usize, 3), implicit_range.start);
+    try std.testing.expectEqual(implicit.len, implicit_range.end);
+}
+
+test "duplicate explicit slide retains its full morph source byte for byte" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box id=hero text=First\n" ++
+        "@state(morph) duration=0.5\n" ++
+        "@set hero x=400\n" ++
+        "# trailing note\n" ++
+        "@slide\n" ++
+        "@box text=Second\n";
+    const duplicated = try duplicateSlide(std.testing.allocator, source, 0);
+    defer duplicated.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@slide\n" ++
+            "@box id=hero text=First\n" ++
+            "@state(morph) duration=0.5\n" ++
+            "@set hero x=400\n" ++
+            "# trailing note\n" ++
+            "@slide\n" ++
+            "@box id=hero text=First\n" ++
+            "@state(morph) duration=0.5\n" ++
+            "@set hero x=400\n" ++
+            "# trailing note\n" ++
+            "@slide\n" ++
+            "@box text=Second\n",
+        duplicated.source,
+    );
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(duplicated.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 3), deck.slides.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deck.slides.items[0].morph_states.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deck.slides.items[1].morph_states.items.len);
+    try std.testing.expectApproxEqAbs(
+        deck.slides.items[0].morph_states.items[0].items.items[0].position.x,
+        deck.slides.items[1].morph_states.items[0].items.items[0].position.x,
+        0.0001,
+    );
+}
+
+test "duplicate implicit BOM CRLF slide creates two explicit valid slides" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source = "\xEF\xBB\xBF# retained\r\n@box text=Implicit";
+    const expected =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "# retained\r\n" ++
+        "@box text=Implicit\r\n" ++
+        "@slide\r\n" ++
+        "# retained\r\n" ++
+        "@box text=Implicit";
+    const duplicated = try duplicateSlide(std.testing.allocator, source, 0);
+    defer duplicated.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, duplicated.source);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, duplicated.source, utf8_bom));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(duplicated.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deck.slides.items.len);
+    try std.testing.expectEqualStrings("Implicit", deck.slides.items[0].items.?.items[0].text.?);
+    try std.testing.expectEqualStrings("Implicit", deck.slides.items[1].items.?.items[0].text.?);
+}
+
+test "blank slide after implicit deck preserves the original as slide one" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source = "\xEF\xBB\xBF# retained\r\n@box text=Original";
+    const expected =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "# retained\r\n" ++
+        "@box text=Original\r\n" ++
+        "@slide\r\n";
+    const inserted = try insertBlankSlideAfter(std.testing.allocator, source, 0);
+    defer inserted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, inserted.source);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inserted.source, utf8_bom));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(inserted.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deck.slides.items.len);
+    try std.testing.expectEqualStrings("Original", deck.slides.items[0].items.?.items[0].text.?);
+    try std.testing.expectEqual(@as(usize, 0), deck.slides.items[1].items.?.items.len);
+}
+
+test "duplicate implicit slide rejects reusable definitions" {
+    const reusable_source =
+        "@push title x=100 y=100 text=Template\n" ++
+        "@pop title text=Rendered\n";
+    try std.testing.expectError(
+        error.AmbiguousSlideTemplateLayout,
+        duplicateSlide(std.testing.allocator, reusable_source, 0),
+    );
+    try std.testing.expectError(
+        error.AmbiguousSlideTemplateLayout,
+        insertBlankSlideAfter(std.testing.allocator, reusable_source, 0),
+    );
+
+    // With no rendered anchor, @pushslide captures rather than emits the
+    // apparent block; treating the parser's default position zero as a plain
+    // implicit slide would therefore be unsafe.
+    const slide_template_source =
+        "@box text=Template\n" ++
+        "@pushslide content\n";
+    try std.testing.expectError(
+        error.AmbiguousSlideTemplateLayout,
+        logicalSlideRange(slide_template_source, 0),
+    );
+    try std.testing.expectError(
+        error.AmbiguousSlideTemplateLayout,
+        duplicateSlide(std.testing.allocator, slide_template_source, 0),
+    );
+}
+
+test "duplicate popslide keeps template prefix fixed and reparses clones" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "# definitions\n" ++
+        "@box id=header text=Header\n" ++
+        "@pushslide content\n" ++
+        "@popslide content\n" ++
+        "@box text=One\n" ++
+        "@popslide content\n" ++
+        "@box text=Two\n";
+    const selected = std.mem.indexOf(u8, source, "@popslide").?;
+    const duplicated = try duplicateSlide(std.testing.allocator, source, selected);
+    defer duplicated.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        duplicated.source,
+        "# definitions\n@box id=header text=Header\n@pushslide content\n",
+    ));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, duplicated.source, "@popslide content"));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(duplicated.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 3), deck.slides.items.len);
+    try std.testing.expectEqualStrings("One", deck.slides.items[0].items.?.items[1].text.?);
+    try std.testing.expectEqualStrings("One", deck.slides.items[1].items.?.items[1].text.?);
+    try std.testing.expectEqualStrings("Two", deck.slides.items[2].items.?.items[1].text.?);
+}
+
+test "delete complete slide preserves unrelated CRLF bytes" {
+    const source =
+        "\xEF\xBB\xBF# prefix\r\n" ++
+        "@slide\r\n" ++
+        "@box text=One\r\n" ++
+        "@slide transition=fade\r\n" ++
+        "@box id=middle text=Two\r\n" ++
+        "@state\r\n" ++
+        "@hide middle\r\n" ++
+        "# middle tail\r\n" ++
+        "@slide\r\n" ++
+        "@box text=Three";
+    const middle = std.mem.indexOf(u8, source, "@slide transition").?;
+    const deleted = try deleteSlide(std.testing.allocator, source, middle);
+    try expectSourceResult(
+        deleted,
+        source,
+        "\xEF\xBB\xBF# prefix\r\n" ++
+            "@slide\r\n" ++
+            "@box text=One\r\n" ++
+            "@slide\r\n" ++
+            "@box text=Three",
+    );
+}
+
+test "delete refuses to remove the only logical slide" {
+    try std.testing.expectError(
+        error.CannotDeleteOnlySlide,
+        deleteSlide(std.testing.allocator, "@slide\n@box text=Only\n", 0),
+    );
+    try std.testing.expectError(
+        error.CannotDeleteOnlySlide,
+        deleteSlide(std.testing.allocator, "# implicit\n@box text=Only", 0),
+    );
+}
+
+test "structural slide edits reject owned global context directives" {
+    const source =
+        "@slide\n" ++
+        "@color #112233ff\n" ++
+        "@push card text=Shared\n" ++
+        "@pop card\n" ++
+        "@slide\n" ++
+        "@pop card\n";
+    const first = std.mem.indexOf(u8, source, "@slide").?;
+    const second = std.mem.indexOfPos(u8, source, first + 1, "@slide").?;
+
+    try std.testing.expectError(
+        error.UnsafeSlideGlobalDirective,
+        duplicateSlide(std.testing.allocator, source, first),
+    );
+    try std.testing.expectError(
+        error.UnsafeSlideGlobalDirective,
+        deleteSlide(std.testing.allocator, source, first),
+    );
+    try std.testing.expectError(
+        error.UnsafeSlideGlobalDirective,
+        moveSlide(std.testing.allocator, source, first, .later),
+    );
+    try std.testing.expectError(
+        error.UnsafeSlideGlobalDirective,
+        moveSlide(std.testing.allocator, source, second, .earlier),
+    );
+}
+
+test "move slide earlier and later swaps complete adjacent ranges" {
+    const source =
+        "# prefix\n" ++
+        "@slide\n" ++
+        "@box text=One\n" ++
+        "# one tail\n" ++
+        "@slide transition=fade\n" ++
+        "@box id=two text=Two\n" ++
+        "@state\n" ++
+        "@set two x=200\n" ++
+        "# two tail\n" ++
+        "@slide\n" ++
+        "@box text=Three";
+    const second = std.mem.indexOf(u8, source, "@slide transition").?;
+    const moved_earlier = try moveSlide(std.testing.allocator, source, second, .earlier);
+    defer moved_earlier.deinit(std.testing.allocator);
+    const earlier_expected =
+        "# prefix\n" ++
+        "@slide transition=fade\n" ++
+        "@box id=two text=Two\n" ++
+        "@state\n" ++
+        "@set two x=200\n" ++
+        "# two tail\n" ++
+        "@slide\n" ++
+        "@box text=One\n" ++
+        "# one tail\n" ++
+        "@slide\n" ++
+        "@box text=Three";
+    try std.testing.expectEqualStrings(earlier_expected, moved_earlier.source);
+
+    const first = std.mem.indexOf(u8, source, "@slide\n").?;
+    const moved_later = try moveSlide(std.testing.allocator, source, first, .later);
+    defer moved_later.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(earlier_expected, moved_later.source);
+    try std.testing.expectError(
+        error.NoAdjacentSlide,
+        moveSlide(std.testing.allocator, source, first, .earlier),
+    );
+    const third = std.mem.lastIndexOf(u8, source, "@slide\n").?;
+    try std.testing.expectError(
+        error.NoAdjacentSlide,
+        moveSlide(std.testing.allocator, source, third, .later),
+    );
+}
+
+test "moving unterminated final slide transfers existing line ending" {
+    const source =
+        "@slide\r\n" ++
+        "@box text=One\r\n" ++
+        "@slide\r\n" ++
+        "@box text=Two";
+    const first = std.mem.indexOf(u8, source, "@slide").?;
+    const second = std.mem.lastIndexOf(u8, source, "@slide").?;
+    const expected =
+        "@slide\r\n" ++
+        "@box text=Two\r\n" ++
+        "@slide\r\n" ++
+        "@box text=One";
+
+    const earlier = try moveSlide(std.testing.allocator, source, second, .earlier);
+    defer earlier.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, earlier.source);
+    try std.testing.expectEqual(@as(isize, 0), earlier.byte_delta);
+
+    const later = try moveSlide(std.testing.allocator, source, first, .later);
+    defer later.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, later.source);
+    try std.testing.expectEqual(@as(isize, 0), later.byte_delta);
+}
+
+test "slide operations reject ambiguous template captures after rendered slides" {
+    const source =
+        "@slide\n" ++
+        "@box text=Looks rendered\n" ++
+        "@pushslide late_template\n" ++
+        "@popslide late_template\n";
+    try std.testing.expectError(error.AmbiguousSlideTemplateLayout, logicalSlideRange(source, 0));
+    try std.testing.expectError(
+        error.AmbiguousSlideTemplateLayout,
+        duplicateSlide(std.testing.allocator, source, 0),
+    );
+    try std.testing.expectError(
+        error.AmbiguousSlideTemplateLayout,
+        deleteSlide(std.testing.allocator, source, 0),
+    );
+    try std.testing.expectError(
+        error.AmbiguousSlideTemplateLayout,
+        moveSlide(std.testing.allocator, source, 0, .later),
+    );
+    const push = std.mem.indexOf(u8, source, "@pushslide").?;
+    try std.testing.expectError(error.AmbiguousSlideTemplateLayout, logicalSlideRange(source, push));
+}
+
+test "logical slide range rejects non-anchor offsets" {
+    const source = "@slide\n@box text=One\n@slide\n";
+    const item = std.mem.indexOf(u8, source, "@box").?;
+    try std.testing.expectError(error.InvalidSlideOffset, logicalSlideRange(source, item));
+    try std.testing.expectError(error.InvalidSlideOffset, logicalSlideRange(source, source.len));
 }
 
 test "promotion preserves inline item formatting comments BOM and CRLF" {

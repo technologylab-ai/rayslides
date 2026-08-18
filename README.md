@@ -78,6 +78,16 @@ background palette colors. <kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new
 slide immediately after the current one. <kbd>Esc</kbd> cancels an active drag
 or tool, then leaves Studio.
 
+The Studio sidebar is a deck organizer and source-aware library. Its slide
+cards contain live rendered thumbnails and can select, add, duplicate, delete,
+or move complete slides while preserving their base content, morph states,
+comments, and line endings. The library lists the effective `@push` elements
+and `@pushslide` templates available at the current source position. Click an
+element and then the canvas to place an instance at its authored size; click a
+slide template to create the next slide from it. Later or shadowed definitions
+are intentionally absent because they would not resolve at that insertion
+point.
+
 Text, bullet, image, and reusable-name actions open a small modal editor.
 <kbd>Enter</kbd> commits, <kbd>Shift-Enter</kbd> inserts a line in text fields,
 <kbd>Cmd/Ctrl-V</kbd> pastes, and <kbd>Esc</kbd> cancels without touching the
@@ -109,6 +119,10 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Enter</kbd> | Edit the selected object's text |
 | <kbd>P</kbd> | Promote the selected object for reuse |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>N</kbd> | Insert a new slide after this slide |
+| <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Select the previous or next slide in Studio |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>D</kbd> | Duplicate the current slide |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>Backspace</kbd> | Delete the current slide (except the only slide) |
+| <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>Up/Down</kbd> | Move the current slide earlier or later |
 
 The `*` beside `STUDIO` means the in-memory document differs from the original
 file. Automatic file reload is paused while those unsaved changes exist.
@@ -118,6 +132,10 @@ state. Editing an inherited, named item creates or updates a state-local `@set`;
 deleting it creates `@hide`. Items born in the active state are edited at their
 own directive. Background creation and reusable promotion remain base-scene
 operations because they change structural layout rather than one morph state.
+Structural edits are also undoable. If a source layout cannot be moved or
+duplicated unambiguously—most notably a reusable definition, global font/color
+default, or unusual slide-template definition inside a rendered slide—Studio
+refuses the edit and leaves the source intact.
 
 If the original file changes externally, Studio refuses to overwrite it and
 asks you to use Save Copy. Quitting with unsaved work also writes a unique

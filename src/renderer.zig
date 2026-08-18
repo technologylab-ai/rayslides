@@ -1000,6 +1000,32 @@ pub const SlideshowRenderer = struct {
         try self.renderOneSlide(slide_number, reveal, transforms.incoming, pos, size, internal_render_size, crowd_snapshot, crowd_url);
     }
 
+    /// Paint the final stable scene of one slide into a small Studio card.
+    /// Thumbnail rendering deliberately ignores a live canvas geometry preview
+    /// (item identities restart on every slide) and audience-only Crowdplay
+    /// state, then restores the preview for the main canvas.
+    pub fn renderStudioThumbnail(
+        self: *SlideshowRenderer,
+        slide_number: i32,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+    ) !void {
+        const preview = self.item_geometry_preview;
+        self.item_geometry_preview = null;
+        defer self.item_geometry_preview = preview;
+        try self.renderOneSlide(
+            slide_number,
+            .{ .visible_through = self.stepCount(slide_number) },
+            .{},
+            pos,
+            size,
+            internal_render_size,
+            null,
+            "",
+        );
+    }
+
     fn renderOneSlide(
         self: *SlideshowRenderer,
         slide_number: i32,
