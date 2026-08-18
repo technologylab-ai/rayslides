@@ -955,7 +955,7 @@ pub const SlideshowRenderer = struct {
             }
         }
 
-        drawPollSwarm(snapshot, live_poll, card_rects[0..count], scale, opacity);
+        drawPollSwarm(snapshot, card_rects[0..count], scale, opacity);
         const controls = if (crowd_url.len > 0) "O  open/lock     V  reveal     R  reset\x00" else "Crowdplay server unavailable\x00";
         drawCrowdText(self.fonts.normal, controls, .{ .x = panel.x + 66 * scale, .y = panel.y + panel.height - 65 * scale }, 21 * scale, colorWithOpacity(.{ .r = 137, .g = 144, .b = 177, .a = 255 }, opacity));
     }
@@ -1183,17 +1183,22 @@ fn drawSwarm(snapshot: crowdplay.Snapshot, choice: ?u8, region: rl.Rectangle, sc
     }
 }
 
-fn drawPollSwarm(snapshot: crowdplay.Snapshot, poll: ?crowdplay.PollSnapshot, cards: []const rl.Rectangle, scale: f32, opacity: f32) void {
+fn pollChoiceCard(choice: ?u8, card_count: usize) ?usize {
+    const index = choice orelse return null;
+    if (index >= card_count) return null;
+    return @intCast(index);
+}
+
+fn drawPollSwarm(snapshot: crowdplay.Snapshot, cards: []const rl.Rectangle, scale: f32, opacity: f32) void {
     if (cards.len == 0) return;
-    const revealed = if (poll) |active| active.revealed else false;
     const now: f32 = @floatCast(rl.getTime());
     const max_visible: usize = @min(snapshot.participant_count, 260);
     for (snapshot.participants[0..max_visible], 0..) |participant, index| {
-        const show_choice = revealed and participant.choice != null and participant.choice.? < cards.len;
-        const card = if (show_choice) cards[participant.choice.?] else cards[index % cards.len];
+        const choice_card = pollChoiceCard(participant.choice, cards.len);
+        const card = if (choice_card) |card_index| cards[card_index] else cards[index % cards.len];
         const phase = seedUnit(participant.seed, 0) * std.math.tau + now * (0.18 + seedUnit(participant.seed, 16) * 0.32);
         var position: rl.Vector2 = undefined;
-        if (show_choice) {
+        if (choice_card != null) {
             position = .{
                 .x = card.x + card.width * (0.22 + seedUnit(participant.seed, 32) * 0.54) + std.math.cos(phase) * 15 * scale,
                 .y = card.y + card.height * 0.5 + std.math.sin(phase * 1.31) * @max(4.0 * scale, card.height * 0.24),
@@ -1206,7 +1211,7 @@ fn drawPollSwarm(snapshot: crowdplay.Snapshot, poll: ?crowdplay.PollSnapshot, ca
                 .y = full_top + (full_bottom - full_top) * seedUnit(participant.seed, 48) + std.math.sin(phase * 1.19) * 14 * scale,
             };
         }
-        const color = if (show_choice) crowdPalette(participant.choice.?) else crowdPalette(@intCast((participant.seed +% index) % crowdplay.max_choices));
+        const color = if (choice_card) |card_index| crowdPalette(card_index) else crowdPalette(@intCast((participant.seed +% index) % crowdplay.max_choices));
         const radius = (3.4 + seedUnit(participant.seed, 8) * 4.3) * scale;
         rl.drawCircleV(position, radius * 1.9, colorWithOpacity(color, opacity * 0.13));
         rl.drawCircleV(position, radius, colorWithOpacity(color, opacity * 0.92));
@@ -1233,6 +1238,12 @@ test "line and bullet grouping leave surrounding content static" {
     try std.testing.expect(!startsLineStep(.bullet, false));
     try std.testing.expect(startsLineStep(.bullet, true));
     try std.testing.expect(!startsLineStep(.item, true));
+}
+
+test "poll participant anchors to a valid selected choice before reveal" {
+    try std.testing.expectEqual(@as(?usize, 1), pollChoiceCard(1, 4));
+    try std.testing.expectEqual(@as(?usize, null), pollChoiceCard(null, 4));
+    try std.testing.expectEqual(@as(?usize, null), pollChoiceCard(4, 4));
 }
 
 pub fn slidePosToRenderPos(pos: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) rl.Vector2 {
