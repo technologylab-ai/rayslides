@@ -46,6 +46,9 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>0</kbd> | Goto last slide |
 | <kbd>G</kbd> | Goto first slide |
 | <kbd>Shift</kbd> + <kbd>G</kbd> | Goto last slide |
+| <kbd>O</kbd> | Open or lock the active Crowdplay poll |
+| <kbd>V</kbd> | Reveal or hide Crowdplay results |
+| <kbd>R</kbd> | Reset votes in the active Crowdplay poll |
 
 **Beast Mode**: removes the 60 FPS limit
 
@@ -100,6 +103,59 @@ The shadow uses the same font, wrapping, markdown spans, reveal state, opacity,
 and motion as its text. It is deliberately a crisp duplicate-text shadow, not
 a blurred raster effect. As with other box attributes, place shadow attributes
 before `text=` on an inline `@box` or `@pop` directive.
+
+## Crowdplay: live audience participation
+
+Crowdplay turns audience phones into live inputs without an app, account, or
+cloud service. A deck containing `@crowd` starts a small LAN server, embeds a
+self-contained phone client, and renders participants as an animated swarm.
+Votes are unique per browser, retry-safe, and may be changed while a poll is
+open.
+
+Start with a join slide. rayslides displays a scannable QR code, the local URL,
+and the live participant count:
+
+```text
+@bg color=#070b18ff
+@crowd join x=100 y=80 w=1720 h=920
+Scan to join the room
+```
+
+Add a poll with a stable `id=`. The first body line is the question and each
+`- ` line is a choice:
+
+```text
+@bg color=#070b18ff
+@crowd poll id=architecture open=true x=100 y=80 w=1720 h=920
+What should we build next?
+- A tiny compiler
+- A moon base
+- Both, obviously
+```
+
+Use <kbd>O</kbd> to open/lock voting, <kbd>V</kbd> to reveal the animated
+distribution, and <kbd>R</kbd> to reset the poll. Revealing and locking are
+independent, so you can show results while votes continue to arrive. Crowdplay items participate
+in normal z-order, item animations, and slide transitions. A poll supports up
+to eight choices; a deck supports up to 32 polls and 512 active participants.
+Use one Crowdplay item per slide and unique poll IDs containing only letters,
+digits, `-`, or `_`. IDs are limited to 48 bytes, prompts to 192 bytes, and
+choice labels to 64 bytes.
+
+The default audience address is `http://<computer-name>.local:7331/`. Override
+the advertised hostname or port when mDNS is unavailable:
+
+```sh
+zig build run -- testslides/crowdplay.sld --crowd-host=192.168.1.42 --crowd-port=7331
+```
+
+Use `--no-crowd` to disable the server. Phones and the presenting computer must
+be on the same network, and the local firewall must permit the selected port.
+On Windows, pass `--crowd-host=<LAN-IP>`; `localhost` is only reachable from the
+presenting computer itself.
+The transport is deliberately ordinary HTTP with revision polling for maximum
+phone/browser compatibility; the state and voting protocol remains suitable
+for a future WebSocket transport.
 
 ## Slideshow Format
 

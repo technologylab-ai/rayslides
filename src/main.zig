@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const rl = @import("raylib");
 const rg = @import("raygui");
 const c = @cImport({
@@ -11,9 +12,41 @@ const renderer = @import("renderer.zig");
 const slides = @import("slides.zig");
 const animation = @import("animation.zig");
 const playback = @import("playback.zig");
+const crowdplay = @import("crowdplay.zig");
 const SlideShow = slides.SlideShow;
 
 const log = std.log.scoped(.main);
+
+const CrowdOptions = struct {
+    enabled: bool = true,
+    host: []const u8 = "localhost",
+    host_explicit: bool = false,
+    port: u16 = 7331,
+};
+
+fn defaultCrowdHost(buffer: *[256]u8) []const u8 {
+    if (comptime builtin.os.tag == .windows) return "localhost";
+    var hostname_buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname = std.posix.gethostname(&hostname_buffer) catch return "localhost";
+    if (std.mem.endsWith(u8, hostname, ".local") or std.mem.findScalar(u8, hostname, '.') != null) {
+        return std.fmt.bufPrint(buffer, "{s}", .{hostname}) catch "localhost";
+    }
+    return std.fmt.bufPrint(buffer, "{s}.local", .{hostname}) catch "localhost";
+}
+
+fn slideshowHasCrowd(slideshow: *const SlideShow) bool {
+    for (slideshow.slides.items) |slide| {
+        if (slide.items) |items| for (items.items) |item| if (item.crowd != null) return true;
+    }
+    return false;
+}
+
+fn crowdSpecForSlide(slideshow: *const SlideShow, slide_number: i32) ?slides.CrowdSpec {
+    if (slide_number < 0 or slide_number >= slideshow.slides.items.len) return null;
+    const slide = slideshow.slides.items[@intCast(slide_number)];
+    if (slide.items) |items| for (items.items) |item| if (item.crowd) |spec| return spec;
+    return null;
+}
 
 const ExportController = struct {
     gpa: std.mem.Allocator,
@@ -323,14 +356,33 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     //--------------------------------------------------------------------------------------
 
-    // get arg
+    var crowd_options = CrowdOptions{};
+    var crowd_host_buffer: [256]u8 = undefined;
+    crowd_options.host = defaultCrowdHost(&crowd_host_buffer);
+
+    // get args
     const slideshow_to_load = blk: {
         var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
         defer args_it.deinit();
         _ = args_it.skip();
-        const slideshow_arg = args_it.next() orelse std.process.fatal("No slideshow arg given!", .{});
-        log.debug("loading... {s}", .{slideshow_arg});
-        break :blk try std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{slideshow_arg});
+        var slideshow_arg: ?[]const u8 = null;
+        while (args_it.next()) |arg| {
+            if (std.mem.startsWith(u8, arg, "--crowd-host=")) {
+                crowd_options.host = try std.fmt.bufPrint(&crowd_host_buffer, "{s}", .{arg["--crowd-host=".len..]});
+                crowd_options.host_explicit = true;
+            } else if (std.mem.startsWith(u8, arg, "--crowd-port=")) {
+                crowd_options.port = std.fmt.parseInt(u16, arg["--crowd-port=".len..], 10) catch std.process.fatal("Invalid --crowd-port value", .{});
+            } else if (std.mem.eql(u8, arg, "--no-crowd")) {
+                crowd_options.enabled = false;
+            } else if (slideshow_arg == null) {
+                slideshow_arg = arg;
+            } else {
+                std.process.fatal("Unexpected argument: {s}", .{arg});
+            }
+        }
+        const selected = slideshow_arg orelse std.process.fatal("No slideshow arg given!", .{});
+        log.debug("loading... {s}", .{selected});
+        break :blk try std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{selected});
     };
 
     const windowWidth: i32 = if (rl.getScreenWidth() >= 1920) 1920 else 1280;
@@ -347,6 +399,8 @@ pub fn main(init: std.process.Init) anyerror!void {
     try G.init(gpa, io);
     defer G.deinit();
     G.slideshow_filp_to_load = slideshow_to_load;
+    var crowd_runtime = try crowdplay.Runtime.init(gpa, io);
+    defer crowd_runtime.stop();
 
     rl.setTargetFPS(61);
     var beast_mode: bool = false;
@@ -363,7 +417,6 @@ pub fn main(init: std.process.Init) anyerror!void {
     var manual_fullscreen: bool = false;
 
     while (!rl.windowShouldClose()) { // Detect window close button or ESC key
-        std.debug.print("RENDER w={d}, h={d}\n", .{ screenWidth, screenHeight });
         // Update
         //----------------------------------------------------------------------------------
         // TODO: Update your variables here
@@ -429,6 +482,30 @@ pub fn main(init: std.process.Init) anyerror!void {
                 G.slide_renderer.preRender(G.slideshow, slideshow_filp) catch |err| {
                     log.err("Pre-rendering failed: {any}", .{err});
                 };
+                const deck_has_crowd = slideshowHasCrowd(G.slideshow);
+                const host_is_usable = builtin.os.tag != .windows or crowd_options.host_explicit;
+                if (crowd_options.enabled and deck_has_crowd and !host_is_usable) {
+                    log.err("Crowdplay on Windows requires --crowd-host=<LAN-IP>; server disabled", .{});
+                }
+                const wants_crowd = crowd_options.enabled and deck_has_crowd and host_is_usable;
+                var crowd_configured = false;
+                if (wants_crowd) {
+                    if (crowd_runtime.configure(G.slideshow)) |_| {
+                        crowd_configured = true;
+                    } else |err| {
+                        log.err("Crowdplay configuration failed; server disabled: {any}", .{err});
+                        crowd_runtime.stop();
+                    }
+                } else {
+                    crowd_runtime.stop();
+                }
+                if (crowd_configured and !crowd_runtime.isRunning()) {
+                    if (crowd_runtime.start(crowd_options.port, crowd_options.host)) |port| {
+                        log.info("Crowdplay listening on port {d}; audience URL: {s}", .{ port, crowd_runtime.public_url.slice() });
+                    } else |err| {
+                        log.err("Crowdplay could not start: {any}", .{err});
+                    }
+                }
                 if (G.slideshow.slides.items.len > 0) {
                     if (G.current_slide < 0 or G.current_slide >= G.slideshow.slides.items.len) G.current_slide = 0;
                     const now = rl.getTime();
@@ -442,6 +519,8 @@ pub fn main(init: std.process.Init) anyerror!void {
         const now = rl.getTime();
         G.playback.settle(now);
         if (!export_controller.running) updateAutomaticReveal(now);
+        const current_crowd_spec = crowdSpecForSlide(G.slideshow, G.current_slide);
+        if (crowd_runtime.isRunning() and !export_controller.running) crowd_runtime.activate(current_crowd_spec);
 
         // render slide
         // G.slide_render_width = G.internal_render_size.x - ed_anim.current_size.x;
@@ -472,9 +551,23 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .progress = G.playback.transitionProgress(now),
                 .direction = G.playback.direction,
             };
-        try G.slide_renderer.render(G.current_slide, reveal_state, transition_state, slide_tl, slide_size_in_window, internal_render_size);
+        const crowd_snapshot: ?crowdplay.Snapshot = if (crowd_runtime.isRunning()) crowd_runtime.snapshotFor(current_crowd_spec) else null;
+        const previous_crowd_snapshot: ?crowdplay.Snapshot = if (crowd_runtime.isRunning()) blk: {
+            const previous_slide = G.playback.previous_slide orelse break :blk null;
+            break :blk crowd_runtime.snapshotFor(crowdSpecForSlide(G.slideshow, previous_slide));
+        } else null;
+        try G.slide_renderer.render(
+            G.current_slide,
+            reveal_state,
+            transition_state,
+            slide_tl,
+            slide_size_in_window,
+            internal_render_size,
+            crowd_snapshot,
+            previous_crowd_snapshot,
+            crowd_runtime.public_url.slice(),
+        );
         // try G.slide_renderer.render(G.current_slide, .{ .x = 0.0, .y = 0.0 }, .{ .x = @floatFromInt(screenWidth), .y = @floatFromInt(screenHeight) }, .{ .x = 1920, .y = 1080 });
-        std.log.debug("window_size: {any}, slideAreaTL: {any}, slideSizeInWindow: {any}, internal_render_size: {any}", .{ window_size, slide_tl, slide_size_in_window, internal_render_size });
         if (beast_mode) {
             rl.drawFPS(20, 20);
         }
@@ -503,6 +596,16 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         if (!export_controller.running and (rl.isKeyPressed(.backspace) or rl.isKeyPressed(.left) or rl.isKeyPressed(.page_up))) {
             reversePresentation(rl.getTime());
+        }
+
+        if (crowd_runtime.isRunning() and !export_controller.running and rl.isKeyPressed(.o)) {
+            _ = crowd_runtime.toggleOpen();
+        }
+        if (crowd_runtime.isRunning() and !export_controller.running and rl.isKeyPressed(.v)) {
+            _ = crowd_runtime.toggleReveal();
+        }
+        if (crowd_runtime.isRunning() and !export_controller.running and rl.isKeyPressed(.r)) {
+            _ = crowd_runtime.resetActive();
         }
 
         // hack for M1 macbook 14" with low resolution set to : 1512 x 981

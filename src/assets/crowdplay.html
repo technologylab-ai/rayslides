@@ -1,0 +1,680 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#090b16">
+  <meta name="color-scheme" content="dark">
+  <title>rayslides Crowdplay</title>
+  <style>
+    :root {
+      --bg: #090b16;
+      --panel: rgba(21, 24, 46, .82);
+      --panel-solid: #15182e;
+      --ink: #f7f8ff;
+      --muted: #a6abc7;
+      --line: rgba(255,255,255,.11);
+      --hot: #ff4fc3;
+      --violet: #8b7cff;
+      --cyan: #42e8e0;
+      --good: #70f5ae;
+      --danger: #ff7b8b;
+      --shadow: 0 24px 80px rgba(0,0,0,.42);
+      font-family: Inter, ui-rounded, "SF Pro Rounded", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html { min-height: 100%; background: var(--bg); }
+    body {
+      min-height: 100vh;
+      min-height: 100svh;
+      margin: 0;
+      color: var(--ink);
+      overflow-x: hidden;
+      background:
+        radial-gradient(circle at 15% 5%, rgba(139,124,255,.28), transparent 34rem),
+        radial-gradient(circle at 95% 78%, rgba(255,79,195,.18), transparent 30rem),
+        var(--bg);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .32;
+      background-image: radial-gradient(rgba(255,255,255,.3) .7px, transparent .7px);
+      background-size: 19px 19px;
+      mask-image: linear-gradient(to bottom, black, transparent 72%);
+    }
+
+    button, input { font: inherit; }
+    button { -webkit-tap-highlight-color: transparent; }
+
+    .shell {
+      position: relative;
+      width: min(100%, 39rem);
+      min-height: 100vh;
+      min-height: 100svh;
+      margin: 0 auto;
+      padding: max(1rem, env(safe-area-inset-top)) 1rem max(1rem, env(safe-area-inset-bottom));
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 1rem;
+    }
+
+    header, footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem;
+    }
+
+    .brand { display: flex; align-items: center; gap: .65rem; font-weight: 850; letter-spacing: -.02em; }
+    .brand small { display: block; margin-top: .08rem; color: var(--muted); font-size: .68rem; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
+    .mark {
+      width: 2.35rem;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      position: relative;
+      flex: none;
+      background: conic-gradient(from 35deg, var(--hot), var(--violet), var(--cyan), var(--hot));
+      box-shadow: 0 0 32px rgba(139,124,255,.52);
+      animation: breathe 3s ease-in-out infinite;
+    }
+    .mark::after { content: ""; position: absolute; inset: .42rem; border: 3px solid var(--bg); border-radius: inherit; }
+
+    .net {
+      display: inline-flex;
+      align-items: center;
+      gap: .42rem;
+      min-height: 2rem;
+      padding: .42rem .68rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(9,11,22,.58);
+      font-size: .76rem;
+      font-weight: 750;
+      white-space: nowrap;
+      backdrop-filter: blur(12px);
+    }
+    .dot { width: .5rem; height: .5rem; border-radius: 50%; background: #747993; transition: .2s ease; }
+    .net[data-state="live"] .dot { background: var(--good); box-shadow: 0 0 0 4px rgba(112,245,174,.12), 0 0 15px var(--good); }
+    .net[data-state="retry"] .dot { background: #ffd166; animation: blink 1s infinite; }
+    .net[data-state="offline"] .dot { background: var(--danger); }
+
+    main { display: grid; align-items: center; }
+    .card {
+      position: relative;
+      overflow: hidden;
+      width: 100%;
+      padding: clamp(1.35rem, 5vw, 2rem);
+      border: 1px solid var(--line);
+      border-radius: 1.7rem;
+      background: linear-gradient(145deg, rgba(28,31,59,.92), var(--panel));
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(22px);
+      animation: rise .38s cubic-bezier(.2,.9,.3,1) both;
+    }
+    .card::before {
+      content: "";
+      position: absolute;
+      width: 12rem;
+      height: 12rem;
+      top: -8rem;
+      right: -6rem;
+      border-radius: 50%;
+      background: var(--violet);
+      filter: blur(55px);
+      opacity: .25;
+      pointer-events: none;
+    }
+
+    .eyebrow { margin: 0 0 .65rem; color: var(--cyan); font-size: .72rem; font-weight: 900; letter-spacing: .17em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(1.75rem, 8vw, 3rem); line-height: 1.04; letter-spacing: -.045em; text-wrap: balance; }
+    p { line-height: 1.55; }
+    .lede { margin: .85rem 0 1.4rem; color: var(--muted); }
+
+    label { display: block; margin-bottom: .48rem; color: var(--muted); font-size: .78rem; font-weight: 800; }
+    input {
+      width: 100%;
+      min-height: 3.55rem;
+      padding: 0 1rem;
+      border: 1px solid var(--line);
+      border-radius: 1rem;
+      outline: 0;
+      color: var(--ink);
+      background: rgba(7,9,20,.72);
+      transition: border-color .18s, box-shadow .18s;
+    }
+    input:focus { border-color: var(--violet); box-shadow: 0 0 0 4px rgba(139,124,255,.18); }
+
+    .primary, .ghost {
+      width: 100%;
+      min-height: 3.55rem;
+      border-radius: 1rem;
+      border: 0;
+      cursor: pointer;
+      font-weight: 900;
+      transition: transform .13s, filter .13s, opacity .13s;
+    }
+    .primary { margin-top: .9rem; color: #090b16; background: linear-gradient(100deg, var(--cyan), #b4ffbd); box-shadow: 0 12px 30px rgba(66,232,224,.2); }
+    .ghost { margin-top: .35rem; color: var(--muted); background: transparent; }
+    button:active { transform: scale(.975); }
+    button:focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; }
+    button:disabled { cursor: default; opacity: .58; }
+
+    .arena { display: grid; place-items: center; min-height: 14rem; text-align: center; }
+    .orbit { position: relative; width: 6.3rem; height: 6.3rem; margin: 0 auto 1.25rem; }
+    .orbit i { position: absolute; left: 50%; top: 50%; width: .75rem; height: .75rem; margin: -.375rem; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 17px currentColor; animation: orbit 2.4s linear infinite; }
+    .orbit i:nth-child(2) { color: var(--hot); background: var(--hot); animation-delay: -.8s; }
+    .orbit i:nth-child(3) { color: var(--violet); background: var(--violet); animation-delay: -1.6s; }
+    .arena h1 { font-size: clamp(1.7rem, 7vw, 2.5rem); }
+    .arena p { max-width: 23rem; margin: .7rem auto 0; color: var(--muted); }
+
+    .choices { display: grid; gap: .7rem; margin-top: 1.35rem; }
+    .choice {
+      position: relative;
+      overflow: hidden;
+      width: 100%;
+      min-height: 3.9rem;
+      padding: .75rem .9rem;
+      border: 1px solid var(--line);
+      border-radius: 1.05rem;
+      color: var(--ink);
+      background: rgba(6,8,19,.56);
+      text-align: left;
+      cursor: pointer;
+      isolation: isolate;
+      transition: border-color .18s, background .18s, transform .13s;
+    }
+    .choice:hover { border-color: rgba(255,255,255,.23); }
+    .choice.selected { border-color: var(--cyan); background: rgba(66,232,224,.09); }
+    .choice.pending { animation: pulse-border .75s ease-in-out infinite alternate; }
+    .choice-row { position: relative; z-index: 2; display: grid; grid-template-columns: 2rem 1fr auto; align-items: center; gap: .7rem; }
+    .key { display: grid; place-items: center; width: 2rem; height: 2rem; border-radius: .7rem; color: var(--muted); background: rgba(255,255,255,.07); font-size: .78rem; font-weight: 900; }
+    .selected .key { color: #071515; background: var(--cyan); }
+    .choice-label { min-width: 0; font-weight: 800; overflow-wrap: anywhere; }
+    .score { color: var(--cyan); font-size: .87rem; font-weight: 900; font-variant-numeric: tabular-nums; }
+    .bar { position: absolute; z-index: 1; inset: 0 auto 0 0; width: 0; background: linear-gradient(90deg, rgba(139,124,255,.24), rgba(66,232,224,.16)); transition: width .7s cubic-bezier(.2,.8,.25,1); }
+    .results .choice { cursor: default; }
+
+    .hint { min-height: 1.5em; margin: 1rem 0 0; color: var(--muted); font-size: .83rem; text-align: center; }
+    .hint strong { color: var(--good); }
+
+    footer { min-height: 2rem; padding: 0 .3rem; color: var(--muted); font-size: .73rem; }
+    .identity { display: flex; align-items: center; min-width: 0; gap: .45rem; }
+    .you { width: .58rem; height: .58rem; flex: none; border-radius: 50%; background: var(--violet); box-shadow: 0 0 13px var(--violet); }
+    #identityName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #serverName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+
+    .toast {
+      position: fixed;
+      z-index: 10;
+      left: 50%;
+      bottom: max(1rem, env(safe-area-inset-bottom));
+      width: min(calc(100% - 2rem), 31rem);
+      padding: .85rem 1rem;
+      border: 1px solid rgba(255,123,139,.35);
+      border-radius: .9rem;
+      color: #ffd8de;
+      background: rgba(52,15,28,.96);
+      box-shadow: var(--shadow);
+      text-align: center;
+      font-size: .82rem;
+      font-weight: 800;
+      transform: translate(-50%, 140%);
+      transition: transform .25s ease;
+    }
+    .toast.show { transform: translate(-50%, 0); }
+
+    @keyframes rise { from { opacity: 0; transform: translateY(12px) scale(.99); } }
+    @keyframes breathe { 50% { transform: scale(1.06); filter: hue-rotate(24deg); } }
+    @keyframes blink { 50% { opacity: .35; } }
+    @keyframes pulse-border { to { border-color: var(--violet); box-shadow: inset 0 0 24px rgba(139,124,255,.1); } }
+    @keyframes orbit { from { transform: rotate(0) translateX(2.7rem) rotate(0); } to { transform: rotate(360deg) translateX(2.7rem) rotate(-360deg); } }
+
+    @media (min-width: 42rem) { .shell { padding-inline: 1.4rem; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span>rayslides<small>Crowdplay</small></span>
+      </div>
+      <div class="net" id="net" data-state="idle" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span><span id="netText">Ready</span>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="card" id="joinView">
+        <p class="eyebrow">Join the room</p>
+        <h1>Become part of the slide.</h1>
+        <p class="lede">Choose a name, or arrive mysteriously. No account, no app, no nonsense.</p>
+        <form id="joinForm">
+          <label for="displayName">Your name <span aria-hidden="true">·</span> optional</label>
+          <input id="displayName" name="displayName" type="text" maxlength="32" autocomplete="nickname" enterkeyhint="go" placeholder="Ada, Linus, Mystery Guest…">
+          <button class="primary" id="joinButton" type="submit">Join Crowdplay</button>
+          <button class="ghost" id="anonymousButton" type="button">Continue anonymously</button>
+        </form>
+      </section>
+
+      <section class="card arena" id="waitingView" hidden>
+        <div>
+          <div class="orbit" aria-hidden="true"><i></i><i></i><i></i></div>
+          <p class="eyebrow">You’re in</p>
+          <h1>Watch the big screen.</h1>
+          <p>The next question will land here automatically.</p>
+        </div>
+      </section>
+
+      <section class="card" id="pollView" hidden>
+        <p class="eyebrow" id="pollPhase">Live question</p>
+        <h1 id="pollPrompt"></h1>
+        <div class="choices" id="choices" role="group" aria-label="Answer choices"></div>
+        <p class="hint" id="pollHint" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="card arena" id="endedView" hidden>
+        <div>
+          <p class="eyebrow">Session paused</p>
+          <h1>The room went quiet.</h1>
+          <p>Stay here—we’ll reconnect as soon as the presenter is back.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span class="identity"><i class="you" aria-hidden="true"></i><span id="identityName">Not joined</span></span>
+      <span id="serverName">Local &amp; private</span>
+    </footer>
+  </div>
+  <div class="toast" id="toast" role="alert"></div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const $ = (id) => document.getElementById(id);
+      const views = [$("joinView"), $("waitingView"), $("pollView"), $("endedView")];
+      const storageKey = "rayslides:crowdplay:" + location.host;
+
+      function randomId() {
+        const bytes = new Uint8Array(16);
+        if (globalThis.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
+        else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+        return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+      }
+
+      function utf8Prefix(value, maxBytes) {
+        const encoder = new TextEncoder();
+        let result = "";
+        for (const character of value) {
+          if (encoder.encode(result + character).length > maxBytes) break;
+          result += character;
+        }
+        return result;
+      }
+
+      function readSaved() {
+        try { return JSON.parse(localStorage.getItem(storageKey)) || {}; }
+        catch (_) { return {}; }
+      }
+
+      const saved = readSaved();
+      const savedId = typeof saved.id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(saved.id) ? saved.id : randomId();
+      const client = {
+        id: savedId,
+        name: typeof saved.name === "string" ? saved.name : "",
+        joined: saved.joined === true,
+        session: typeof saved.session === "string" ? saved.session : "",
+        revision: Number.isSafeInteger(saved.revision) ? saved.revision : 0,
+        pollId: typeof saved.pollId === "string" ? saved.pollId : "",
+        seq: Number.isSafeInteger(saved.seq) ? saved.seq : 0
+      };
+
+      let state = null;
+      let timer = 0;
+      let inFlight = false;
+      let failures = 0;
+      let pendingVote = null;
+      let toastTimer = 0;
+
+      function save() {
+        try { localStorage.setItem(storageKey, JSON.stringify(client)); }
+        catch (_) {}
+      }
+      save();
+
+      function showView(view) {
+        for (const item of views) item.hidden = item !== view;
+      }
+
+      function setNetwork(kind, text) {
+        $("net").dataset.state = kind;
+        $("netText").textContent = text;
+      }
+
+      function notify(message) {
+        clearTimeout(toastTimer);
+        $("toast").textContent = message;
+        $("toast").classList.add("show");
+        toastTimer = setTimeout(() => $("toast").classList.remove("show"), 3600);
+      }
+
+      function persistIdentity(joined, displayName) {
+        client.joined = joined;
+        if (typeof displayName === "string") client.name = displayName;
+        $("identityName").textContent = joined ? (client.name || "Anonymous") : "Not joined";
+        save();
+      }
+
+      async function api(path, options = {}) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 6500);
+        try {
+          const response = await fetch(path, {
+            cache: "no-store",
+            credentials: "same-origin",
+            ...options,
+            headers: { "Accept": "application/json", ...(options.headers || {}) },
+            signal: controller.signal
+          });
+          if (response.status === 304) return null;
+          const raw = await response.text();
+          let body = null;
+          if (raw) {
+            try { body = JSON.parse(raw); }
+            catch (_) { throw new Error("The presenter sent an unreadable response."); }
+          }
+          if (!response.ok) {
+            const serverMessage = body && (body.error || body.message);
+            const error = new Error(serverMessage || "Request failed (" + response.status + ")");
+            error.status = response.status;
+            error.body = body;
+            throw error;
+          }
+          return body;
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      function nextInterval() {
+        if (document.hidden) return 5000;
+        return state && state.poll && state.poll.open ? 750 : 1500;
+      }
+
+      function schedule(delay = nextInterval()) {
+        clearTimeout(timer);
+        const jitter = .9 + Math.random() * .2;
+        timer = setTimeout(refresh, Math.round(delay * jitter));
+      }
+
+      function resetForJoin(message) {
+        pendingVote = null;
+        client.joined = false;
+        client.session = "";
+        client.revision = 0;
+        client.pollId = "";
+        client.seq = 0;
+        persistIdentity(false);
+        showView($("joinView"));
+        setNetwork(navigator.onLine ? "idle" : "offline", navigator.onLine ? "Ready" : "Offline");
+        if (message) notify(message);
+      }
+
+      function validState(next) {
+        return next && typeof next.session_id === "string" && Number.isSafeInteger(next.revision) && Number.isSafeInteger(next.connected) && typeof next.joined === "boolean";
+      }
+
+      function applyState(next) {
+        if (!validState(next)) throw new Error("The presenter sent an incompatible Crowdplay state.");
+
+        if (state && client.session === next.session_id && next.revision < state.revision) return;
+
+        if (client.session && client.session !== next.session_id) {
+          client.pollId = "";
+          client.seq = 0;
+          pendingVote = null;
+        }
+        client.session = next.session_id;
+        client.revision = next.revision;
+        state = next;
+
+        if (typeof next.server_name === "string" && next.server_name) $("serverName").textContent = next.server_name;
+        else if (typeof next.url === "string" && next.url) $("serverName").textContent = next.url;
+
+        if (!next.joined) {
+          resetForJoin(client.joined ? "The session changed—please join the room again." : "");
+          return;
+        }
+
+        persistIdentity(true);
+        if (!next.poll) {
+          client.pollId = "";
+          client.seq = 0;
+          pendingVote = null;
+          save();
+          showView($("waitingView"));
+          return;
+        }
+
+        if (client.pollId !== next.poll.id) {
+          client.pollId = next.poll.id;
+          client.seq = Number.isSafeInteger(next.poll.vote_seq) ? next.poll.vote_seq : 0;
+          pendingVote = null;
+        } else if (Number.isSafeInteger(next.poll.vote_seq)) {
+          client.seq = Math.max(client.seq, next.poll.vote_seq);
+        }
+        save();
+        renderPoll();
+      }
+
+      function selectedChoice(poll) {
+        return pendingVote && pendingVote.pollId === poll.id ? pendingVote.choiceId : poll.selected;
+      }
+
+      function renderPoll() {
+        const poll = state && state.poll;
+        if (!poll) return;
+        showView($("pollView"));
+        $("pollPrompt").textContent = poll.prompt || "Make your choice";
+        $("pollView").classList.toggle("results", poll.revealed === true);
+
+        const selected = selectedChoice(poll);
+        const hasSelection = selected !== null && selected !== undefined;
+        const results = poll.revealed === true;
+        const canVote = poll.open === true;
+        $("pollPhase").textContent = results ? (canVote ? "Live results" : "The room has spoken") : canVote ? "Live question" : "Voting closed";
+
+        if (results) {
+          const votes = Number.isFinite(poll.total) ? poll.total : 0;
+          $("pollHint").textContent = votes + (votes === 1 ? " vote" : " votes") + (canVote ? " · Tap an answer; results update live" : " · Final results");
+        } else if (!canVote) {
+          $("pollHint").textContent = hasSelection ? "Your vote is locked in. Results are coming…" : "Voting is closed. Results are coming…";
+        } else if (hasSelection) {
+          const confirmation = document.createElement("strong");
+          confirmation.textContent = "Vote received.";
+          $("pollHint").replaceChildren(confirmation, " Tap another answer to change it.");
+        } else {
+          $("pollHint").textContent = "Tap an answer — you can change it while voting is open.";
+        }
+
+        const choices = $("choices");
+        choices.replaceChildren();
+        const total = Math.max(0, Number(poll.total) || 0);
+        (Array.isArray(poll.choices) ? poll.choices : []).forEach((choice, index) => {
+          const isSelected = choice.id === selected;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "choice" + (isSelected ? " selected" : "") + (pendingVote && pendingVote.choiceId === choice.id ? " pending" : "");
+          button.disabled = !canVote;
+          button.setAttribute("aria-pressed", String(isSelected));
+
+          const bar = document.createElement("span");
+          bar.className = "bar";
+          const votes = Math.max(0, Number(choice.votes) || 0);
+          const percent = total > 0 ? Math.round(votes * 100 / total) : 0;
+          button.setAttribute("aria-label", String(choice.label || "Choice " + (index + 1)) + (isSelected ? ", your choice" : "") + (results ? ", " + percent + " percent, " + votes + (votes === 1 ? " vote" : " votes") : ""));
+          bar.style.width = results ? percent + "%" : "0";
+
+          const row = document.createElement("span");
+          row.className = "choice-row";
+          const key = document.createElement("span");
+          key.className = "key";
+          key.textContent = isSelected ? "✓" : String(index + 1);
+          const label = document.createElement("span");
+          label.className = "choice-label";
+          label.textContent = choice.label || "Choice " + (index + 1);
+          const score = document.createElement("span");
+          score.className = "score";
+          score.textContent = results ? percent + "%" : "";
+          row.append(key, label, score);
+          button.append(bar, row);
+          if (canVote) button.addEventListener("click", () => vote(choice.id));
+          choices.append(button);
+        });
+      }
+
+      async function refresh() {
+        if (!client.joined || inFlight) return;
+        inFlight = true;
+        const params = new URLSearchParams({ client_id: client.id, revision: String(client.revision) });
+        try {
+          const next = await api("/api/v1/state?" + params);
+          failures = 0;
+          setNetwork("live", "Live");
+          if (next) applyState(next.state || next);
+          schedule();
+        } catch (error) {
+          failures++;
+          if (error.status === 401 || error.status === 404) {
+            resetForJoin("Please join the room again.");
+          } else {
+            const offline = navigator.onLine === false;
+            setNetwork(offline ? "offline" : "retry", offline ? "Offline" : "Reconnecting");
+            if (failures >= 3) showView($("endedView"));
+            const backoff = Math.min(15000, 750 * Math.pow(2, Math.min(failures, 5)));
+            schedule(backoff);
+          }
+        } finally {
+          inFlight = false;
+        }
+      }
+
+      async function join(displayName) {
+        if (inFlight) return;
+        displayName = utf8Prefix(displayName, 32);
+        inFlight = true;
+        const controls = [$("joinButton"), $("anonymousButton"), $("displayName")];
+        controls.forEach((control) => control.disabled = true);
+        setNetwork("retry", "Joining");
+        try {
+          const next = await api("/api/v1/join", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ client_id: client.id, display_name: displayName })
+          });
+          client.name = displayName;
+          client.joined = true;
+          client.revision = 0;
+          persistIdentity(true, displayName);
+          failures = 0;
+          setNetwork("live", "Live");
+          if (next) applyState(next.state || next);
+          schedule(0);
+        } catch (error) {
+          setNetwork(navigator.onLine ? "retry" : "offline", navigator.onLine ? "Try again" : "Offline");
+          notify(error.message || "Could not join the room.");
+        } finally {
+          inFlight = false;
+          controls.forEach((control) => control.disabled = false);
+        }
+      }
+
+      async function vote(choiceId) {
+        const poll = state && state.poll;
+        if (!poll || !poll.open) return;
+
+        const seq = Math.max(client.seq, Number(poll.vote_seq) || 0) + 1;
+        client.seq = seq;
+        pendingVote = { pollId: poll.id, choiceId, seq };
+        save();
+        renderPoll();
+        try { if (navigator.vibrate) navigator.vibrate(12); } catch (_) {}
+
+        const payload = { client_id: client.id, poll_id: poll.id, choice_id: choiceId, seq };
+        let result;
+        try {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            if (!pendingVote || pendingVote.seq !== seq) return;
+            try {
+              result = await api("/api/v1/vote", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+              });
+              break;
+            } catch (error) {
+              if (error.status || attempt === 2) throw error;
+              await new Promise((resolve) => setTimeout(resolve, 250 * Math.pow(2, attempt)));
+            }
+          }
+          if (!pendingVote || pendingVote.seq !== seq) return;
+          pendingVote = null;
+          failures = 0;
+          setNetwork("live", "Live");
+          if (result) applyState(result.state || result);
+          schedule(0);
+        } catch (error) {
+          if (!pendingVote || pendingVote.seq !== seq) return;
+          pendingVote = null;
+          if (error.status === 401 || error.status === 404) {
+            resetForJoin("Please join the room again.");
+          } else {
+            if (error.body && (error.body.state || validState(error.body))) {
+              try { applyState(error.body.state || error.body); } catch (_) {}
+            } else {
+              renderPoll();
+            }
+            notify(error.status === 409 ? "Voting just closed." : "Your vote did not get through. Please tap again.");
+            schedule(0);
+          }
+        }
+      }
+
+      $("joinForm").addEventListener("submit", (event) => {
+        event.preventDefault();
+        join($("displayName").value.trim());
+      });
+      $("anonymousButton").addEventListener("click", () => join(""));
+      $("displayName").value = client.name;
+
+      window.addEventListener("online", () => {
+        setNetwork("retry", "Reconnecting");
+        if (client.joined) schedule(0);
+      });
+      window.addEventListener("offline", () => setNetwork("offline", "Offline"));
+      document.addEventListener("visibilitychange", () => { if (client.joined) schedule(0); });
+
+      if (client.joined) {
+        persistIdentity(true);
+        showView($("waitingView"));
+        setNetwork("retry", "Connecting");
+        schedule(0);
+      } else {
+        persistIdentity(false);
+        showView($("joinView"));
+      }
+    })();
+  </script>
+</body>
+</html>

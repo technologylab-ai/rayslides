@@ -91,6 +91,7 @@ pub const SlideItemKind = enum {
     background,
     textbox,
     img,
+    crowd,
 };
 
 pub const SlideItemError = error{
@@ -102,6 +103,27 @@ pub const SlideItemError = error{
     UnderlineWidthNull,
     BulletColorNull,
     BulletSymbolNull,
+    CrowdSpecNull,
+    CrowdIdNull,
+    CrowdPromptNull,
+    CrowdChoicesInvalid,
+    CrowdIdTooLong,
+    CrowdIdInvalid,
+    CrowdPromptTooLong,
+    CrowdChoiceTooLong,
+};
+
+pub const CrowdKind = enum {
+    join,
+    poll,
+};
+
+pub const CrowdSpec = struct {
+    kind: CrowdKind,
+    id: []const u8 = "",
+    prompt: []const u8 = "",
+    choices: []const []const u8 = &.{},
+    initially_open: bool = true,
 };
 
 pub const TextShadow = struct {
@@ -129,6 +151,7 @@ pub const SlideItem = struct {
     ratio: ?f32 = null,
     animation: ?animation.ItemSpec = null,
     text_shadow: ?TextShadow = null,
+    crowd: ?CrowdSpec = null,
 
     pub fn new(a: std.mem.Allocator) !*SlideItem {
         const self = try a.create(SlideItem);
@@ -155,6 +178,7 @@ pub const SlideItem = struct {
         if (context.ratio) |r| self.ratio = r;
         if (context.animation) |anim| self.animation = anim;
         if (context.text_shadow) |shadow| self.text_shadow = shadow;
+        if (context.crowd) |crowd| self.crowd = crowd;
     }
     pub fn applySlideDefaultsIfNecessary(self: *SlideItem, slide: *Slide) void {
         if (self.fontSize == null) self.fontSize = slide.fontsize;
@@ -187,6 +211,24 @@ pub const SlideItem = struct {
         if (self.kind == .background) {
             if (self.img_path == null and self.color == null) {
                 return SlideItemError.ColorNull;
+            }
+        }
+        if (self.kind == .crowd) {
+            const crowd = self.crowd orelse return SlideItemError.CrowdSpecNull;
+            if (crowd.prompt.len == 0) return SlideItemError.CrowdPromptNull;
+            if (crowd.prompt.len > 192) return SlideItemError.CrowdPromptTooLong;
+            if (crowd.kind == .poll) {
+                if (crowd.id.len == 0) return SlideItemError.CrowdIdNull;
+                if (crowd.id.len > 48) return SlideItemError.CrowdIdTooLong;
+                for (crowd.id) |char| {
+                    if (!std.ascii.isAlphanumeric(char) and char != '-' and char != '_') return SlideItemError.CrowdIdInvalid;
+                }
+                if (crowd.choices.len < 2) return SlideItemError.CrowdChoicesInvalid;
+                if (crowd.choices.len > 8) return SlideItemError.CrowdChoicesInvalid;
+                for (crowd.choices) |choice| {
+                    if (choice.len == 0) return SlideItemError.CrowdChoicesInvalid;
+                    if (choice.len > 64) return SlideItemError.CrowdChoiceTooLong;
+                }
             }
         }
     }
@@ -226,6 +268,12 @@ pub const SlideItem = struct {
                 log.info(indent ++ "  line_height_factor: {any}", .{self.line_height_factor});
                 log.info(indent ++ " shadow: {any}", .{self.text_shadow});
             },
+            .crowd => {
+                log.info(indent ++ "Kind: Crowdplay", .{});
+                log.info(indent ++ "  spec: {any}", .{self.crowd});
+                log.info(indent ++ "   pos: {any}", .{self.position});
+                log.info(indent ++ "  size: {any}", .{self.size});
+            },
         }
         log.info(indent ++ "-----------------------", .{});
     }
@@ -253,6 +301,7 @@ pub const ItemContext = struct {
     animation: ?animation.ItemSpec = null,
     transition: ?animation.Transition = null,
     text_shadow: ?TextShadow = null,
+    crowd: ?CrowdSpec = null,
 
     pub fn applyOtherIfNull(self: *ItemContext, other: ItemContext) void {
         if (self.text == null) {

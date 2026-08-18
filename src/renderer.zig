@@ -2,8 +2,10 @@ const std = @import("std");
 const TextureCache = @import("texturecache.zig");
 const slides = @import("slides.zig");
 const animation = @import("animation.zig");
+const crowdplay = @import("crowdplay.zig");
 const markdownlineparser = @import("markdownlineparser.zig");
 const my_fonts = @import("fonts.zig");
+const qrcode = @import("qrcode.zig");
 
 const rl = @import("raylib");
 
@@ -26,6 +28,7 @@ const RenderElementKind = enum {
     background,
     text,
     image,
+    crowd,
 };
 
 const RenderElement = struct {
@@ -44,6 +47,7 @@ const RenderElement = struct {
     bullet_symbol: [*:0]const u8 = "",
     reveal_step: usize = 0,
     text_shadow: ?slides.TextShadow = null,
+    crowd: ?slides.CrowdSpec = null,
 };
 
 const RenderedSlide = struct {
@@ -85,6 +89,7 @@ pub const SlideshowRenderer = struct {
     md_parser: markdownlineparser.MdLineParser = .{},
     texture_cache: TextureCache,
     fonts: *my_fonts.AvailableFonts,
+    qr_code: qrcode.Code = .{},
 
     pub fn new(allocator: std.mem.Allocator, fonts: *my_fonts.AvailableFonts) !*SlideshowRenderer {
         var self: *SlideshowRenderer = try allocator.create(SlideshowRenderer);
@@ -128,6 +133,7 @@ pub const SlideshowRenderer = struct {
                         .background => try self.createBg(renderSlide, item, slideshow_filp),
                         .textbox => try self.preRenderTextBlock(renderSlide, item, slide_number),
                         .img => try self.createImg(renderSlide, item, slideshow_filp),
+                        .crowd => try self.createCrowd(renderSlide, item),
                     }
                 }
             }
@@ -182,6 +188,16 @@ pub const SlideshowRenderer = struct {
                 log.info("bg has NO COLOR", .{});
             }
         }
+    }
+
+    fn createCrowd(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem) !void {
+        try renderSlide.elements.append(self.allocator, .{
+            .kind = .crowd,
+            .position = item.position,
+            .size = item.size,
+            .crowd = item.crowd,
+            .reveal_step = try self.wholeItemStep(renderSlide, item),
+        });
     }
 
     fn preRenderTextBlock(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slide_number: usize) !void {
@@ -737,6 +753,9 @@ pub const SlideshowRenderer = struct {
         pos: rl.Vector2,
         size: rl.Vector2,
         internal_render_size: rl.Vector2,
+        crowd_snapshot: ?crowdplay.Snapshot,
+        previous_crowd_snapshot: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
     ) !void {
         if (self.renderedSlides.items.len == 0 or slide_number < 0 or slide_number >= self.renderedSlides.items.len) return;
 
@@ -752,10 +771,12 @@ pub const SlideshowRenderer = struct {
                     pos,
                     size,
                     internal_render_size,
+                    previous_crowd_snapshot,
+                    crowd_url,
                 );
             }
         }
-        try self.renderOneSlide(slide_number, reveal, transforms.incoming, pos, size, internal_render_size);
+        try self.renderOneSlide(slide_number, reveal, transforms.incoming, pos, size, internal_render_size, crowd_snapshot, crowd_url);
     }
 
     fn renderOneSlide(
@@ -766,6 +787,8 @@ pub const SlideshowRenderer = struct {
         pos: rl.Vector2,
         size: rl.Vector2,
         internal_render_size: rl.Vector2,
+        crowd_snapshot: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
     ) !void {
         if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return;
         const slide = self.renderedSlides.items[@intCast(slide_number)];
@@ -800,8 +823,141 @@ pub const SlideshowRenderer = struct {
                         renderImg(element.position, element.size, texture, .white, .blank, pos, size, internal_render_size, transform);
                     }
                 },
+                .crowd => self.renderCrowd(&element, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),
             }
         }
+    }
+
+    fn renderCrowd(
+        self: *SlideshowRenderer,
+        item: *const RenderElement,
+        snapshot_opt: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
+        slide_tl: rl.Vector2,
+        slide_size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+        transform: RenderTransform,
+    ) void {
+        const spec = item.crowd orelse return;
+        const snapshot = snapshot_opt orelse crowdplay.Snapshot{};
+        var logical_pos = item.position;
+        var logical_size = item.size;
+        if (logical_size.x <= 0) {
+            logical_pos.x = 100;
+            logical_size.x = internal_render_size.x - 200;
+        }
+        if (logical_size.y <= 0) {
+            logical_pos.y = 80;
+            logical_size.y = internal_render_size.y - 160;
+        }
+        const screen_pos = translated(slidePosToRenderPos(logical_pos, slide_tl, slide_size, internal_render_size), transform.offset);
+        const screen_size = slideSizeToRenderSize(logical_size, slide_size, internal_render_size);
+        const slide_scale = slide_size.y / internal_render_size.y;
+        const scale = @max(0.1, @min(slide_scale, @min(screen_size.x / 1000.0, screen_size.y / 600.0)));
+        const panel = rl.Rectangle{ .x = screen_pos.x, .y = screen_pos.y, .width = screen_size.x, .height = screen_size.y };
+        const opacity = transform.opacity;
+
+        rl.drawRectangleRounded(panel, 0.04, 16, colorWithOpacity(.{ .r = 10, .g = 13, .b = 27, .a = 242 }, opacity));
+        rl.drawRectangleRoundedLinesEx(panel, 0.04, 16, @max(1.0, 2.0 * scale), colorWithOpacity(.{ .r = 105, .g = 112, .b = 255, .a = 110 }, opacity));
+
+        const connected_text = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{d} live", .{snapshot.connected}) catch return;
+        const pulse = @as(f32, 0.72) + @as(f32, 0.28) * std.math.sin(@as(f32, @floatCast(rl.getTime())) * 3.0);
+        rl.drawCircleV(.{ .x = panel.x + panel.width - 194 * scale, .y = panel.y + 54 * scale }, (7.0 + pulse * 2.0) * scale, colorWithOpacity(.{ .r = 77, .g = 255, .b = 181, .a = 255 }, opacity));
+        drawCrowdText(self.fonts.bold, connected_text, .{ .x = panel.x + panel.width - 172 * scale, .y = panel.y + 35 * scale }, 30 * scale, colorWithOpacity(.{ .r = 205, .g = 255, .b = 232, .a = 255 }, opacity));
+
+        switch (spec.kind) {
+            .join => self.renderCrowdJoin(spec, snapshot, crowd_url, panel, scale, opacity),
+            .poll => self.renderCrowdPoll(spec, snapshot, crowd_url, panel, scale, opacity),
+        }
+    }
+
+    fn renderCrowdJoin(self: *SlideshowRenderer, spec: slides.CrowdSpec, snapshot: crowdplay.Snapshot, crowd_url: []const u8, panel: rl.Rectangle, scale: f32, opacity: f32) void {
+        const eyebrow = "CROWDPLAY\x00";
+        drawCrowdText(self.fonts.bold, eyebrow, .{ .x = panel.x + 72 * scale, .y = panel.y + 52 * scale }, 24 * scale, colorWithOpacity(.{ .r = 147, .g = 156, .b = 255, .a = 255 }, opacity));
+        const prompt = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{s}", .{spec.prompt}) catch return;
+        drawCrowdTextFitted(self.fonts.bold, prompt, .{ .x = panel.x + 72 * scale, .y = panel.y + 116 * scale }, 62 * scale, panel.width - 144 * scale, colorWithOpacity(.white, opacity));
+        drawCrowdText(self.fonts.normal, "Open this address on your phone\x00", .{ .x = panel.x + 74 * scale, .y = panel.y + 214 * scale }, 28 * scale, colorWithOpacity(.{ .r = 177, .g = 185, .b = 214, .a = 255 }, opacity));
+
+        const qr_side = @min(panel.width * 0.30, panel.height * 0.55);
+        const qr_region = rl.Rectangle{
+            .x = panel.x + panel.width - qr_side - 72 * scale,
+            .y = panel.y + 184 * scale,
+            .width = qr_side,
+            .height = qr_side,
+        };
+        const url_panel = rl.Rectangle{ .x = panel.x + 72 * scale, .y = panel.y + 278 * scale, .width = panel.width - qr_side - 190 * scale, .height = 116 * scale };
+        rl.drawRectangleRounded(url_panel, 0.16, 12, colorWithOpacity(.{ .r = 24, .g = 29, .b = 54, .a = 255 }, opacity));
+        const url = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{if (crowd_url.len > 0) crowd_url else "Crowdplay server unavailable"}) catch return;
+        drawCrowdTextFitted(self.fonts.bold, url, .{ .x = url_panel.x + 34 * scale, .y = url_panel.y + 34 * scale }, 34 * scale, url_panel.width - 68 * scale, colorWithOpacity(.{ .r = 113, .g = 242, .b = 255, .a = 255 }, opacity));
+        if (crowd_url.len > 0 and self.qr_code.ensure(crowd_url)) drawQrCode(&self.qr_code, qr_region, opacity);
+
+        drawSwarm(snapshot, null, .{
+            .x = panel.x + panel.width * 0.30,
+            .y = panel.y + panel.height * 0.70,
+            .width = panel.width * 0.34,
+            .height = panel.height * 0.22,
+        }, scale, opacity);
+        const people = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d} {s} in the room", .{ snapshot.connected, if (snapshot.connected == 1) "person" else "people" }) catch return;
+        const measured = rl.measureTextEx(self.fonts.bold, people, 34 * scale, 0);
+        drawCrowdText(self.fonts.bold, people, .{ .x = panel.x + (panel.width - measured.x) / 2, .y = panel.y + panel.height - 92 * scale }, 34 * scale, colorWithOpacity(.{ .r = 205, .g = 211, .b = 239, .a = 255 }, opacity));
+    }
+
+    fn renderCrowdPoll(self: *SlideshowRenderer, spec: slides.CrowdSpec, snapshot: crowdplay.Snapshot, crowd_url: []const u8, panel: rl.Rectangle, scale: f32, opacity: f32) void {
+        const live_poll: ?crowdplay.PollSnapshot = if (snapshot.poll) |poll|
+            if (poll.id.eql(spec.id)) poll else null
+        else
+            null;
+        const available = crowd_url.len > 0 and live_poll != null;
+        const open = if (live_poll) |poll| poll.open else false;
+        const revealed = if (live_poll) |poll| poll.revealed else false;
+        const total = if (live_poll) |poll| poll.total else 0;
+
+        const poll_label = if (!available) "POLL OFFLINE\x00" else if (open) "LIVE POLL\x00" else "POLL LOCKED\x00";
+        drawCrowdText(self.fonts.bold, poll_label, .{ .x = panel.x + 64 * scale, .y = panel.y + 42 * scale }, 23 * scale, colorWithOpacity(if (!available) .{ .r = 255, .g = 107, .b = 133, .a = 255 } else if (open) .{ .r = 77, .g = 255, .b = 181, .a = 255 } else .{ .r = 255, .g = 178, .b = 87, .a = 255 }, opacity));
+        const question = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{spec.prompt}) catch return;
+        drawCrowdTextFitted(self.fonts.bold, question, .{ .x = panel.x + 64 * scale, .y = panel.y + 92 * scale }, 48 * scale, panel.width - 128 * scale, colorWithOpacity(.white, opacity));
+
+        const total_text = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d} {s}", .{ total, if (total == 1) "vote" else "votes" }) catch return;
+        drawCrowdText(self.fonts.normal, total_text, .{ .x = panel.x + 66 * scale, .y = panel.y + 160 * scale }, 24 * scale, colorWithOpacity(.{ .r = 173, .g = 180, .b = 211, .a = 255 }, opacity));
+
+        const count: usize = @min(spec.choices.len, crowdplay.max_choices);
+        if (count == 0) return;
+        const cards_top = panel.y + 214 * scale;
+        const cards_bottom = panel.y + panel.height - 106 * scale;
+        const gap = 13 * scale;
+        const card_height = @max(8 * scale, (cards_bottom - cards_top - gap * @as(f32, @floatFromInt(count - 1))) / @as(f32, @floatFromInt(count)));
+        var card_rects: [crowdplay.max_choices]rl.Rectangle = undefined;
+        for (spec.choices[0..count], 0..) |choice_label, index| {
+            const card = rl.Rectangle{
+                .x = panel.x + 64 * scale,
+                .y = cards_top + @as(f32, @floatFromInt(index)) * (card_height + gap),
+                .width = panel.width - 128 * scale,
+                .height = card_height,
+            };
+            card_rects[index] = card;
+            const accent = crowdPalette(index);
+            rl.drawRectangleRounded(card, 0.14, 10, colorWithOpacity(.{ .r = 24, .g = 29, .b = 54, .a = 245 }, opacity));
+            const votes: u32 = if (live_poll) |poll| poll.choices[index].votes else 0;
+            const fraction: f32 = if (revealed and total > 0) @as(f32, @floatFromInt(votes)) / @as(f32, @floatFromInt(total)) else 0;
+            if (fraction > 0) {
+                const fill = rl.Rectangle{ .x = card.x, .y = card.y, .width = @max(card.height, card.width * fraction), .height = card.height };
+                rl.drawRectangleRounded(fill, 0.14, 10, colorWithOpacity(accent, opacity * 0.42));
+            }
+            rl.drawRectangleRoundedLinesEx(card, 0.14, 10, @max(1.0, 1.5 * scale), colorWithOpacity(accent, opacity * 0.52));
+            const choice = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{choice_label}) catch continue;
+            const label_width = card.width - (if (revealed) 245 * scale else 54 * scale);
+            drawCrowdTextFitted(self.fonts.bold, choice, .{ .x = card.x + 27 * scale, .y = card.y + (card.height - 30 * scale) / 2 }, 28 * scale, label_width, colorWithOpacity(.white, opacity));
+            if (revealed) {
+                const percent: u32 = if (total > 0) @intFromFloat(@round(fraction * 100.0)) else 0;
+                const result = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d}%  ·  {d}", .{ percent, votes }) catch continue;
+                const measured = rl.measureTextEx(self.fonts.bold, result, 27 * scale, 0);
+                drawCrowdText(self.fonts.bold, result, .{ .x = card.x + card.width - measured.x - 26 * scale, .y = card.y + (card.height - 29 * scale) / 2 }, 27 * scale, colorWithOpacity(accent, opacity));
+            }
+        }
+
+        drawPollSwarm(snapshot, live_poll, card_rects[0..count], scale, opacity);
+        const controls = if (crowd_url.len > 0) "O  open/lock     V  reveal     R  reset\x00" else "Crowdplay server unavailable\x00";
+        drawCrowdText(self.fonts.normal, controls, .{ .x = panel.x + 66 * scale, .y = panel.y + panel.height - 65 * scale }, 21 * scale, colorWithOpacity(.{ .r = 137, .g = 144, .b = 177, .a = 255 }, opacity));
     }
 
     fn renderText(self: *SlideshowRenderer, item: *const RenderElement, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2, transform: RenderTransform) void {
@@ -950,6 +1106,111 @@ fn combineTransforms(a: RenderTransform, b: RenderTransform) RenderTransform {
         .offset = .{ .x = a.offset.x + b.offset.x, .y = a.offset.y + b.offset.y },
         .opacity = a.opacity * b.opacity,
     };
+}
+
+var crowd_text_buffer_a: [512]u8 = undefined;
+var crowd_text_buffer_b: [512]u8 = undefined;
+
+fn drawCrowdText(font: rl.Font, text: [:0]const u8, pos: rl.Vector2, size: f32, color: rl.Color) void {
+    rl.drawTextEx(font, text, pos, @max(1.0, size), 0, color);
+}
+
+fn drawCrowdTextFitted(font: rl.Font, text: [:0]const u8, pos: rl.Vector2, size: f32, max_width: f32, color: rl.Color) void {
+    const base_size = @max(1.0, size);
+    const measured = rl.measureTextEx(font, text, base_size, 0).x;
+    const fitted = if (measured > max_width and measured > 0) @max(1.0, base_size * max_width / measured) else base_size;
+    rl.drawTextEx(font, text, pos, fitted, 0, color);
+}
+
+fn drawQrCode(code: *const qrcode.Code, region: rl.Rectangle, opacity: f32) void {
+    const matrix_size = code.size();
+    if (matrix_size <= 0) return;
+    const quiet_modules: i32 = 4;
+    const full_modules = matrix_size + quiet_modules * 2;
+    const module_pixels = @floor(@min(region.width, region.height) / @as(f32, @floatFromInt(full_modules)));
+    if (module_pixels < 1) return;
+    const rendered_side = module_pixels * @as(f32, @floatFromInt(full_modules));
+    const left = region.x + (region.width - rendered_side) * 0.5;
+    const top = region.y + (region.height - rendered_side) * 0.5;
+    rl.drawRectangleRec(.{ .x = left, .y = top, .width = rendered_side, .height = rendered_side }, colorWithOpacity(.white, opacity));
+    for (0..@intCast(matrix_size)) |y| {
+        for (0..@intCast(matrix_size)) |x| {
+            if (!code.module(@intCast(x), @intCast(y))) continue;
+            rl.drawRectangleRec(.{
+                .x = left + @as(f32, @floatFromInt(@as(i32, @intCast(x)) + quiet_modules)) * module_pixels,
+                .y = top + @as(f32, @floatFromInt(@as(i32, @intCast(y)) + quiet_modules)) * module_pixels,
+                .width = module_pixels,
+                .height = module_pixels,
+            }, colorWithOpacity(.black, opacity));
+        }
+    }
+}
+
+fn crowdPalette(index: usize) rl.Color {
+    const colors = [_]rl.Color{
+        .{ .r = 111, .g = 124, .b = 255, .a = 255 },
+        .{ .r = 255, .g = 91, .b = 159, .a = 255 },
+        .{ .r = 46, .g = 224, .b = 190, .a = 255 },
+        .{ .r = 255, .g = 184, .b = 76, .a = 255 },
+        .{ .r = 87, .g = 195, .b = 255, .a = 255 },
+        .{ .r = 185, .g = 112, .b = 255, .a = 255 },
+        .{ .r = 255, .g = 116, .b = 95, .a = 255 },
+        .{ .r = 128, .g = 234, .b = 116, .a = 255 },
+    };
+    return colors[index % colors.len];
+}
+
+fn seedUnit(seed: u64, shift: u6) f32 {
+    return @as(f32, @floatFromInt((seed >> shift) & 0xffff)) / 65535.0;
+}
+
+fn drawSwarm(snapshot: crowdplay.Snapshot, choice: ?u8, region: rl.Rectangle, scale: f32, opacity: f32) void {
+    const now: f32 = @floatCast(rl.getTime());
+    const max_visible: usize = @min(snapshot.participant_count, 220);
+    for (snapshot.participants[0..max_visible], 0..) |participant, index| {
+        if (choice != null and participant.choice != choice) continue;
+        const phase = seedUnit(participant.seed, 0) * std.math.tau + now * (0.22 + seedUnit(participant.seed, 16) * 0.36);
+        const orbit_x = (0.12 + seedUnit(participant.seed, 32) * 0.38) * region.width;
+        const orbit_y = (0.12 + seedUnit(participant.seed, 48) * 0.35) * region.height;
+        const position = rl.Vector2{
+            .x = region.x + region.width * 0.5 + std.math.cos(phase) * orbit_x,
+            .y = region.y + region.height * 0.5 + std.math.sin(phase * 1.17) * orbit_y,
+        };
+        const color = crowdPalette(@intCast((participant.seed +% index) % crowdplay.max_choices));
+        const radius = (4.0 + seedUnit(participant.seed, 8) * 5.0) * scale;
+        rl.drawCircleV(position, radius * 1.9, colorWithOpacity(color, opacity * 0.12));
+        rl.drawCircleV(position, radius, colorWithOpacity(color, opacity * 0.90));
+    }
+}
+
+fn drawPollSwarm(snapshot: crowdplay.Snapshot, poll: ?crowdplay.PollSnapshot, cards: []const rl.Rectangle, scale: f32, opacity: f32) void {
+    if (cards.len == 0) return;
+    const revealed = if (poll) |active| active.revealed else false;
+    const now: f32 = @floatCast(rl.getTime());
+    const max_visible: usize = @min(snapshot.participant_count, 260);
+    for (snapshot.participants[0..max_visible], 0..) |participant, index| {
+        const show_choice = revealed and participant.choice != null and participant.choice.? < cards.len;
+        const card = if (show_choice) cards[participant.choice.?] else cards[index % cards.len];
+        const phase = seedUnit(participant.seed, 0) * std.math.tau + now * (0.18 + seedUnit(participant.seed, 16) * 0.32);
+        var position: rl.Vector2 = undefined;
+        if (show_choice) {
+            position = .{
+                .x = card.x + card.width * (0.22 + seedUnit(participant.seed, 32) * 0.54) + std.math.cos(phase) * 15 * scale,
+                .y = card.y + card.height * 0.5 + std.math.sin(phase * 1.31) * @max(4.0 * scale, card.height * 0.24),
+            };
+        } else {
+            const full_top = cards[0].y;
+            const full_bottom = cards[cards.len - 1].y + cards[cards.len - 1].height;
+            position = .{
+                .x = cards[0].x + cards[0].width * (0.18 + seedUnit(participant.seed, 32) * 0.64) + std.math.cos(phase) * 20 * scale,
+                .y = full_top + (full_bottom - full_top) * seedUnit(participant.seed, 48) + std.math.sin(phase * 1.19) * 14 * scale,
+            };
+        }
+        const color = if (show_choice) crowdPalette(participant.choice.?) else crowdPalette(@intCast((participant.seed +% index) % crowdplay.max_choices));
+        const radius = (3.4 + seedUnit(participant.seed, 8) * 4.3) * scale;
+        rl.drawCircleV(position, radius * 1.9, colorWithOpacity(color, opacity * 0.13));
+        rl.drawCircleV(position, radius, colorWithOpacity(color, opacity * 0.92));
+    }
 }
 
 fn translated(pos: rl.Vector2, offset: rl.Vector2) rl.Vector2 {

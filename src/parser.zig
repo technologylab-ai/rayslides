@@ -334,6 +334,7 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
                 };
                 // then parse current item context
                 parsing_item_context = parseItemAttributes(line, context) catch |err| {
+                    parsing_item_context = .{};
                     reportErrorInContext(err, context, null);
                     continue;
                 };
@@ -554,6 +555,22 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
         }
     }
 
+    if (std.mem.eql(u8, item_context.directive, "@crowd")) {
+        const action = word_it.next() orelse {
+            reportErrorInContext(ParserError.Syntax, context, "@crowd requires `join` or `poll`");
+            return ParserError.Syntax;
+        };
+        const kind: slides.CrowdKind = if (std.mem.eql(u8, action, "join"))
+            .join
+        else if (std.mem.eql(u8, action, "poll"))
+            .poll
+        else {
+            reportErrorInContext(ParserError.Syntax, context, "unknown @crowd action; expected `join` or `poll`");
+            return ParserError.Syntax;
+        };
+        item_context.crowd = .{ .kind = kind };
+    }
+
     log.debug("Parsing {s}", .{item_context.directive});
 
     var text_words = std.ArrayList([]const u8).empty;
@@ -744,6 +761,26 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.ratio = ratio_val;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "id") and item_context.crowd != null) {
+                    if (attr_it.next()) |id| {
+                        var crowd = item_context.crowd.?;
+                        crowd.id = id;
+                        item_context.crowd = crowd;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "open") and item_context.crowd != null) {
+                    if (attr_it.next()) |openstr| {
+                        var crowd = item_context.crowd.?;
+                        if (std.mem.eql(u8, openstr, "true") or std.mem.eql(u8, openstr, "yes") or std.mem.eql(u8, openstr, "1")) {
+                            crowd.initially_open = true;
+                        } else if (std.mem.eql(u8, openstr, "false") or std.mem.eql(u8, openstr, "no") or std.mem.eql(u8, openstr, "0")) {
+                            crowd.initially_open = false;
+                        } else {
+                            reportErrorInContext(ParserError.Syntax, context, "@crowd open= must be true or false");
+                        }
+                        item_context.crowd = crowd;
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "anim") or std.mem.eql(u8, attrname, "effect")) {
                     if (attr_it.next()) |effectstr| {
                         var spec = item_context.animation orelse animation.ItemSpec{};
@@ -877,7 +914,8 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
 
     const consumes_pending_animation = std.mem.eql(u8, parsing_item_context.directive, "@box") or
         std.mem.eql(u8, parsing_item_context.directive, "@pop") or
-        std.mem.eql(u8, parsing_item_context.directive, "@bg");
+        std.mem.eql(u8, parsing_item_context.directive, "@bg") or
+        std.mem.eql(u8, parsing_item_context.directive, "@crowd");
     if (consumes_pending_animation) {
         if (context.pending_animation) |pending| {
             if (parsing_item_context.animation == null) parsing_item_context.animation = pending;
@@ -997,6 +1035,12 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         return;
     }
 
+    if (std.mem.eql(u8, parsing_item_context.directive, "@crowd")) {
+        try finalizeCrowdSpec(parsing_item_context, context);
+        _ = try commitItemToSlide(parsing_item_context, context);
+        return;
+    }
+
     // @bg is just for convenience. x=0, y=0, w=render_width, h=render_hight
     if (std.mem.eql(u8, parsing_item_context.directive, "@bg")) {
         // well, we can see if fun features emerge when we do all the merges
@@ -1020,13 +1064,67 @@ fn commitItemToSlide(parsing_item_context: *slides.ItemContext, parser_context: 
     if (std.mem.eql(u8, parsing_item_context.directive, "@bg")) {
         slide_item.kind = .background;
     }
-    // log.info("\n\n\n ADDING {s} as {any}", .{ parsing_item_context.directive, slide_item.kind });
-    try parser_context.current_slide.items.?.append(parser_context.allocator, slide_item.*);
-
+    if (std.mem.eql(u8, parsing_item_context.directive, "@crowd")) {
+        slide_item.kind = .crowd;
+    }
+    if (slide_item.kind == .crowd) {
+        for (parser_context.current_slide.items.?.items) |existing| {
+            if (existing.kind == .crowd) {
+                reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, parser_context, "a slide can contain only one @crowd item");
+                return ParserError.Syntax;
+            }
+        }
+        const crowd = slide_item.crowd.?;
+        if (crowd.kind == .poll) {
+            for (parser_context.slideshow.slides.items) |existing_slide| {
+                if (existing_slide.items) |existing_items| {
+                    for (existing_items.items) |existing| {
+                        const existing_crowd = existing.crowd orelse continue;
+                        if (existing_crowd.kind == .poll and std.mem.eql(u8, existing_crowd.id, crowd.id)) {
+                            reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, parser_context, "@crowd poll id= must be unique across the deck");
+                            return ParserError.Syntax;
+                        }
+                    }
+                }
+            }
+        }
+    }
     slide_item.sanityCheck() catch |err| {
         reportErrorInParsingContext(err, parsing_item_context, parser_context, "item sanity check failed");
+        return err;
     };
+    // log.info("\n\n\n ADDING {s} as {any}", .{ parsing_item_context.directive, slide_item.kind });
+    try parser_context.current_slide.items.?.append(parser_context.allocator, slide_item.*);
     return slide_item; // just FYI
+}
+
+fn finalizeCrowdSpec(item_context: *slides.ItemContext, parser_context: *ParserContext) !void {
+    var crowd = item_context.crowd orelse return ParserError.Syntax;
+    const body = std.mem.trim(u8, item_context.text orelse "", " \t\r\n");
+
+    if (crowd.kind == .join) {
+        crowd.prompt = if (body.len > 0) body else "Join the room";
+        item_context.crowd = crowd;
+        return;
+    }
+
+    var choices = std.ArrayList([]const u8).empty;
+    defer choices.deinit(parser_context.allocator);
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "- ")) {
+            const choice = std.mem.trim(u8, line[2..], " \t");
+            if (choice.len > 0) try choices.append(parser_context.allocator, choice);
+        } else if (crowd.prompt.len == 0) {
+            crowd.prompt = line;
+        } else {
+            reportErrorInParsingContext(ParserError.Syntax, item_context, parser_context, "poll choices must start with `- `");
+        }
+    }
+    crowd.choices = try choices.toOwnedSlice(parser_context.allocator);
+    item_context.crowd = crowd;
 }
 
 test "animation annotations and slide transitions are parsed" {
@@ -1109,4 +1207,83 @@ test "text shadows inherit from item templates and can be disabled" {
     try std.testing.expectApproxEqAbs(@as(f32, 2), inherited.offset.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 3), inherited.offset.y, 0.0001);
     try std.testing.expect(!items[1].text_shadow.?.enabled);
+}
+
+test "crowd join and multiline poll directives are parsed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@crowd join x=120 y=90 w=1680 h=900
+        \\Point your camera here
+        \\@slide
+        \\@crowd poll id=architecture open=false x=160 y=120 w=1600 h=840
+        \\What should we build next?
+        \\- A tiny compiler
+        \\- A moon base
+        \\- Both, obviously
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+
+    const join = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SlideItemKind.crowd, join.kind);
+    try std.testing.expectEqual(slides.CrowdKind.join, join.crowd.?.kind);
+    try std.testing.expectEqualStrings("Point your camera here", join.crowd.?.prompt);
+
+    const poll = slideshow.slides.items[1].items.?.items[0];
+    try std.testing.expectEqual(slides.SlideItemKind.crowd, poll.kind);
+    try std.testing.expectEqual(slides.CrowdKind.poll, poll.crowd.?.kind);
+    try std.testing.expectEqualStrings("architecture", poll.crowd.?.id);
+    try std.testing.expectEqualStrings("What should we build next?", poll.crowd.?.prompt);
+    try std.testing.expect(!poll.crowd.?.initially_open);
+    try std.testing.expectEqual(@as(usize, 3), poll.crowd.?.choices.len);
+    try std.testing.expectEqualStrings("A moon base", poll.crowd.?.choices[1]);
+}
+
+test "invalid crowd polls report parser errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@crowd poll
+        \\Missing an id and enough choices
+        \\- Lonely choice
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expect(context.parser_errors.items.len >= 1);
+}
+
+test "malformed crowd directives do not recommit the previous item" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@box text=Safe
+        \\@crowd wat
+        \\orphaned text
+        \\@slide
+        \\@box text=Next
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expect(context.parser_errors.items.len >= 1);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+    try std.testing.expectEqual(@as(usize, 1), slideshow.slides.items[0].items.?.items.len);
+    try std.testing.expectEqualStrings("Safe", slideshow.slides.items[0].items.?.items[0].text.?);
 }

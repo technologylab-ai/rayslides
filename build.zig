@@ -13,6 +13,8 @@ pub fn build(b: *std.Build) void {
 
     exe_mod.addCSourceFile(.{ .file = b.path("src/pdf/pdfgen.c") });
     exe_mod.addIncludePath(b.path("src/pdf"));
+    exe_mod.addCSourceFile(.{ .file = b.path("src/qr/qrcodegen.c") });
+    exe_mod.addIncludePath(b.path("src/qr"));
 
     const exe = b.addExecutable(.{
         .name = "rayslides",
