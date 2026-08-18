@@ -60,7 +60,7 @@
 # -------------------------------------------------------------
 @bg img=assets/bglb.jpg
 @pop slide_number
-@pushslide content
+@pushslide content transition=slide-left duration=0.35
 
 # -------------------------------------------------------------
 # -- thankyou slide template
@@ -97,6 +97,7 @@
 # -------------------------------------------------------------
 @popslide content
 @pop slide_title text=~~**Overview**~~
+@anim(fade) by=bullet duration=0.25
 @pop bigbox bullet_symbol=- color=#202020FF
 - **Presentations are created in a simple, markdown-based text format**
         - <#808080FF>_makes your slides totally GitHub-friendly_</>
@@ -138,6 +139,7 @@ _
 _
 - **and so on**, _and on_
 
+@anim(slide-left) by=bullet after=0.45 duration=0.2
 @pop rightbox bullet_symbol=*
 _
 _
@@ -160,6 +162,7 @@ _
 @popslide content
 @pop slide_title text=**Easier than Bullets**
 
+@anim(slide-up) duration=0.4
 @box img=assets/godotscr2.png x=400 y=150 w=1475 h=840
 
 @pop leftbox w=260 h=800
@@ -218,4 +221,3 @@ _
 @box img=assets/GitHub-Mark-64px.png x=1120 y=45 w=64 h=64
 # -------------------------------------------------------------
 # eof commits the slide
-

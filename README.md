@@ -35,12 +35,13 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>SHIFT</kbd> + <kbd>L</kbd> | Iterate laserpointer sizes |
 | <kbd>C</kbd> | Clear laserpointer drawing |
 | <kbd>B</kbd> | Toggle Beast Mode* |
-| <kbd><-</kbd> | Goto previous slide |
-| <kbd>PgUp</kbd> | Goto previous slide |
-| <kbd>Backspace</kbd> | Goto previous slide |
-| <kbd>-></kbd> | Goto next slide |
-| <kbd>PgDown</kbd> | Goto next slide |
-| <kbd>Space</kbd> | Goto next slide |
+| <kbd><-</kbd> | Hide the previous animation step or goto the previous slide |
+| <kbd>PgUp</kbd> | Hide the previous animation step or goto the previous slide |
+| <kbd>Backspace</kbd> | Hide the previous animation step or goto the previous slide |
+| <kbd>-></kbd> | Reveal the next animation step or goto the next slide |
+| <kbd>PgDown</kbd> | Reveal the next animation step or goto the next slide |
+| <kbd>Space</kbd> | Reveal the next animation step or goto the next slide |
+| Left click | Reveal the next animation step or goto the next slide |
 | <kbd>1</kbd> | Goto first slide |
 | <kbd>0</kbd> | Goto last slide |
 | <kbd>G</kbd> | Goto first slide |
@@ -77,6 +78,79 @@ _**Bold italic**_ text.
 Internal render buffer resolution is 1920x1080. So always use coordinates in this range.
 
 More documentation to follow.
+
+## Animations and slide states
+
+Animations add reveal states to one logical slide; they do not duplicate the
+slide. Unannotated content is visible immediately when the slide enters. A
+one-shot `@anim(...)` annotation applies to the next `@box`, `@pop`, or `@bg`:
+
+```text
+@pop slide_title text=Why this matters
+
+@anim(fade) by=bullet duration=0.25
+@pop bigbox
+Introductory text stays visible.
+- First click reveals this bullet
+- The next click reveals this one
+    - Nested bullets are steps too
+```
+
+The forward controls (right arrow, Page Down, Space, or left click) reveal the
+next step before moving to the next slide. Backward controls hide steps before
+moving to the previous slide. The available effects are `appear`, `fade`,
+`slide-left`, `slide-right`, `slide-up`, and `slide-down`. Animated elements
+using a slide effect also fade; for example, `slide-left` enters from the right
+and travels left. `appear` is instantaneous. The default effect is `fade`, the
+default grouping is `item`, and the default duration is 0.3 seconds.
+
+`by=` controls how a text box is split into states:
+
+- `by=item` (the default) reveals the whole box or image together.
+- `by=line` reveals each non-empty source line.
+- `by=bullet` reveals only bullet lines; surrounding lines remain static.
+
+Steps wait for a presentation action by default. Add `after=` to start them
+automatically after the previous animation finishes:
+
+```text
+@anim(slide-left) by=bullet after=0.8 duration=0.25
+@box x=100 y=200 w=1200 h=700
+- Appears automatically
+- Then this appears 0.8 seconds after the first animation finishes
+```
+
+The same annotation works on other items, including images:
+
+```text
+@anim(slide-up) duration=0.4
+@box img=assets/diagram.png x=800 y=250 w=700
+```
+
+For compact cases, animation properties can be placed directly on the item:
+
+```text
+@box img=assets/diagram.png x=800 y=250 anim=fade after=1 duration=0.4
+```
+
+Slide transitions are properties of a slide boundary. Put them on a slide
+template to reuse them or override them on one slide:
+
+```text
+@pushslide content transition=slide-left duration=0.35
+
+@popslide content
+# ...slide contents...
+
+@popslide content transition=fade duration=0.5
+# ...this slide fades in while the prior slide fades out...
+```
+
+Transitions use the same effect names. PDF export renders the final state of
+each logical slide, so builds still produce one PDF page per source slide. A
+transition lasts 0.4 seconds by default, automatically reverses direction when
+navigating backwards, and can be disabled for one slide with
+`transition=none`.
 
 Example of the current text format - see [test_public.sld](./testslides/test_public.sld) for a more realistic example:
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const TextureCache = @import("texturecache.zig");
 const slides = @import("slides.zig");
+const animation = @import("animation.zig");
 const markdownlineparser = @import("markdownlineparser.zig");
 const my_fonts = @import("fonts.zig");
 
@@ -41,17 +42,40 @@ const RenderElement = struct {
     bullet_color: ?rl.Color = null,
     texture: ?rl.Texture2D = null,
     bullet_symbol: [*:0]const u8 = "",
+    reveal_step: usize = 0,
 };
 
 const RenderedSlide = struct {
     elements: std.ArrayList(RenderElement) = undefined,
+    steps: std.ArrayList(animation.Step) = undefined,
+    transition: animation.Transition = .{},
 
     fn new(allocator: std.mem.Allocator) !*RenderedSlide {
         var self: *RenderedSlide = try allocator.create(RenderedSlide);
         self.* = .{};
         self.elements = std.ArrayList(RenderElement).empty;
+        self.steps = std.ArrayList(animation.Step).empty;
         return self;
     }
+};
+
+pub const RevealState = struct {
+    visible_through: usize = 0,
+    active_step: ?usize = null,
+    active_progress: f32 = 1.0,
+};
+
+pub const TransitionState = struct {
+    previous_slide: ?i32 = null,
+    previous_step: usize = 0,
+    spec: animation.Transition = .{},
+    progress: f32 = 1.0,
+    direction: i8 = 1,
+};
+
+const RenderTransform = struct {
+    offset: rl.Vector2 = .{ .x = 0, .y = 0 },
+    opacity: f32 = 1.0,
 };
 
 pub const SlideshowRenderer = struct {
@@ -89,23 +113,21 @@ pub const SlideshowRenderer = struct {
         for (slideshow.slides.items, 0..) |slide, i| {
             const slide_number = i + 1;
 
-            if (slide.items) |items_list| {
-                if (items_list.items.len == 0) {
-                    log.warn("Slide {d} has NO ITEMS!", .{slide_number});
-                    continue;
-                }
-            } else {
+            if (slide.items == null or slide.items.?.items.len == 0) {
                 log.warn("Slide {d} has NO ITEMS!", .{slide_number});
             }
 
             // add a renderedSlide
             const renderSlide = try RenderedSlide.new(self.allocator);
+            renderSlide.transition = slide.transition;
 
-            for (slide.items.?.items) |item| {
-                switch (item.kind) {
-                    .background => try self.createBg(renderSlide, item, slideshow_filp),
-                    .textbox => try self.preRenderTextBlock(renderSlide, item, slide_number),
-                    .img => try self.createImg(renderSlide, item, slideshow_filp),
+            if (slide.items) |items| {
+                for (items.items) |item| {
+                    switch (item.kind) {
+                        .background => try self.createBg(renderSlide, item, slideshow_filp),
+                        .textbox => try self.preRenderTextBlock(renderSlide, item, slide_number),
+                        .img => try self.createImg(renderSlide, item, slideshow_filp),
+                    }
                 }
             }
 
@@ -115,17 +137,46 @@ pub const SlideshowRenderer = struct {
         log.debug("LEAVE preRender with {d} slides", .{self.renderedSlides.items.len});
     }
 
+    pub fn stepCount(self: *const SlideshowRenderer, slide_number: i32) usize {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return 0;
+        return self.renderedSlides.items[@intCast(slide_number)].steps.items.len;
+    }
+
+    pub fn stepAt(self: *const SlideshowRenderer, slide_number: i32, step_index: usize) ?animation.Step {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len or step_index == 0) return null;
+        const steps = self.renderedSlides.items[@intCast(slide_number)].steps.items;
+        if (step_index > steps.len) return null;
+        return steps[step_index - 1];
+    }
+
+    pub fn transitionForSlide(self: *const SlideshowRenderer, slide_number: i32) animation.Transition {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return .{};
+        return self.renderedSlides.items[@intCast(slide_number)].transition;
+    }
+
+    fn appendStep(self: *SlideshowRenderer, renderSlide: *RenderedSlide, spec: animation.ItemSpec) !usize {
+        try renderSlide.steps.append(self.allocator, animation.Step.fromItem(spec));
+        return renderSlide.steps.items.len;
+    }
+
+    fn wholeItemStep(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem) !usize {
+        if (item.animation) |spec| return try self.appendStep(renderSlide, spec);
+        return 0;
+    }
+
     fn createBg(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
         log.info("pre-rendering bg {}", .{item});
         if (item.img_path) |p| {
             const result = try self.texture_cache.getImageTexture(p, slideshow_filp);
             if (result) |tex_info| {
-                try renderSlide.elements.append(self.allocator, RenderElement{ .kind = .background, .texture = tex_info.texture });
+                const reveal_step = try self.wholeItemStep(renderSlide, item);
+                try renderSlide.elements.append(self.allocator, RenderElement{ .kind = .background, .texture = tex_info.texture, .reveal_step = reveal_step });
             }
         } else {
             if (item.color) |color| {
                 log.info("bg has color {}", .{color});
-                try renderSlide.elements.append(self.allocator, RenderElement{ .kind = .background, .color = color });
+                const reveal_step = try self.wholeItemStep(renderSlide, item);
+                try renderSlide.elements.append(self.allocator, RenderElement{ .kind = .background, .color = color, .reveal_step = reveal_step });
             } else {
                 log.info("bg has NO COLOR", .{});
             }
@@ -140,9 +191,16 @@ pub const SlideshowRenderer = struct {
         const spaces_per_indent: usize = 4;
         var fontSize: i32 = 0;
         var line_height_bullet_width: rl.Vector2 = .{ .x = 0.0, .y = 0.0 };
+        var item_reveal_step: usize = 0;
+        if (item.animation) |spec| {
+            if (spec.by == .item) item_reveal_step = try self.appendStep(renderSlide, spec);
+        }
 
         // box without text, but with color: render a colored box!
         if (item.text == null and item.color != null) {
+            if (item_reveal_step == 0 and item.animation != null) {
+                item_reveal_step = try self.appendStep(renderSlide, item.animation.?);
+            }
             log.debug("preRenderTextBlock (color) creating RenderElement", .{});
             try renderSlide.elements.append(self.allocator, RenderElement{
                 .kind = .text,
@@ -153,6 +211,7 @@ pub const SlideshowRenderer = struct {
                 .line_height_factor = null,
                 .text = null,
                 .color = item.color,
+                .reveal_step = item_reveal_step,
             });
             log.debug("LEAVE preRenderTextBlock (color) for slide {d}", .{slide_number});
             return;
@@ -202,6 +261,7 @@ pub const SlideshowRenderer = struct {
                 .text = "", // will be overridden immediately
                 .current_line_height = line_height_bullet_width.y * line_height_factor, // will be overridden immediately but needed if text starts with empty line(s)
                 .current_line_height_factor = line_height_factor,
+                .reveal_step = item_reveal_step,
             };
 
             // slide number
@@ -221,6 +281,11 @@ pub const SlideshowRenderer = struct {
                 //    - starts with `-` or `>`
                 var bullet_indent_in_spaces: usize = 0;
                 const is_bulleted = self.countIndentOfBullet(line, &bullet_indent_in_spaces);
+                var line_reveal_step = item_reveal_step;
+                if (item.animation) |spec| {
+                    const has_visible_content = std.mem.trim(u8, line, " \t").len > 0;
+                    if (has_visible_content and startsLineStep(spec.by, is_bulleted)) line_reveal_step = try self.appendStep(renderSlide, spec);
+                }
                 const indent_level = bullet_indent_in_spaces / spaces_per_indent;
                 const indent_in_pixels = line_height_bullet_width.x * @as(f32, @floatFromInt(indent_level));
                 var available_width = item.size.x - indent_in_pixels;
@@ -231,6 +296,7 @@ pub const SlideshowRenderer = struct {
                 layoutContext.underline_width = @intCast(underline_width);
                 layoutContext.color = color;
                 layoutContext.text = line;
+                layoutContext.reveal_step = line_reveal_step;
 
                 if (is_bulleted) {
                     // 1. add indented bullet symbol at the current pos
@@ -242,6 +308,7 @@ pub const SlideshowRenderer = struct {
                         .underline_width = underline_width,
                         .text = bulletSymbol,
                         .color = bulletColor,
+                        .reveal_step = line_reveal_step,
                     });
                     // 2. increase indent by 1 and add indented text block
                     available_width -= line_height_bullet_width.x;
@@ -282,6 +349,7 @@ pub const SlideshowRenderer = struct {
         underline_width: usize = 0,
         color: rl.Color = .blank,
         text: []const u8 = undefined,
+        reveal_step: usize = 0,
     };
 
     fn renderMdBlock(self: *SlideshowRenderer, renderSlide: *RenderedSlide, layoutContext: *TextLayoutContext) !void {
@@ -317,6 +385,7 @@ pub const SlideshowRenderer = struct {
                 .color = default_color,
                 .fontSize = layoutContext.fontSize,
                 .underline_width = @intCast(layoutContext.underline_width),
+                .reveal_step = layoutContext.reveal_step,
             };
 
             for (spans.items) |span| {
@@ -607,6 +676,7 @@ pub const SlideshowRenderer = struct {
             };
 
             if (result) |tex_info| {
+                const reveal_step = try self.wholeItemStep(renderSlide, item);
                 var final_size = item.size;
 
                 // Calculate dimensions if needed
@@ -648,66 +718,98 @@ pub const SlideshowRenderer = struct {
                     .position = item.position,
                     .size = final_size,
                     .texture = tex_info.texture,
+                    .reveal_step = reveal_step,
                 });
             }
         }
     }
 
-    pub fn render(self: *SlideshowRenderer, slide_number: i32, pos: rl.Vector2, size: rl.Vector2, internal_render_size: rl.Vector2) !void {
-        if (self.renderedSlides.items.len == 0) {
-            // log.debug("0 renderedSlides", .{});
-            return;
-        }
+    pub fn render(
+        self: *SlideshowRenderer,
+        slide_number: i32,
+        reveal: RevealState,
+        transition: TransitionState,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+    ) !void {
+        if (self.renderedSlides.items.len == 0 or slide_number < 0 or slide_number >= self.renderedSlides.items.len) return;
 
-        const slide = self.renderedSlides.items[@as(usize, @intCast(slide_number))];
-        if (slide.elements.items.len == 0) {
-            log.debug("0 elements", .{});
-            return;
-        }
+        const transition_progress = animation.eased(transition.progress);
+        const transforms = slideTransitionTransforms(transition.spec.effect, transition_progress, transition.direction, size);
 
-        // TODO: pass that in from G
-        const img_tint_col: rl.Color = .white;
-        const img_border_col: rl.Color = .blank;
+        if (transition.previous_slide) |previous_slide| {
+            if (transition.spec.effect != .none and transition.spec.effect != .appear and transition_progress < 1.0) {
+                try self.renderOneSlide(
+                    previous_slide,
+                    .{ .visible_through = transition.previous_step },
+                    transforms.outgoing,
+                    pos,
+                    size,
+                    internal_render_size,
+                );
+            }
+        }
+        try self.renderOneSlide(slide_number, reveal, transforms.incoming, pos, size, internal_render_size);
+    }
+
+    fn renderOneSlide(
+        self: *SlideshowRenderer,
+        slide_number: i32,
+        reveal: RevealState,
+        slide_transform: RenderTransform,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+    ) !void {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return;
+        const slide = self.renderedSlides.items[@intCast(slide_number)];
 
         for (slide.elements.items) |element| {
+            var progress: f32 = 1.0;
+            if (element.reveal_step > 0) {
+                if (reveal.active_step != null and reveal.active_step.? == element.reveal_step) {
+                    progress = reveal.active_progress;
+                } else if (element.reveal_step > reveal.visible_through) {
+                    progress = 0.0;
+                }
+            }
+            if (progress <= 0) continue;
+
+            const effect = if (element.reveal_step > 0) slide.steps.items[element.reveal_step - 1].effect else animation.Effect.none;
+            const item_transform = itemAnimationTransform(effect, animation.eased(progress), size, internal_render_size);
+            const transform = combineTransforms(slide_transform, item_transform);
+            if (transform.opacity <= 0) continue;
+
             switch (element.kind) {
                 .background => {
-                    // log.debug("rendering background", .{});
-                    if (element.texture) |txt| {
-                        renderImg(.{ .x = 0.0, .y = 0.0 }, internal_render_size, txt, img_tint_col, img_border_col, pos, size, internal_render_size);
-                    } else {
-                        // log.debug("rendering color background", .{});
-                        if (element.color) |color| {
-                            renderBgColor(color, internal_render_size, pos, size, internal_render_size);
-                        } else {
-                            //. empty
-                        }
+                    if (element.texture) |texture| {
+                        renderImg(.{ .x = 0.0, .y = 0.0 }, internal_render_size, texture, .white, .blank, pos, size, internal_render_size, transform);
+                    } else if (element.color) |color| {
+                        renderBgColor(color, pos, size, transform);
                     }
                 },
-                .text => {
-                    // log.debug("rendering text", .{});
-                    self.renderText(&element, pos, size, internal_render_size);
-                },
+                .text => self.renderText(&element, pos, size, internal_render_size, transform),
                 .image => {
-                    // log.debug("rendering image", .{});
-                    if (element.texture) |txt| {
-                        renderImg(element.position, element.size, txt, img_tint_col, img_border_col, pos, size, internal_render_size);
+                    if (element.texture) |texture| {
+                        renderImg(element.position, element.size, texture, .white, .blank, pos, size, internal_render_size, transform);
                     }
                 },
             }
         }
     }
 
-    fn renderText(self: *SlideshowRenderer, item: *const RenderElement, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) void {
+    fn renderText(self: *SlideshowRenderer, item: *const RenderElement, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2, transform: RenderTransform) void {
         if (item.text == null and item.color == null) {
             return;
         }
         // new: box without text, but with color: make a colored box
         if (item.text == null and item.color != null) {
-            const startpos = slidePosToRenderPos(item.position, slide_tl, slide_size, internal_render_size);
+            const startpos = translated(slidePosToRenderPos(item.position, slide_tl, slide_size, internal_render_size), transform.offset);
+            const rendered_size = slideSizeToRenderSize(item.size, slide_size, internal_render_size);
             rl.drawRectangleRec(
-                .{ .x = startpos.x, .y = startpos.y, .width = item.size.x, .height = item.size.y },
-                item.color.?,
+                .{ .x = startpos.x, .y = startpos.y, .width = rendered_size.x, .height = rendered_size.y },
+                colorWithOpacity(item.color.?, transform.opacity),
             );
             return;
         }
@@ -742,8 +844,8 @@ pub const SlideshowRenderer = struct {
 
         // diplay the text
         const t = item.text.?;
-        const startpos = slidePosToRenderPos(item.position, slide_tl, slide_size, internal_render_size);
-        const color = col.?;
+        const startpos = translated(slidePosToRenderPos(item.position, slide_tl, slide_size, internal_render_size), transform.offset);
+        const color = colorWithOpacity(col.?, transform.opacity);
 
         rl.drawTextEx(font, @as([:0]const u8, t), startpos, fsize, 0.0, color);
 
@@ -762,12 +864,103 @@ pub const SlideshowRenderer = struct {
 
             // imgui.igRenderFrame(slidePosToRenderPos(tl, slide_tl, slide_size, internal_render_size), slidePosToRenderPos(br, slide_tl, slide_size, internal_render_size), bgcolu32, true, 0.0);
 
-            const line_startpos = slidePosToRenderPos(tl, slide_tl, slide_size, internal_render_size);
-            const line_endpos = slidePosToRenderPos(br, slide_tl, slide_size, internal_render_size);
+            const line_startpos = translated(slidePosToRenderPos(tl, slide_tl, slide_size, internal_render_size), transform.offset);
+            const line_endpos = translated(slidePosToRenderPos(br, slide_tl, slide_size, internal_render_size), transform.offset);
             rl.drawLineEx(line_startpos, line_endpos, 2.0, color);
         }
     }
 };
+
+const SlideTransitionTransforms = struct {
+    incoming: RenderTransform = .{},
+    outgoing: RenderTransform = .{},
+};
+
+fn slideTransitionTransforms(effect: animation.Effect, progress: f32, direction: i8, slide_size: rl.Vector2) SlideTransitionTransforms {
+    var result = SlideTransitionTransforms{};
+    const direction_factor: f32 = if (direction < 0) -1.0 else 1.0;
+    switch (effect) {
+        .none, .appear => {},
+        .fade => {
+            result.incoming.opacity = progress;
+            result.outgoing.opacity = 1.0 - progress;
+        },
+        .slide_left => {
+            result.incoming.offset.x = (1.0 - progress) * slide_size.x * direction_factor;
+            result.outgoing.offset.x = -progress * slide_size.x * direction_factor;
+        },
+        .slide_right => {
+            result.incoming.offset.x = -(1.0 - progress) * slide_size.x * direction_factor;
+            result.outgoing.offset.x = progress * slide_size.x * direction_factor;
+        },
+        .slide_up => {
+            result.incoming.offset.y = (1.0 - progress) * slide_size.y * direction_factor;
+            result.outgoing.offset.y = -progress * slide_size.y * direction_factor;
+        },
+        .slide_down => {
+            result.incoming.offset.y = -(1.0 - progress) * slide_size.y * direction_factor;
+            result.outgoing.offset.y = progress * slide_size.y * direction_factor;
+        },
+    }
+    return result;
+}
+
+fn itemAnimationTransform(effect: animation.Effect, progress: f32, slide_size: rl.Vector2, internal_render_size: rl.Vector2) RenderTransform {
+    var result = RenderTransform{};
+    const travel_x = 90.0 * slide_size.x / internal_render_size.x;
+    const travel_y = 90.0 * slide_size.y / internal_render_size.y;
+    switch (effect) {
+        .none => {},
+        .appear => result.opacity = if (progress >= 1.0) 1.0 else 0.0,
+        .fade => result.opacity = progress,
+        .slide_left => {
+            result.offset.x = (1.0 - progress) * travel_x;
+            result.opacity = progress;
+        },
+        .slide_right => {
+            result.offset.x = -(1.0 - progress) * travel_x;
+            result.opacity = progress;
+        },
+        .slide_up => {
+            result.offset.y = (1.0 - progress) * travel_y;
+            result.opacity = progress;
+        },
+        .slide_down => {
+            result.offset.y = -(1.0 - progress) * travel_y;
+            result.opacity = progress;
+        },
+    }
+    return result;
+}
+
+fn combineTransforms(a: RenderTransform, b: RenderTransform) RenderTransform {
+    return .{
+        .offset = .{ .x = a.offset.x + b.offset.x, .y = a.offset.y + b.offset.y },
+        .opacity = a.opacity * b.opacity,
+    };
+}
+
+fn translated(pos: rl.Vector2, offset: rl.Vector2) rl.Vector2 {
+    return .{ .x = pos.x + offset.x, .y = pos.y + offset.y };
+}
+
+fn colorWithOpacity(color: rl.Color, opacity: f32) rl.Color {
+    var result = color;
+    result.a = @intFromFloat(@round(@as(f32, @floatFromInt(color.a)) * animation.clampProgress(opacity)));
+    return result;
+}
+
+fn startsLineStep(grouping: animation.Grouping, is_bulleted: bool) bool {
+    return grouping == .line or (grouping == .bullet and is_bulleted);
+}
+
+test "line and bullet grouping leave surrounding content static" {
+    try std.testing.expect(startsLineStep(.line, false));
+    try std.testing.expect(startsLineStep(.line, true));
+    try std.testing.expect(!startsLineStep(.bullet, false));
+    try std.testing.expect(startsLineStep(.bullet, true));
+    try std.testing.expect(!startsLineStep(.item, true));
+}
 
 pub fn slidePosToRenderPos(pos: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) rl.Vector2 {
     var my_tl: rl.Vector2 = .{
@@ -790,9 +983,9 @@ pub fn slideSizeToRenderSize(size: rl.Vector2, slide_size: rl.Vector2, internal_
     return my_size;
 }
 
-fn renderImg(pos: rl.Vector2, size: rl.Vector2, texture: rl.Texture2D, tint_color: rl.Color, border_color: rl.Color, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) void {
+fn renderImg(pos: rl.Vector2, size: rl.Vector2, texture: rl.Texture2D, tint_color: rl.Color, border_color: rl.Color, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2, transform: RenderTransform) void {
     // position the img in the slide
-    const my_tl = slidePosToRenderPos(pos, slide_tl, slide_size, internal_render_size);
+    const my_tl = translated(slidePosToRenderPos(pos, slide_tl, slide_size, internal_render_size), transform.offset);
     const my_size = slideSizeToRenderSize(size, slide_size, internal_render_size);
 
     // imgui.igSetCursorPos(my_tl);
@@ -808,19 +1001,16 @@ fn renderImg(pos: rl.Vector2, size: rl.Vector2, texture: rl.Texture2D, tint_colo
         // rotation
         0.0,
         // tint
-        tint_color,
+        colorWithOpacity(tint_color, transform.opacity),
     );
 
     // TODO: Border
     _ = border_color;
 }
 
-fn renderBgColor(bgcol: rl.Color, size: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) void {
-    // TODO: might have to translate to render coordinates!!!
-    _ = internal_render_size;
-    _ = size;
+fn renderBgColor(bgcol: rl.Color, slide_tl: rl.Vector2, slide_size: rl.Vector2, transform: RenderTransform) void {
     rl.drawRectangleRec(
-        .{ .x = slide_tl.x, .y = slide_tl.y, .width = slide_size.x, .height = slide_size.y },
-        bgcol,
+        .{ .x = slide_tl.x + transform.offset.x, .y = slide_tl.y + transform.offset.y, .width = slide_size.x, .height = slide_size.y },
+        colorWithOpacity(bgcol, transform.opacity),
     );
 }

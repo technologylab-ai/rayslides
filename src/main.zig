@@ -9,6 +9,8 @@ const fonts = @import("fonts.zig");
 const parser = @import("parser.zig");
 const renderer = @import("renderer.zig");
 const slides = @import("slides.zig");
+const animation = @import("animation.zig");
+const playback = @import("playback.zig");
 const SlideShow = slides.SlideShow;
 
 const log = std.log.scoped(.main);
@@ -17,6 +19,7 @@ const ExportController = struct {
     gpa: std.mem.Allocator,
     running: bool,
     return_to_slide_number: i32,
+    return_to_step_number: usize,
     current_slide_number: i32,
     num_slides: usize,
     export_dir: []const u8,
@@ -36,6 +39,7 @@ const ExportController = struct {
             .running = false,
             .export_dir = try gpa.dupe(u8, ex_dir),
             .return_to_slide_number = 0,
+            .return_to_step_number = 0,
             .current_slide_number = 0,
             .num_slides = 0,
         };
@@ -60,9 +64,10 @@ const ExportController = struct {
         self.exported_imgs = null;
     }
 
-    pub fn start(self: *ExportController, current_slide_number: i32, num_slides: usize) void {
+    pub fn start(self: *ExportController, current_slide_number: i32, current_step_number: usize, num_slides: usize) void {
         self.running = true;
         self.return_to_slide_number = current_slide_number;
+        self.return_to_step_number = current_step_number;
         self.current_slide_number = 0;
         self.num_slides = num_slides;
         self.exported_imgs = std.ArrayListUnmanaged([]const u8).empty;
@@ -380,6 +385,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                             log.err("PDF-export: could not retrieve slideshow name, it's null!!!", .{});
                         }
                         G.current_slide = export_controller.return_to_slide_number;
+                        G.playback.enterSlide(null, 0, export_controller.return_to_step_number, .{}, 1, rl.getTime());
                         export_controller.clean_img_list();
                     } else {
                         G.current_slide = export_controller.current_slide_number;
@@ -393,7 +399,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (rl.isKeyPressed(.s)) {
             if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                 if (export_controller.running == false) {
-                    export_controller.start(G.current_slide, G.slideshow.slides.items.len);
+                    export_controller.start(G.current_slide, G.playback.visible_step, G.slideshow.slides.items.len);
                     G.current_slide = 0;
                 }
             } else {
@@ -423,10 +429,19 @@ pub fn main(init: std.process.Init) anyerror!void {
                 G.slide_renderer.preRender(G.slideshow, slideshow_filp) catch |err| {
                     log.err("Pre-rendering failed: {any}", .{err});
                 };
+                if (G.slideshow.slides.items.len > 0) {
+                    if (G.current_slide < 0 or G.current_slide >= G.slideshow.slides.items.len) G.current_slide = 0;
+                    const now = rl.getTime();
+                    G.playback.enterSlide(null, 0, 0, G.slide_renderer.transitionForSlide(G.current_slide), 1, now);
+                }
                 log.info("PRE-RENDERED!!!!", .{});
                 is_pre_rendered = true;
             }
         }
+
+        const now = rl.getTime();
+        G.playback.settle(now);
+        if (!export_controller.running) updateAutomaticReveal(now);
 
         // render slide
         // G.slide_render_width = G.internal_render_size.x - ed_anim.current_size.x;
@@ -439,7 +454,25 @@ pub fn main(init: std.process.Init) anyerror!void {
         const window_size: rl.Vector2 = .{ .x = @floatFromInt(screenWidth), .y = @floatFromInt(screenHeight) };
         const slide_size_in_window = slideSizeInWindow(internal_render_size, window_size);
         const slide_tl = slideAreaTL(internal_render_size, window_size);
-        try G.slide_renderer.render(G.current_slide, slide_tl, slide_size_in_window, internal_render_size);
+        const reveal_state: renderer.RevealState = if (export_controller.running)
+            .{ .visible_through = G.slide_renderer.stepCount(G.current_slide) }
+        else
+            .{
+                .visible_through = G.playback.visible_step,
+                .active_step = G.playback.active_step,
+                .active_progress = G.playback.activeStepProgress(now),
+            };
+        const transition_state: renderer.TransitionState = if (export_controller.running)
+            .{}
+        else
+            .{
+                .previous_slide = G.playback.previous_slide,
+                .previous_step = G.playback.previous_step,
+                .spec = G.playback.transition,
+                .progress = G.playback.transitionProgress(now),
+                .direction = G.playback.direction,
+            };
+        try G.slide_renderer.render(G.current_slide, reveal_state, transition_state, slide_tl, slide_size_in_window, internal_render_size);
         // try G.slide_renderer.render(G.current_slide, .{ .x = 0.0, .y = 0.0 }, .{ .x = @floatFromInt(screenWidth), .y = @floatFromInt(screenHeight) }, .{ .x = 1920, .y = 1080 });
         std.log.debug("window_size: {any}, slideAreaTL: {any}, slideSizeInWindow: {any}, internal_render_size: {any}", .{ window_size, slide_tl, slide_size_in_window, internal_render_size });
         if (beast_mode) {
@@ -464,18 +497,12 @@ pub fn main(init: std.process.Init) anyerror!void {
         //
         // hanlde keys
         //
-        if (rl.isKeyPressed(.space) or rl.isKeyPressed(.right) or rl.isKeyPressed(.page_down)) {
-            G.current_slide += 1;
-            if (G.current_slide >= G.slideshow.slides.items.len) {
-                G.current_slide -= 1;
-            }
+        if (!export_controller.running and (rl.isKeyPressed(.space) or rl.isKeyPressed(.right) or rl.isKeyPressed(.page_down) or (!laser_pointer.show and rl.isMouseButtonPressed(.left)))) {
+            advancePresentation(rl.getTime());
         }
 
-        if (rl.isKeyPressed(.backspace) or rl.isKeyPressed(.left) or rl.isKeyPressed(.page_up)) {
-            G.current_slide -= 1;
-            if (G.current_slide < 0) {
-                G.current_slide = 0;
-            }
+        if (!export_controller.running and (rl.isKeyPressed(.backspace) or rl.isKeyPressed(.left) or rl.isKeyPressed(.page_up))) {
+            reversePresentation(rl.getTime());
         }
 
         // hack for M1 macbook 14" with low resolution set to : 1512 x 981
@@ -518,19 +545,19 @@ pub fn main(init: std.process.Init) anyerror!void {
             break;
         }
 
-        if (rl.isKeyPressed(.one)) {
-            G.current_slide = 0;
+        if (!export_controller.running and rl.isKeyPressed(.one)) {
+            jumpToSlide(0, rl.getTime());
         }
 
-        if (rl.isKeyPressed(.zero)) {
-            G.current_slide = @intCast(G.slideshow.slides.items.len - 1);
+        if (!export_controller.running and G.slideshow.slides.items.len > 0 and rl.isKeyPressed(.zero)) {
+            jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime());
         }
 
-        if (rl.isKeyPressed(.g)) {
+        if (!export_controller.running and G.slideshow.slides.items.len > 0 and rl.isKeyPressed(.g)) {
             if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
-                G.current_slide = @intCast(G.slideshow.slides.items.len - 1);
+                jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime());
             } else {
-                G.current_slide = 0;
+                jumpToSlide(0, rl.getTime());
             }
         }
 
@@ -573,6 +600,62 @@ pub fn main(init: std.process.Init) anyerror!void {
     }
 }
 
+fn updateAutomaticReveal(now: f64) void {
+    const next_step = G.playback.visible_step + 1;
+    const step = G.slide_renderer.stepAt(G.current_slide, next_step) orelse return;
+    if (G.playback.shouldAutoReveal(step, now)) {
+        G.playback.reveal(next_step, step, now);
+    }
+}
+
+fn advancePresentation(now: f64) void {
+    G.playback.settle(now);
+    const next_step = G.playback.visible_step + 1;
+    if (G.slide_renderer.stepAt(G.current_slide, next_step)) |step| {
+        G.playback.reveal(next_step, step, now);
+        return;
+    }
+
+    const next_slide = G.current_slide + 1;
+    if (next_slide < G.slideshow.slides.items.len) {
+        moveToSlide(next_slide, 1, 0, now);
+    }
+}
+
+fn reversePresentation(now: f64) void {
+    G.playback.settle(now);
+    if (G.playback.visible_step > 0) {
+        const step_index = G.playback.visible_step;
+        if (G.slide_renderer.stepAt(G.current_slide, step_index)) |step| {
+            G.playback.hide(step_index, step, now);
+        }
+        return;
+    }
+
+    const previous_slide = G.current_slide - 1;
+    if (previous_slide >= 0) {
+        moveToSlide(previous_slide, -1, G.slide_renderer.stepCount(previous_slide), now);
+    }
+}
+
+fn moveToSlide(target: i32, direction: i8, initial_step: usize, now: f64) void {
+    if (target < 0 or target >= G.slideshow.slides.items.len or target == G.current_slide) return;
+    const old_slide = G.current_slide;
+    const old_step = G.playback.visible_step;
+    const transition: animation.Transition = if (direction > 0)
+        G.slide_renderer.transitionForSlide(target)
+    else
+        G.slide_renderer.transitionForSlide(old_slide);
+    G.current_slide = target;
+    G.playback.enterSlide(old_slide, old_step, initial_step, transition, direction, now);
+}
+
+fn jumpToSlide(target: i32, now: f64) void {
+    if (target < 0 or target >= G.slideshow.slides.items.len) return;
+    G.current_slide = target;
+    G.playback.enterSlide(null, 0, 0, .{}, 1, now);
+}
+
 fn checkAutoReload() !bool {
     if (G.slideshow_filp) |filp| {
         if (filp.len > 0) {
@@ -613,6 +696,7 @@ const AppData = struct {
     slideshow_filp_to_load: ?[]const u8 = null,
     slideshow: *SlideShow = undefined,
     current_slide: i32 = 0,
+    playback: playback.State = .{},
     hot_reload_next_time: f64 = 0.0,
     hot_reload_interval_seconds: f64 = 1.0,
     hot_reload_last_stat: ?std.Io.File.Stat = undefined,
@@ -627,6 +711,7 @@ const AppData = struct {
         self.fonts = try fonts.AvailableFonts.init(.{});
         self.slideshow = try SlideShow.new(self.slideshow_allocator);
         self.slide_renderer = try renderer.SlideshowRenderer.new(self.slideshow_allocator, &self.fonts);
+        self.playback.reset(rl.getTime());
 
         self.editor_memory = try self.allocator.alloc(u8, 128 * 1024);
         self.loaded_content = try self.allocator.alloc(u8, 128 * 1024);

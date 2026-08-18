@@ -1,6 +1,7 @@
 const std = @import("std");
 const slides = @import("slides.zig");
 const fonts = @import("fonts.zig");
+const animation = @import("animation.zig");
 const rl = @import("raylib");
 
 const log = std.log.scoped(.parser);
@@ -74,6 +75,7 @@ pub const ParserContext = struct {
 
     current_context: slides.ItemContext = slides.ItemContext{},
     current_slide: *slides.Slide,
+    pending_animation: ?animation.ItemSpec = null,
 
     allErrorsCstrArray: ?[][*]const u8 = null,
 
@@ -522,7 +524,17 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
     var item_context = slides.ItemContext{};
     var word_it = std.mem.tokenizeAny(u8, line, " \t");
     if (word_it.next()) |directive| {
-        item_context.directive = directive;
+        if (std.mem.startsWith(u8, directive, "@anim(") and std.mem.endsWith(u8, directive, ")")) {
+            item_context.directive = "@anim";
+            var spec = animation.ItemSpec{};
+            spec.effect = animation.parseEffect(directive["@anim(".len .. directive.len - 1]) catch |err| {
+                reportErrorInContext(err, context, "unknown @anim effect");
+                return ParserError.Syntax;
+            };
+            item_context.animation = spec;
+        } else {
+            item_context.directive = directive;
+        }
     } else {
         return ParserError.Internal;
     }
@@ -550,6 +562,15 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
 
     while (word_it.next()) |word| {
         if (!after_text_directive) {
+            if (std.mem.eql(u8, item_context.directive, "@anim") and std.mem.indexOfScalar(u8, word, '=') == null) {
+                var spec = item_context.animation orelse animation.ItemSpec{};
+                spec.effect = animation.parseEffect(word) catch |err| {
+                    reportErrorInContext(err, context, "unknown @anim effect");
+                    continue;
+                };
+                item_context.animation = spec;
+                continue;
+            }
             var attr_it = std.mem.tokenizeScalar(u8, word, '=');
             if (attr_it.next()) |attrname| {
                 if (std.mem.eql(u8, attrname, "x")) {
@@ -675,6 +696,75 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.ratio = ratio_val;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "anim") or std.mem.eql(u8, attrname, "effect")) {
+                    if (attr_it.next()) |effectstr| {
+                        var spec = item_context.animation orelse animation.ItemSpec{};
+                        spec.effect = animation.parseEffect(effectstr) catch |err| {
+                            reportErrorInContext(err, context, "unknown animation effect");
+                            continue;
+                        };
+                        item_context.animation = spec;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "by")) {
+                    if (attr_it.next()) |groupstr| {
+                        var spec = item_context.animation orelse animation.ItemSpec{};
+                        spec.by = animation.parseGrouping(groupstr) catch |err| {
+                            reportErrorInContext(err, context, "unknown animation grouping");
+                            continue;
+                        };
+                        item_context.animation = spec;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "after")) {
+                    if (attr_it.next()) |delaystr| {
+                        const delay = std.fmt.parseFloat(f32, delaystr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse animation after=");
+                            continue;
+                        };
+                        if (delay < 0) {
+                            reportErrorInContext(ParserError.Syntax, context, "animation after= must not be negative");
+                            continue;
+                        }
+                        var spec = item_context.animation orelse animation.ItemSpec{};
+                        spec.after = delay;
+                        item_context.animation = spec;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "transition")) {
+                    if (attr_it.next()) |effectstr| {
+                        var transition = item_context.transition orelse animation.Transition{};
+                        transition.effect = animation.parseEffect(effectstr) catch |err| {
+                            reportErrorInContext(err, context, "unknown slide transition");
+                            continue;
+                        };
+                        item_context.transition = transition;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "duration")) {
+                    if (attr_it.next()) |durationstr| {
+                        const duration = std.fmt.parseFloat(f32, durationstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse animation duration=");
+                            continue;
+                        };
+                        if (duration < 0) {
+                            reportErrorInContext(ParserError.Syntax, context, "animation duration= must not be negative");
+                            continue;
+                        }
+                        if (std.mem.eql(u8, item_context.directive, "@slide") or
+                            std.mem.eql(u8, item_context.directive, "@popslide") or
+                            std.mem.eql(u8, item_context.directive, "@pushslide"))
+                        {
+                            var transition = item_context.transition orelse animation.Transition{};
+                            transition.duration = duration;
+                            item_context.transition = transition;
+                        } else {
+                            var spec = item_context.animation orelse animation.ItemSpec{};
+                            spec.duration = duration;
+                            item_context.animation = spec;
+                        }
+                    }
+                }
             }
         } else {
             try text_words.append(context.allocator, word);
@@ -682,6 +772,9 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
     }
     if (text_words.items.len > 0) {
         item_context.text = try std.mem.join(context.allocator, " ", text_words.items);
+    }
+    if (std.mem.eql(u8, item_context.directive, "@anim") and item_context.animation == null) {
+        item_context.animation = animation.ItemSpec{};
     }
     return item_context;
 }
@@ -719,11 +812,29 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     if (parsing_item_context.bullet_color == null) parsing_item_context.bullet_color = item_context.bullet_color;
     if (parsing_item_context.scale == null) parsing_item_context.scale = item_context.scale;
     if (parsing_item_context.ratio == null) parsing_item_context.ratio = item_context.ratio;
+    if (parsing_item_context.animation == null) parsing_item_context.animation = item_context.animation;
+    if (parsing_item_context.transition == null) parsing_item_context.transition = item_context.transition;
 }
 
 fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
     // .
+    if (parsing_item_context.directive.len == 0) return;
     log.debug("{s} : text=`{?s}`", .{ parsing_item_context.directive, parsing_item_context.text });
+
+    if (std.mem.eql(u8, parsing_item_context.directive, "@anim")) {
+        context.pending_animation = parsing_item_context.animation orelse animation.ItemSpec{};
+        return;
+    }
+
+    const consumes_pending_animation = std.mem.eql(u8, parsing_item_context.directive, "@box") or
+        std.mem.eql(u8, parsing_item_context.directive, "@pop") or
+        std.mem.eql(u8, parsing_item_context.directive, "@bg");
+    if (consumes_pending_animation) {
+        if (context.pending_animation) |pending| {
+            if (parsing_item_context.animation == null) parsing_item_context.animation = pending;
+            context.pending_animation = null;
+        }
+    }
 
     // switch over directives
     if (std.mem.eql(u8, parsing_item_context.directive, "@push")) {
@@ -772,7 +883,9 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         // and make it the current slide
         // after that, clear the current item context
         if (context.first_slide_emitted) {
-            context.current_slide.applyContext(parsing_item_context); //  ignore current item context, it's a @slide
+            var previous_slide_context = parsing_item_context.*;
+            previous_slide_context.transition = null;
+            context.current_slide.applyContext(&previous_slide_context); // ignore the new slide's transition
             try context.slideshow.slides.append(context.allocator, context.current_slide);
         }
         context.first_slide_emitted = true;
@@ -784,6 +897,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                 context.current_slide = try slides.Slide.fromSlide(sld, context.allocator);
                 context.current_slide.pos_in_editor = parsing_item_context.line_offset;
                 context.current_slide.line_in_editor = parsing_item_context.line_number;
+                if (parsing_item_context.transition) |transition| context.current_slide.transition = transition;
             } else {
                 const errmsg = try std.fmt.allocPrint(context.allocator, "cannot @popslide `{s}` : was not pushed!", .{context_name});
                 reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, errmsg);
@@ -800,7 +914,9 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         // and make it the current slide
         // after that, clear the current item context
         if (context.first_slide_emitted) {
-            context.current_slide.applyContext(parsing_item_context); //  ignore current item context, it's a @slide
+            var previous_slide_context = parsing_item_context.*;
+            previous_slide_context.transition = null;
+            context.current_slide.applyContext(&previous_slide_context); // ignore the new slide's transition
             try context.slideshow.slides.append(context.allocator, context.current_slide);
         }
         context.first_slide_emitted = true;
@@ -808,6 +924,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         context.current_slide = try slides.Slide.new(context.allocator);
         context.current_slide.pos_in_editor = parsing_item_context.line_offset; //context.parsed_line_offset;
         context.current_slide.line_in_editor = parsing_item_context.line_number; // context.parsed_line_number;
+        context.current_slide.applyContext(parsing_item_context);
         context.current_context = .{}; // clear the current item context, to start fresh in each new slide
         return;
     }
@@ -861,4 +978,54 @@ fn commitItemToSlide(parsing_item_context: *slides.ItemContext, parser_context: 
         reportErrorInParsingContext(err, parsing_item_context, parser_context, "item sanity check failed");
     };
     return slide_item; // just FYI
+}
+
+test "animation annotations and slide transitions are parsed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@bg color=#101010ff
+        \\@pushslide content transition=fade duration=0.6
+        \\@popslide content transition=slide-left duration=0.5
+        \\@anim(fade) by=bullet after=1.0 duration=0.2
+        \\@box x=100 y=100 w=800 h=600
+        \\Always visible
+        \\- First reveal
+        \\- Second reveal
+        \\@anim slide-up duration=0.4
+        \\@box img=assets/example.png x=100 y=100
+        \\@popslide content
+        \\@box x=100 y=100 w=800 h=600 anim=slide-right duration=0.1
+        \\Second slide
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+    const slide = slideshow.slides.items[0];
+    try std.testing.expectEqual(animation.Effect.slide_left, slide.transition.effect);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), slide.transition.duration, 0.0001);
+    try std.testing.expectEqual(@as(usize, 3), slide.items.?.items.len);
+
+    const bullets = slide.items.?.items[1].animation.?;
+    try std.testing.expectEqual(animation.Effect.fade, bullets.effect);
+    try std.testing.expectEqual(animation.Grouping.bullet, bullets.by);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bullets.after.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), bullets.duration, 0.0001);
+
+    const image = slide.items.?.items[2].animation.?;
+    try std.testing.expectEqual(animation.Effect.slide_up, image.effect);
+    try std.testing.expectEqual(animation.Grouping.item, image.by);
+
+    const second_slide = slideshow.slides.items[1];
+    try std.testing.expectEqual(animation.Effect.fade, second_slide.transition.effect);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), second_slide.transition.duration, 0.0001);
+    const inline_animation = second_slide.items.?.items[1].animation.?;
+    try std.testing.expectEqual(animation.Effect.slide_right, inline_animation.effect);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), inline_animation.duration, 0.0001);
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const rl = @import("raylib");
+const animation = @import("animation.zig");
 
 const log = std.log.scoped(.slides);
 
@@ -44,6 +45,7 @@ pub const Slide = struct {
     bullet_symbol: ?[]const u8 = null,
     underline_width: i32 = 1,
     line_height_factor: ?f32 = null,
+    transition: animation.Transition = .{},
 
     // .
 
@@ -68,10 +70,18 @@ pub const Slide = struct {
         if (ctx.underline_width) |uw| self.underline_width = uw;
         if (ctx.bullet_symbol) |bs| self.bullet_symbol = bs;
         if (ctx.line_height_factor) |lhf| self.line_height_factor = lhf;
+        if (ctx.transition) |transition| self.transition = transition;
     }
 
     pub fn fromSlide(orig: *Slide, a: std.mem.Allocator) !*Slide {
         var n = try new(a);
+        n.fontsize = orig.fontsize;
+        n.text_color = orig.text_color;
+        n.bullet_color = orig.bullet_color;
+        n.bullet_symbol = orig.bullet_symbol;
+        n.underline_width = orig.underline_width;
+        n.line_height_factor = orig.line_height_factor;
+        n.transition = orig.transition;
         try n.items.?.appendSlice(n.allocator, orig.items.?.items);
         return n;
     }
@@ -111,6 +121,7 @@ pub const SlideItem = struct {
     // Image auto-dimension parameters
     scale: ?f32 = null,
     ratio: ?f32 = null,
+    animation: ?animation.ItemSpec = null,
 
     pub fn new(a: std.mem.Allocator) !*SlideItem {
         const self = try a.create(SlideItem);
@@ -135,6 +146,7 @@ pub const SlideItem = struct {
         if (context.line_height_factor) |lhf| self.line_height_factor = lhf;
         if (context.scale) |s| self.scale = s;
         if (context.ratio) |r| self.ratio = r;
+        if (context.animation) |anim| self.animation = anim;
     }
     pub fn applySlideDefaultsIfNecessary(self: *SlideItem, slide: *Slide) void {
         if (self.fontSize == null) self.fontSize = slide.fontsize;
@@ -211,7 +223,7 @@ pub const SlideItem = struct {
 };
 
 pub const ItemContext = struct {
-    directive: []const u8 = undefined, // @push, @slide, ...
+    directive: []const u8 = "", // @push, @slide, ...
     context_name: ?[]const u8 = null,
     text: ?[]const u8 = null,
     fontSize: ?i32 = null,
@@ -229,6 +241,8 @@ pub const ItemContext = struct {
     // Image auto-dimension parameters
     scale: ?f32 = null,
     ratio: ?f32 = null,
+    animation: ?animation.ItemSpec = null,
+    transition: ?animation.Transition = null,
 
     pub fn applyOtherIfNull(self: *ItemContext, other: ItemContext) void {
         if (self.text == null) {
@@ -268,6 +282,12 @@ pub const ItemContext = struct {
         }
         if (self.ratio == null) {
             if (other.ratio) |r| self.ratio = r;
+        }
+        if (self.animation == null) {
+            if (other.animation) |anim| self.animation = anim;
+        }
+        if (self.transition == null) {
+            if (other.transition) |transition| self.transition = transition;
         }
     }
 };
