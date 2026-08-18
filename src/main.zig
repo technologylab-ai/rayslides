@@ -785,6 +785,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         var semantic_to_apply: ?studio.SemanticCommand = null;
         var semantic_text: ?[]const u8 = null;
         var studio_slide_to_select: ?usize = null;
+        var source_graph_reparsed_this_frame = false;
         const prompt_was_active = property_prompt.active;
         if (prompt_was_active) {
             switch (property_prompt.updateFromRaylib()) {
@@ -987,6 +988,11 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
             studio_mode.dirty = editorSourceDirty();
             is_pre_rendered = false;
+            source_graph_reparsed_this_frame = true;
+            // Geometry and semantic commands are mutually exclusive in the
+            // Studio update path. Keep that invariant explicit so a future UI
+            // change cannot apply a second command through stale graph slices.
+            semantic_to_apply = null;
         }
 
         if (studio_slide_to_select) |slide_index| {
@@ -1004,6 +1010,10 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
 
         if (semantic_to_apply) |command| {
+            const duplicated_identity: ?usize = switch (command) {
+                .duplicate_item => |target| target.item_identity + 1,
+                else => null,
+            };
             if (applyStudioSemanticEdit(
                 &studio_history,
                 command,
@@ -1023,12 +1033,16 @@ pub fn main(init: std.process.Init) anyerror!void {
                     studio_mode.active_morph_state = null;
                 }
                 studio_mode.markSourceChanged();
+                if (duplicated_identity) |identity| studio_mode.selected_identity = identity;
                 studio_mode.setNotice(.none);
             } else |err| {
                 studio_mode.setNotice(switch (err) {
                     error.AmbiguousSlideTemplateLayout,
                     error.UnsafeSlideGlobalDirective,
                     error.UnsupportedSlideTemplateOverride,
+                    error.UnsupportedItemDuplication,
+                    error.TemplateInstanceDuplicationUnsupported,
+                    error.MorphItemDuplicationUnsupported,
                     => .structural_source_locked,
                     error.NameCollision => .library_name_conflict,
                     error.SlideTemplateNameCollision => .library_name_conflict,
@@ -1043,12 +1057,16 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
             studio_mode.dirty = editorSourceDirty();
             is_pre_rendered = false;
+            source_graph_reparsed_this_frame = true;
         }
 
-        if (studio_mode.capturesInput() and !property_prompt.active and shortcutModifierDown() and rl.isKeyPressed(.z)) {
+        if (!source_graph_reparsed_this_frame and studio_mode.capturesInput() and !property_prompt.active and shortcutModifierDown() and rl.isKeyPressed(.z)) {
             // Undo owns the source graph. End a transient pointer gesture before
             // reparsing so it cannot later release stale pre-undo geometry.
-            studio_mode.cancelActiveInteraction(studio_items);
+            // Source history may remove an item and recycle its numeric
+            // identity onto a following sibling. Clear the source-bound
+            // selection before reparsing so undo/redo can never retarget it.
+            studio_mode.clearSelection(studio_items);
             const changed = if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift))
                 redoStudioEdit(&studio_history)
             else
@@ -2198,6 +2216,33 @@ fn applyStudioSemanticEdit(
             } else {
                 try insertStudioSnippet(history, slide, morph_state, directive);
             }
+        },
+        .duplicate_item => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind == .crowd) return error.UnsupportedItemDuplication;
+
+            const source_ref: slides.SourceRef = if (morph_state) |state_index| blk: {
+                if (!itemBornInMorphState(slide, state_index, item) or item.state_source != null) {
+                    return error.MorphItemDuplicationUnsupported;
+                }
+                break :blk item.source;
+            } else switch (target.edit_scope) {
+                .local_instance => return error.TemplateInstanceDuplicationUnsupported,
+                .direct => target.source,
+                .shared_template => item.source,
+            };
+            if (!source_ref.patchable) return error.StudioItemHasNoPatchableSource;
+
+            var id_buffer: [64]u8 = undefined;
+            const id = try nextStudioItemId(&id_buffer);
+            const geometry = studio.itemGeometry(item.*, resolved_bounds);
+            try recordStudioPatch(history, try source_editor.duplicateItem(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                source_ref.line_offset,
+                id,
+                .{ .x = geometry.position.x + 20, .y = geometry.position.y + 20 },
+            ));
         },
         .delete_item => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;

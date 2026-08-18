@@ -9,6 +9,13 @@ pub const GeometryPatch = struct {
     h: ?f32 = null,
 };
 
+/// Explicit position for a newly duplicated item. Duplication deliberately
+/// leaves all sizing attributes untouched, including auto-image dimensions.
+pub const DuplicateItemPlacement = struct {
+    x: f32,
+    y: f32,
+};
+
 /// The caller owns `source` and must free it with the allocator passed to
 /// `patchGeometry`.
 pub const PatchResult = struct {
@@ -35,10 +42,12 @@ pub const PatchError = error{
     InvalidReusableName,
     InvalidSlideOffset,
     InvalidSnippet,
+    ItemIdCollision,
     NoAdjacentSlide,
     NotPromotableDirective,
     SlideTemplateNameCollision,
     SourceTooLarge,
+    UnsupportedItemDuplication,
     UnsupportedSlideTemplateOverride,
     UnsupportedSlidePromotion,
     UnsafeSlideGlobalDirective,
@@ -785,6 +794,74 @@ pub fn promoteItemToReusable(
     });
     sortEditsByPosition(edits.items);
     return applyEdits(allocator, source, edits.items);
+}
+
+/// Duplicate one complete authored item immediately after itself and give the
+/// clone a new literal ID.
+///
+/// The clone owns the same pending `@anim` decorators, directive formatting,
+/// body text, comments, and blank lines as the original. Only its effective
+/// `id=` value is replaced or inserted. Direct `@box` items and literal `@pop`
+/// component instances are supported. `@crowd` is refused because rayslides
+/// permits only one crowd item per slide; `@bg` is refused because the parser
+/// forces every background to (0,0), defeating the clone placement contract.
+/// Structural directives, morph mutations, generated `@let` source, and ID
+/// collisions are rejected without producing a partial rewrite. The clone's
+/// x/y are written explicitly in the same atomic edit; w/h/scale/ratio remain
+/// byte-identical to the original.
+pub fn duplicateItem(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+    new_id: []const u8,
+    placement: DuplicateItemPlacement,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (!isLiteralItemId(new_id)) return error.InvalidLiteralValue;
+    if (hasLiteralItemId(source, new_id)) return error.ItemIdCollision;
+
+    const line = directiveLine(source, directive_offset) catch
+        return error.UnsupportedItemDuplication;
+    const line_text = source[line.start..line.content_end];
+    const name = directiveName(line_text);
+    if (!(std.mem.eql(u8, name, "@box") or std.mem.eql(u8, name, "@pop"))) {
+        return error.UnsupportedItemDuplication;
+    }
+    if (std.mem.eql(u8, name, "@pop")) {
+        const component_name = directiveContextName(line_text, name.len) orelse
+            return error.UnsupportedItemDuplication;
+        if (!isReusableName(component_name)) return error.UnsupportedItemDuplication;
+    }
+
+    const owned_start = try itemOwnedAnimationStart(source, line.start);
+    const item_end = itemBodyEndOffset(source, line.full_end);
+    const owned_source = source[owned_start..item_end];
+    if (hasPotentialLetExpansion(owned_source)) return error.UnsupportedItemDuplication;
+
+    var x_buffer: [64]u8 = undefined;
+    var y_buffer: [64]u8 = undefined;
+    const x = try formatCoordinate(&x_buffer, placement.x);
+    const y = try formatCoordinate(&y_buffer, placement.y);
+    const clone_patches = [_]LiteralAttributePatch{
+        .{ .key = "id", .value = new_id },
+        .{ .key = "x", .value = x },
+        .{ .key = "y", .value = y },
+    };
+    const cloned = try patchLiteralAttributes(
+        allocator,
+        owned_source,
+        line.start - owned_start,
+        &clone_patches,
+    );
+    defer cloned.deinit(allocator);
+
+    const newline = lineEndingNear(source, item_end);
+    var insertion = std.ArrayList(u8).empty;
+    defer insertion.deinit(allocator);
+    if (item_end == source.len and item_end > sourceStart(source) and source[item_end - 1] != '\n') {
+        try insertion.appendSlice(allocator, newline);
+    }
+    try insertion.appendSlice(allocator, cloned.source);
+    return replaceRange(allocator, source, item_end, item_end, insertion.items);
 }
 
 /// Delete exactly the physical directive line beginning at `directive_offset`,
@@ -1650,6 +1727,89 @@ fn itemBodyEndOffset(source: []const u8, body_start: usize) usize {
         cursor = line.full_end;
     }
     return source.len;
+}
+
+fn itemOwnedAnimationStart(source: []const u8, item_start: usize) PatchError!usize {
+    var pending_start: ?usize = null;
+    var pending_crossed_directive = false;
+    var cursor = sourceStart(source);
+    while (cursor < item_start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > item_start) return error.UnsupportedItemDuplication;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isAnimationDirective(name)) {
+                if (pending_start == null) pending_start = cursor;
+            } else if (directiveEmitsSlideItem(name)) {
+                pending_start = null;
+                pending_crossed_directive = false;
+            } else if (pending_start != null) {
+                // The parser can carry a pending animation across global and
+                // context directives. Copying that contiguous range would also
+                // duplicate those structural directives, while omitting it
+                // would lose the item's animation. Decline the ambiguous case.
+                pending_crossed_directive = true;
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (cursor != item_start) return error.UnsupportedItemDuplication;
+    if (pending_start) |start| {
+        if (pending_crossed_directive) return error.UnsupportedItemDuplication;
+        return start;
+    }
+    return item_start;
+}
+
+fn hasPotentialLetExpansion(value: []const u8) bool {
+    const first = std.mem.indexOfScalar(u8, value, '$') orelse return false;
+    const last = std.mem.lastIndexOfScalar(u8, value, '$') orelse return false;
+    return first != last;
+}
+
+fn hasLiteralItemId(source: []const u8, sought: []const u8) bool {
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const line_text = source[cursor..line.content_end];
+            const name = directiveName(line_text);
+            if (effectiveLiteralId(line_text, name.len)) |id| {
+                if (std.mem.eql(u8, id, sought)) return true;
+            } else if (std.mem.eql(u8, name, "@pop")) {
+                // A component instance without explicit id= inherits its
+                // component name as its item ID in the parser.
+                if (directiveContextName(line_text, name.len)) |component_name| {
+                    if (isLiteralItemId(component_name) and std.mem.eql(u8, component_name, sought)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+    return false;
+}
+
+fn effectiveLiteralId(line: []const u8, directive_name_len: usize) ?[]const u8 {
+    var effective: ?[]const u8 = null;
+    var cursor = directive_name_len;
+    while (cursor < line.len) {
+        while (cursor < line.len and isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+        if (cursor == line.len) break;
+        const token_start = cursor;
+        while (cursor < line.len and !isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+        const token = line[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals];
+        if (std.mem.eql(u8, key, "text")) break;
+        if (!std.mem.eql(u8, key, "id")) continue;
+        const raw_value = token[equals + 1 ..];
+        const parser_value_end = std.mem.indexOfScalar(u8, raw_value, '=') orelse raw_value.len;
+        const value = raw_value[0..parser_value_end];
+        effective = if (isLiteralItemId(value)) value else null;
+    }
+    return effective;
 }
 
 fn findInlineTextToken(source: []const u8, line: DirectiveLine) ?Span {
@@ -3253,6 +3413,313 @@ test "promotion validates directive and reusable name" {
     try std.testing.expectError(
         error.NotPromotableDirective,
         promoteItemToReusable(std.testing.allocator, source, 0, "hero"),
+    );
+}
+
+test "item duplication preserves BOM CRLF multiline body comments and replaces clone id" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box  id=hero\tx=10 y=20 w=300 h=180 color=#102030ff\r\n" ++
+        "- First\r\n" ++
+        "# item explanation\r\n" ++
+        "- Second\r\n" ++
+        "@box id=tail text=Tail\r\n";
+    const expected =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box  id=hero\tx=10 y=20 w=300 h=180 color=#102030ff\r\n" ++
+        "- First\r\n" ++
+        "# item explanation\r\n" ++
+        "- Second\r\n" ++
+        "@box  id=hero_copy\tx=30 y=40 w=300 h=180 color=#102030ff\r\n" ++
+        "- First\r\n" ++
+        "# item explanation\r\n" ++
+        "- Second\r\n" ++
+        "@box id=tail text=Tail\r\n";
+    const item_offset = std.mem.indexOf(u8, source, "@box  id=hero").?;
+    const result = try duplicateItem(
+        std.testing.allocator,
+        source,
+        item_offset,
+        "hero_copy",
+        .{ .x = 30, .y = 40 },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.source, utf8_bom));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqualStrings("hero", items[0].id.?);
+    try std.testing.expectEqualStrings("hero_copy", items[1].id.?);
+    try std.testing.expectEqualStrings("- First\n- Second", items[0].text.?);
+    try std.testing.expectEqualStrings(items[0].text.?, items[1].text.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 30), items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), items[1].position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), items[0].position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(items[0].size.x, items[1].size.x, 0.0001);
+}
+
+test "item duplication inserts missing id and retains unterminated EOF" {
+    const source = "@slide\n@box x=5 y=6 text=No ID";
+    const expected =
+        "@slide\n" ++
+        "@box x=5 y=6 text=No ID\n" ++
+        "@box x=25 y=26 id=copy text=No ID";
+    const item_offset = std.mem.indexOf(u8, source, "@box").?;
+    const result = try duplicateItem(
+        std.testing.allocator,
+        source,
+        item_offset,
+        "copy",
+        .{ .x = 25, .y = 26 },
+    );
+    try expectSourceResult(result, source, expected);
+}
+
+test "component instance duplication preserves pop resolution and changes only clone id" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@push card x=20 y=30 w=200 h=80 text=Card\n" ++
+        "@slide\n" ++
+        "@pop card id=first\n" ++
+        "@box id=tail text=Tail\n";
+    const expected =
+        "@push card x=20 y=30 w=200 h=80 text=Card\n" ++
+        "@slide\n" ++
+        "@pop card id=first\n" ++
+        "@pop card id=second x=40 y=50\n" ++
+        "@box id=tail text=Tail\n";
+    const pop_offset = std.mem.indexOf(u8, source, "@pop card").?;
+    const result = try duplicateItem(
+        std.testing.allocator,
+        source,
+        pop_offset,
+        "second",
+        .{ .x = 40, .y = 50 },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqualStrings("first", items[0].id.?);
+    try std.testing.expectEqualStrings("second", items[1].id.?);
+    try std.testing.expectEqual(slides.SourceScope.component_instance, items[0].source.scope);
+    try std.testing.expectEqual(slides.SourceScope.component_instance, items[1].source.scope);
+    try std.testing.expectEqualStrings(items[0].text.?, items[1].text.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), items[1].position.y, 0.0001);
+}
+
+test "item duplication copies owned animation decorators and their formatting" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@anim(fade) duration=0.4\n" ++
+        "# animation note\n" ++
+        "@box id=hero x=10 y=20 text=Animated\n" ++
+        "# item note\n" ++
+        "@box id=tail text=Tail\n";
+    const expected =
+        "@slide\n" ++
+        "@anim(fade) duration=0.4\n" ++
+        "# animation note\n" ++
+        "@box id=hero x=10 y=20 text=Animated\n" ++
+        "# item note\n" ++
+        "@anim(fade) duration=0.4\n" ++
+        "# animation note\n" ++
+        "@box id=hero_copy x=30 y=40 text=Animated\n" ++
+        "# item note\n" ++
+        "@box id=tail text=Tail\n";
+    const item_offset = std.mem.indexOf(u8, source, "@box id=hero").?;
+    const result = try duplicateItem(
+        std.testing.allocator,
+        source,
+        item_offset,
+        "hero_copy",
+        .{ .x = 30, .y = 40 },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expect(items[0].animation != null);
+    try std.testing.expect(items[1].animation != null);
+    try std.testing.expectEqual(items[0].animation.?.effect, items[1].animation.?.effect);
+    try std.testing.expectApproxEqAbs(items[0].animation.?.duration, items[1].animation.?.duration, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 30), items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), items[1].position.y, 0.0001);
+}
+
+test "image duplication offsets position without materializing automatic dimensions" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box id=photo img=photo.png x=100 y=200 scale=0.5 ratio=1.4\n";
+    const item_offset = std.mem.indexOf(u8, source, "@box").?;
+    const result = try duplicateItem(
+        std.testing.allocator,
+        source,
+        item_offset,
+        "photo_copy",
+        .{ .x = 120, .y = 220 },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@slide\n" ++
+            "@box id=photo img=photo.png x=100 y=200 scale=0.5 ratio=1.4\n" ++
+            "@box id=photo_copy img=photo.png x=120 y=220 scale=0.5 ratio=1.4\n",
+        result.source,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "photo_copy") != null);
+    try std.testing.expect(std.mem.indexOfPos(u8, result.source, std.mem.indexOf(u8, result.source, "photo_copy").?, " w=") == null);
+    try std.testing.expect(std.mem.indexOfPos(u8, result.source, std.mem.indexOf(u8, result.source, "photo_copy").?, " h=") == null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqual(slides.SlideItemKind.img, items[1].kind);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 220), items[1].position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), items[1].scale.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.4), items[1].ratio.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), items[1].size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), items[1].size.y, 0.0001);
+}
+
+test "item duplication rejects structural mutation crowd generated and colliding source" {
+    const placement: DuplicateItemPlacement = .{ .x = 20, .y = 20 };
+    const structural =
+        "@slide\n" ++
+        "@box id=hero text=Hero\n" ++
+        "@state(morph)\n" ++
+        "@set hero x=20\n";
+    const state = std.mem.indexOf(u8, structural, "@state").?;
+    const mutation = std.mem.indexOf(u8, structural, "@set").?;
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, structural, 0, "slide_copy", placement),
+    );
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, structural, state, "state_copy", placement),
+    );
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, structural, mutation, "mutation_copy", placement),
+    );
+
+    const crowd = "@slide\n@crowd join id=room text=Join\n";
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, crowd, std.mem.indexOf(u8, crowd, "@crowd").?, "other_room", placement),
+    );
+    const background = "@slide\n@bg id=back color=#102030ff\n";
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, background, std.mem.indexOf(u8, background, "@bg").?, "back_copy", placement),
+    );
+
+    const dynamic = "@slide\n@box id=hero x=$left$ text=Generated\n";
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, dynamic, std.mem.indexOf(u8, dynamic, "@box").?, "hero_copy", placement),
+    );
+    const dynamic_body = "@slide\n@box id=hero\n$title$\n";
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, dynamic_body, std.mem.indexOf(u8, dynamic_body, "@box").?, "hero_copy", placement),
+    );
+
+    const collision = "@slide\n@box id=hero text=Hero\n@box id=used text=Used\n";
+    try std.testing.expectError(
+        error.ItemIdCollision,
+        duplicateItem(std.testing.allocator, collision, std.mem.indexOf(u8, collision, "@box").?, "used", placement),
+    );
+    try std.testing.expectError(
+        error.InvalidLiteralValue,
+        duplicateItem(std.testing.allocator, collision, std.mem.indexOf(u8, collision, "@box").?, "$copy$", placement),
+    );
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, collision, 2, "copy", placement),
+    );
+    try std.testing.expectError(
+        error.InvalidCoordinate,
+        duplicateItem(
+            std.testing.allocator,
+            collision,
+            std.mem.indexOf(u8, collision, "@box").?,
+            "copy",
+            .{ .x = std.math.nan(f32), .y = 20 },
+        ),
+    );
+}
+
+test "item duplication rejects ambiguous pending animation and dynamic pop name" {
+    const placement: DuplicateItemPlacement = .{ .x = 20, .y = 20 };
+    const crossed_global =
+        "@slide\n" ++
+        "@anim(fade)\n" ++
+        "@color=#ffffffff\n" ++
+        "@box id=hero text=Hero\n";
+    const item_offset = std.mem.indexOf(u8, crossed_global, "@box").?;
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, crossed_global, item_offset, "hero_copy", placement),
+    );
+
+    const dynamic_pop = "@slide\n@pop $component$ id=hero\n";
+    const pop_offset = std.mem.indexOf(u8, dynamic_pop, "@pop").?;
+    try std.testing.expectError(
+        error.UnsupportedItemDuplication,
+        duplicateItem(std.testing.allocator, dynamic_pop, pop_offset, "hero_copy", placement),
+    );
+
+    const implicit_pop_collision =
+        "@push card text=Card\n" ++
+        "@slide\n" ++
+        "@box id=hero text=Hero\n" ++
+        "@pop card\n";
+    try std.testing.expectError(
+        error.ItemIdCollision,
+        duplicateItem(
+            std.testing.allocator,
+            implicit_pop_collision,
+            std.mem.indexOf(u8, implicit_pop_collision, "@box").?,
+            "card",
+            placement,
+        ),
     );
 }
 

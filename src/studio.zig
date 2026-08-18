@@ -18,6 +18,8 @@ const slides = @import("slides.zig");
 pub const default_logical_size: rl.Vector2 = .{ .x = 1920, .y = 1080 };
 pub const default_handle_size: f32 = 14;
 pub const default_min_item_size: f32 = 8;
+pub const default_snap_threshold_screen: f32 = 8;
+pub const default_grid_spacing: f32 = 20;
 
 pub const SourceRef = slides.SourceRef;
 pub const SourceScope = slides.SourceScope;
@@ -43,6 +45,27 @@ pub const Geometry = struct {
         item.position = self.position;
         item.size = self.size;
     }
+};
+
+/// Logical slide coordinates for the currently active smart-alignment guides.
+/// A null axis means no edge/center target captured within the snap threshold.
+pub const SnapGuides = struct {
+    vertical: ?f32 = null,
+    horizontal: ?f32 = null,
+};
+
+pub const SnapResult = struct {
+    geometry: Geometry,
+    guides: SnapGuides = .{},
+};
+
+pub const AlignAction = enum {
+    left,
+    horizontal_center,
+    right,
+    top,
+    vertical_center,
+    bottom,
 };
 
 /// Describes where an emitted edit should be applied. This is deliberately
@@ -174,6 +197,209 @@ pub fn hitTest(items: []const slides.SlideItem, resolved_bounds: []const Resolve
     return null;
 }
 
+const AxisSnap = struct {
+    target: ?f32 = null,
+    adjustment: f32 = 0,
+    distance: f32 = std.math.inf(f32),
+};
+
+fn considerAxisSnap(best: *AxisSnap, anchor: f32, target: f32, threshold: f32) void {
+    const adjustment = target - anchor;
+    const distance = @abs(adjustment);
+    if (distance <= threshold and distance < best.distance) {
+        best.* = .{ .target = target, .adjustment = adjustment, .distance = distance };
+    }
+}
+
+fn considerGeometryTargets(
+    x_snap: *AxisSnap,
+    y_snap: *AxisSnap,
+    interaction: Interaction,
+    candidate: Geometry,
+    target: Geometry,
+    threshold: rl.Vector2,
+    minimum_size: f32,
+    aspect_ratio: ?f32,
+) void {
+    const target_x = [_]f32{ target.position.x, target.position.x + target.size.x / 2, target.position.x + target.size.x };
+    const target_y = [_]f32{ target.position.y, target.position.y + target.size.y / 2, target.position.y + target.size.y };
+    switch (interaction) {
+        .moving => {
+            const anchors_x = [_]f32{ candidate.position.x, candidate.position.x + candidate.size.x / 2, candidate.position.x + candidate.size.x };
+            const anchors_y = [_]f32{ candidate.position.y, candidate.position.y + candidate.size.y / 2, candidate.position.y + candidate.size.y };
+            for (target_x) |target_value| for (anchors_x) |anchor| considerAxisSnap(x_snap, anchor, target_value, threshold.x);
+            for (target_y) |target_value| for (anchors_y) |anchor| considerAxisSnap(y_snap, anchor, target_value, threshold.y);
+        },
+        .resizing => {
+            const right = candidate.position.x + candidate.size.x;
+            const bottom = candidate.position.y + candidate.size.y;
+            for (target_x) |target_value| {
+                const width = target_value - candidate.position.x;
+                const ratio_ok = if (aspect_ratio) |ratio| ratio <= 0 or width / ratio >= minimum_size else true;
+                if (width >= minimum_size and ratio_ok)
+                    considerAxisSnap(x_snap, right, target_value, threshold.x);
+            }
+            for (target_y) |target_value| {
+                const height = target_value - candidate.position.y;
+                const ratio_ok = if (aspect_ratio) |ratio| ratio <= 0 or height * ratio >= minimum_size else true;
+                if (height >= minimum_size and ratio_ok)
+                    considerAxisSnap(y_snap, bottom, target_value, threshold.y);
+            }
+        },
+        .idle => {},
+    }
+}
+
+fn nearestGrid(value: f32, spacing: f32) f32 {
+    if (spacing <= 0) return value;
+    return @round(value / spacing) * spacing;
+}
+
+/// Snap one candidate geometry against the slide and all other selectable
+/// items. Thresholds are logical-axis distances, normally converted from a
+/// constant screen-pixel tolerance by the caller.
+pub fn snapGeometry(
+    candidate: Geometry,
+    interaction: Interaction,
+    logical_size: rl.Vector2,
+    threshold: rl.Vector2,
+    grid_enabled: bool,
+    grid_spacing: f32,
+    minimum_size: f32,
+    aspect_ratio: ?f32,
+    include_item_targets: bool,
+    selected_identity: usize,
+    items: []const slides.SlideItem,
+    resolved_bounds: []const ResolvedBounds,
+) SnapResult {
+    if (interaction == .idle) return .{ .geometry = candidate };
+    const valid_aspect_ratio = if (aspect_ratio) |value|
+        if (value > 0 and std.math.isFinite(value)) value else null
+    else
+        null;
+
+    var x_snap = AxisSnap{};
+    var y_snap = AxisSnap{};
+    considerGeometryTargets(
+        &x_snap,
+        &y_snap,
+        interaction,
+        candidate,
+        .{ .position = .zero(), .size = logical_size },
+        threshold,
+        minimum_size,
+        valid_aspect_ratio,
+    );
+    if (include_item_targets) {
+        for (items) |item| {
+            if (item.identity == selected_identity or !isSelectable(item, resolved_bounds)) continue;
+            considerGeometryTargets(
+                &x_snap,
+                &y_snap,
+                interaction,
+                candidate,
+                itemGeometry(item, resolved_bounds),
+                threshold,
+                minimum_size,
+                valid_aspect_ratio,
+            );
+        }
+    }
+
+    var result = SnapResult{ .geometry = candidate };
+    switch (interaction) {
+        .moving => {
+            if (x_snap.target) |target| {
+                result.geometry.position.x += x_snap.adjustment;
+                result.guides.vertical = target;
+            } else if (grid_enabled) {
+                result.geometry.position.x = nearestGrid(result.geometry.position.x, grid_spacing);
+            }
+            if (y_snap.target) |target| {
+                result.geometry.position.y += y_snap.adjustment;
+                result.guides.horizontal = target;
+            } else if (grid_enabled) {
+                result.geometry.position.y = nearestGrid(result.geometry.position.y, grid_spacing);
+            }
+        },
+        .resizing => {
+            if (valid_aspect_ratio) |locked_ratio| {
+                const normalized_x = if (x_snap.target != null) x_snap.distance / @max(threshold.x, 0.0001) else std.math.inf(f32);
+                const normalized_y = if (y_snap.target != null) y_snap.distance / @max(threshold.y, 0.0001) else std.math.inf(f32);
+                const prefer_x = normalized_x <= normalized_y;
+                var snapped = false;
+                var attempt: usize = 0;
+                while (attempt < 2 and !snapped) : (attempt += 1) {
+                    const use_x = if (attempt == 0) prefer_x else !prefer_x;
+                    if (use_x) {
+                        if (x_snap.target) |target| {
+                            const width = target - candidate.position.x;
+                            if (width >= minimum_size and width / locked_ratio >= minimum_size) {
+                                result.geometry.size = .{ .x = width, .y = width / locked_ratio };
+                                result.guides.vertical = target;
+                                snapped = true;
+                            }
+                        }
+                    } else if (y_snap.target) |target| {
+                        const height = target - candidate.position.y;
+                        if (height >= minimum_size and height * locked_ratio >= minimum_size) {
+                            result.geometry.size = .{ .x = height * locked_ratio, .y = height };
+                            result.guides.horizontal = target;
+                            snapped = true;
+                        }
+                    }
+                }
+                if (!snapped and grid_enabled) {
+                    const right = candidate.position.x + candidate.size.x;
+                    const bottom = candidate.position.y + candidate.size.y;
+                    const grid_right = nearestGrid(right, grid_spacing);
+                    const grid_bottom = nearestGrid(bottom, grid_spacing);
+                    const x_distance = @abs(grid_right - right);
+                    const y_distance = @abs(grid_bottom - bottom);
+                    const prefer_grid_x = x_distance <= y_distance;
+                    attempt = 0;
+                    while (attempt < 2 and !snapped) : (attempt += 1) {
+                        if ((attempt == 0) == prefer_grid_x) {
+                            const width = grid_right - candidate.position.x;
+                            if (width >= minimum_size and width / locked_ratio >= minimum_size) {
+                                result.geometry.size = .{ .x = width, .y = width / locked_ratio };
+                                snapped = true;
+                            }
+                        } else {
+                            const height = grid_bottom - candidate.position.y;
+                            if (height >= minimum_size and height * locked_ratio >= minimum_size) {
+                                result.geometry.size = .{ .x = height * locked_ratio, .y = height };
+                                snapped = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (x_snap.target) |target| {
+                    const width = target - candidate.position.x;
+                    if (width >= minimum_size) {
+                        result.geometry.size.x = width;
+                        result.guides.vertical = target;
+                    }
+                } else if (grid_enabled) {
+                    result.geometry.size.x = @max(minimum_size, nearestGrid(candidate.position.x + candidate.size.x, grid_spacing) - candidate.position.x);
+                }
+                if (y_snap.target) |target| {
+                    const height = target - candidate.position.y;
+                    if (height >= minimum_size) {
+                        result.geometry.size.y = height;
+                        result.guides.horizontal = target;
+                    }
+                } else if (grid_enabled) {
+                    result.geometry.size.y = @max(minimum_size, nearestGrid(candidate.position.y + candidate.size.y, grid_spacing) - candidate.position.y);
+                }
+            }
+        },
+        .idle => {},
+    }
+    return result;
+}
+
 pub fn itemIndexByIdentity(items: []const slides.SlideItem, identity: usize) ?usize {
     for (items, 0..) |item, index| {
         if (item.identity == identity) return index;
@@ -230,6 +456,7 @@ pub const Notice = enum {
     shared_template_masked,
     shared_template_delete_unsupported,
     local_override_needs_unique_id,
+    duplicate_item_unsupported,
     template_background_local_unsupported,
     generated_source_read_only,
     property_unavailable,
@@ -371,6 +598,7 @@ pub const Workspace = struct {
 /// prompt for text/path details and atomically rewrite/reparse the `.sld`.
 pub const SemanticCommand = union(enum) {
     add_item: AddItemCommand,
+    duplicate_item: CommandTarget,
     delete_item: CommandTarget,
     edit_text: CommandTarget,
     set_foreground: ColorCommand,
@@ -404,15 +632,18 @@ pub const UiLayout = struct {
     toolbar: rl.Rectangle,
     tool_buttons: [6]rl.Rectangle,
     new_slide: rl.Rectangle,
+    grid_toggle: rl.Rectangle,
     scene_previous: rl.Rectangle,
     scene_label: rl.Rectangle,
     scene_next: rl.Rectangle,
     properties: rl.Rectangle,
     edit_text: rl.Rectangle,
+    duplicate_item: rl.Rectangle,
     delete_item: rl.Rectangle,
     promote: rl.Rectangle,
     foreground_swatches: [palette.len]rl.Rectangle,
     background_swatches: [palette.len]rl.Rectangle,
+    align_buttons: [6]rl.Rectangle,
 };
 
 pub const organizer_action_count = 6;
@@ -604,8 +835,9 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     const gap: f32 = 6;
     const tool_size: f32 = 42;
     const new_slide_width: f32 = 74;
+    const grid_width: f32 = 58;
     const scene_width: f32 = 132;
-    const toolbar_width = margin * 2 + tool_size * 6 + gap * 5 + gap + new_slide_width + gap + scene_width;
+    const toolbar_width = margin * 2 + tool_size * 6 + gap * 5 + gap + new_slide_width + gap + grid_width + gap + scene_width;
     const toolbar: rl.Rectangle = .{
         .x = viewport.slide_top_left.x + margin,
         .y = viewport.slide_top_left.y + margin,
@@ -625,8 +857,14 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = new_slide_width,
         .height = tool_size,
     };
-    const scene_previous: rl.Rectangle = .{
+    const grid_toggle: rl.Rectangle = .{
         .x = new_slide.x + new_slide.width + gap,
+        .y = new_slide.y,
+        .width = grid_width,
+        .height = tool_size,
+    };
+    const scene_previous: rl.Rectangle = .{
+        .x = grid_toggle.x + grid_toggle.width + gap,
         .y = new_slide.y,
         .width = 26,
         .height = tool_size,
@@ -649,13 +887,15 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .x = viewport.slide_top_left.x + viewport.slide_size.x - property_width - margin,
         .y = viewport.slide_top_left.y + margin,
         .width = property_width,
-        .height = 224,
+        .height = 278,
     };
     const action_y = properties.y + 38;
-    const action_width: f32 = 72;
+    const action_gap: f32 = 4;
+    const action_width: f32 = 54;
     const edit_text: rl.Rectangle = .{ .x = properties.x + 12, .y = action_y, .width = action_width, .height = 30 };
-    const delete_item: rl.Rectangle = .{ .x = edit_text.x + action_width + gap, .y = action_y, .width = action_width, .height = 30 };
-    const promote: rl.Rectangle = .{ .x = delete_item.x + action_width + gap, .y = action_y, .width = action_width, .height = 30 };
+    const duplicate_item: rl.Rectangle = .{ .x = edit_text.x + action_width + action_gap, .y = action_y, .width = action_width, .height = 30 };
+    const delete_item: rl.Rectangle = .{ .x = duplicate_item.x + action_width + action_gap, .y = action_y, .width = action_width, .height = 30 };
+    const promote: rl.Rectangle = .{ .x = delete_item.x + action_width + action_gap, .y = action_y, .width = action_width, .height = 30 };
 
     var foreground_swatches: [palette.len]rl.Rectangle = undefined;
     var background_swatches: [palette.len]rl.Rectangle = undefined;
@@ -672,19 +912,31 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = swatch_size,
         .height = swatch_size,
     };
+    var align_buttons: [6]rl.Rectangle = undefined;
+    const align_gap: f32 = 4;
+    const align_width = (properties.width - 24 - align_gap * 5) / 6;
+    for (&align_buttons, 0..) |*button, index| button.* = .{
+        .x = properties.x + 12 + @as(f32, @floatFromInt(index)) * (align_width + align_gap),
+        .y = properties.y + 232,
+        .width = align_width,
+        .height = 28,
+    };
     return .{
         .toolbar = toolbar,
         .tool_buttons = tool_buttons,
         .new_slide = new_slide,
+        .grid_toggle = grid_toggle,
         .scene_previous = scene_previous,
         .scene_label = scene_label,
         .scene_next = scene_next,
         .properties = properties,
         .edit_text = edit_text,
+        .duplicate_item = duplicate_item,
         .delete_item = delete_item,
         .promote = promote,
         .foreground_swatches = foreground_swatches,
         .background_swatches = background_swatches,
+        .align_buttons = align_buttons,
     };
 }
 
@@ -708,6 +960,10 @@ pub const FrameInput = struct {
     pointer_down: bool = false,
     pointer_released: bool = false,
     nudge: rl.Vector2 = .{ .x = 0, .y = 0 },
+    toggle_grid_pressed: bool = false,
+    lock_aspect_ratio: bool = false,
+    disable_snapping: bool = false,
+    align_action: ?AlignAction = null,
     allow_shared_edit: bool = false,
     choose_tool: ?Tool = null,
     delete_pressed: bool = false,
@@ -741,12 +997,10 @@ pub const FrameInput = struct {
         const moving_slide = alt and shift;
         const amount: f32 = if (shift) 10 else 1;
         var nudge: rl.Vector2 = .{ .x = 0, .y = 0 };
-        if (!moving_slide) {
-            if (keyPressedOrRepeated(.left)) nudge.x -= amount;
-            if (keyPressedOrRepeated(.right)) nudge.x += amount;
-            if (keyPressedOrRepeated(.up)) nudge.y -= amount;
-            if (keyPressedOrRepeated(.down)) nudge.y += amount;
-        }
+        if (keyPressedOrRepeated(.left)) nudge.x -= amount;
+        if (keyPressedOrRepeated(.right)) nudge.x += amount;
+        if (keyPressedOrRepeated(.up)) nudge.y -= amount;
+        if (keyPressedOrRepeated(.down)) nudge.y += amount;
         const choose_tool: ?Tool = if (rl.isKeyPressed(.v))
             .select
         else if (rl.isKeyPressed(.t))
@@ -769,6 +1023,9 @@ pub const FrameInput = struct {
             .pointer_down = rl.isMouseButtonDown(.left),
             .pointer_released = rl.isMouseButtonReleased(.left),
             .nudge = nudge,
+            .toggle_grid_pressed = !shortcut_modifier and rl.isKeyPressed(.g),
+            .lock_aspect_ratio = shift,
+            .disable_snapping = shortcut_modifier,
             .allow_shared_edit = alt,
             .choose_tool = choose_tool,
             .delete_pressed = !shortcut_modifier and rl.isKeyPressed(.backspace),
@@ -836,12 +1093,17 @@ pub const Studio = struct {
     interaction: Interaction = .idle,
     handle_size_screen: f32 = default_handle_size,
     min_item_size: f32 = default_min_item_size,
+    snap_threshold_screen: f32 = default_snap_threshold_screen,
+    grid_spacing: f32 = default_grid_spacing,
+    grid_snapping: bool = false,
+    snap_guides: SnapGuides = .{},
     drag: Drag = .{},
     preview: Geometry = .{
         .position = .{ .x = 0, .y = 0 },
         .size = .{ .x = 0, .y = 0 },
     },
     pending_semantic_command: ?SemanticCommand = null,
+    pending_geometry_command: ?GeometryCommand = null,
     organizer_first_visible: usize = 0,
     library_first_visible: usize = 0,
     selected_library_index: ?usize = null,
@@ -872,6 +1134,7 @@ pub const Studio = struct {
 
     pub fn markSourceChanged(self: *Studio) void {
         self.copy_is_current = false;
+        self.snap_guides = .{};
         // Library commands retain only a workspace index. Any source rewrite
         // can reorder the catalog, so a prior selection must not silently
         // resolve to a different reusable afterward.
@@ -906,7 +1169,10 @@ pub const Studio = struct {
     pub fn setMorphStateCount(self: *Studio, count: usize) void {
         self.morph_state_count = count;
         if (self.active_morph_state) |state| {
-            if (state >= count) self.active_morph_state = null;
+            if (state >= count) {
+                self.active_morph_state = null;
+                self.snap_guides = .{};
+            }
         }
     }
 
@@ -918,6 +1184,7 @@ pub const Studio = struct {
         if (self.active_morph_state == normalized) return;
         self.clearSelection(items);
         self.active_morph_state = normalized;
+        self.snap_guides = .{};
         self.selected_library_index = null;
         self.tool = .select;
     }
@@ -933,6 +1200,7 @@ pub const Studio = struct {
         const next_state: ?usize = if (next_scene == 0) null else @intCast(next_scene - 1);
         self.clearSelection(items);
         self.active_morph_state = next_state;
+        self.snap_guides = .{};
         self.selected_library_index = null;
         self.tool = .select;
         self.pending_semantic_command = .{ .select_morph_scene = .{ .active_state = next_state } };
@@ -951,6 +1219,7 @@ pub const Studio = struct {
             self.selected_identity = null;
             self.selected_source = null;
             self.selected_library_index = null;
+            self.snap_guides = .{};
         }
     }
 
@@ -962,12 +1231,14 @@ pub const Studio = struct {
         self.selected_identity = null;
         self.selected_source = null;
         self.selected_library_index = null;
+        self.snap_guides = .{};
     }
 
     pub fn clearSelection(self: *Studio, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.selected_identity = null;
         self.selected_source = null;
+        self.snap_guides = .{};
     }
 
     pub fn selectedIndex(self: Studio, items: []const slides.SlideItem) ?usize {
@@ -989,6 +1260,11 @@ pub const Studio = struct {
             .after = self.preview,
             .resized = self.interaction == .resizing,
         };
+    }
+
+    pub fn liveSnapGuides(self: Studio) ?SnapGuides {
+        if (!self.enabled or self.interaction == .idle) return null;
+        return self.snap_guides;
     }
 
     pub fn resizeHandleRect(self: Studio, viewport: Viewport, geometry: Geometry) ?rl.Rectangle {
@@ -1034,6 +1310,11 @@ pub const Studio = struct {
 
         self.validateSelection(items, resolved_bounds);
 
+        if (input.toggle_grid_pressed) {
+            self.grid_snapping = !self.grid_snapping;
+            self.snap_guides = .{};
+        }
+
         if (workspace.visible) {
             self.normalizeWorkspace(viewport, workspace);
             if (self.handleWorkspaceKeyboard(items, workspace, input)) return null;
@@ -1065,6 +1346,14 @@ pub const Studio = struct {
             return null;
         }
 
+        if (input.duplicate_slide_pressed and self.selected_identity != null) {
+            _ = self.emitDuplicateItem(items, input.allow_shared_edit);
+            return null;
+        }
+        if (input.align_action) |action| {
+            return self.alignSelected(items, resolved_bounds, viewport.logical_size, action, input.allow_shared_edit);
+        }
+
         if (input.delete_pressed) {
             _ = self.emitSelectedCommand(items, input.allow_shared_edit, .delete_item);
             return null;
@@ -1088,7 +1377,11 @@ pub const Studio = struct {
 
         if (input.pointer_pressed and workspace.visible and
             self.handleWorkspaceClick(items, viewport, workspace, input.pointer_screen)) return null;
-        if (input.pointer_pressed and self.handleUiClick(items, viewport, input.pointer_screen, input.allow_shared_edit)) return null;
+        if (input.pointer_pressed and self.handleUiClick(items, resolved_bounds, viewport, input.pointer_screen, input.allow_shared_edit)) {
+            const command = self.pending_geometry_command;
+            self.pending_geometry_command = null;
+            return command;
+        }
 
         const pointer_logical = screenToLogical(viewport, input.pointer_screen);
 
@@ -1124,7 +1417,14 @@ pub const Studio = struct {
         }
 
         if (self.interaction != .idle and (input.pointer_down or input.pointer_released)) {
-            if (pointer_logical) |pointer| self.applyPointer(items, pointer);
+            if (pointer_logical) |pointer| self.applyPointer(
+                items,
+                resolved_bounds,
+                viewport,
+                pointer,
+                input.lock_aspect_ratio,
+                input.disable_snapping,
+            );
         }
 
         if (self.interaction != .idle and input.pointer_released) {
@@ -1150,6 +1450,41 @@ pub const Studio = struct {
     }
 
     const TargetCommandKind = enum { delete_item, edit_text, promote_to_reusable };
+
+    fn emitDuplicateItem(self: *Studio, items: []slides.SlideItem, allow_shared_edit: bool) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        const item = items[index];
+
+        const edit_scope: EditScope = if (self.active_morph_state) |state_index| blk: {
+            if (item.creation_morph_state == null or item.creation_morph_state.? != state_index or item.state_source != null) {
+                self.notice = .duplicate_item_unsupported;
+                return true;
+            }
+            break :blk self.editScopeForItem(items, index, false) orelse return true;
+        } else switch (item.source.scope) {
+            .direct, .component_instance => self.editScopeForItem(items, index, false) orelse return true,
+            .slide_template => blk: {
+                if (!allow_shared_edit) {
+                    self.notice = .duplicate_item_unsupported;
+                    return true;
+                }
+                const scope = self.editScopeForItem(items, index, true) orelse return true;
+                if (scope != .shared_template) {
+                    self.notice = .duplicate_item_unsupported;
+                    return true;
+                }
+                break :blk scope;
+            },
+            else => {
+                self.notice = .duplicate_item_unsupported;
+                return true;
+            },
+        };
+
+        self.pending_semantic_command = .{ .duplicate_item = self.selectedTarget(items, edit_scope) orelse return true };
+        return true;
+    }
 
     fn emitSelectedCommand(
         self: *Studio,
@@ -1312,6 +1647,7 @@ pub const Studio = struct {
             }
             self.last_workspace_slide = workspace.current_slide;
             self.selected_library_index = null;
+            self.snap_guides = .{};
             self.tool = .select;
         }
 
@@ -1360,7 +1696,7 @@ pub const Studio = struct {
             }
             return true;
         }
-        if (input.duplicate_slide_pressed) {
+        if (input.duplicate_slide_pressed and self.selected_identity == null) {
             if (summaryOffsetForSlide(workspace.slides, workspace.current_slide) != null) {
                 self.prepareDeckCommand(items);
                 self.pending_semantic_command = .{ .duplicate_slide = workspace.current_slide };
@@ -1376,7 +1712,7 @@ pub const Studio = struct {
             }
             return true;
         }
-        if (input.move_slide != 0) {
+        if (input.move_slide != 0 and self.selected_identity == null) {
             const offset = summaryOffsetForSlide(workspace.slides, workspace.current_slide) orelse return true;
             const direction: SlideMoveDirection = if (input.move_slide < 0) .up else .down;
             if ((direction == .up and offset > 0) or (direction == .down and offset + 1 < workspace.slides.len)) {
@@ -1605,6 +1941,7 @@ pub const Studio = struct {
     fn handleUiClick(
         self: *Studio,
         items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
         viewport: Viewport,
         pointer: rl.Vector2,
         allow_shared_edit: bool,
@@ -1628,6 +1965,10 @@ pub const Studio = struct {
                 self.tool = .select;
                 self.pending_semantic_command = .{ .new_slide = {} };
             }
+            if (pointInRectangle(pointer, layout.grid_toggle)) {
+                self.grid_snapping = !self.grid_snapping;
+                self.snap_guides = .{};
+            }
             if (pointInRectangle(pointer, layout.scene_previous)) self.cycleMorphState(items, -1);
             if (pointInRectangle(pointer, layout.scene_label) or pointInRectangle(pointer, layout.scene_next)) {
                 self.cycleMorphState(items, 1);
@@ -1636,6 +1977,8 @@ pub const Studio = struct {
         }
         if (pointInRectangle(pointer, layout.edit_text))
             return self.emitSelectedCommand(items, allow_shared_edit, .edit_text);
+        if (pointInRectangle(pointer, layout.duplicate_item))
+            return self.emitDuplicateItem(items, allow_shared_edit);
         if (pointInRectangle(pointer, layout.delete_item))
             return self.emitSelectedCommand(items, allow_shared_edit, .delete_item);
         if (pointInRectangle(pointer, layout.promote))
@@ -1647,6 +1990,18 @@ pub const Studio = struct {
         for (layout.background_swatches, 0..) |swatch, index| {
             if (pointInRectangle(pointer, swatch))
                 return self.emitColorCommand(items, allow_shared_edit, palette[index], true);
+        }
+        for (layout.align_buttons, 0..) |button, index| {
+            if (pointInRectangle(pointer, button)) {
+                self.pending_geometry_command = self.alignSelected(
+                    items,
+                    resolved_bounds,
+                    viewport.logical_size,
+                    @enumFromInt(index),
+                    allow_shared_edit,
+                );
+                return true;
+            }
         }
         // Clicking empty property-panel space must never reach the canvas.
         return true;
@@ -1680,6 +2035,7 @@ pub const Studio = struct {
                 if (itemIndexBySource(items, source)) |rebound| {
                     index = rebound;
                     self.selected_identity = items[rebound].identity;
+                    if (self.selected_identity.? != identity) self.snap_guides = .{};
                 } else if (index) |same_identity| {
                     // A preceding source patch may shift this directive's byte
                     // offset while logical identities remain stable.
@@ -1693,6 +2049,7 @@ pub const Studio = struct {
                 self.interaction = .idle;
                 self.selected_identity = null;
                 self.selected_source = null;
+                self.snap_guides = .{};
                 return;
             };
             if (!isSelectable(items[selected_index], resolved_bounds)) {
@@ -1700,6 +2057,7 @@ pub const Studio = struct {
                 self.interaction = .idle;
                 self.selected_identity = null;
                 self.selected_source = null;
+                self.snap_guides = .{};
             }
         }
     }
@@ -1716,18 +2074,22 @@ pub const Studio = struct {
         if (!viewport.containsScreenPoint(pointer_screen)) {
             self.selected_identity = null;
             self.selected_source = null;
+            self.snap_guides = .{};
             return;
         }
         const pointer = pointer_logical orelse {
             self.selected_identity = null;
             self.selected_source = null;
+            self.snap_guides = .{};
             return;
         };
         const hit_index = hitTest(items, resolved_bounds, pointer) orelse {
             self.selected_identity = null;
             self.selected_source = null;
+            self.snap_guides = .{};
             return;
         };
+        if (self.selected_identity != items[hit_index].identity) self.snap_guides = .{};
         self.selected_identity = items[hit_index].identity;
         self.selected_source = if (items[hit_index].source.scope == .none) null else items[hit_index].source;
         const edit_scope = self.editScopeForItem(items, hit_index, allow_shared_edit) orelse return;
@@ -1861,6 +2223,7 @@ pub const Studio = struct {
         edit_scope: EditScope,
     ) void {
         self.interaction = interaction;
+        self.snap_guides = .{};
         self.drag = .{
             .pointer_start = pointer,
             .before = geometry,
@@ -1870,19 +2233,63 @@ pub const Studio = struct {
         self.preview = geometry;
     }
 
-    fn applyPointer(self: *Studio, items: []slides.SlideItem, pointer: rl.Vector2) void {
+    fn applyPointer(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        pointer: rl.Vector2,
+        lock_aspect_ratio: bool,
+        disable_snapping: bool,
+    ) void {
         const index = self.selectedIndex(items) orelse return;
         const delta = subtract(pointer, self.drag.pointer_start);
         var geometry = self.drag.before;
+        var aspect_ratio: ?f32 = null;
         switch (self.interaction) {
             .idle => return,
             .moving => geometry.position = roundVector(add(self.drag.before.position, delta)),
             .resizing => {
-                geometry.size = roundVector(.{
-                    .x = @max(self.min_item_size, self.drag.before.size.x + delta.x),
-                    .y = @max(self.min_item_size, self.drag.before.size.y + delta.y),
-                });
+                if (lock_aspect_ratio and self.drag.before.size.x > 0 and self.drag.before.size.y > 0) {
+                    const ratio = self.drag.before.size.x / self.drag.before.size.y;
+                    aspect_ratio = ratio;
+                    if (@abs(delta.x) >= @abs(delta.y * ratio)) {
+                        const width = @max(@max(self.min_item_size, self.min_item_size * ratio), self.drag.before.size.x + delta.x);
+                        geometry.size = .{ .x = width, .y = width / ratio };
+                    } else {
+                        const height = @max(@max(self.min_item_size, self.min_item_size / ratio), self.drag.before.size.y + delta.y);
+                        geometry.size = .{ .x = height * ratio, .y = height };
+                    }
+                } else {
+                    geometry.size = roundVector(.{
+                        .x = @max(self.min_item_size, self.drag.before.size.x + delta.x),
+                        .y = @max(self.min_item_size, self.drag.before.size.y + delta.y),
+                    });
+                }
             },
+        }
+        self.snap_guides = .{};
+        if (!disable_snapping and (delta.x != 0 or delta.y != 0)) {
+            const threshold: rl.Vector2 = if (viewport.valid()) .{
+                .x = self.snap_threshold_screen * viewport.logical_size.x / viewport.slide_size.x,
+                .y = self.snap_threshold_screen * viewport.logical_size.y / viewport.slide_size.y,
+            } else .zero();
+            const snapped = snapGeometry(
+                geometry,
+                self.interaction,
+                viewport.logical_size,
+                threshold,
+                self.grid_snapping,
+                self.grid_spacing,
+                self.min_item_size,
+                aspect_ratio,
+                self.drag.edit_scope != .shared_template,
+                items[index].identity,
+                items,
+                resolved_bounds,
+            );
+            geometry = snapped.geometry;
+            self.snap_guides = snapped.guides;
         }
         self.preview = geometry;
         items[index].position = geometry.position;
@@ -1892,6 +2299,7 @@ pub const Studio = struct {
     fn finishInteraction(self: *Studio, items: []slides.SlideItem) ?GeometryCommand {
         const interaction = self.interaction;
         self.interaction = .idle;
+        self.snap_guides = .{};
         const identity = self.selected_identity orelse return null;
         const index = itemIndexByIdentity(items, identity) orelse return null;
         const after = self.preview;
@@ -1913,6 +2321,7 @@ pub const Studio = struct {
     fn cancelInteraction(self: *Studio, items: []slides.SlideItem) void {
         if (self.selectedIndex(items)) |index| self.restoreBefore(&items[index]);
         self.interaction = .idle;
+        self.snap_guides = .{};
     }
 
     fn restoreBefore(self: Studio, item: *slides.SlideItem) void {
@@ -1946,12 +2355,52 @@ pub const Studio = struct {
         };
     }
 
+    fn alignSelected(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        logical_size: rl.Vector2,
+        action: AlignAction,
+        allow_shared_edit: bool,
+    ) ?GeometryCommand {
+        const index = self.selectedIndex(items) orelse return null;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return null;
+        const before = itemGeometry(items[index], resolved_bounds);
+        var after = before;
+        switch (action) {
+            .left => after.position.x = 0,
+            .horizontal_center => after.position.x = (logical_size.x - before.size.x) / 2,
+            .right => after.position.x = logical_size.x - before.size.x,
+            .top => after.position.y = 0,
+            .vertical_center => after.position.y = (logical_size.y - before.size.y) / 2,
+            .bottom => after.position.y = logical_size.y - before.size.y,
+        }
+        if (geometryEqual(before, after)) return null;
+        items[index].position = after.position;
+        self.dirty = true;
+        self.copy_is_current = false;
+        return .{
+            .item_identity = items[index].identity,
+            .source = self.commandSource(items[index], edit_scope),
+            .edit_scope = edit_scope,
+            .before_position = before.position,
+            .before_size = before.size,
+            .after_position = after.position,
+            .after_size = after.size,
+            .resized = false,
+        };
+    }
+
     /// Draw after the slide itself. While dragging, the original bounds remain
     /// visible as a subdued outline and the live geometry gets the accent.
     pub fn draw(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
         if (!self.enabled) return;
 
+        if (self.grid_snapping) self.drawLogicalGrid(viewport);
+
         if (self.interaction != .idle) {
+            self.drawSnapGuides(viewport);
             if (geometryToScreenRect(viewport, self.drag.before)) |original| {
                 rl.drawRectangleLinesEx(original, 1, .{ .r = 255, .g = 255, .b = 255, .a = 105 });
             }
@@ -1978,12 +2427,101 @@ pub const Studio = struct {
                         }
                     }
                 }
+                if (self.interaction != .idle) self.drawGeometryHud(viewport, rect, geometry);
             }
         }
 
         self.drawToolbar(viewport);
         if (self.selected_identity != null) self.drawProperties(viewport);
         self.drawStatus(items, resolved_bounds, viewport);
+    }
+
+    fn drawLogicalGrid(self: Studio, viewport: Viewport) void {
+        if (!viewport.valid() or self.grid_spacing <= 0) return;
+        const minor: rl.Color = .{ .r = 105, .g = 207, .b = 230, .a = 24 };
+        const major: rl.Color = .{ .r = 105, .g = 207, .b = 230, .a = 52 };
+
+        var index: usize = 0;
+        var logical_x: f32 = 0;
+        while (logical_x <= viewport.logical_size.x) : ({
+            index += 1;
+            logical_x = @as(f32, @floatFromInt(index)) * self.grid_spacing;
+        }) {
+            const screen = logicalToScreen(viewport, .{ .x = logical_x, .y = 0 }) orelse return;
+            rl.drawLineEx(
+                .{ .x = screen.x, .y = viewport.slide_top_left.y },
+                .{ .x = screen.x, .y = viewport.slide_top_left.y + viewport.slide_size.y },
+                if (index % 5 == 0) 1.25 else 1,
+                if (index % 5 == 0) major else minor,
+            );
+        }
+
+        index = 0;
+        var logical_y: f32 = 0;
+        while (logical_y <= viewport.logical_size.y) : ({
+            index += 1;
+            logical_y = @as(f32, @floatFromInt(index)) * self.grid_spacing;
+        }) {
+            const screen = logicalToScreen(viewport, .{ .x = 0, .y = logical_y }) orelse return;
+            rl.drawLineEx(
+                .{ .x = viewport.slide_top_left.x, .y = screen.y },
+                .{ .x = viewport.slide_top_left.x + viewport.slide_size.x, .y = screen.y },
+                if (index % 5 == 0) 1.25 else 1,
+                if (index % 5 == 0) major else minor,
+            );
+        }
+    }
+
+    fn drawSnapGuides(self: Studio, viewport: Viewport) void {
+        const color: rl.Color = .{ .r = 255, .g = 92, .b = 198, .a = 230 };
+        if (self.snap_guides.vertical) |logical_x| {
+            const screen = logicalToScreen(viewport, .{ .x = logical_x, .y = 0 }) orelse return;
+            rl.drawLineEx(
+                .{ .x = screen.x, .y = viewport.slide_top_left.y },
+                .{ .x = screen.x, .y = viewport.slide_top_left.y + viewport.slide_size.y },
+                1.5,
+                color,
+            );
+        }
+        if (self.snap_guides.horizontal) |logical_y| {
+            const screen = logicalToScreen(viewport, .{ .x = 0, .y = logical_y }) orelse return;
+            rl.drawLineEx(
+                .{ .x = viewport.slide_top_left.x, .y = screen.y },
+                .{ .x = viewport.slide_top_left.x + viewport.slide_size.x, .y = screen.y },
+                1.5,
+                color,
+            );
+        }
+    }
+
+    fn drawGeometryHud(_: Studio, viewport: Viewport, item_rect: rl.Rectangle, geometry: Geometry) void {
+        var buffer: [128]u8 = undefined;
+        const text = std.fmt.bufPrintZ(
+            &buffer,
+            "x {d:.1}  y {d:.1}  w {d:.1}  h {d:.1}",
+            .{ geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
+        ) catch return;
+        const font_size: i32 = 14;
+        const padding: f32 = 7;
+        const width: f32 = @floatFromInt(rl.measureText(text, font_size));
+        const hud_width = width + padding * 2;
+        const hud_height: f32 = 28;
+        const rect = geometryHudRectangle(viewport, item_rect, hud_width, hud_height);
+        rl.drawRectangleRec(rect, .{ .r = 12, .g = 16, .b = 28, .a = 238 });
+        rl.drawRectangleLinesEx(rect, 1, .{ .r = 255, .g = 92, .b = 198, .a = 220 });
+        rl.drawText(text, @intFromFloat(rect.x + padding), @intFromFloat(rect.y + 7), font_size, .white);
+    }
+
+    fn geometryHudRectangle(viewport: Viewport, item_rect: rl.Rectangle, hud_width: f32, hud_height: f32) rl.Rectangle {
+        const min_x = viewport.slide_top_left.x;
+        const max_x = viewport.slide_top_left.x + viewport.slide_size.x - hud_width;
+        const x = @max(min_x, @min(item_rect.x, max_x));
+        const above_y = item_rect.y - hud_height - 6;
+        const desired_y = if (above_y >= viewport.slide_top_left.y) above_y else item_rect.y + item_rect.height + 6;
+        const min_y = viewport.slide_top_left.y;
+        const max_y = viewport.slide_top_left.y + viewport.slide_size.y - hud_height;
+        const y = @max(min_y, @min(desired_y, max_y));
+        return .{ .x = x, .y = y, .width = hud_width, .height = hud_height };
     }
 
     /// Convenience draw path with placeholder thumbnail wells. Integrations
@@ -2137,6 +2675,23 @@ pub const Studio = struct {
             );
         }
         drawActionButton(layout.new_slide, "+ Slide");
+        rl.drawRectangleRec(layout.grid_toggle, if (self.grid_snapping)
+            .{ .r = 43, .g = 123, .b = 151, .a = 255 }
+        else
+            .{ .r = 31, .g = 38, .b = 55, .a = 245 });
+        rl.drawRectangleLinesEx(layout.grid_toggle, if (self.grid_snapping) 2 else 1, if (self.grid_snapping)
+            .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+        else
+            .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+        const grid_label: [:0]const u8 = if (self.grid_snapping) "GRID ON" else "GRID";
+        const grid_label_width = rl.measureText(grid_label, 11);
+        rl.drawText(
+            grid_label,
+            @intFromFloat(layout.grid_toggle.x + (layout.grid_toggle.width - @as(f32, @floatFromInt(grid_label_width))) / 2),
+            @intFromFloat(layout.grid_toggle.y + 15),
+            11,
+            .white,
+        );
         drawActionButton(layout.scene_previous, "<");
         var scene_buffer: [32]u8 = undefined;
         const scene_label: [:0]const u8 = if (self.active_morph_state) |state|
@@ -2152,12 +2707,16 @@ pub const Studio = struct {
         drawStudioPanel(layout.properties);
         rl.drawText("PROPERTIES", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 11), 15, .white);
         drawActionButton(layout.edit_text, "Text");
-        drawActionButton(layout.delete_item, "Delete");
+        drawActionButton(layout.duplicate_item, "Dup");
+        drawActionButton(layout.delete_item, "Del");
         drawActionButton(layout.promote, "Reuse");
         rl.drawText("FOREGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 82), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
         drawSwatches(layout.foreground_swatches);
         rl.drawText("BACKGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 146), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
         drawSwatches(layout.background_swatches);
+        rl.drawText("ALIGN TO SLIDE", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 210), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+        const align_labels = [_][:0]const u8{ "L", "HC", "R", "T", "VC", "B" };
+        for (layout.align_buttons, align_labels) |button, label| drawCompactButton(button, label);
     }
 
     fn drawStatus(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
@@ -2180,7 +2739,10 @@ pub const Studio = struct {
 
         rl.drawText(status_text, @intFromFloat(panel.x + 12), @intFromFloat(panel.y + 9), 18, .white);
         rl.drawText(
-            "V select · T text · B bullets · I image · R shape · U library · Cmd/Ctrl-N slide · [ ] morph",
+            if (self.grid_snapping)
+                "GRID ON · G toggle · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap"
+            else
+                "G grid · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap · [ ] morph scenes",
             @intFromFloat(panel.x + 12),
             @intFromFloat(panel.y + 35),
             14,
@@ -2204,6 +2766,7 @@ pub const Studio = struct {
             .shared_template_masked => "This slide already overrides the item; edit the shared template from an uncustomized instance",
             .shared_template_delete_unsupported => "Shared template deletion needs dependency cleanup and is not available yet",
             .local_override_needs_unique_id => "Add a unique id=... to create a local override; Alt edits an uncustomized shared item",
+            .duplicate_item_unsupported => "Duplicate is not source-safe here; use a direct item, current-state birth, or Alt on an uncustomized template",
             .template_background_local_unsupported => "Background insertion cannot be local to a template instance; hold Alt to edit the shared template",
             .generated_source_read_only => "Read-only in Studio: this item directive is produced with @let",
             .property_unavailable => "That property does not apply to this kind of item",
@@ -2362,6 +2925,461 @@ fn testItem(identity: usize, kind: slides.SlideItemKind, x: f32, y: f32, w: f32,
 fn expectVector(expected: rl.Vector2, actual: rl.Vector2) !void {
     try std.testing.expectApproxEqAbs(expected.x, actual.x, 0.0001);
     try std.testing.expectApproxEqAbs(expected.y, actual.y, 0.0001);
+}
+
+test "smart snapping aligns moving edges and centers with deterministic guides" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 0, 0, 200, 100),
+        testItem(2, .textbox, 300, 400, 200, 100),
+    };
+    const slide_center = snapGeometry(
+        .{ .position = .{ .x = 855, .y = 101 }, .size = .{ .x = 200, .y = 100 } },
+        .moving,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 860), slide_center.geometry.position.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 960), slide_center.guides.vertical);
+
+    items[1].position = .{ .x = 300, .y = 400 };
+    const other_edge = snapGeometry(
+        .{ .position = .{ .x = 505, .y = 250 }, .size = .{ .x = 100, .y = 100 } },
+        .moving,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 500), other_edge.geometry.position.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 500), other_edge.guides.vertical);
+}
+
+test "grid snapping affects free axes while smart guides take priority" {
+    const items = [_]slides.SlideItem{testItem(1, .textbox, 0, 0, 100, 100)};
+    const grid = snapGeometry(
+        .{ .position = .{ .x = 33, .y = 47 }, .size = .{ .x = 101, .y = 99 } },
+        .moving,
+        default_logical_size,
+        .{ .x = 1, .y = 1 },
+        true,
+        20,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    try expectVector(.{ .x = 40, .y = 40 }, grid.geometry.position);
+    try std.testing.expect(grid.guides.vertical == null and grid.guides.horizontal == null);
+
+    const slide_edge = snapGeometry(
+        .{ .position = .{ .x = 7, .y = 47 }, .size = .{ .x = 101, .y = 99 } },
+        .moving,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        true,
+        20,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 0), slide_edge.geometry.position.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 0), slide_edge.guides.vertical);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), slide_edge.geometry.position.y, 0.0001);
+}
+
+test "resize snapping skips infeasible smart targets and falls back to grid" {
+    const smart_items = [_]slides.SlideItem{
+        testItem(1, .textbox, 10, 100, 6, 100),
+        testItem(2, .textbox, 15, 500, 10, 10),
+    };
+    const smart = snapGeometry(
+        .{ .position = .{ .x = 10, .y = 100 }, .size = .{ .x = 6, .y = 100 } },
+        .resizing,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &smart_items,
+        &.{},
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 10), smart.geometry.size.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 20), smart.guides.vertical);
+
+    const grid_items = [_]slides.SlideItem{
+        testItem(1, .textbox, 10, 100, 6, 100),
+        testItem(2, .textbox, 15, 500, 1, 10),
+    };
+    const grid = snapGeometry(
+        .{ .position = .{ .x = 10, .y = 100 }, .size = .{ .x = 6, .y = 100 } },
+        .resizing,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        true,
+        20,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &grid_items,
+        &.{},
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 10), grid.geometry.size.x, 0.0001);
+    try std.testing.expect(grid.guides.vertical == null);
+}
+
+test "aspect locked resizing snaps one dominant edge then derives the other" {
+    const items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 100, 200, 100),
+        testItem(2, .textbox, 460, 300, 100, 100),
+    };
+    const result = snapGeometry(
+        .{ .position = .{ .x = 100, .y = 100 }, .size = .{ .x = 355, .y = 177.5 } },
+        .resizing,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        2,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    try expectVector(.{ .x = 360, .y = 180 }, result.geometry.size);
+    try std.testing.expectEqual(@as(?f32, 460), result.guides.vertical);
+    try std.testing.expect(result.guides.horizontal == null);
+}
+
+test "aspect locked snapping falls back when the nearest axis is too small" {
+    const items = [_]slides.SlideItem{
+        testItem(1, .textbox, 10, 10, 6, 3),
+        testItem(2, .textbox, 15, 20, 100, 100),
+    };
+    const smart = snapGeometry(
+        .{ .position = .{ .x = 10, .y = 10 }, .size = .{ .x = 6, .y = 3 } },
+        .resizing,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        2,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    try expectVector(.{ .x = 20, .y = 10 }, smart.geometry.size);
+    try std.testing.expect(smart.guides.vertical == null);
+    try std.testing.expectEqual(@as(?f32, 20), smart.guides.horizontal);
+
+    const grid = snapGeometry(
+        .{ .position = .{ .x = 10, .y = 10 }, .size = .{ .x = 6, .y = 3 } },
+        .resizing,
+        default_logical_size,
+        .{ .x = 0, .y = 0 },
+        true,
+        20,
+        default_min_item_size,
+        2,
+        false,
+        1,
+        &items,
+        &.{},
+    );
+    try expectVector(.{ .x = 20, .y = 10 }, grid.geometry.size);
+}
+
+test "smart snapping preserves fractional centers exactly" {
+    const items = [_]slides.SlideItem{testItem(1, .textbox, 0, 0, 101, 50)};
+    const result = snapGeometry(
+        .{ .position = .{ .x = 449.8, .y = 100 }, .size = .{ .x = 101, .y = 50 } },
+        .moving,
+        .{ .x = 1000, .y = 500 },
+        .{ .x = 2, .y = 2 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 449.5), result.geometry.position.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 500), result.guides.vertical);
+}
+
+test "shared template snapping excludes instance-local object guides" {
+    const items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 100, 100, 100),
+        testItem(2, .textbox, 500, 400, 200, 100),
+    };
+    const candidate: Geometry = .{ .position = .{ .x = 394, .y = 250 }, .size = .{ .x = 100, .y = 80 } };
+    const local = snapGeometry(
+        candidate,
+        .moving,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 400), local.geometry.position.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 500), local.guides.vertical);
+
+    const shared = snapGeometry(
+        candidate,
+        .moving,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        null,
+        false,
+        1,
+        &items,
+        &.{},
+    );
+    try std.testing.expectApproxEqAbs(candidate.position.x, shared.geometry.position.x, 0.0001);
+    try std.testing.expect(shared.guides.vertical == null);
+}
+
+test "smart snap candidates use resolved auto image bounds and filter hidden items" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 100, 100, 100),
+        testItem(2, .img, 500, 100, 0, 0),
+        testItem(3, .textbox, 494, 100, 100, 100),
+    };
+    items[2].visible = false;
+    const bounds = [_]ResolvedBounds{.{
+        .identity = 2,
+        .position = .{ .x = 500, .y = 100 },
+        .size = .{ .x = 240, .y = 120 },
+    }};
+    const result = snapGeometry(
+        .{ .position = .{ .x = 394, .y = 260 }, .size = .{ .x = 100, .y = 80 } },
+        .moving,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &items,
+        &bounds,
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 400), result.geometry.position.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 500), result.guides.vertical);
+}
+
+test "screen pixel snap threshold stays stable across viewport scales" {
+    const scaled_viewport: Viewport = .{
+        .slide_top_left = .zero(),
+        .slide_size = .{ .x = 960, .y = 540 },
+    };
+    var scaled_items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 100),
+        testItem(2, .textbox, 300, 700, 100, 100),
+    };
+    var scaled: Studio = .{ .enabled = true };
+    _ = scaled.update(&scaled_items, &.{}, scaled_viewport, .{
+        .pointer_screen = .{ .x = 60, .y = 160 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = scaled.update(&scaled_items, &.{}, scaled_viewport, .{
+        .pointer_screen = .{ .x = 103.5, .y = 160 },
+        .pointer_down = true,
+    });
+    try std.testing.expectApproxEqAbs(@as(f32, 200), scaled_items[0].position.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 300), scaled.liveSnapGuides().?.vertical);
+
+    var full_items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 100),
+        testItem(2, .textbox, 300, 700, 100, 100),
+    };
+    var full: Studio = .{ .enabled = true };
+    const full_viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    _ = full.update(&full_items, &.{}, full_viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = full.update(&full_items, &.{}, full_viewport, .{
+        .pointer_screen = .{ .x = 207, .y = 320 },
+        .pointer_down = true,
+    });
+    try std.testing.expectApproxEqAbs(@as(f32, 187), full_items[0].position.x, 0.0001);
+    try std.testing.expect(full.liveSnapGuides().?.vertical == null);
+}
+
+test "shortcut modifier bypasses snapping and cancel clears guides" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 100),
+        testItem(2, .textbox, 300, 700, 100, 100),
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = .{ .x = 960, .y = 540 } };
+    var studio: Studio = .{ .enabled = true };
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 60, .y = 160 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 103.5, .y = 160 },
+        .pointer_down = true,
+        .disable_snapping = true,
+    });
+    try std.testing.expectApproxEqAbs(@as(f32, 187), items[0].position.x, 0.0001);
+    try std.testing.expect(studio.liveSnapGuides().?.vertical == null);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 103.5, .y = 160 },
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(@as(?f32, 300), studio.liveSnapGuides().?.vertical);
+    _ = studio.update(&items, &.{}, viewport, .{ .cancel_pressed = true });
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try std.testing.expect(studio.liveSnapGuides() == null);
+    try std.testing.expect(studio.snap_guides.vertical == null and studio.snap_guides.horizontal == null);
+    try expectVector(.{ .x = 100, .y = 300 }, items[0].position);
+}
+
+test "shift resize locks the authored aspect ratio" {
+    var items = [_]slides.SlideItem{testItem(1, .textbox, 100, 100, 200, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 1 };
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 300, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(Interaction.resizing, studio.interaction);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 400, .y = 220 },
+        .pointer_down = true,
+        .lock_aspect_ratio = true,
+        .disable_snapping = true,
+    });
+    try expectVector(.{ .x = 300, .y = 150 }, items[0].size);
+}
+
+test "grid toggle works from keyboard input and toolbar button" {
+    var items: [0]slides.SlideItem = .{};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = uiLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .toggle_grid_pressed = true });
+    try std.testing.expect(studio.grid_snapping);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.grid_toggle),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(!studio.grid_snapping);
+}
+
+test "grid toggle on pointer release still finishes the active gesture" {
+    var items = [_]slides.SlideItem{testItem(1, .textbox, 100, 300, 200, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 220, .y = 320 },
+        .pointer_down = true,
+    });
+    const command = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 220, .y = 320 },
+        .pointer_released = true,
+        .toggle_grid_pressed = true,
+    }).?;
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try std.testing.expect(studio.grid_snapping);
+    try expectVector(.{ .x = 200, .y = 300 }, command.after_position);
+}
+
+test "geometry HUD stays inside the slide viewport" {
+    const viewport: Viewport = .{
+        .slide_top_left = .{ .x = 50, .y = 100 },
+        .slide_size = .{ .x = 300, .y = 200 },
+    };
+    const rect = Studio.geometryHudRectangle(
+        viewport,
+        .{ .x = 100, .y = 100, .width = 100, .height = 200 },
+        160,
+        28,
+    );
+    try std.testing.expect(rect.x >= viewport.slide_top_left.x);
+    try std.testing.expect(rect.x + rect.width <= viewport.slide_top_left.x + viewport.slide_size.x);
+    try std.testing.expect(rect.y >= viewport.slide_top_left.y);
+    try std.testing.expect(rect.y + rect.height <= viewport.slide_top_left.y + viewport.slide_size.y);
+}
+
+test "all align actions emit exact slide-relative geometry for resolved bounds" {
+    const item = testItem(1, .img, 123, 234, 0, 0);
+    var items = [_]slides.SlideItem{item};
+    const bounds = [_]ResolvedBounds{.{
+        .identity = 1,
+        .position = .{ .x = 123, .y = 234 },
+        .size = .{ .x = 101, .y = 51 },
+    }};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const actions = [_]AlignAction{ .left, .horizontal_center, .right, .top, .vertical_center, .bottom };
+    const expected = [_]rl.Vector2{
+        .{ .x = 0, .y = 234 },
+        .{ .x = 909.5, .y = 234 },
+        .{ .x = 1819, .y = 234 },
+        .{ .x = 123, .y = 0 },
+        .{ .x = 123, .y = 514.5 },
+        .{ .x = 123, .y = 1029 },
+    };
+
+    for (actions, expected) |action, expected_position| {
+        items[0] = item;
+        var studio: Studio = .{ .enabled = true, .selected_identity = 1 };
+        const command = studio.update(&items, &bounds, viewport, .{ .align_action = action }).?;
+        try expectVector(expected_position, command.after_position);
+        try expectVector(.{ .x = 101, .y = 51 }, command.after_size);
+        try std.testing.expectEqual(EditScope.direct, command.edit_scope);
+        try expectVector(expected_position, items[0].position);
+    }
 }
 
 test "coordinate conversion round trips through a letterboxed viewport" {
@@ -2829,6 +3847,103 @@ test "property hit targets emit delete and color commands" {
         else => return error.UnexpectedSemanticCommand,
     }
     try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+}
+
+test "duplicate shortcut targets an item and falls back to the current slide" {
+    var items = [_]slides.SlideItem{testItem(181, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .direct, .line_number = 7, .line_offset = 72, .patchable = true };
+    const summaries = [_]SlideSummary{.{ .index = 4 }};
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 4 };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 181 };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .duplicate_slide_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_item => |target| {
+            try std.testing.expectEqual(@as(usize, 181), target.item_identity);
+            try std.testing.expectEqual(EditScope.direct, target.edit_scope);
+            try std.testing.expectEqual(@as(usize, 72), target.source.line_offset);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.clearSelection(&items);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .duplicate_slide_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_slide => |slide_index| try std.testing.expectEqual(@as(usize, 4), slide_index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "duplicate property button dispatches the selected direct item" {
+    var items = [_]slides.SlideItem{testItem(182, .textbox, 100, 100, 300, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = uiLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .selected_identity = 182 };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.duplicate_item),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_item => |target| try std.testing.expectEqual(@as(usize, 182), target.item_identity),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "template duplication is shared-only and rejects customized instances" {
+    var items = [_]slides.SlideItem{testItem(183, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
+    items[0].id = "hero";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 183 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.duplicate_item_unsupported, studio.notice);
+
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true, .allow_shared_edit = true });
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_item => |target| try std.testing.expectEqual(EditScope.shared_template, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 20, .line_offset = 220, .patchable = true };
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true, .allow_shared_edit = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.shared_template_masked, studio.notice);
+}
+
+test "morph duplication allows only an unmodified current-state birth" {
+    var items = [_]slides.SlideItem{testItem(184, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .morph_item, .line_number = 5, .line_offset = 50, .patchable = true };
+    items[0].creation_morph_state = 0;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{
+        .enabled = true,
+        .selected_identity = 184,
+        .active_morph_state = 0,
+        .morph_state_count = 2,
+    };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_item => |target| try std.testing.expectEqual(EditScope.direct, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[0].state_source = .{ .scope = .morph_item, .line_number = 6, .line_offset = 60, .patchable = true };
+    items[0].state_source_state = 0;
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.duplicate_item_unsupported, studio.notice);
+
+    items[0].state_source = null;
+    items[0].state_source_state = null;
+    studio.active_morph_state = 1;
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.duplicate_item_unsupported, studio.notice);
 }
 
 test "identified template text edits default local and Alt selects shared" {
@@ -3393,13 +4508,46 @@ test "workspace keyboard navigation and reorder do not nudge canvas items" {
     }
     try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
 
-    studio.selected_identity = 121;
+    studio.selected_identity = null;
     _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .move_slide = -1 });
     switch (studio.takeSemanticCommand().?) {
         .move_slide => |command| try std.testing.expectEqual(SlideMoveDirection.up, command.direction),
         else => return error.UnexpectedSemanticCommand,
     }
     try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+}
+
+test "Alt Shift arrows nudge a shared item but reorder with no canvas selection" {
+    var items = [_]slides.SlideItem{testItem(122, .textbox, 100, 100, 200, 80)};
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    const summaries = [_]SlideSummary{ .{ .index = 1 }, .{ .index = 2 } };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 2 };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 122 };
+
+    const command = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .nudge = .{ .x = 10, .y = 0 },
+        .move_slide = -1,
+        .allow_shared_edit = true,
+    }).?;
+    try std.testing.expectEqual(EditScope.shared_template, command.edit_scope);
+    try expectVector(.{ .x = 110, .y = 100 }, command.after_position);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    studio.clearSelection(&items);
+    try std.testing.expect(studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .nudge = .{ .x = 10, .y = 0 },
+        .move_slide = -1,
+        .allow_shared_edit = true,
+    }) == null);
+    switch (studio.takeSemanticCommand().?) {
+        .move_slide => |move| {
+            try std.testing.expectEqual(@as(usize, 2), move.slide_index);
+            try std.testing.expectEqual(SlideMoveDirection.up, move.direction);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try expectVector(.{ .x = 110, .y = 100 }, items[0].position);
 }
 
 fn rectangleCenter(rect: rl.Rectangle) rl.Vector2 {

@@ -72,11 +72,16 @@ The top toolbar contains these one-shot canvas tools:
 
 Click an object and drag it to move it, or drag the cyan handle at its
 bottom-right corner to resize it. The arrow keys nudge the selection by one
-logical pixel; hold <kbd>Shift</kbd> to nudge by ten. The property panel edits
-text, deletes the object, promotes it for reuse, and applies foreground or
-background palette colors. <kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new
-slide immediately after the current one. <kbd>Esc</kbd> cancels an active drag
-or tool, then leaves Studio.
+logical pixel; hold <kbd>Shift</kbd> to nudge by ten. Moves and resizes snap to
+the slide and nearby object edges and centers, with magenta guides and a live
+`x/y/w/h` readout. Hold <kbd>Cmd/Ctrl</kbd> during a drag to bypass snapping,
+or press <kbd>G</kbd> to toggle the visible 20-pixel grid. Holding
+<kbd>Shift</kbd> while resizing preserves the displayed aspect ratio, including
+for auto-sized images. The property panel edits text, duplicates or deletes
+the object, promotes it for reuse, applies palette colors, and aligns it to any
+slide edge or center. <kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new slide
+immediately after the current one. <kbd>Esc</kbd> cancels an active drag or
+tool, then leaves Studio.
 
 The Studio sidebar is a deck organizer and source-aware library. Its slide
 cards contain live rendered thumbnails and can select, add, duplicate, delete,
@@ -130,6 +135,9 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Undo the last visual edit |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
 | <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |
+| <kbd>G</kbd> | Toggle grid display and grid snapping |
+| Hold <kbd>Shift</kbd> while resizing | Preserve the object's aspect ratio |
+| Hold <kbd>Cmd/Ctrl</kbd> while dragging | Temporarily bypass smart guides and grid snapping |
 | <kbd>Backspace</kbd> | Delete the selected object |
 | Hold <kbd>Alt</kbd> while editing a template item | Edit its shared definition instead of this instance |
 | <kbd>Enter</kbd> | Edit the selected object's text |
@@ -140,9 +148,9 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Cmd/Ctrl</kbd> + <kbd>N</kbd> | Insert a new slide after this slide |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd> | Promote the current slide to a reusable slide template |
 | <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Select the previous or next slide in Studio |
-| <kbd>Cmd/Ctrl</kbd> + <kbd>D</kbd> | Duplicate the current slide |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>D</kbd> | Duplicate the selected object, or the current slide when no object is selected |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Backspace</kbd> | Delete the current slide (except the only slide) |
-| <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>Up/Down</kbd> | Move the current slide earlier or later |
+| <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>Up/Down</kbd> | Move the current slide when no object is selected; otherwise nudge the shared template item by ten |
 
 The `*` beside `STUDIO` means the in-memory document differs from the original
 file. Automatic file reload is paused while those unsaved changes exist.
@@ -156,6 +164,15 @@ Structural edits are also undoable. If a source layout cannot be moved or
 duplicated unambiguously—most notably a reusable definition, global font/color
 default, or unusual slide-template definition inside a rendered slide—Studio
 refuses the edit and leaves the source intact.
+
+Object duplication is also source-aware: it copies the complete item body and
+owned reveal animation, assigns a fresh stable `id=`, offsets the clone by 20
+logical pixels, and leaves auto-image sizing untouched. Inherited morph items,
+local slide-template clones, generated directives, and crowd panels are
+conservatively refused when they cannot be duplicated without changing their
+ownership semantics. Hold <kbd>Alt</kbd> with **Dup** or
+<kbd>Cmd/Ctrl-D</kbd> to duplicate an uncustomized item in the shared slide
+template.
 
 If the original file changes externally, Studio refuses to overwrite it and
 asks you to use Save Copy. Quitting with unsaved work also writes a unique
