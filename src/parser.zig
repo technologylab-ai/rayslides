@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const slides = @import("slides.zig");
 const fonts = @import("fonts.zig");
 const animation = @import("animation.zig");
@@ -132,6 +133,7 @@ pub const ParserContext = struct {
     }
 
     fn logAllErrors(self: *ParserContext) void {
+        if (builtin.is_test) return;
         for (self.parser_errors.items) |err| {
             if (err.message) |msg| {
                 log.err("line {d}: {} ({s})", .{ err.line_number, err.parser_error, msg });
@@ -1085,6 +1087,13 @@ fn commitMorphMutation(parsing_item_context: *slides.ItemContext, context: *Pars
     if (std.mem.eql(u8, parsing_item_context.directive, "@show")) parsing_item_context.visible = true;
     if (std.mem.eql(u8, parsing_item_context.directive, "@hide")) parsing_item_context.visible = false;
     item.applyPatch(parsing_item_context.*);
+    item.state_source = .{
+        .scope = .morph_item,
+        .line_number = parsing_item_context.line_number,
+        .line_offset = parsing_item_context.line_offset,
+        .patchable = parsing_item_context.source_patchable,
+    };
+    item.state_source_state = state_index;
 }
 
 fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
@@ -1108,6 +1117,12 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         }
         context.active_morph_state = try context.current_slide.beginMorphState(
             parsing_item_context.morph orelse animation.MorphSpec{},
+            .{
+                .scope = .morph_item,
+                .line_number = parsing_item_context.line_number,
+                .line_offset = parsing_item_context.line_offset,
+                .patchable = parsing_item_context.source_patchable,
+            },
             context.active_morph_state,
         );
         context.current_context = .{};
@@ -1317,6 +1332,7 @@ fn commitItemToSlide(parsing_item_context: *slides.ItemContext, parser_context: 
         .line_offset = parsing_item_context.line_offset,
         .patchable = parsing_item_context.source_patchable,
     };
+    slide_item.creation_morph_state = parser_context.active_morph_state;
     if (parser_context.active_morph_state != null and slide_item.animation != null) {
         reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, parser_context, "items born inside morph states animate as part of the state; anim= is not valid here");
         slide_item.animation = null;
@@ -1671,6 +1687,7 @@ test "semantic morph states are cumulative reversible snapshots" {
     try std.testing.expectEqual(@as(usize, 2), slide.morph_states.items.len);
 
     const base_hero = slide.items.?.items[0];
+    try std.testing.expectEqual(@as(?usize, null), base_hero.creation_morph_state);
     try std.testing.expectApproxEqAbs(@as(f32, 100), slide.items.?.items[1].position.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 90), slide.items.?.items[1].position.y, 0.0001);
     const state_one = slide.morph_states.items[0];
@@ -1685,6 +1702,7 @@ test "semantic morph states are cumulative reversible snapshots" {
     try std.testing.expectEqual(@as(u8, 1), state_one.items.items[1].text_shadow.?.color.r);
     try std.testing.expectApproxEqAbs(@as(f32, 9), state_one.items.items[1].text_shadow.?.offset.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 3), state_one.items.items[1].text_shadow.?.offset.y, 0.0001);
+    try std.testing.expectEqual(@as(?usize, 0), state_one.items.items[2].creation_morph_state);
 
     const state_two = slide.morph_states.items[1];
     try std.testing.expectEqual(animation.Easing.linear, state_two.spec.easing);
@@ -1697,6 +1715,89 @@ test "semantic morph states are cumulative reversible snapshots" {
     try std.testing.expectApproxEqAbs(@as(f32, 40), state_two.items.items[1].position.y, 0.0001);
     try std.testing.expectEqual(@as(u8, 1), state_two.items.items[1].color.?.r);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), state_two.items.items[2].opacity, 0.0001);
+    try std.testing.expectEqual(@as(?usize, 0), state_two.items.items[2].creation_morph_state);
+}
+
+test "semantic morph snapshots retain creation and effective state sources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@box id=hero x=10 y=20 w=100 h=80 text=Hero
+        \\@box id=steady x=30 y=40 w=120 h=90 text=Steady
+        \\@state(morph)
+        \\@set hero x=100
+        \\@hide steady
+        \\@state(morph)
+        \\@show hero y=200
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = slideshow.slides.items[0];
+    const base_hero = &slide.items.?.items[0];
+    const base_steady = &slide.items.?.items[1];
+    try std.testing.expect(base_hero.state_source == null);
+    try std.testing.expect(base_steady.state_source == null);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box id=hero").?, base_hero.source.line_offset);
+    try std.testing.expectEqual(base_hero.source.line_offset, base_hero.effectiveSource().line_offset);
+
+    const state_one = slide.morph_states.items[0].items.items;
+    try std.testing.expectEqual(@as(usize, 4), slide.morph_states.items[0].source.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@state(morph)").?, slide.morph_states.items[0].source.line_offset);
+    try std.testing.expect(slide.morph_states.items[0].source.patchable);
+    try std.testing.expectEqual(base_hero.source.line_offset, state_one[0].source.line_offset);
+    try std.testing.expectEqual(base_steady.source.line_offset, state_one[1].source.line_offset);
+    try std.testing.expectEqual(slides.SourceScope.morph_item, state_one[0].state_source.?.scope);
+    try std.testing.expectEqual(@as(?usize, 0), state_one[0].state_source_state);
+    try std.testing.expectEqual(@as(?usize, 0), state_one[1].state_source_state);
+    try std.testing.expect(state_one[0].state_source.?.patchable);
+    try std.testing.expectEqual(@as(usize, 5), state_one[0].state_source.?.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero").?, state_one[0].effectiveSource().line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@hide steady").?, state_one[1].effectiveSource().line_offset);
+
+    const state_two = slide.morph_states.items[1].items.items;
+    try std.testing.expectEqual(@as(usize, 7), slide.morph_states.items[1].source.line_number);
+    try std.testing.expectEqual(base_hero.source.line_offset, state_two[0].source.line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@show hero").?, state_two[0].effectiveSource().line_offset);
+    try std.testing.expectEqual(@as(?usize, 1), state_two[0].state_source_state);
+    // An item not touched in a later state keeps the directive that still
+    // determines its effective state.
+    try std.testing.expectEqual(state_one[1].effectiveSource().line_offset, state_two[1].effectiveSource().line_offset);
+    try std.testing.expectEqual(@as(?usize, 0), state_two[1].state_source_state);
+}
+
+test "let-expanded semantic morph sources are read only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        "@let move=x=100 y=200\n" ++
+        "@slide\n" ++
+        "@box id=hero x=10 y=20 w=100 h=80 text=Hero\n" ++
+        "@state(morph)\n" ++
+        "@set hero $move$\n";
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = slideshow.slides.items[0].morph_states.items[0].items.items[0];
+    try std.testing.expect(item.state_source != null);
+    try std.testing.expectEqual(slides.SourceScope.morph_item, item.state_source.?.scope);
+    try std.testing.expectEqual(@as(?usize, 0), item.state_source_state);
+    try std.testing.expect(!item.effectiveSource().patchable);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero").?, item.effectiveSource().line_offset);
+    // Only the @set line is expanded. The literal @state directive remains a
+    // safe insertion anchor for a later local Studio override.
+    try std.testing.expect(slideshow.slides.items[0].morph_states.items[0].source.patchable);
 }
 
 test "semantic morph mutations report unknown and ambiguous targets" {

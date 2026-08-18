@@ -284,8 +284,24 @@ pub const SlideshowRenderer = struct {
     /// SlideItem. Studio uses this for objects whose authored size is
     /// intentionally implicit, most notably auto-dimensioned images.
     pub fn itemRenderBounds(self: *const SlideshowRenderer, slide_number: i32, owner_identity: usize) ?rl.Rectangle {
+        return self.itemRenderBoundsForMorphState(slide_number, null, owner_identity);
+    }
+
+    /// Logical bounds for an owner in either the base scene or one materialized
+    /// semantic-morph snapshot. Studio uses the same scene for painting and
+    /// hit-testing, so auto-sized images stay selectable while editing states.
+    pub fn itemRenderBoundsForMorphState(
+        self: *const SlideshowRenderer,
+        slide_number: i32,
+        morph_state: ?usize,
+        owner_identity: usize,
+    ) ?rl.Rectangle {
         if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return null;
-        const elements = self.renderedSlides.items[@intCast(slide_number)].elements.items;
+        const slide = self.renderedSlides.items[@intCast(slide_number)];
+        const elements = if (morph_state) |state_index| blk: {
+            if (state_index >= slide.morph_scenes.items.len) return null;
+            break :blk slide.morph_scenes.items[state_index].elements.items;
+        } else slide.elements.items;
         var result: ?rl.Rectangle = null;
         for (elements) |element| {
             if (element.owner_identity != owner_identity or element.kind == .background) continue;

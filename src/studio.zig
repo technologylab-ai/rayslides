@@ -1,14 +1,15 @@
-//! First vertical slice of rayslides' visual Studio mode.
+//! Interaction and overlay logic for rayslides' visual Studio mode.
 //!
-//! This module deliberately knows how to edit geometry, but not how to rewrite
-//! `.sld` source. `SlideItem.source` supplies provenance and the integration
-//! layer consumes the small `GeometryCommand` values returned by
-//! `Studio.update`. During an interaction the logical item is mutated so the
-//! selection/preview overlay follows the pointer immediately. On cancellation
-//! the original geometry is restored.
+//! This module handles selection, live geometry gestures, semantic property
+//! controls, creation tools, and base/morph scene navigation. It deliberately
+//! does not rewrite `.sld` source: `SlideItem` provenance lets the integration
+//! layer consume the `GeometryCommand` and `SemanticCommand` intentions emitted
+//! by `Studio.update`. During a geometry interaction the logical item is
+//! mutated so the preview follows the pointer immediately; cancellation
+//! restores the authored geometry.
 //!
-//! Studio operates on the base slide item list. Callers should pass
-//! `slide.items.?.items`; editing a morph snapshot is a later, separate mode.
+//! Studio operates on the item list for the scene selected by its caller: the
+//! base slide items or one cumulative semantic-morph snapshot.
 
 const std = @import("std");
 const rl = @import("raylib");
@@ -216,7 +217,217 @@ pub const Notice = enum {
     undo_failed,
     shared_template_locked,
     generated_source_read_only,
+    property_unavailable,
+    base_scene_only,
 };
+
+/// The active canvas tool. Creation tools are deliberately one-shot: after a
+/// canvas click emits an add command Studio returns to Select. This keeps the
+/// presentation source as the authority while still making placement visual.
+pub const Tool = enum {
+    select,
+    add_text,
+    add_bullets,
+    add_image,
+    add_shape,
+    add_reusable,
+};
+
+pub const NewItemKind = enum {
+    text,
+    bullets,
+    image,
+    shape,
+};
+
+pub const PaletteColor = enum {
+    white,
+    black,
+    red,
+    orange,
+    yellow,
+    green,
+    cyan,
+    blue,
+};
+
+pub const palette = [_]PaletteColor{ .white, .black, .red, .orange, .yellow, .green, .cyan, .blue };
+
+pub fn paletteColor(value: PaletteColor) rl.Color {
+    return switch (value) {
+        .white => .{ .r = 245, .g = 247, .b = 252, .a = 255 },
+        .black => .{ .r = 20, .g = 24, .b = 34, .a = 255 },
+        .red => .{ .r = 244, .g = 92, .b = 92, .a = 255 },
+        .orange => .{ .r = 247, .g = 164, .b = 29, .a = 255 },
+        .yellow => .{ .r = 246, .g = 218, .b = 85, .a = 255 },
+        .green => .{ .r = 86, .g = 204, .b = 139, .a = 255 },
+        .cyan => .{ .r = 80, .g = 215, .b = 255, .a = 255 },
+        .blue => .{ .r = 102, .g = 139, .b = 255, .a = 255 },
+    };
+}
+
+pub const CommandTarget = struct {
+    item_identity: usize,
+    source: slides.SourceRef,
+};
+
+pub const AddItemCommand = struct {
+    kind: NewItemKind,
+    position: rl.Vector2,
+    suggested_size: rl.Vector2,
+    /// Shapes begin as a visible colored rectangle; other creation flows get
+    /// their foreground from authored slide defaults.
+    suggested_color: ?PaletteColor = null,
+};
+
+pub const ColorCommand = struct {
+    target: CommandTarget,
+    color: PaletteColor,
+};
+
+pub const MorphSceneCommand = struct {
+    /// null selects the authored base scene; otherwise this is a zero-based
+    /// morph-state index.
+    active_state: ?usize,
+};
+
+pub const AddReusableCommand = struct {
+    position: rl.Vector2,
+    suggested_size: rl.Vector2,
+};
+
+/// Source-level intentions emitted by the visual controls. Unlike
+/// GeometryCommand, these never mutate SlideItem; the integration layer can
+/// prompt for text/path details and atomically rewrite/reparse the `.sld`.
+pub const SemanticCommand = union(enum) {
+    add_item: AddItemCommand,
+    delete_item: CommandTarget,
+    edit_text: CommandTarget,
+    set_foreground: ColorCommand,
+    set_background: ColorCommand,
+    promote_to_reusable: CommandTarget,
+    select_morph_scene: MorphSceneCommand,
+    new_slide: void,
+    /// The integration layer prompts for an existing @push name and inserts
+    /// the corresponding @pop instance at this visual placement.
+    add_reusable: AddReusableCommand,
+};
+
+/// Stable hit targets shared by drawing, mouse handling, and tests. Keeping
+/// this layout in logical UI code also makes a future alternate frontend easy.
+pub const UiLayout = struct {
+    toolbar: rl.Rectangle,
+    tool_buttons: [6]rl.Rectangle,
+    new_slide: rl.Rectangle,
+    scene_previous: rl.Rectangle,
+    scene_label: rl.Rectangle,
+    scene_next: rl.Rectangle,
+    properties: rl.Rectangle,
+    edit_text: rl.Rectangle,
+    delete_item: rl.Rectangle,
+    promote: rl.Rectangle,
+    foreground_swatches: [palette.len]rl.Rectangle,
+    background_swatches: [palette.len]rl.Rectangle,
+};
+
+pub fn uiLayout(viewport: Viewport) UiLayout {
+    const margin: f32 = 12;
+    const gap: f32 = 6;
+    const tool_size: f32 = 42;
+    const new_slide_width: f32 = 74;
+    const scene_width: f32 = 132;
+    const toolbar_width = margin * 2 + tool_size * 6 + gap * 5 + gap + new_slide_width + gap + scene_width;
+    const toolbar: rl.Rectangle = .{
+        .x = viewport.slide_top_left.x + margin,
+        .y = viewport.slide_top_left.y + margin,
+        .width = toolbar_width,
+        .height = tool_size + margin * 2,
+    };
+    var tool_buttons: [6]rl.Rectangle = undefined;
+    for (&tool_buttons, 0..) |*button, index| button.* = .{
+        .x = toolbar.x + margin + @as(f32, @floatFromInt(index)) * (tool_size + gap),
+        .y = toolbar.y + margin,
+        .width = tool_size,
+        .height = tool_size,
+    };
+    const new_slide: rl.Rectangle = .{
+        .x = tool_buttons[5].x + tool_buttons[5].width + gap,
+        .y = toolbar.y + margin,
+        .width = new_slide_width,
+        .height = tool_size,
+    };
+    const scene_previous: rl.Rectangle = .{
+        .x = new_slide.x + new_slide.width + gap,
+        .y = new_slide.y,
+        .width = 26,
+        .height = tool_size,
+    };
+    const scene_label: rl.Rectangle = .{
+        .x = scene_previous.x + scene_previous.width,
+        .y = new_slide.y,
+        .width = scene_width - 52,
+        .height = tool_size,
+    };
+    const scene_next: rl.Rectangle = .{
+        .x = scene_label.x + scene_label.width,
+        .y = new_slide.y,
+        .width = 26,
+        .height = tool_size,
+    };
+
+    const property_width: f32 = 264;
+    const properties: rl.Rectangle = .{
+        .x = viewport.slide_top_left.x + viewport.slide_size.x - property_width - margin,
+        .y = viewport.slide_top_left.y + margin,
+        .width = property_width,
+        .height = 224,
+    };
+    const action_y = properties.y + 38;
+    const action_width: f32 = 72;
+    const edit_text: rl.Rectangle = .{ .x = properties.x + 12, .y = action_y, .width = action_width, .height = 30 };
+    const delete_item: rl.Rectangle = .{ .x = edit_text.x + action_width + gap, .y = action_y, .width = action_width, .height = 30 };
+    const promote: rl.Rectangle = .{ .x = delete_item.x + action_width + gap, .y = action_y, .width = action_width, .height = 30 };
+
+    var foreground_swatches: [palette.len]rl.Rectangle = undefined;
+    var background_swatches: [palette.len]rl.Rectangle = undefined;
+    const swatch_size: f32 = 24;
+    for (&foreground_swatches, 0..) |*swatch, index| swatch.* = .{
+        .x = properties.x + 12 + @as(f32, @floatFromInt(index)) * (swatch_size + gap),
+        .y = properties.y + 105,
+        .width = swatch_size,
+        .height = swatch_size,
+    };
+    for (&background_swatches, 0..) |*swatch, index| swatch.* = .{
+        .x = properties.x + 12 + @as(f32, @floatFromInt(index)) * (swatch_size + gap),
+        .y = properties.y + 169,
+        .width = swatch_size,
+        .height = swatch_size,
+    };
+    return .{
+        .toolbar = toolbar,
+        .tool_buttons = tool_buttons,
+        .new_slide = new_slide,
+        .scene_previous = scene_previous,
+        .scene_label = scene_label,
+        .scene_next = scene_next,
+        .properties = properties,
+        .edit_text = edit_text,
+        .delete_item = delete_item,
+        .promote = promote,
+        .foreground_swatches = foreground_swatches,
+        .background_swatches = background_swatches,
+    };
+}
+
+fn statusPanel(viewport: Viewport) rl.Rectangle {
+    const panel_height: f32 = 103;
+    return .{
+        .x = viewport.slide_top_left.x + 12,
+        .y = viewport.slide_top_left.y + viewport.slide_size.y - panel_height - 12,
+        .width = @max(340, @min(900, viewport.slide_size.x - 24)),
+        .height = panel_height,
+    };
+}
 
 /// A testable input snapshot. `updateFromRaylib` is the convenient runtime
 /// adapter; tests and other frontends can call `update` directly.
@@ -229,15 +440,40 @@ pub const FrameInput = struct {
     pointer_released: bool = false,
     nudge: rl.Vector2 = .{ .x = 0, .y = 0 },
     allow_shared_edit: bool = false,
+    choose_tool: ?Tool = null,
+    delete_pressed: bool = false,
+    edit_text_pressed: bool = false,
+    promote_pressed: bool = false,
+    foreground_color: ?PaletteColor = null,
+    background_color: ?PaletteColor = null,
+    new_slide_pressed: bool = false,
+    /// Negative selects the previous base/morph scene, positive the next.
+    cycle_morph_scene: i8 = 0,
 
     pub fn fromRaylib() FrameInput {
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+        const shortcut_modifier = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control) or
+            rl.isKeyDown(.left_super) or rl.isKeyDown(.right_super);
         const amount: f32 = if (shift) 10 else 1;
         var nudge: rl.Vector2 = .{ .x = 0, .y = 0 };
         if (keyPressedOrRepeated(.left)) nudge.x -= amount;
         if (keyPressedOrRepeated(.right)) nudge.x += amount;
         if (keyPressedOrRepeated(.up)) nudge.y -= amount;
         if (keyPressedOrRepeated(.down)) nudge.y += amount;
+        const choose_tool: ?Tool = if (rl.isKeyPressed(.v))
+            .select
+        else if (rl.isKeyPressed(.t))
+            .add_text
+        else if (rl.isKeyPressed(.b))
+            .add_bullets
+        else if (rl.isKeyPressed(.i))
+            .add_image
+        else if (rl.isKeyPressed(.r))
+            .add_shape
+        else if (rl.isKeyPressed(.u))
+            .add_reusable
+        else
+            null;
         return .{
             .toggle_pressed = rl.isKeyPressed(.e),
             .cancel_pressed = rl.isKeyPressed(.escape),
@@ -247,6 +483,17 @@ pub const FrameInput = struct {
             .pointer_released = rl.isMouseButtonReleased(.left),
             .nudge = nudge,
             .allow_shared_edit = rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt),
+            .choose_tool = choose_tool,
+            .delete_pressed = rl.isKeyPressed(.backspace),
+            .edit_text_pressed = rl.isKeyPressed(.enter),
+            .promote_pressed = rl.isKeyPressed(.p),
+            .new_slide_pressed = shortcut_modifier and rl.isKeyPressed(.n),
+            .cycle_morph_scene = if (rl.isKeyPressed(.left_bracket))
+                -1
+            else if (rl.isKeyPressed(.right_bracket))
+                1
+            else
+                0,
         };
     }
 };
@@ -269,6 +516,9 @@ const Drag = struct {
 
 pub const Studio = struct {
     enabled: bool = false,
+    tool: Tool = .select,
+    active_morph_state: ?usize = null,
+    morph_state_count: usize = 0,
     dirty: bool = false,
     copy_is_current: bool = false,
     notice: Notice = .none,
@@ -284,6 +534,7 @@ pub const Studio = struct {
         .position = .{ .x = 0, .y = 0 },
         .size = .{ .x = 0, .y = 0 },
     },
+    pending_semantic_command: ?SemanticCommand = null,
 
     pub fn capturesInput(self: Studio) bool {
         return self.enabled;
@@ -320,6 +571,54 @@ pub const Studio = struct {
         return self.interaction != .idle;
     }
 
+    /// Returns and clears the most recent non-geometry UI intention.
+    pub fn takeSemanticCommand(self: *Studio) ?SemanticCommand {
+        const command = self.pending_semantic_command;
+        self.pending_semantic_command = null;
+        return command;
+    }
+
+    pub fn peekSemanticCommand(self: Studio) ?SemanticCommand {
+        return self.pending_semantic_command;
+    }
+
+    pub fn setTool(self: *Studio, tool: Tool, items: []slides.SlideItem) void {
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.tool = tool;
+        self.notice = .none;
+    }
+
+    pub fn setMorphStateCount(self: *Studio, count: usize) void {
+        self.morph_state_count = count;
+        if (self.active_morph_state) |state| {
+            if (state >= count) self.active_morph_state = null;
+        }
+    }
+
+    pub fn setActiveMorphState(self: *Studio, items: []slides.SlideItem, state: ?usize) void {
+        const normalized = if (state) |index|
+            if (index < self.morph_state_count) index else null
+        else
+            null;
+        if (self.active_morph_state == normalized) return;
+        self.clearSelection(items);
+        self.active_morph_state = normalized;
+    }
+
+    /// Cycles base -> state 1 ... state N -> base and emits the scene choice
+    /// for the integration layer to switch both item slice and renderer state.
+    pub fn cycleMorphState(self: *Studio, items: []slides.SlideItem, delta: i8) void {
+        if (delta == 0 or self.morph_state_count == 0) return;
+        const scene_count: isize = @intCast(self.morph_state_count + 1);
+        const current: isize = if (self.active_morph_state) |state| @intCast(state + 1) else 0;
+        const movement: isize = @intCast(delta);
+        const next_scene = @mod(current + movement, scene_count);
+        const next_state: ?usize = if (next_scene == 0) null else @intCast(next_scene - 1);
+        self.clearSelection(items);
+        self.active_morph_state = next_state;
+        self.pending_semantic_command = .{ .select_morph_scene = .{ .active_state = next_state } };
+    }
+
     pub fn cancelActiveInteraction(self: *Studio, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
     }
@@ -328,6 +627,8 @@ pub const Studio = struct {
         if (self.enabled and self.interaction != .idle) self.cancelInteraction(items);
         self.enabled = !self.enabled;
         if (!self.enabled) {
+            self.tool = .select;
+            self.active_morph_state = null;
             self.selected_identity = null;
             self.selected_source = null;
         }
@@ -336,6 +637,8 @@ pub const Studio = struct {
     pub fn disable(self: *Studio, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.enabled = false;
+        self.tool = .select;
+        self.active_morph_state = null;
         self.selected_identity = null;
         self.selected_source = null;
     }
@@ -396,16 +699,62 @@ pub const Studio = struct {
 
         self.validateSelection(items, resolved_bounds);
 
+        if (input.choose_tool) |tool| self.setTool(tool, items);
+
+        if (input.cycle_morph_scene != 0) {
+            self.cycleMorphState(items, input.cycle_morph_scene);
+            return null;
+        }
+
+        if (input.new_slide_pressed) {
+            self.clearSelection(items);
+            self.tool = .select;
+            self.pending_semantic_command = .{ .new_slide = {} };
+            return null;
+        }
+
         if (input.cancel_pressed) {
             if (self.interaction != .idle) {
                 self.cancelInteraction(items);
+            } else if (self.tool != .select) {
+                self.tool = .select;
             } else {
                 self.disable(items);
             }
             return null;
         }
 
+        if (input.delete_pressed) {
+            _ = self.emitSelectedCommand(items, input.allow_shared_edit, .delete_item);
+            return null;
+        }
+        if (input.edit_text_pressed) {
+            _ = self.emitSelectedCommand(items, input.allow_shared_edit, .edit_text);
+            return null;
+        }
+        if (input.promote_pressed) {
+            _ = self.emitSelectedCommand(items, input.allow_shared_edit, .promote_to_reusable);
+            return null;
+        }
+        if (input.foreground_color) |color| {
+            _ = self.emitColorCommand(items, input.allow_shared_edit, color, false);
+            return null;
+        }
+        if (input.background_color) |color| {
+            _ = self.emitColorCommand(items, input.allow_shared_edit, color, true);
+            return null;
+        }
+
+        if (input.pointer_pressed and self.handleUiClick(items, viewport, input.pointer_screen, input.allow_shared_edit)) return null;
+
         const pointer_logical = screenToLogical(viewport, input.pointer_screen);
+
+        if (input.pointer_pressed and self.interaction == .idle and self.tool != .select) {
+            if (viewport.containsScreenPoint(input.pointer_screen)) {
+                if (pointer_logical) |pointer| self.emitAddCommand(pointer);
+            }
+            return null;
+        }
 
         if (input.pointer_pressed and self.interaction == .idle) {
             if (self.selectedGeometry(items, resolved_bounds)) |selected_geometry| {
@@ -445,6 +794,157 @@ pub const Studio = struct {
         }
 
         return null;
+    }
+
+    fn selectedTarget(self: Studio, items: []const slides.SlideItem) ?CommandTarget {
+        const index = self.selectedIndex(items) orelse return null;
+        return .{ .item_identity = items[index].identity, .source = items[index].source };
+    }
+
+    const TargetCommandKind = enum { delete_item, edit_text, promote_to_reusable };
+
+    fn emitSelectedCommand(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+        kind: TargetCommandKind,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        if (!self.canEditItem(items[index], allow_shared_edit)) return true;
+        if (kind == .edit_text and items[index].kind != .textbox and items[index].kind != .crowd) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        if (kind == .promote_to_reusable and self.active_morph_state != null) {
+            self.notice = .base_scene_only;
+            return true;
+        }
+        if (kind == .promote_to_reusable and
+            (items[index].source.scope != .direct or
+                items[index].kind == .crowd or
+                items[index].kind == .background))
+        {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const target = self.selectedTarget(items) orelse return true;
+        self.pending_semantic_command = switch (kind) {
+            .delete_item => .{ .delete_item = target },
+            .edit_text => .{ .edit_text = target },
+            .promote_to_reusable => .{ .promote_to_reusable = target },
+        };
+        return true;
+    }
+
+    fn emitColorCommand(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+        color: PaletteColor,
+        background: bool,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        if (!self.canEditItem(items[index], allow_shared_edit)) return true;
+        if (!background and items[index].kind != .textbox) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        if (background and self.active_morph_state != null) {
+            self.notice = .base_scene_only;
+            return true;
+        }
+        const command: ColorCommand = .{
+            .target = self.selectedTarget(items) orelse return true,
+            .color = color,
+        };
+        self.pending_semantic_command = if (background)
+            .{ .set_background = command }
+        else
+            .{ .set_foreground = command };
+        return true;
+    }
+
+    fn emitAddCommand(self: *Studio, pointer: rl.Vector2) void {
+        if (self.tool == .add_reusable) {
+            self.pending_semantic_command = .{ .add_reusable = .{
+                .position = roundVector(pointer),
+                .suggested_size = .{ .x = 600, .y = 200 },
+            } };
+            self.tool = .select;
+            return;
+        }
+        const kind: NewItemKind = switch (self.tool) {
+            .select => return,
+            .add_text => .text,
+            .add_bullets => .bullets,
+            .add_image => .image,
+            .add_shape => .shape,
+            .add_reusable => unreachable,
+        };
+        self.pending_semantic_command = .{ .add_item = .{
+            .kind = kind,
+            .position = roundVector(pointer),
+            .suggested_size = switch (kind) {
+                .text => .{ .x = 600, .y = 120 },
+                .bullets => .{ .x = 720, .y = 320 },
+                .image => .{ .x = 640, .y = 360 },
+                .shape => .{ .x = 480, .y = 270 },
+            },
+            .suggested_color = if (kind == .shape) .blue else null,
+        } };
+        self.tool = .select;
+    }
+
+    fn handleUiClick(
+        self: *Studio,
+        items: []slides.SlideItem,
+        viewport: Viewport,
+        pointer: rl.Vector2,
+        allow_shared_edit: bool,
+    ) bool {
+        const layout = uiLayout(viewport);
+        const in_status = pointInRectangle(pointer, statusPanel(viewport));
+        const in_toolbar = pointInRectangle(pointer, layout.toolbar);
+        const in_properties = self.selected_identity != null and pointInRectangle(pointer, layout.properties);
+        if (!in_status and !in_toolbar and !in_properties) return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        if (in_status) return true;
+        if (in_toolbar) {
+            for (layout.tool_buttons, 0..) |button, index| {
+                if (pointInRectangle(pointer, button)) {
+                    self.setTool(@enumFromInt(index), items);
+                    break;
+                }
+            }
+            if (pointInRectangle(pointer, layout.new_slide)) {
+                self.clearSelection(items);
+                self.tool = .select;
+                self.pending_semantic_command = .{ .new_slide = {} };
+            }
+            if (pointInRectangle(pointer, layout.scene_previous)) self.cycleMorphState(items, -1);
+            if (pointInRectangle(pointer, layout.scene_label) or pointInRectangle(pointer, layout.scene_next)) {
+                self.cycleMorphState(items, 1);
+            }
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.edit_text))
+            return self.emitSelectedCommand(items, allow_shared_edit, .edit_text);
+        if (pointInRectangle(pointer, layout.delete_item))
+            return self.emitSelectedCommand(items, allow_shared_edit, .delete_item);
+        if (pointInRectangle(pointer, layout.promote))
+            return self.emitSelectedCommand(items, allow_shared_edit, .promote_to_reusable);
+        for (layout.foreground_swatches, 0..) |swatch, index| {
+            if (pointInRectangle(pointer, swatch))
+                return self.emitColorCommand(items, allow_shared_edit, palette[index], false);
+        }
+        for (layout.background_swatches, 0..) |swatch, index| {
+            if (pointInRectangle(pointer, swatch))
+                return self.emitColorCommand(items, allow_shared_edit, palette[index], true);
+        }
+        // Clicking empty property-panel space must never reach the canvas.
+        return true;
     }
 
     /// Runtime adapter. Call before ordinary presentation input and skip that
@@ -525,15 +1025,34 @@ pub const Studio = struct {
     }
 
     fn canEditItem(self: *Studio, item: slides.SlideItem, allow_shared_edit: bool) bool {
-        if (item.source.scope == .none or !item.source.patchable) {
+        if (!self.itemEditableInScene(item)) {
             self.notice = .generated_source_read_only;
             return false;
         }
+        if (self.active_morph_state != null) return true;
         if (item.source.scope == .slide_template and !allow_shared_edit) {
             self.notice = .shared_template_locked;
             return false;
         }
         return true;
+    }
+
+    fn itemEditableInScene(self: Studio, item: slides.SlideItem) bool {
+        if (self.active_morph_state) |state_index| {
+            if (item.state_source_state != null and item.state_source_state.? == state_index) {
+                return item.state_source != null and item.state_source.?.patchable;
+            }
+            // A creation directive can be patched directly only in the state
+            // that actually owns it. Later cumulative snapshots need an ID so
+            // the integration layer can append a local @set/@hide override.
+            if (item.creation_morph_state != null and item.creation_morph_state.? == state_index) {
+                return item.source.patchable;
+            }
+            // Inherited objects with IDs get a new local @set, so their base
+            // or shared-template directive need not itself be writable.
+            return item.id != null;
+        }
+        return item.source.scope != .none and item.source.patchable;
     }
 
     fn beginInteraction(
@@ -640,9 +1159,9 @@ pub const Studio = struct {
             if (geometryToScreenRect(viewport, geometry)) |rect| {
                 const selected_index = self.selectedIndex(items);
                 const accent: rl.Color = if (selected_index) |index|
-                    if (!items[index].source.patchable)
+                    if (!self.itemEditableInScene(items[index]))
                         .{ .r = 255, .g = 112, .b = 112, .a = 255 }
-                    else if (items[index].source.scope == .slide_template)
+                    else if (self.active_morph_state == null and items[index].source.scope == .slide_template)
                         .{ .r = 247, .g = 164, .b = 29, .a = 255 }
                     else
                         .{ .r = 80, .g = 215, .b = 255, .a = 255 }
@@ -650,7 +1169,7 @@ pub const Studio = struct {
                     .{ .r = 80, .g = 215, .b = 255, .a = 255 };
                 rl.drawRectangleLinesEx(rect, 3, accent);
                 if (selected_index) |index| {
-                    if (items[index].source.patchable) {
+                    if (self.itemEditableInScene(items[index])) {
                         if (self.resizeHandleRect(viewport, geometry)) |handle| {
                             rl.drawRectangleRec(handle, accent);
                             rl.drawRectangleLinesEx(handle, 1, .white);
@@ -660,17 +1179,62 @@ pub const Studio = struct {
             }
         }
 
+        self.drawToolbar(viewport);
+        if (self.selected_identity != null) self.drawProperties(viewport);
         self.drawStatus(items, resolved_bounds, viewport);
     }
 
+    fn drawToolbar(self: Studio, viewport: Viewport) void {
+        const layout = uiLayout(viewport);
+        drawStudioPanel(layout.toolbar);
+        const tools = [_]Tool{ .select, .add_text, .add_bullets, .add_image, .add_shape, .add_reusable };
+        for (layout.tool_buttons, tools) |button, tool| {
+            const active = self.tool == tool;
+            rl.drawRectangleRec(button, if (active)
+                .{ .r = 43, .g = 123, .b = 151, .a = 255 }
+            else
+                .{ .r = 31, .g = 38, .b = 55, .a = 245 });
+            rl.drawRectangleLinesEx(button, if (active) 2 else 1, if (active)
+                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            else
+                .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+            const label = toolLabel(tool);
+            const font_size: i32 = 15;
+            const width = rl.measureText(label, font_size);
+            rl.drawText(
+                label,
+                @intFromFloat(button.x + (button.width - @as(f32, @floatFromInt(width))) / 2),
+                @intFromFloat(button.y + 13),
+                font_size,
+                .white,
+            );
+        }
+        drawActionButton(layout.new_slide, "+ Slide");
+        drawActionButton(layout.scene_previous, "<");
+        var scene_buffer: [32]u8 = undefined;
+        const scene_label: [:0]const u8 = if (self.active_morph_state) |state|
+            std.fmt.bufPrintZ(&scene_buffer, "STATE {d}/{d}", .{ state + 1, self.morph_state_count }) catch "MORPH"
+        else
+            "BASE";
+        drawActionButton(layout.scene_label, scene_label);
+        drawActionButton(layout.scene_next, ">");
+    }
+
+    fn drawProperties(_: Studio, viewport: Viewport) void {
+        const layout = uiLayout(viewport);
+        drawStudioPanel(layout.properties);
+        rl.drawText("PROPERTIES", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 11), 15, .white);
+        drawActionButton(layout.edit_text, "Text");
+        drawActionButton(layout.delete_item, "Delete");
+        drawActionButton(layout.promote, "Reuse");
+        rl.drawText("FOREGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 82), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+        drawSwatches(layout.foreground_swatches);
+        rl.drawText("BACKGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 146), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+        drawSwatches(layout.background_swatches);
+    }
+
     fn drawStatus(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
-        const panel_height: f32 = 103;
-        const panel: rl.Rectangle = .{
-            .x = viewport.slide_top_left.x + 12,
-            .y = viewport.slide_top_left.y + viewport.slide_size.y - panel_height - 12,
-            .width = @max(340, @min(900, viewport.slide_size.x - 24)),
-            .height = panel_height,
-        };
+        const panel = statusPanel(viewport);
         rl.drawRectangleRec(panel, .{ .r = 10, .g = 14, .b = 24, .a = 225 });
         rl.drawRectangleLinesEx(panel, 1, .{ .r = 80, .g = 215, .b = 255, .a = 180 });
 
@@ -678,7 +1242,7 @@ pub const Studio = struct {
         const status_text = if (self.selected_identity) |identity| selected: {
             const geometry = self.selectedGeometry(items, resolved_bounds) orelse break :selected "STUDIO · selection unavailable";
             const index = self.selectedIndex(items) orelse break :selected "STUDIO · selection unavailable";
-            const source = items[index].source;
+            const source = if (self.active_morph_state != null) items[index].effectiveSource() else items[index].source;
             break :selected std.fmt.bufPrintZ(
                 &status_buffer,
                 "STUDIO{s} · item #{d} · {s}, line {d} · x {d:.0} y {d:.0} w {d:.0} h {d:.0}",
@@ -688,7 +1252,7 @@ pub const Studio = struct {
 
         rl.drawText(status_text, @intFromFloat(panel.x + 12), @intFromFloat(panel.y + 9), 18, .white);
         rl.drawText(
-            "E exit  ·  drag move  ·  corner resize  ·  arrows nudge  ·  Shift 10px  ·  Alt shared  ·  Esc cancel",
+            "V select · T text · B bullets · I image · R shape · U library · Cmd/Ctrl-N slide · [ ] morph",
             @intFromFloat(panel.x + 12),
             @intFromFloat(panel.y + 35),
             14,
@@ -711,6 +1275,8 @@ pub const Studio = struct {
             .undo_failed => "Undo/redo failed - see the log for details",
             .shared_template_locked => "Shared layout item: hold Alt to edit every slide that uses it",
             .generated_source_read_only => "Read-only in Studio: this item directive is produced with @let",
+            .property_unavailable => "That property does not apply to this kind of item",
+            .base_scene_only => "That action is available in the BASE scene",
         };
         if (notice_text) |message| {
             const notice_color: rl.Color = switch (self.notice) {
@@ -721,6 +1287,43 @@ pub const Studio = struct {
         }
     }
 };
+
+fn toolLabel(tool: Tool) [:0]const u8 {
+    return switch (tool) {
+        .select => "V",
+        .add_text => "T",
+        .add_bullets => "B",
+        .add_image => "IMG",
+        .add_shape => "RECT",
+        .add_reusable => "LIB",
+    };
+}
+
+fn drawStudioPanel(rect: rl.Rectangle) void {
+    rl.drawRectangleRec(rect, .{ .r = 10, .g = 14, .b = 24, .a = 235 });
+    rl.drawRectangleLinesEx(rect, 1, .{ .r = 80, .g = 215, .b = 255, .a = 180 });
+}
+
+fn drawActionButton(rect: rl.Rectangle, label: [:0]const u8) void {
+    rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
+    rl.drawRectangleLinesEx(rect, 1, .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+    const font_size: i32 = 13;
+    const width = rl.measureText(label, font_size);
+    rl.drawText(
+        label,
+        @intFromFloat(rect.x + (rect.width - @as(f32, @floatFromInt(width))) / 2),
+        @intFromFloat(rect.y + 8),
+        font_size,
+        .white,
+    );
+}
+
+fn drawSwatches(rects: [palette.len]rl.Rectangle) void {
+    for (rects, palette) |rect, value| {
+        rl.drawRectangleRec(rect, paletteColor(value));
+        rl.drawRectangleLinesEx(rect, 1, .{ .r = 225, .g = 231, .b = 240, .a = 210 });
+    }
+}
 
 fn pointInRectangle(point: rl.Vector2, rect: rl.Rectangle) bool {
     return point.x >= rect.x and point.y >= rect.y and
@@ -871,28 +1474,28 @@ test "keyboard nudge is one complete command" {
 }
 
 test "toggle during a drag restores geometry and clears selection" {
-    var items = [_]slides.SlideItem{testItem(11, .textbox, 10, 20, 100, 100)};
+    var items = [_]slides.SlideItem{testItem(11, .textbox, 10, 220, 100, 100)};
     const viewport: Viewport = .{
         .slide_top_left = .{ .x = 0, .y = 0 },
         .slide_size = default_logical_size,
     };
     var studio: Studio = .{ .enabled = true };
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = .{ .x = 20, .y = 30 },
+        .pointer_screen = .{ .x = 20, .y = 230 },
         .pointer_pressed = true,
         .pointer_down = true,
     });
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = .{ .x = 70, .y = 80 },
+        .pointer_screen = .{ .x = 70, .y = 280 },
         .pointer_down = true,
     });
-    try expectVector(.{ .x = 60, .y = 70 }, items[0].position);
+    try expectVector(.{ .x = 60, .y = 270 }, items[0].position);
 
     _ = studio.update(&items, &.{}, viewport, .{ .toggle_pressed = true });
     try std.testing.expect(!studio.enabled);
     try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
     try std.testing.expectEqual(Interaction.idle, studio.interaction);
-    try expectVector(.{ .x = 10, .y = 20 }, items[0].position);
+    try expectVector(.{ .x = 10, .y = 220 }, items[0].position);
 }
 
 test "resolved renderer bounds make an auto-sized image selectable" {
@@ -908,7 +1511,7 @@ test "resolved renderer bounds make an auto-sized image selectable" {
 }
 
 test "selection rebinds by source after item identities change" {
-    var old_items = [_]slides.SlideItem{testItem(30, .textbox, 20, 30, 100, 80)};
+    var old_items = [_]slides.SlideItem{testItem(30, .textbox, 20, 300, 100, 80)};
     old_items[0].source = .{ .scope = .direct, .line_number = 4, .line_offset = 123, .patchable = true };
     const viewport: Viewport = .{
         .slide_top_left = .{ .x = 0, .y = 0 },
@@ -916,17 +1519,17 @@ test "selection rebinds by source after item identities change" {
     };
     var studio: Studio = .{ .enabled = true };
     _ = studio.update(&old_items, &.{}, viewport, .{
-        .pointer_screen = .{ .x = 40, .y = 50 },
+        .pointer_screen = .{ .x = 40, .y = 320 },
         .pointer_pressed = true,
         .pointer_down = true,
     });
     _ = studio.update(&old_items, &.{}, viewport, .{
-        .pointer_screen = .{ .x = 40, .y = 50 },
+        .pointer_screen = .{ .x = 40, .y = 320 },
         .pointer_released = true,
     });
     try std.testing.expectEqual(@as(?usize, 30), studio.selected_identity);
 
-    var reparsed = [_]slides.SlideItem{testItem(91, .textbox, 20, 30, 100, 80)};
+    var reparsed = [_]slides.SlideItem{testItem(91, .textbox, 20, 300, 100, 80)};
     reparsed[0].source = old_items[0].source;
     _ = studio.update(&reparsed, &.{}, viewport, .{});
     try std.testing.expectEqual(@as(?usize, 91), studio.selected_identity);
@@ -999,4 +1602,291 @@ test "let-expanded source stays selectable but cannot emit an edit" {
     try std.testing.expectEqual(Notice.generated_source_read_only, studio.notice);
     try std.testing.expect(studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } }) == null);
     try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+}
+
+test "one-shot creation tool emits placement without mutating slide items" {
+    var items = [_]slides.SlideItem{testItem(80, .textbox, 10, 20, 100, 40)};
+    const original = items[0];
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .tool = .add_bullets };
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 321.4, .y = 245.6 },
+        .pointer_pressed = true,
+    }) == null);
+    try std.testing.expectEqual(Tool.select, studio.tool);
+    try expectVector(original.position, items[0].position);
+    try expectVector(original.size, items[0].size);
+
+    const semantic = studio.takeSemanticCommand().?;
+    switch (semantic) {
+        .add_item => |command| {
+            try std.testing.expectEqual(NewItemKind.bullets, command.kind);
+            try expectVector(.{ .x = 321, .y = 246 }, command.position);
+            try expectVector(.{ .x = 720, .y = 320 }, command.suggested_size);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expect(studio.peekSemanticCommand() == null);
+}
+
+test "shape tool suggests a colored rectangle-sized item" {
+    var items: [0]slides.SlideItem = .{};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .tool = .add_shape };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 700, .y = 400 },
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .add_item => |command| {
+            try std.testing.expectEqual(NewItemKind.shape, command.kind);
+            try expectVector(.{ .x = 700, .y = 400 }, command.position);
+            try expectVector(.{ .x = 480, .y = 270 }, command.suggested_size);
+            try std.testing.expectEqual(@as(?PaletteColor, .blue), command.suggested_color);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(Tool.select, studio.tool);
+}
+
+test "reusable library tool emits a positioned pop-insertion intent" {
+    var items: [0]slides.SlideItem = .{};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .tool = .add_reusable };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 900.2, .y = 500.8 },
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .add_reusable => |command| {
+            try expectVector(.{ .x = 900, .y = 501 }, command.position);
+            try expectVector(.{ .x = 600, .y = 200 }, command.suggested_size);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(Tool.select, studio.tool);
+}
+
+test "new slide toolbar action clears selection and emits a semantic command" {
+    var items = [_]slides.SlideItem{testItem(84, .textbox, 100, 100, 300, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = uiLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .tool = .add_image, .selected_identity = 84 };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.new_slide),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
+    try std.testing.expectEqual(Tool.select, studio.tool);
+    switch (studio.takeSemanticCommand().?) {
+        .new_slide => {},
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "property hit targets emit delete and color commands" {
+    var items = [_]slides.SlideItem{testItem(81, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .direct, .line_number = 7, .line_offset = 72, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = uiLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .selected_identity = 81 };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.delete_item),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .delete_item => |target| {
+            try std.testing.expectEqual(@as(usize, 81), target.item_identity);
+            try std.testing.expectEqual(@as(usize, 72), target.source.line_offset);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    const cyan_index = @intFromEnum(PaletteColor.cyan);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.foreground_swatches[cyan_index]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_foreground => |command| {
+            try std.testing.expectEqual(PaletteColor.cyan, command.color);
+            try std.testing.expectEqual(@as(usize, 81), command.target.item_identity);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+}
+
+test "keyboard property commands respect shared template lock" {
+    var items = [_]slides.SlideItem{testItem(82, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 82 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .edit_text_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.shared_template_locked, studio.notice);
+
+    _ = studio.update(&items, &.{}, viewport, .{ .edit_text_pressed = true, .allow_shared_edit = true });
+    switch (studio.takeSemanticCommand().?) {
+        .edit_text => |target| try std.testing.expectEqual(@as(usize, 82), target.item_identity),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "promotion is offered only for direct base box items" {
+    var items = [_]slides.SlideItem{testItem(88, .textbox, 100, 100, 300, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 88 };
+
+    items[0].source.scope = .component_instance;
+    _ = studio.update(&items, &.{}, viewport, .{ .promote_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
+
+    items[0].source.scope = .direct;
+    items[0].kind = .crowd;
+    _ = studio.update(&items, &.{}, viewport, .{ .promote_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
+
+    items[0].kind = .textbox;
+    _ = studio.update(&items, &.{}, viewport, .{ .promote_pressed = true });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .promote_to_reusable);
+}
+
+test "morph scene cycles through states and base while clearing selection" {
+    var items = [_]slides.SlideItem{testItem(83, .textbox, 100, 100, 300, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 83 };
+    studio.setMorphStateCount(2);
+
+    _ = studio.update(&items, &.{}, viewport, .{ .cycle_morph_scene = 1 });
+    try std.testing.expectEqual(@as(?usize, 0), studio.active_morph_state);
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
+    switch (studio.takeSemanticCommand().?) {
+        .select_morph_scene => |command| try std.testing.expectEqual(@as(?usize, 0), command.active_state),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.cycleMorphState(&items, 1);
+    try std.testing.expectEqual(@as(?usize, 1), studio.active_morph_state);
+    _ = studio.takeSemanticCommand();
+    studio.cycleMorphState(&items, 1);
+    try std.testing.expectEqual(@as(?usize, null), studio.active_morph_state);
+    _ = studio.takeSemanticCommand();
+    studio.cycleMorphState(&items, -1);
+    try std.testing.expectEqual(@as(?usize, 1), studio.active_morph_state);
+}
+
+test "morph scene toolbar controls cycle without bracket keys" {
+    var items = [_]slides.SlideItem{testItem(84, .textbox, 100, 100, 300, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = uiLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+    studio.setMorphStateCount(2);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.scene_next),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 0), studio.active_morph_state);
+    _ = studio.takeSemanticCommand();
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.scene_previous),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, null), studio.active_morph_state);
+    _ = studio.takeSemanticCommand();
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.scene_label),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 0), studio.active_morph_state);
+}
+
+test "leaving Studio resets morph scene to base" {
+    var items = [_]slides.SlideItem{testItem(85, .textbox, 100, 100, 300, 100)};
+    var studio: Studio = .{ .enabled = true, .active_morph_state = 1, .morph_state_count = 2 };
+
+    studio.toggle(&items);
+    try std.testing.expect(!studio.enabled);
+    try std.testing.expectEqual(@as(?usize, null), studio.active_morph_state);
+
+    studio.enabled = true;
+    studio.active_morph_state = 0;
+    studio.disable(&items);
+    try std.testing.expectEqual(@as(?usize, null), studio.active_morph_state);
+}
+
+test "idless morph births are editable only in their creation state" {
+    var items = [_]slides.SlideItem{testItem(86, .textbox, 100, 100, 300, 100)};
+    items[0].source = .{ .scope = .morph_item, .line_number = 5, .line_offset = 50, .patchable = true };
+    items[0].creation_morph_state = 0;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+
+    var local: Studio = .{ .enabled = true, .active_morph_state = 0, .morph_state_count = 2, .selected_identity = 86 };
+    const local_command = local.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } }).?;
+    try expectVector(.{ .x = 101, .y = 100 }, local_command.after_position);
+
+    items[0].position = .{ .x = 100, .y = 100 };
+    var inherited: Studio = .{ .enabled = true, .active_morph_state = 1, .morph_state_count = 2, .selected_identity = 86 };
+    try std.testing.expect(inherited.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } }) == null);
+    try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+    try std.testing.expectEqual(Notice.generated_source_read_only, inherited.notice);
+
+    items[0].id = "born";
+    const inherited_command = inherited.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } }).?;
+    try expectVector(.{ .x = 101, .y = 100 }, inherited_command.after_position);
+}
+
+test "semantic keyboard and panel actions cancel active geometry first" {
+    var items = [_]slides.SlideItem{testItem(87, .textbox, 100, 100, 300, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = uiLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 120 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 220, .y = 180 },
+        .pointer_down = true,
+    });
+    try expectVector(.{ .x = 200, .y = 160 }, items[0].position);
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .delete_item);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 120 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 260, .y = 200 },
+        .pointer_down = true,
+    });
+    try expectVector(.{ .x = 240, .y = 180 }, items[0].position);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.delete_item),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .delete_item);
+}
+
+fn rectangleCenter(rect: rl.Rectangle) rl.Vector2 {
+    return .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 };
 }

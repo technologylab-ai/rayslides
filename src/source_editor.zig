@@ -21,9 +21,28 @@ pub const PatchResult = struct {
 };
 
 pub const PatchError = error{
+    DuplicateAttribute,
+    InvalidAttribute,
+    InvalidColorLiteral,
     InvalidDirectiveOffset,
+    InvalidDirectiveText,
     InvalidCoordinate,
+    InvalidInsertionOffset,
+    InvalidLiteralValue,
+    InvalidMorphStateOffset,
+    InvalidReusableName,
+    InvalidSlideOffset,
+    InvalidSnippet,
+    NotPromotableDirective,
     SourceTooLarge,
+};
+
+/// One literal directive attribute to replace or insert. `text` is special:
+/// as in the parser, its value owns the rest of the physical line and may
+/// contain horizontal whitespace. Other values must be single tokens.
+pub const LiteralAttributePatch = struct {
+    key: []const u8,
+    value: []const u8,
 };
 
 const ValuePatch = struct {
@@ -207,9 +226,862 @@ fn patchGeometryText(
     };
 }
 
+/// Insert one complete directive immediately before `insertion_offset`.
+///
+/// The offset must be a physical line boundary (or EOF). The inserted line
+/// uses the surrounding source's line ending. At EOF, a missing separator is
+/// supplied before the directive. `directive` must begin with `@` and must not
+/// contain a line ending.
+pub fn insertDirectiveAt(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    insertion_offset: usize,
+    directive: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateDirectiveText(directive);
+    return insertSnippetAt(allocator, source, insertion_offset, directive);
+}
+
+/// Insert a directive plus optional following body-text lines at an explicit
+/// physical line boundary. LF separators in `snippet` are normalized to the
+/// source's local line ending. Additional directive lines are rejected: one
+/// call inserts exactly one item/state mutation and its body.
+pub fn insertSnippetAt(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    insertion_offset: usize,
+    snippet: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateSnippet(snippet);
+    if (!isPhysicalLineBoundary(source, insertion_offset)) return error.InvalidInsertionOffset;
+
+    const newline = lineEndingNear(source, insertion_offset);
+    const needs_separator = insertion_offset == source.len and
+        source.len > 0 and
+        !(source.len == utf8_bom.len and std.mem.eql(u8, source, utf8_bom)) and
+        source[source.len - 1] != '\n';
+
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.ensureTotalCapacity(allocator, source.len + snippet.len + newline.len * 2);
+    try output.appendSlice(allocator, source[0..insertion_offset]);
+    if (needs_separator) try output.appendSlice(allocator, newline);
+    try appendNormalizedLines(allocator, &output, std.mem.trimEnd(u8, snippet, "\n"), newline);
+    try output.appendSlice(allocator, newline);
+    try output.appendSlice(allocator, source[insertion_offset..]);
+
+    return finishResult(allocator, &output, source.len);
+}
+
+/// Append a new item to the selected slide's base scene.
+///
+/// `slide_offset` identifies the physical `@slide` or `@popslide` line that
+/// created the slide. The directive is inserted before the first morph state;
+/// otherwise it is inserted before the next slide boundary, or at EOF. This
+/// gives a newly added item topmost base-scene z-order without accidentally
+/// creating it inside a morph state.
+pub fn insertDirective(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    directive: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateDirectiveText(directive);
+    return insertSnippet(allocator, source, slide_offset, directive);
+}
+
+/// Append a directive and optional body lines to a selected slide's base
+/// scene. See `slideItemInsertionOffset` for its exact placement semantics.
+pub fn insertSnippet(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    snippet: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const insertion_offset = try slideItemInsertionOffset(source, slide_offset);
+    return insertSnippetAt(allocator, source, insertion_offset, snippet);
+}
+
+/// Find the end of a slide's base scene: its first morph state, next slide
+/// boundary, or EOF. This is where ordinary new items should be inserted.
+pub fn slideItemInsertionOffset(source: []const u8, slide_offset: usize) PatchError!usize {
+    return findSlideBoundary(source, slide_offset, true);
+}
+
+/// Find the boundary after the complete selected logical slide, including all
+/// morph states. Inserting `@slide` here creates a new slide immediately after
+/// the selected one instead of appending it to the whole file.
+pub fn slideEndOffset(source: []const u8, slide_offset: usize) PatchError!usize {
+    return findSlideBoundary(source, slide_offset, false);
+}
+
+/// Find the boundary after one morph state: the next `@state(morph)`, next
+/// slide boundary, or EOF. Insert state-local `@set`, `@hide`, or born-item
+/// directives at the returned physical line offset.
+pub fn morphStateEndOffset(source: []const u8, state_directive_offset: usize) PatchError!usize {
+    const state_line = directiveLine(source, state_directive_offset) catch return error.InvalidMorphStateOffset;
+    const state_name = directiveName(source[state_line.start..state_line.content_end]);
+    if (!isMorphStateDirective(state_name)) return error.InvalidMorphStateOffset;
+
+    var cursor = state_line.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isMorphStateDirective(name) or
+                std.mem.eql(u8, name, "@slide") or
+                std.mem.eql(u8, name, "@popslide") or
+                std.mem.eql(u8, name, "@pushslide"))
+            {
+                return cursor;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return source.len;
+}
+
+/// Promote one direct `@box` item to a reusable component in place.
+///
+/// The directive token becomes `@push name`; all attributes, inline text, body
+/// text, comments, whitespace, BOM, and line endings remain untouched. A
+/// matching `@pop name` is inserted after the item's complete body/comment
+/// region so the slide still contains an instance at the same z-order.
+pub fn promoteItemToReusable(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+    name: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (!isReusableName(name)) return error.InvalidReusableName;
+    const line = try directiveLine(source, directive_offset);
+    const old_name = directiveName(source[line.start..line.content_end]);
+    if (!std.mem.eql(u8, old_name, "@box")) return error.NotPromotableDirective;
+
+    const item_end = itemBodyEndOffset(source, line.full_end);
+    const newline = lineEndingNear(source, item_end);
+
+    var id_spans = std.ArrayList(Span).empty;
+    defer id_spans.deinit(allocator);
+    var effective_id: ?[]const u8 = null;
+    var cursor = line.start + old_name.len;
+    while (cursor < line.content_end) {
+        while (cursor < line.content_end and isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        if (cursor == line.content_end) break;
+        const token_start = cursor;
+        while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token = source[token_start..cursor];
+        const equals_index = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals_index];
+        if (std.mem.eql(u8, key, "text")) break;
+        if (!std.mem.eql(u8, key, "id")) continue;
+
+        try id_spans.append(allocator, .{ .start = token_start, .end = cursor });
+        const raw_value = token[equals_index + 1 ..];
+        const parser_value_end = std.mem.indexOfScalar(u8, raw_value, '=') orelse raw_value.len;
+        if (parser_value_end > 0) effective_id = raw_value[0..parser_value_end];
+    }
+
+    var push_name = std.ArrayList(u8).empty;
+    defer push_name.deinit(allocator);
+    try push_name.appendSlice(allocator, "@push ");
+    try push_name.appendSlice(allocator, name);
+
+    var pop_line = std.ArrayList(u8).empty;
+    defer pop_line.deinit(allocator);
+    if (item_end == source.len and source.len > 0 and source[source.len - 1] != '\n') {
+        try pop_line.appendSlice(allocator, newline);
+    }
+    try pop_line.appendSlice(allocator, "@pop ");
+    try pop_line.appendSlice(allocator, name);
+    if (effective_id) |id| {
+        try pop_line.appendSlice(allocator, " id=");
+        try pop_line.appendSlice(allocator, id);
+    }
+    try pop_line.appendSlice(allocator, newline);
+
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    try edits.append(allocator, .{
+        .start = line.start,
+        .end = line.start + old_name.len,
+        .replacement = push_name.items,
+    });
+    for (id_spans.items) |span| {
+        try edits.append(allocator, .{
+            .start = span.start,
+            .end = span.end,
+            .replacement = "",
+        });
+    }
+    try edits.append(allocator, .{
+        .start = item_end,
+        .end = item_end,
+        .replacement = pop_line.items,
+    });
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+/// Delete exactly the physical directive line beginning at `directive_offset`,
+/// including its existing CRLF/LF terminator when present. Continuation text
+/// on following physical lines is deliberately not removed.
+pub fn deleteDirective(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const line = try directiveLine(source, directive_offset);
+    return replaceRange(allocator, source, line.start, line.full_end, "");
+}
+
+/// Delete one logical item: its directive plus following body-text lines up to
+/// the next directive. Standalone comments and empty formatting lines survive.
+/// Use `deleteDirective` when only the physical directive line is intended.
+pub fn deleteItem(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const line = try directiveLine(source, directive_offset);
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+
+    try appendItemDeletionEdits(allocator, source, line, &edits);
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+/// Delete an item and every later `@set`, `@show`, or `@hide` targeting
+/// `item_id` before the next slide boundary. This is the safe semantic delete
+/// for a base or state-born morph item: plain `deleteItem` deliberately remains
+/// the smaller source primitive for callers that do not want cascading edits.
+pub fn deleteItemCascadingMorphMutations(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+    item_id: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (item_id.len == 0 or std.mem.indexOfAny(u8, item_id, " \t\r\n=") != null) {
+        return error.InvalidLiteralValue;
+    }
+    const item_line = try directiveLine(source, directive_offset);
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    try appendItemDeletionEdits(allocator, source, item_line, &edits);
+
+    var cursor = item_line.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isSlideBoundaryDirective(name)) break;
+            if (isMorphMutationDirective(name)) {
+                const target = directiveContextName(source[cursor..line.content_end], name.len);
+                if (target != null and std.mem.eql(u8, target.?, item_id)) {
+                    try edits.append(allocator, .{
+                        .start = cursor,
+                        .end = line.full_end,
+                        .replacement = "",
+                    });
+                    try appendBodyDeletionEdits(allocator, source, line.full_end, &edits);
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+fn appendItemDeletionEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    line: DirectiveLine,
+    edits: *std.ArrayList(Edit),
+) std.mem.Allocator.Error!void {
+
+    // `@anim` is a pending decorator: the parser applies it to the next item
+    // directive. Leaving it behind when that item is deleted silently moves
+    // the animation to the following item instead. Treat immediately preceding
+    // animation directives (with comments/body lines between them and the
+    // item) as part of the item's semantic source ownership.
+    var decorator_before = line.start;
+    while (previousDirectiveLine(source, decorator_before)) |decorator| {
+        const name = directiveName(source[decorator.start..decorator.content_end]);
+        if (!isAnimationDirective(name)) break;
+        try edits.append(allocator, .{
+            .start = decorator.start,
+            .end = decorator.full_end,
+            .replacement = "",
+        });
+        // Parser body text attached to @anim is ignored, but retaining it after
+        // the decorator is removed could attach it to an earlier item. Match
+        // item deletion semantics: remove text, retain comments/blank layout.
+        try appendBodyDeletionEdits(allocator, source, decorator.full_end, edits);
+        decorator_before = decorator.start;
+    }
+    try edits.append(allocator, .{
+        .start = line.start,
+        .end = line.full_end,
+        .replacement = "",
+    });
+    try appendBodyDeletionEdits(allocator, source, line.full_end, edits);
+}
+
+/// Return the safe z-order insertion point immediately below the item at
+/// `directive_offset`. When one or more pending `@anim`/`@anim(...)`
+/// decorators immediately precede the item, the returned offset is before the
+/// earliest decorator so an inserted item cannot steal its animation.
+/// Comments, blank lines, and decorator body lines do not break ownership.
+pub fn itemInsertionOffsetBeforeAnimations(source: []const u8, directive_offset: usize) PatchError!usize {
+    const line = try directiveLine(source, directive_offset);
+    var insertion_offset = line.start;
+    while (previousDirectiveLine(source, insertion_offset)) |decorator| {
+        const name = directiveName(source[decorator.start..decorator.content_end]);
+        if (!isAnimationDirective(name)) break;
+        insertion_offset = decorator.start;
+    }
+    return insertion_offset;
+}
+
+/// Replace exactly one directive's content while retaining its existing line
+/// ending and every byte outside that physical line.
+pub fn replaceDirectiveLine(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+    directive: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateDirectiveText(directive);
+    const line = try directiveLine(source, directive_offset);
+    return replaceRange(allocator, source, line.start, line.content_end, directive);
+}
+
+/// Patch literal token attributes on one directive without reformatting it.
+///
+/// Existing attributes retain all surrounding whitespace and only their
+/// effective (last) value bytes are replaced. Missing attributes are inserted
+/// before `text=`. A `text` patch is also semantic: following body-text lines
+/// are removed so stale text cannot be appended by the parser. For multiline
+/// text, prefer `patchItemText`.
+pub fn patchLiteralAttributes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+    patches: []const LiteralAttributePatch,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const line = try directiveLine(source, directive_offset);
+
+    for (patches, 0..) |patch, index| {
+        try validateLiteralPatch(patch);
+        for (patches[0..index]) |previous| {
+            if (std.mem.eql(u8, patch.key, previous.key)) return error.DuplicateAttribute;
+        }
+    }
+
+    if (patches.len == 0) {
+        const copy = try allocator.dupe(u8, source);
+        return .{ .source = copy, .byte_delta = 0 };
+    }
+
+    var spans = try allocator.alloc(?Span, patches.len);
+    defer allocator.free(spans);
+    @memset(spans, null);
+
+    var text_token_start: ?usize = null;
+    var cursor = line.start;
+    while (cursor < line.content_end) {
+        while (cursor < line.content_end and isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        if (cursor == line.content_end) break;
+
+        const token_start = cursor;
+        while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token_end = cursor;
+        const token = source[token_start..token_end];
+        const equals_index = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals_index];
+
+        if (std.mem.eql(u8, key, "text")) {
+            text_token_start = token_start;
+            for (patches, 0..) |patch, patch_index| {
+                if (std.mem.eql(u8, patch.key, "text")) {
+                    spans[patch_index] = .{
+                        .start = token_start + equals_index + 1,
+                        .end = line.content_end,
+                    };
+                    break;
+                }
+            }
+            break;
+        }
+
+        for (patches, 0..) |patch, patch_index| {
+            if (std.mem.eql(u8, patch.key, key)) {
+                // Match parser semantics: for malformed duplicates, the last
+                // token before text= is the effective value.
+                spans[patch_index] = .{
+                    .start = token_start + equals_index + 1,
+                    .end = token_end,
+                };
+                break;
+            }
+        }
+    }
+
+    const insertion_point = text_token_start orelse
+        trimHorizontalWhitespaceEnd(source, line.content_end, line.start);
+    var insertion = std.ArrayList(u8).empty;
+    defer insertion.deinit(allocator);
+    var emitted: usize = 0;
+
+    // Token attributes must precede text= because text owns the remainder.
+    for (patches, 0..) |patch, patch_index| {
+        if (spans[patch_index] != null or std.mem.eql(u8, patch.key, "text")) continue;
+        if (emitted == 0 and
+            (insertion_point == line.start or !isHorizontalWhitespace(source[insertion_point - 1])))
+        {
+            try insertion.append(allocator, ' ');
+        } else if (emitted > 0) {
+            try insertion.append(allocator, ' ');
+        }
+        try insertion.appendSlice(allocator, patch.key);
+        try insertion.append(allocator, '=');
+        try insertion.appendSlice(allocator, patch.value);
+        emitted += 1;
+    }
+
+    const text_patch_index = findPatch(patches, "text");
+    if (text_patch_index != null and spans[text_patch_index.?] == null) {
+        if ((emitted == 0 and
+            (insertion_point == line.start or !isHorizontalWhitespace(source[insertion_point - 1]))) or
+            emitted > 0)
+        {
+            try insertion.append(allocator, ' ');
+        }
+        try insertion.appendSlice(allocator, "text=");
+        try insertion.appendSlice(allocator, patches[text_patch_index.?].value);
+        emitted += 1;
+    } else if (emitted > 0 and text_token_start != null) {
+        try insertion.append(allocator, ' ');
+    }
+
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    for (patches, 0..) |patch, patch_index| {
+        if (spans[patch_index]) |span| {
+            try edits.append(allocator, .{
+                .start = span.start,
+                .end = span.end,
+                .replacement = patch.value,
+            });
+        }
+    }
+    if (insertion.items.len > 0) {
+        try edits.append(allocator, .{
+            .start = insertion_point,
+            .end = insertion_point,
+            .replacement = insertion.items,
+        });
+    }
+    if (text_patch_index != null) {
+        try appendBodyDeletionEdits(allocator, source, line.full_end, &edits);
+    }
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+/// Replace an item's semantic text, whether its current source uses inline
+/// `text=` or following body lines. Single-line text is written inline;
+/// multiline text is written as body lines using the file's local line ending.
+/// Existing body comments and empty formatting lines are preserved.
+pub fn patchItemText(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+    text_value: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (std.mem.indexOfScalar(u8, text_value, '\r') != null) return error.InvalidLiteralValue;
+    if (std.mem.indexOfScalar(u8, text_value, '\n') == null) {
+        const patches = [_]LiteralAttributePatch{.{ .key = "text", .value = text_value }};
+        return patchLiteralAttributes(allocator, source, directive_offset, &patches);
+    }
+    try validateBodyText(text_value);
+
+    const line = try directiveLine(source, directive_offset);
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+
+    if (findInlineTextToken(source, line)) |span| {
+        try edits.append(allocator, .{
+            .start = span.start,
+            .end = line.content_end,
+            .replacement = "",
+        });
+    }
+
+    const newline = lineEndingNear(source, line.start);
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    if (line.full_end == line.content_end) try body.appendSlice(allocator, newline);
+    try appendNormalizedLines(allocator, &body, text_value, newline);
+    try body.appendSlice(allocator, newline);
+    try edits.append(allocator, .{
+        .start = line.full_end,
+        .end = line.full_end,
+        .replacement = body.items,
+    });
+    try appendBodyDeletionEdits(allocator, source, line.full_end, &edits);
+
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+const utf8_bom = "\xEF\xBB\xBF";
+
+fn findSlideBoundary(source: []const u8, slide_offset: usize, stop_at_state: bool) PatchError!usize {
+    var cursor: usize = undefined;
+    if (directiveLine(source, slide_offset)) |slide_line| {
+        const slide_name = directiveName(source[slide_line.start..slide_line.content_end]);
+        if (std.mem.eql(u8, slide_name, "@slide") or std.mem.eql(u8, slide_name, "@popslide")) {
+            cursor = slide_line.full_end;
+        } else {
+            if (slide_offset != 0 or hasExplicitSlideBoundary(source)) return error.InvalidSlideOffset;
+            cursor = sourceStart(source);
+        }
+    } else |_| {
+        if (slide_offset != 0 or hasExplicitSlideBoundary(source)) return error.InvalidSlideOffset;
+        cursor = sourceStart(source);
+    }
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if ((stop_at_state and isMorphStateDirective(name)) or
+                std.mem.eql(u8, name, "@slide") or
+                std.mem.eql(u8, name, "@popslide") or
+                std.mem.eql(u8, name, "@pushslide"))
+            {
+                return cursor;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return source.len;
+}
+
+fn sourceStart(source: []const u8) usize {
+    return if (std.mem.startsWith(u8, source, utf8_bom)) utf8_bom.len else 0;
+}
+
+fn isMorphStateDirective(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@state") or std.mem.eql(u8, name, "@state(morph)");
+}
+
+fn isAnimationDirective(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@anim") or
+        (std.mem.startsWith(u8, name, "@anim(") and std.mem.endsWith(u8, name, ")"));
+}
+
+fn isMorphMutationDirective(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@set") or
+        std.mem.eql(u8, name, "@show") or
+        std.mem.eql(u8, name, "@hide");
+}
+
+fn isSlideBoundaryDirective(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@slide") or
+        std.mem.eql(u8, name, "@popslide") or
+        std.mem.eql(u8, name, "@pushslide");
+}
+
+fn directiveContextName(line: []const u8, directive_name_len: usize) ?[]const u8 {
+    var cursor = directive_name_len;
+    while (cursor < line.len and isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+    if (cursor == line.len) return null;
+    const start = cursor;
+    while (cursor < line.len and !isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+    return line[start..cursor];
+}
+
+fn hasExplicitSlideBoundary(source: []const u8) bool {
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isSlideBoundaryDirective(name)) return true;
+        }
+        cursor = line.full_end;
+    }
+    return false;
+}
+
+fn appendBodyDeletionEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    body_start: usize,
+    edits: *std.ArrayList(Edit),
+) std.mem.Allocator.Error!void {
+    var cursor = body_start;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const content = source[cursor..line.content_end];
+        if (content.len > 0 and content[0] == '@') break;
+        if (content.len > 0 and content[0] != '#') {
+            try edits.append(allocator, .{
+                .start = cursor,
+                .end = line.full_end,
+                .replacement = "",
+            });
+        }
+        cursor = line.full_end;
+    }
+}
+
+fn itemBodyEndOffset(source: []const u8, body_start: usize) usize {
+    var cursor = body_start;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') return cursor;
+        cursor = line.full_end;
+    }
+    return source.len;
+}
+
+fn findInlineTextToken(source: []const u8, line: DirectiveLine) ?Span {
+    var cursor = line.start;
+    while (cursor < line.content_end) {
+        while (cursor < line.content_end and isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        if (cursor == line.content_end) break;
+        const token_start = cursor;
+        while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token = source[token_start..cursor];
+        const equals_index = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        if (std.mem.eql(u8, token[0..equals_index], "text")) {
+            return .{ .start = token_start, .end = line.content_end };
+        }
+    }
+    return null;
+}
+
+fn validateBodyText(value: []const u8) PatchError!void {
+    var lines = std.mem.splitScalar(u8, value, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0 and (line[0] == '@' or line[0] == '#')) return error.InvalidLiteralValue;
+    }
+}
+
+fn validateSnippet(snippet: []const u8) PatchError!void {
+    if (snippet.len == 0 or std.mem.indexOfScalar(u8, snippet, '\r') != null) return error.InvalidSnippet;
+    const content = std.mem.trimEnd(u8, snippet, "\n");
+    if (content.len == 0) return error.InvalidSnippet;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    const directive = lines.next() orelse return error.InvalidSnippet;
+    validateDirectiveText(directive) catch return error.InvalidSnippet;
+    while (lines.next()) |line| {
+        if (line.len > 0 and line[0] == '@') return error.InvalidSnippet;
+    }
+}
+
+fn appendNormalizedLines(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+    newline: []const u8,
+) std.mem.Allocator.Error!void {
+    var pieces = std.mem.splitScalar(u8, value, '\n');
+    var first = true;
+    while (pieces.next()) |piece| {
+        if (!first) try output.appendSlice(allocator, newline);
+        try output.appendSlice(allocator, piece);
+        first = false;
+    }
+}
+
+fn findPatch(patches: []const LiteralAttributePatch, key: []const u8) ?usize {
+    for (patches, 0..) |patch, index| {
+        if (std.mem.eql(u8, patch.key, key)) return index;
+    }
+    return null;
+}
+
+fn validateLiteralPatch(patch: LiteralAttributePatch) PatchError!void {
+    if (!isAttributeName(patch.key)) return error.InvalidAttribute;
+    const is_text = std.mem.eql(u8, patch.key, "text");
+    if (!is_text and patch.value.len == 0) return error.InvalidLiteralValue;
+    for (patch.value) |byte| {
+        if (byte == '\r' or byte == '\n' or
+            (!is_text and (isHorizontalWhitespace(byte) or byte == '=')))
+        {
+            return error.InvalidLiteralValue;
+        }
+    }
+    if (isColorAttribute(patch.key) and !validColorLiteral(patch.key, patch.value)) {
+        return error.InvalidColorLiteral;
+    }
+}
+
+fn isAttributeName(key: []const u8) bool {
+    if (key.len == 0 or !(std.ascii.isAlphabetic(key[0]) or key[0] == '_')) return false;
+    for (key[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) return false;
+    }
+    return true;
+}
+
+fn isReusableName(name: []const u8) bool {
+    return isAttributeName(name);
+}
+
+fn isColorAttribute(key: []const u8) bool {
+    return std.mem.eql(u8, key, "color") or
+        std.mem.eql(u8, key, "bullet_color") or
+        std.mem.eql(u8, key, "shadow");
+}
+
+fn validColorLiteral(key: []const u8, value: []const u8) bool {
+    if (std.mem.eql(u8, key, "shadow") and std.mem.eql(u8, value, "none")) return true;
+    if (value.len != 9 or value[0] != '#') return false;
+    for (value[1..]) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+fn validateDirectiveText(directive: []const u8) PatchError!void {
+    if (directive.len < 2 or directive[0] != '@') return error.InvalidDirectiveText;
+    for (directive) |byte| {
+        if (byte == '\r' or byte == '\n') return error.InvalidDirectiveText;
+    }
+    const name = directiveName(directive);
+    if (name.len < 2) return error.InvalidDirectiveText;
+}
+
+fn directiveName(line: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < line.len and !isHorizontalWhitespace(line[end])) : (end += 1) {}
+    return line[0..end];
+}
+
+fn isPhysicalLineBoundary(source: []const u8, offset: usize) bool {
+    if (offset > source.len) return false;
+    if (offset == source.len) return true;
+    if (offset == 0) return !std.mem.startsWith(u8, source, utf8_bom);
+    if (offset == utf8_bom.len and std.mem.startsWith(u8, source, utf8_bom)) return true;
+    return source[offset - 1] == '\n';
+}
+
+fn lineEndingNear(source: []const u8, offset: usize) []const u8 {
+    if (offset < source.len) {
+        if (std.mem.indexOfScalar(u8, source[offset..], '\n')) |relative| {
+            const newline = offset + relative;
+            return if (newline > offset and source[newline - 1] == '\r') "\r\n" else "\n";
+        }
+    }
+    if (offset > 0) {
+        if (std.mem.lastIndexOfScalar(u8, source[0..offset], '\n')) |newline| {
+            return if (newline > 0 and source[newline - 1] == '\r') "\r\n" else "\n";
+        }
+    }
+    return "\n";
+}
+
+fn physicalLineAt(source: []const u8, start: usize) DirectiveLine {
+    const line_end = if (std.mem.indexOfScalar(u8, source[start..], '\n')) |relative|
+        start + relative
+    else
+        source.len;
+    const content_end = if (line_end > start and source[line_end - 1] == '\r') line_end - 1 else line_end;
+    const full_end = if (line_end < source.len) line_end + 1 else line_end;
+    return .{ .start = start, .content_end = content_end, .full_end = full_end };
+}
+
+fn previousPhysicalLine(source: []const u8, before: usize) ?DirectiveLine {
+    const first_content = sourceStart(source);
+    if (before <= first_content) return null;
+
+    var line_end = before;
+    if (line_end > 0 and source[line_end - 1] == '\n') line_end -= 1;
+    const content_end = if (line_end > 0 and source[line_end - 1] == '\r') line_end - 1 else line_end;
+    const physical_start = if (std.mem.lastIndexOfScalar(u8, source[0..content_end], '\n')) |newline|
+        newline + 1
+    else
+        0;
+    const content_start = if (physical_start == 0 and first_content != 0) first_content else physical_start;
+    return .{
+        .start = content_start,
+        .content_end = content_end,
+        .full_end = before,
+    };
+}
+
+/// Find the closest preceding physical line that the parser treats as a
+/// directive. Non-directive body, comments, and blank lines are skipped; they
+/// remain in place when callers use the result as an insertion anchor.
+fn previousDirectiveLine(source: []const u8, before: usize) ?DirectiveLine {
+    var cursor = before;
+    while (previousPhysicalLine(source, cursor)) |line| {
+        if (line.start < line.content_end and source[line.start] == '@') {
+            return directiveLine(source, line.start) catch return null;
+        }
+        // The physical start differs from the directive start only on a BOM
+        // line, which cannot precede another line without a newline terminator.
+        cursor = if (line.start == sourceStart(source) and sourceStart(source) != 0)
+            0
+        else
+            line.start;
+    }
+    return null;
+}
+
+fn replaceRange(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    start: usize,
+    end: usize,
+    replacement: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const edit = [_]Edit{.{ .start = start, .end = end, .replacement = replacement }};
+    return applyEdits(allocator, source, &edit);
+}
+
+fn applyEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: []const Edit,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.ensureTotalCapacity(allocator, source.len);
+
+    var copied_until: usize = 0;
+    for (edits) |edit| {
+        try output.appendSlice(allocator, source[copied_until..edit.start]);
+        try output.appendSlice(allocator, edit.replacement);
+        copied_until = edit.end;
+    }
+    try output.appendSlice(allocator, source[copied_until..]);
+    return finishResult(allocator, &output, source.len);
+}
+
+fn finishResult(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    old_length: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const byte_delta = try signedLengthDelta(output.items.len, old_length);
+    return .{
+        .source = try output.toOwnedSlice(allocator),
+        .byte_delta = byte_delta,
+    };
+}
+
 const DirectiveLine = struct {
     start: usize,
     content_end: usize,
+    full_end: usize,
 };
 
 fn directiveLine(source: []const u8, directive_offset: usize) PatchError!DirectiveLine {
@@ -240,7 +1112,8 @@ fn directiveLine(source: []const u8, directive_offset: usize) PatchError!Directi
     while (directive_end < content_end and !isHorizontalWhitespace(source[directive_end])) : (directive_end += 1) {}
     if (directive_end == directive_offset + 1) return error.InvalidDirectiveOffset;
 
-    return .{ .start = directive_offset, .content_end = content_end };
+    const full_end = if (line_end < source.len) line_end + 1 else line_end;
+    return .{ .start = directive_offset, .content_end = content_end, .full_end = full_end };
 }
 
 fn formatCoordinate(buffer: *[64]u8, value: f32) PatchError![]const u8 {
@@ -479,4 +1352,533 @@ test "editing a slide-template clone updates its shared definition" {
     try std.testing.expectApproxEqAbs(@as(f32, 120), edited_clone.position.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1020), edited_clone.position.y, 0.0001);
     try std.testing.expectEqual(slides.SourceScope.slide_template, edited_clone.source.scope);
+}
+
+fn expectSourceResult(result: PatchResult, original: []const u8, expected: []const u8) !void {
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+    try std.testing.expectEqual(try signedLengthDelta(expected.len, original.len), result.byte_delta);
+}
+
+test "explicit snippet insertion preserves BOM and local CRLF" {
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box x=1 y=2 text=Existing\r\n";
+    const insertion_offset = std.mem.indexOf(u8, source, "@box").?;
+    const expected =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@crowd join x=10 y=20\r\n" ++
+        "Join this room\r\n" ++
+        "@box x=1 y=2 text=Existing\r\n";
+
+    const result = try insertSnippetAt(
+        std.testing.allocator,
+        source,
+        insertion_offset,
+        "@crowd join x=10 y=20\nJoin this room",
+    );
+    try expectSourceResult(result, source, expected);
+}
+
+test "explicit insertion supplies a separator at EOF without a newline" {
+    const source = "@slide";
+    const expected = "@slide\n@box text=New\n";
+    const result = try insertDirectiveAt(std.testing.allocator, source, source.len, "@box text=New");
+    try expectSourceResult(result, source, expected);
+}
+
+test "slide insertion appends before first morph state" {
+    const source =
+        "@slide\n" ++
+        "@box id=base text=Base\n" ++
+        "@state(morph) duration=1\n" ++
+        "@set base x=100\n" ++
+        "@slide\n" ++
+        "@box text=Second\n";
+    const expected =
+        "@slide\n" ++
+        "@box id=base text=Base\n" ++
+        "@box id=new x=20 y=30 text=Topmost\n" ++
+        "@state(morph) duration=1\n" ++
+        "@set base x=100\n" ++
+        "@slide\n" ++
+        "@box text=Second\n";
+
+    const result = try insertDirective(
+        std.testing.allocator,
+        source,
+        0,
+        "@box id=new x=20 y=30 text=Topmost",
+    );
+    try expectSourceResult(result, source, expected);
+}
+
+test "slide boundaries distinguish base insertion from complete slide end" {
+    const source =
+        "@slide\n" ++
+        "@box text=Base\n" ++
+        "@state(morph)\n" ++
+        "@box id=born text=Later\n" ++
+        "@popslide content\n";
+    try std.testing.expectEqual(std.mem.indexOf(u8, source, "@state").?, try slideItemInsertionOffset(source, 0));
+    try std.testing.expectEqual(std.mem.indexOf(u8, source, "@popslide").?, try slideEndOffset(source, 0));
+
+    const end = try slideEndOffset(source, 0);
+    const expected =
+        "@slide\n" ++
+        "@box text=Base\n" ++
+        "@state(morph)\n" ++
+        "@box id=born text=Later\n" ++
+        "@slide\n" ++
+        "@popslide content\n";
+    const result = try insertDirectiveAt(std.testing.allocator, source, end, "@slide");
+    try expectSourceResult(result, source, expected);
+}
+
+test "morph state end finds next state slide boundary and EOF" {
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=hero text=Base\r\n" ++
+        "@state(morph) duration=1\r\n" ++
+        "@set hero x=100\r\n" ++
+        "@state(morph) duration=2\r\n" ++
+        "@hide hero\r\n" ++
+        "@slide\r\n" ++
+        "@state(morph)\r\n" ++
+        "@box id=born text=Born";
+    const first_state = std.mem.indexOf(u8, source, "@state(morph) duration=1").?;
+    const second_state = std.mem.indexOf(u8, source, "@state(morph) duration=2").?;
+    const next_slide = std.mem.indexOfPos(u8, source, second_state, "@slide").?;
+    const final_state = std.mem.lastIndexOf(u8, source, "@state(morph)").?;
+    try std.testing.expectEqual(second_state, try morphStateEndOffset(source, first_state));
+    try std.testing.expectEqual(next_slide, try morphStateEndOffset(source, second_state));
+    try std.testing.expectEqual(source.len, try morphStateEndOffset(source, final_state));
+    try std.testing.expectError(error.InvalidMorphStateOffset, morphStateEndOffset(source, 3));
+}
+
+test "bare morph state is a base and state insertion boundary" {
+    const source =
+        "@slide\n" ++
+        "@box id=hero text=Base\n" ++
+        "@state duration=1\n" ++
+        "@set hero x=100\n" ++
+        "@state\n" ++
+        "@hide hero\n";
+    const first_state = std.mem.indexOf(u8, source, "@state duration=1").?;
+    const second_state = std.mem.indexOfPos(u8, source, first_state + 1, "@state").?;
+
+    try std.testing.expectEqual(first_state, try slideItemInsertionOffset(source, 0));
+    try std.testing.expectEqual(second_state, try morphStateEndOffset(source, first_state));
+    try std.testing.expectEqual(source.len, try morphStateEndOffset(source, second_state));
+
+    const inserted = try insertDirectiveAt(
+        std.testing.allocator,
+        source,
+        try slideItemInsertionOffset(source, 0),
+        "@box id=top text=Still base",
+    );
+    defer inserted.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, inserted.source, "@box id=top text=Still base\n@state") != null);
+}
+
+test "unambiguous implicit slide supports base item and new slide boundaries" {
+    const source =
+        "# one implicit slide\n" ++
+        "@box id=hero text=Base\n" ++
+        "@state\n" ++
+        "@set hero x=100\n";
+    const state = std.mem.indexOf(u8, source, "@state").?;
+    try std.testing.expectEqual(state, try slideItemInsertionOffset(source, 0));
+    try std.testing.expectEqual(source.len, try slideEndOffset(source, 0));
+
+    const ambiguous = "@pushslide template\n@box text=Implicit after a template\n";
+    try std.testing.expectError(error.InvalidSlideOffset, slideItemInsertionOffset(ambiguous, 0));
+}
+
+test "promotion preserves inline item formatting comments BOM and CRLF" {
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box  x=10\ty=20 color=#01020304 text=Hello world\r\n" ++
+        "# item explanation\r\n" ++
+        "@slide\r\n";
+    const box = std.mem.indexOf(u8, source, "@box").?;
+    const expected =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@push hero  x=10\ty=20 color=#01020304 text=Hello world\r\n" ++
+        "# item explanation\r\n" ++
+        "@pop hero\r\n" ++
+        "@slide\r\n";
+
+    const result = try promoteItemToReusable(std.testing.allocator, source, box, "hero");
+    try expectSourceResult(result, source, expected);
+}
+
+test "promotion retains body bullets and reparses an equivalent instance" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box x=100 y=200 w=600 h=400 color=#AABBCCDD\n" ++
+        "- First\n" ++
+        "# retained note\n" ++
+        "- Second\n" ++
+        "@slide\n";
+    const box = std.mem.indexOf(u8, source, "@box").?;
+    const expected =
+        "@slide\n" ++
+        "@push bullet_list x=100 y=200 w=600 h=400 color=#AABBCCDD\n" ++
+        "- First\n" ++
+        "# retained note\n" ++
+        "- Second\n" ++
+        "@pop bullet_list\n" ++
+        "@slide\n";
+    const result = try promoteItemToReusable(std.testing.allocator, source, box, "bullet_list");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = deck.slides.items[0].items.?.items[0];
+    try std.testing.expectEqualStrings("- First\n- Second", item.text.?);
+    try std.testing.expectEqualStrings("bullet_list", item.id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), item.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), item.position.y, 0.0001);
+    try std.testing.expectEqual(slides.SourceScope.component_instance, item.source.scope);
+}
+
+test "promotion moves effective id from reusable push to pop instance" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box  id=old\tid=stable x=100 y=200 text=Identified\n";
+    const box = std.mem.indexOf(u8, source, "@box").?;
+    const expected =
+        "@slide\n" ++
+        "@push reusable  \t x=100 y=200 text=Identified\n" ++
+        "@pop reusable id=stable\n";
+    const result = try promoteItemToReusable(std.testing.allocator, source, box, "reusable");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@push reusable id=") == null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = deck.slides.items[0].items.?.items[0];
+    try std.testing.expectEqualStrings("stable", item.id.?);
+    try std.testing.expectEqualStrings("Identified", item.text.?);
+    try std.testing.expectEqual(slides.SourceScope.component_instance, item.source.scope);
+}
+
+test "promotion validates directive and reusable name" {
+    const source = "@slide\n@crowd join\n";
+    try std.testing.expectError(
+        error.InvalidReusableName,
+        promoteItemToReusable(std.testing.allocator, source, 0, "two words"),
+    );
+    try std.testing.expectError(
+        error.NotPromotableDirective,
+        promoteItemToReusable(std.testing.allocator, source, 0, "hero"),
+    );
+}
+
+test "deletes only the exact selected physical directive" {
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=same text=First\r\n" ++
+        "@box id=same text=Second\r\n" ++
+        "# retained\r\n";
+    const selected = std.mem.indexOf(u8, source, "@box id=same text=Second").?;
+    const expected =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=same text=First\r\n" ++
+        "# retained\r\n";
+
+    const result = try deleteDirective(std.testing.allocator, source, selected);
+    try expectSourceResult(result, source, expected);
+}
+
+test "semantic item deletion removes body text and retains comments" {
+    const source =
+        "@slide\n" ++
+        "@box id=remove\n" ++
+        "- old bullet\n" ++
+        "# retained explanation\n" ++
+        "- another old bullet\n" ++
+        "@box id=keep text=Keep\n";
+    const expected =
+        "@slide\n" ++
+        "# retained explanation\n" ++
+        "@box id=keep text=Keep\n";
+    const offset = std.mem.indexOf(u8, source, "@box id=remove").?;
+    const result = try deleteItem(std.testing.allocator, source, offset);
+    try expectSourceResult(result, source, expected);
+}
+
+test "semantic item deletion owns pending animation decorators" {
+    const source =
+        "@slide\n" ++
+        "@anim(fade) duration=0.4\n" ++
+        "ignored decorator body\n" ++
+        "# first retained note\n" ++
+        "@anim slide-up\n" ++
+        "# second retained note\n" ++
+        "@box id=remove\n" ++
+        "Removed text\n" ++
+        "@box id=keep text=Keep\n";
+    const item_offset = std.mem.indexOf(u8, source, "@box id=remove").?;
+    const first_animation = std.mem.indexOf(u8, source, "@anim(fade)").?;
+    try std.testing.expectEqual(
+        first_animation,
+        try itemInsertionOffsetBeforeAnimations(source, item_offset),
+    );
+
+    const expected =
+        "@slide\n" ++
+        "# first retained note\n" ++
+        "# second retained note\n" ++
+        "@box id=keep text=Keep\n";
+    const result = try deleteItem(std.testing.allocator, source, item_offset);
+    try expectSourceResult(result, source, expected);
+}
+
+test "insertion before an animated item cannot steal its decorator" {
+    const source =
+        "@slide\n" ++
+        "@anim(fade) duration=0.4\n" ++
+        "# animation explanation\n" ++
+        "@box id=hero text=Hero\n";
+    const item_offset = std.mem.indexOf(u8, source, "@box id=hero").?;
+    const insertion_offset = try itemInsertionOffsetBeforeAnimations(source, item_offset);
+    const result = try insertDirectiveAt(
+        std.testing.allocator,
+        source,
+        insertion_offset,
+        "@box id=background color=#102030ff",
+    );
+    const expected =
+        "@slide\n" ++
+        "@box id=background color=#102030ff\n" ++
+        "@anim(fade) duration=0.4\n" ++
+        "# animation explanation\n" ++
+        "@box id=hero text=Hero\n";
+    try expectSourceResult(result, source, expected);
+}
+
+test "cascading semantic deletion removes later morph mutations only on current slide" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box id=remove text=Remove\n" ++
+        "@box id=keep text=Keep\n" ++
+        "@state\n" ++
+        "@set remove\n" ++
+        "Changed text\n" ++
+        "# retained mutation note\n" ++
+        "@set keep x=200\n" ++
+        "@state(morph)\n" ++
+        "@hide remove\n" ++
+        "@slide\n" ++
+        "@box id=remove text=Same ID on next slide\n";
+    const item_offset = std.mem.indexOf(u8, source, "@box id=remove").?;
+    const expected =
+        "@slide\n" ++
+        "@box id=keep text=Keep\n" ++
+        "@state\n" ++
+        "# retained mutation note\n" ++
+        "@set keep x=200\n" ++
+        "@state(morph)\n" ++
+        "@slide\n" ++
+        "@box id=remove text=Same ID on next slide\n";
+    const result = try deleteItemCascadingMorphMutations(
+        std.testing.allocator,
+        source,
+        item_offset,
+        "remove",
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deck.slides.items.len);
+    try std.testing.expectEqualStrings("remove", deck.slides.items[1].items.?.items[0].id.?);
+}
+
+test "deletes and replaces final directives without a terminator" {
+    const source = "# heading\n@box text=Old";
+    const offset = std.mem.indexOf(u8, source, "@box").?;
+
+    const replaced = try replaceDirectiveLine(std.testing.allocator, source, offset, "@crowd join text=Join");
+    try expectSourceResult(replaced, source, "# heading\n@crowd join text=Join");
+
+    const deleted = try deleteDirective(std.testing.allocator, source, offset);
+    try expectSourceResult(deleted, source, "# heading\n");
+}
+
+test "literal attribute patch preserves formatting comments CRLF and BOM" {
+    const source =
+        "\xEF\xBB\xBF# deck\r\n" ++
+        "@box  color=#01020304\timg=old.png  text=Old words\r\n" ++
+        "old body that must not survive\r\n" ++
+        "# retained body comment\r\n" ++
+        "@slide\r\n";
+    const offset = std.mem.indexOf(u8, source, "@box").?;
+    const expected =
+        "\xEF\xBB\xBF# deck\r\n" ++
+        "@box  color=#AABBCCDD\timg=new.png  text=Fresh words\r\n" ++
+        "# retained body comment\r\n" ++
+        "@slide\r\n";
+    const patches = [_]LiteralAttributePatch{
+        .{ .key = "color", .value = "#AABBCCDD" },
+        .{ .key = "img", .value = "new.png" },
+        .{ .key = "text", .value = "Fresh words" },
+    };
+
+    const result = try patchLiteralAttributes(std.testing.allocator, source, offset, &patches);
+    try expectSourceResult(result, source, expected);
+}
+
+test "missing literal attributes are inserted before text" {
+    const source = "@box\tx=1  text=Words and = signs  \n";
+    const expected = "@box\tx=1  color=#10203040 id=hero text=Words and = signs  \n";
+    const patches = [_]LiteralAttributePatch{
+        .{ .key = "color", .value = "#10203040" },
+        .{ .key = "id", .value = "hero" },
+    };
+    const result = try patchLiteralAttributes(std.testing.allocator, source, 0, &patches);
+    try expectSourceResult(result, source, expected);
+}
+
+test "literal patch changes parser-effective duplicate" {
+    const source = "@box color=#01010101 color=#02020202 text=Duplicate\n";
+    const expected = "@box color=#01010101 color=#A0B0C0D0 text=Duplicate\n";
+    const patch = [_]LiteralAttributePatch{.{ .key = "color", .value = "#A0B0C0D0" }};
+    const result = try patchLiteralAttributes(std.testing.allocator, source, 0, &patch);
+    try expectSourceResult(result, source, expected);
+}
+
+test "crowd literal and text patches reparse to edited semantics" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@crowd join x=10 y=20\n" ++
+        "Old prompt\n";
+    const crowd_offset = std.mem.indexOf(u8, source, "@crowd").?;
+    const attrs = [_]LiteralAttributePatch{
+        .{ .key = "id", .value = "room" },
+        .{ .key = "open", .value = "false" },
+    };
+    const first = try patchLiteralAttributes(std.testing.allocator, source, crowd_offset, &attrs);
+    defer first.deinit(std.testing.allocator);
+    const second = try patchItemText(std.testing.allocator, first.source, crowd_offset, "Join us now");
+    defer second.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "@slide\n@crowd join x=10 y=20 id=room open=false text=Join us now\n",
+        second.source,
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(second.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = deck.slides.items[0].items.?.items[0];
+    try std.testing.expectEqualStrings("room", item.crowd.?.id);
+    try std.testing.expectEqualStrings("Join us now", item.crowd.?.prompt);
+    try std.testing.expect(!item.crowd.?.initially_open);
+}
+
+test "multiline item text replaces inline and body text but retains comments" {
+    const source =
+        "@box x=1 text=Inline\r\n" ++
+        "old line one\r\n" ++
+        "# explanation stays\r\n" ++
+        "old line two\r\n" ++
+        "@box text=Next\r\n";
+    const expected =
+        "@box x=1 \r\n" ++
+        "- First\r\n" ++
+        "- Second\r\n" ++
+        "# explanation stays\r\n" ++
+        "@box text=Next\r\n";
+    const result = try patchItemText(std.testing.allocator, source, 0, "- First\n- Second");
+    try expectSourceResult(result, source, expected);
+}
+
+test "single-line text that resembles source syntax remains safely inline" {
+    const source = "@box x=1\n@slide\n";
+    const expected = "@box x=1 text=@slide # still literal\n@slide\n";
+    const result = try patchItemText(std.testing.allocator, source, 0, "@slide # still literal");
+    try expectSourceResult(result, source, expected);
+}
+
+test "inserted bullet snippet reparses as one box" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source = "@slide\n@slide\n@box text=Next\n";
+    const result = try insertSnippet(
+        std.testing.allocator,
+        source,
+        0,
+        "@box x=100 y=100 w=600 h=400\n- First item\n- Second item",
+    );
+    defer result.deinit(std.testing.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deck.slides.items.len);
+    const item = deck.slides.items[0].items.?.items[0];
+    try std.testing.expectEqualStrings("- First item\n- Second item", item.text.?);
+}
+
+test "source editing APIs reject ambiguous unsafe input" {
+    const source = "@slide\n@box text=Safe\n";
+    try std.testing.expectError(
+        error.InvalidInsertionOffset,
+        insertDirectiveAt(std.testing.allocator, source, 2, "@box"),
+    );
+    try std.testing.expectError(
+        error.InvalidSnippet,
+        insertSnippetAt(std.testing.allocator, source, source.len, "@box\n@slide"),
+    );
+    try std.testing.expectError(
+        error.InvalidSlideOffset,
+        slideItemInsertionOffset(source, std.mem.indexOf(u8, source, "@box").?),
+    );
+    try std.testing.expectError(
+        error.InvalidColorLiteral,
+        patchLiteralAttributes(std.testing.allocator, source, source.len - "@box text=Safe\n".len, &.{
+            .{ .key = "color", .value = "red" },
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidLiteralValue,
+        patchLiteralAttributes(std.testing.allocator, source, source.len - "@box text=Safe\n".len, &.{
+            .{ .key = "img", .value = "two words.png" },
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidLiteralValue,
+        patchItemText(std.testing.allocator, source, source.len - "@box text=Safe\n".len, "@slide\nOops"),
+    );
 }

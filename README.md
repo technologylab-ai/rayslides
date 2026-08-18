@@ -53,21 +53,50 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 
 ## Studio visual editing
 
-Press <kbd>E</kbd> while presenting to turn the current slide into an editing
-canvas. Click an object and drag it to move it, or drag the cyan handle at its
+Run rayslides without a slide file to begin with a blank, untitled slide in
+Studio, or press <kbd>E</kbd> while presenting an existing deck. Studio is a
+visual authoring surface backed by the ordinary `.sld` source: every completed
+action rewrites and reparses the document, so the GUI and text formats remain
+two views of the same file.
+
+The top toolbar contains these one-shot canvas tools:
+
+| Tool | Shortcut | Action |
+| ---- | -------- | ------ |
+| Select | <kbd>V</kbd> | Select, move, and resize an existing object |
+| Text | <kbd>T</kbd> | Click, then enter text for a new text box |
+| Bullets | <kbd>B</kbd> | Click, then enter one bullet per line |
+| Image | <kbd>I</kbd> | Click, then enter a path relative to the slide file |
+| Rectangle | <kbd>R</kbd> | Click to add a colored shape |
+| Library | <kbd>U</kbd> | Click, then name an existing reusable `@push` element |
+
+Click an object and drag it to move it, or drag the cyan handle at its
 bottom-right corner to resize it. The arrow keys nudge the selection by one
-logical pixel; hold <kbd>Shift</kbd> to nudge by ten. <kbd>Esc</kbd> cancels an
-active drag, then leaves Studio on the next press.
+logical pixel; hold <kbd>Shift</kbd> to nudge by ten. The property panel edits
+text, deletes the object, promotes it for reuse, and applies foreground or
+background palette colors. <kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new
+slide immediately after the current one. <kbd>Esc</kbd> cancels an active drag
+or tool, then leaves Studio.
+
+Text, bullet, image, and reusable-name actions open a small modal editor.
+<kbd>Enter</kbd> commits, <kbd>Shift-Enter</kbd> inserts a line in text fields,
+<kbd>Cmd/Ctrl-V</kbd> pastes, and <kbd>Esc</kbd> cancels without touching the
+source.
 
 Studio edits the `.sld` document rather than maintaining a separate opaque
-scene. It rewrites only the effective `x=`, `y=`, `w=`, and `h=` values for the
-selected directive and preserves the rest of the source, including spacing,
-comments, text, and line endings. Objects instantiated with `@pop` are edited
-at that instance; objects inherited from `@pushslide` deliberately edit their
-shared template definition. Shared items use an amber outline and require
-holding <kbd>Alt</kbd> while moving, resizing, or nudging so a deck-wide change
-cannot happen accidentally. Items whose directive is produced through `@let`
-remain selectable but read-only until Studio has token-to-source mapping.
+scene. It changes only the source owned by the selected object and preserves
+unrelated spacing, comments, text, and line endings. Objects instantiated with
+`@pop` are edited at that instance; objects inherited from `@pushslide`
+deliberately edit their shared template definition. Shared items use an amber
+outline and require holding <kbd>Alt</kbd> while moving, resizing, nudging, or
+changing properties so a deck-wide change cannot happen accidentally. Items
+whose directive is produced through `@let` remain selectable but read-only
+until Studio has token-to-source mapping.
+
+**Reuse** (or <kbd>P</kbd>) promotes a direct box to a named `@push` definition
+and leaves an equivalent `@pop` instance in place. The Library tool creates
+more instances later in the document. Reusable definitions are source-order
+scoped, so a library item can only be placed after its definition.
 
 | Studio shortcut | Description |
 | --------------- | ----------- |
@@ -75,12 +104,20 @@ remain selectable but read-only until Studio has token-to-source mapping.
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Save an `*.edited.sld` copy |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Undo the last visual edit |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
+| <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |
+| <kbd>Backspace</kbd> | Delete the selected object |
+| <kbd>Enter</kbd> | Edit the selected object's text |
+| <kbd>P</kbd> | Promote the selected object for reuse |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>N</kbd> | Insert a new slide after this slide |
 
 The `*` beside `STUDIO` means the in-memory document differs from the original
 file. Automatic file reload is paused while those unsaved changes exist.
-Transitions are paused in Studio, ordinary reveal items are shown, and semantic
-morph slides expose their stable base scene. Editing individual morph states is
-kept separate from base-layout editing for now.
+Transitions are paused in Studio and ordinary reveal items are shown. The scene
+control in the toolbar switches between the base scene and each semantic morph
+state. Editing an inherited, named item creates or updates a state-local `@set`;
+deleting it creates `@hide`. Items born in the active state are edited at their
+own directive. Background creation and reusable promotion remain base-scene
+operations because they change structural layout rather than one morph state.
 
 If the original file changes externally, Studio refuses to overwrite it and
 asks you to use Save Copy. Quitting with unsaved work also writes a unique

@@ -90,7 +90,7 @@ pub const Slide = struct {
         n.next_item_identity = orig.next_item_identity;
         try n.items.?.appendSlice(n.allocator, orig.items.?.items);
         for (orig.morph_states.items) |state| {
-            var cloned_state = MorphState{ .spec = state.spec };
+            var cloned_state = MorphState{ .spec = state.spec, .source = state.source };
             cloned_state.items = std.ArrayList(SlideItem).empty;
             try cloned_state.items.appendSlice(n.allocator, state.items.items);
             try n.morph_states.append(n.allocator, cloned_state);
@@ -103,9 +103,9 @@ pub const Slide = struct {
         return &self.items.?;
     }
 
-    pub fn beginMorphState(self: *Slide, spec: animation.MorphSpec, previous_state: ?usize) !usize {
+    pub fn beginMorphState(self: *Slide, spec: animation.MorphSpec, source_ref: SourceRef, previous_state: ?usize) !usize {
         const source = self.currentItems(previous_state);
-        var state = MorphState{ .spec = spec };
+        var state = MorphState{ .spec = spec, .source = source_ref };
         state.items = std.ArrayList(SlideItem).empty;
         try state.items.appendSlice(self.allocator, source.items);
         try self.morph_states.append(self.allocator, state);
@@ -163,6 +163,9 @@ pub const TextShadow = struct {
 
 pub const MorphState = struct {
     spec: animation.MorphSpec = .{},
+    /// Location of the @state directive that begins this snapshot. Editors
+    /// use it as the insertion anchor when an item has no local override yet.
+    source: SourceRef = .{},
     items: std.ArrayList(SlideItem) = undefined,
 };
 
@@ -191,10 +194,26 @@ pub const SourceRef = struct {
 pub const SlideItem = struct {
     /// Stable within a logical slide and preserved by morph snapshots.
     identity: usize = 0,
+    /// The semantic-morph state in which this item was created. Null means the
+    /// item belongs to the authored base scene. Unlike `state_source_state`,
+    /// this never changes when later snapshots apply @set/@show/@hide, so an
+    /// editor can distinguish an item born in the selected state from an
+    /// id-less item merely inherited from an earlier state.
+    creation_morph_state: ?usize = null,
     /// Optional author-facing target for @set/@show/@hide.
     id: ?[]const u8 = null,
     /// Location and authoring scope of the directive that created this item.
     source: SourceRef = .{},
+    /// Location of the most recent @set/@show/@hide directive that produced
+    /// this item in a semantic-morph snapshot. The creation source above is
+    /// deliberately retained, so an editor can target either the base item or
+    /// the effective state override. Null means the snapshot still gets all
+    /// of its values from the creation directive (or an earlier item birth).
+    state_source: ?SourceRef = null,
+    /// Index of the state that owns `state_source`. This is copied into later
+    /// cumulative snapshots along with the item, allowing an editor to tell a
+    /// local override from one inherited from an earlier state.
+    state_source_state: ?usize = null,
     kind: SlideItemKind = .background,
     text: ?[]const u8 = null,
     fontSize: ?i32 = null,
@@ -221,6 +240,12 @@ pub const SlideItem = struct {
         const self = try a.create(SlideItem);
         self.* = .{};
         return self;
+    }
+
+    /// Source to patch when editing this item's currently displayed morph
+    /// state. Base editing should continue to use `source` directly.
+    pub fn effectiveSource(self: *const SlideItem) SourceRef {
+        return self.state_source orelse self.source;
     }
     pub fn deinit(_: *Slide) void {
         // empty
@@ -508,3 +533,35 @@ pub const ItemContext = struct {
         }
     }
 };
+
+test "slide cloning preserves morph source provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const original = try Slide.new(allocator);
+    try original.items.?.append(allocator, .{
+        .identity = 1,
+        .source = .{ .scope = .direct, .line_number = 2, .line_offset = 7, .patchable = true },
+    });
+    const state_index = try original.beginMorphState(
+        .{},
+        .{ .scope = .morph_item, .line_number = 3, .line_offset = 42, .patchable = true },
+        null,
+    );
+    original.morph_states.items[state_index].items.items[0].state_source = .{
+        .scope = .morph_item,
+        .line_number = 4,
+        .line_offset = 56,
+        .patchable = true,
+    };
+    original.morph_states.items[state_index].items.items[0].state_source_state = state_index;
+    original.morph_states.items[state_index].items.items[0].creation_morph_state = state_index;
+
+    const clone = try Slide.fromSlide(original, allocator);
+    try std.testing.expectEqual(@as(usize, 1), clone.morph_states.items.len);
+    try std.testing.expectEqual(@as(usize, 42), clone.morph_states.items[0].source.line_offset);
+    try std.testing.expectEqual(@as(usize, 56), clone.morph_states.items[0].items.items[0].effectiveSource().line_offset);
+    try std.testing.expectEqual(@as(?usize, 0), clone.morph_states.items[0].items.items[0].state_source_state);
+    try std.testing.expectEqual(@as(?usize, 0), clone.morph_states.items[0].items.items[0].creation_morph_state);
+}

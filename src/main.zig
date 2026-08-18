@@ -15,9 +15,21 @@ const playback = @import("playback.zig");
 const crowdplay = @import("crowdplay.zig");
 const source_editor = @import("source_editor.zig");
 const studio = @import("studio.zig");
+const studio_prompt = @import("studio_prompt.zig");
+const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const SlideShow = slides.SlideShow;
 
 const log = std.log.scoped(.main);
+
+test {
+    std.testing.refAllDecls(parser);
+    std.testing.refAllDecls(renderer);
+    std.testing.refAllDecls(slides);
+    std.testing.refAllDecls(source_editor);
+    std.testing.refAllDecls(studio);
+    std.testing.refAllDecls(studio_prompt);
+    std.testing.refAllDecls(studio_roundtrip_test);
+}
 
 const CrowdOptions = struct {
     enabled: bool = true,
@@ -425,7 +437,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     crowd_options.host = defaultCrowdHost(&crowd_host_buffer);
 
     // get args
-    const slideshow_to_load = blk: {
+    const slideshow_to_load: ?[]const u8 = blk: {
         var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
         defer args_it.deinit();
         _ = args_it.skip();
@@ -444,7 +456,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 std.process.fatal("Unexpected argument: {s}", .{arg});
             }
         }
-        const selected = slideshow_arg orelse std.process.fatal("No slideshow arg given!", .{});
+        const selected = slideshow_arg orelse break :blk null;
         log.debug("loading... {s}", .{selected});
         break :blk try std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{selected});
     };
@@ -465,7 +477,11 @@ pub fn main(init: std.process.Init) anyerror!void {
     // Initialize GPU-backed resources after the window and unload them before it closes.
     try G.init(gpa, io);
     defer G.deinit();
-    G.slideshow_filp_to_load = slideshow_to_load;
+    if (slideshow_to_load) |path| {
+        G.slideshow_filp_to_load = path;
+    } else {
+        try initializeUntitledSlideshow();
+    }
     var crowd_runtime = try crowdplay.Runtime.init(gpa, io);
     defer crowd_runtime.stop();
 
@@ -480,7 +496,12 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer laser_pointer.deinit();
     var banner: Banner = try .init(screenWidth, screenHeight);
     defer banner.deinit();
-    var studio_mode: studio.Studio = .{};
+    var studio_mode: studio.Studio = .{
+        .enabled = slideshow_to_load == null,
+        .dirty = slideshow_to_load == null,
+    };
+    var property_prompt: studio_prompt.Prompt = .{};
+    var pending_semantic_command: ?studio.SemanticCommand = null;
     var studio_history = StudioHistory.init(gpa);
     defer studio_history.deinit();
     var studio_bounds = std.ArrayList(studio.ResolvedBounds).empty;
@@ -493,7 +514,11 @@ pub fn main(init: std.process.Init) anyerror!void {
         const window_close_now = rl.windowShouldClose();
         const window_close_requested = window_close_now and !window_close_seen;
         window_close_seen = window_close_now;
-        if (window_close_requested and readyToQuitPreservingEdits(&studio_mode)) break;
+        // A modal property edit is not part of the persisted source yet. Do
+        // not let the OS close button silently throw that draft away; after
+        // submitting or cancelling it, Q/Escape (or a fresh close request)
+        // follows the normal source-recovery path below.
+        if (window_close_requested and !property_prompt.active and readyToQuitPreservingEdits(&studio_mode)) break;
 
         const studio_active_at_frame_start = studio_mode.capturesInput();
         // Update
@@ -528,12 +553,23 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (rl.isKeyPressed(.s)) {
+        if (!property_prompt.active and rl.isKeyPressed(.s)) {
             if (studio_mode.capturesInput() or (editorSourceDirty() and shortcutModifierDown())) {
                 if (shortcutModifierDown()) {
                     if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                         if (saveEditorSourceCopy()) |copy_path| {
-                            studio_mode.markCopySaved();
+                            if (G.slideshow_filp == null) {
+                                adoptEditorSourcePath(copy_path) catch |err| {
+                                    studio_mode.setNotice(.save_failed);
+                                    log.err("Studio could not adopt saved document: {any}", .{err});
+                                    gpa.free(copy_path);
+                                    continue;
+                                };
+                                studio_mode.markSaved();
+                                studio_mode.setNotice(.saved);
+                            } else {
+                                studio_mode.markCopySaved();
+                            }
                             log.info("Studio copy saved to {s}", .{copy_path});
                             gpa.free(copy_path);
                         } else |err| {
@@ -541,7 +577,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                             log.err("Studio Save Copy failed: {any}", .{err});
                         }
                     } else {
-                        if (saveEditorSource()) |_| {
+                        const saved = if (G.slideshow_filp == null) saveUntitledEditorSource() else saveEditorSource();
+                        if (saved) |_| {
                             studio_mode.markSaved();
                             studio_mode.setNotice(.saved);
                             log.info("Studio source saved", .{});
@@ -583,7 +620,8 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
 
         if (is_pre_rendered == false) {
-            if (G.slideshow_filp) |slideshow_filp| {
+            if (G.source_len > 0) {
+                const slideshow_filp = G.slideshow_filp orelse "untitled.sld";
                 log.info("LOADED!!!", .{});
                 log.debug("I AM GOING TO PRE-RENDER!", .{});
                 G.slide_renderer.preRender(G.slideshow, slideshow_filp) catch |err| {
@@ -643,20 +681,91 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         var empty_studio_items: [0]slides.SlideItem = .{};
         var studio_items: []slides.SlideItem = empty_studio_items[0..];
+        var current_slide: ?*slides.Slide = null;
         if (G.current_slide >= 0 and G.current_slide < G.slideshow.slides.items.len) {
             const current = G.slideshow.slides.items[@intCast(G.current_slide)];
-            if (current.items) |*items| studio_items = items.items;
+            current_slide = current;
+            studio_mode.setMorphStateCount(current.morph_states.items.len);
+            if (studio_mode.capturesInput()) {
+                if (studio_mode.active_morph_state) |state_index| {
+                    if (state_index < current.morph_states.items.len) {
+                        studio_items = current.morph_states.items[state_index].items.items;
+                    }
+                } else if (current.items) |*items| {
+                    studio_items = items.items;
+                }
+            } else if (current.items) |*items| {
+                studio_items = items.items;
+            }
         }
-        try collectStudioBounds(&studio_bounds, gpa, G.current_slide, studio_items);
+        try collectStudioBounds(&studio_bounds, gpa, G.current_slide, studio_mode.active_morph_state, studio_items);
         const studio_viewport: studio.Viewport = .{
             .slide_top_left = slide_tl,
             .slide_size = slide_size_in_window,
             .logical_size = internal_render_size,
         };
-        const studio_command: ?studio.GeometryCommand = if (!export_controller.running)
+
+        var semantic_to_apply: ?studio.SemanticCommand = null;
+        var semantic_text: ?[]const u8 = null;
+        const prompt_was_active = property_prompt.active;
+        if (prompt_was_active) {
+            switch (property_prompt.updateFromRaylib()) {
+                .none => {},
+                .submitted => {
+                    semantic_to_apply = pending_semantic_command;
+                    semantic_text = property_prompt.text();
+                    pending_semantic_command = null;
+                    window_close_seen = false;
+                },
+                .cancelled => {
+                    pending_semantic_command = null;
+                    window_close_seen = false;
+                },
+            }
+        }
+
+        const studio_command: ?studio.GeometryCommand = if (!export_controller.running and !prompt_was_active)
             studio_mode.updateFromRaylib(studio_items, studio_bounds.items, studio_viewport)
         else
             null;
+        if (!prompt_was_active) {
+            if (studio_mode.takeSemanticCommand()) |command| {
+                switch (command) {
+                    .add_item => |add| switch (add.kind) {
+                        .text => {
+                            pending_semantic_command = command;
+                            property_prompt.begin(.text, "Text");
+                        },
+                        .bullets => {
+                            pending_semantic_command = command;
+                            property_prompt.begin(.bullets, "- First item\n- Second item");
+                        },
+                        .image => {
+                            pending_semantic_command = command;
+                            property_prompt.begin(.image_path, "");
+                        },
+                        .shape => semantic_to_apply = command,
+                    },
+                    .edit_text => |target| {
+                        const initial = studioItemByIdentity(studio_items, target.item_identity) orelse null;
+                        pending_semantic_command = command;
+                        property_prompt.begin(.text, if (initial) |item| item.text orelse "" else "");
+                    },
+                    .promote_to_reusable => |target| {
+                        var suggested_name: [96]u8 = undefined;
+                        const name = std.fmt.bufPrint(&suggested_name, "studio_item_{d}", .{target.source.line_number}) catch "studio_item";
+                        pending_semantic_command = command;
+                        property_prompt.begin(.reusable_name, name);
+                    },
+                    .add_reusable => {
+                        pending_semantic_command = command;
+                        property_prompt.begin(.reusable_name, "");
+                    },
+                    .select_morph_scene => {},
+                    else => semantic_to_apply = command,
+                }
+            }
+        }
         if (studio_mode.capturesInput() and laser_pointer.show) {
             laser_pointer.show = false;
             laser_pointer.clearDrawing();
@@ -687,7 +796,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         const reveal_state: renderer.RevealState = if (export_controller.running)
             .{ .visible_through = G.slide_renderer.stepCount(G.current_slide) }
         else if (studio_mode.capturesInput())
-            .{ .visible_through = G.slide_renderer.baseRevealStepCount(G.current_slide) }
+            .{ .visible_through = G.slide_renderer.baseRevealStepCount(G.current_slide) + if (studio_mode.active_morph_state) |state| state + 1 else 0 }
         else
             .{
                 .visible_through = G.playback.visible_step,
@@ -721,8 +830,9 @@ pub fn main(init: std.process.Init) anyerror!void {
             crowd_runtime.public_url.slice(),
         );
         if (!export_controller.running) studio_mode.draw(studio_items, studio_bounds.items, studio_viewport);
+        property_prompt.draw(window_size);
         if (studio_command) |command| {
-            if (applyStudioGeometryEdit(&studio_history, command)) |_| {} else |err| {
+            if (applyStudioGeometryEdit(&studio_history, command, current_slide, studio_mode.active_morph_state, studio_items)) |_| {} else |err| {
                 studio_mode.setNotice(.edit_failed);
                 log.err("Studio edit failed: {any}", .{err});
                 reparseEditorSource() catch {};
@@ -731,7 +841,34 @@ pub fn main(init: std.process.Init) anyerror!void {
             is_pre_rendered = false;
         }
 
-        if (studio_mode.capturesInput() and shortcutModifierDown() and rl.isKeyPressed(.z)) {
+        if (semantic_to_apply) |command| {
+            if (applyStudioSemanticEdit(
+                &studio_history,
+                command,
+                semantic_text,
+                current_slide,
+                studio_mode.active_morph_state,
+                studio_items,
+                studio_bounds.items,
+            )) |new_slide_index| {
+                studio_mode.selected_identity = null;
+                studio_mode.selected_source = null;
+                if (new_slide_index) |slide_index| {
+                    G.current_slide = @intCast(slide_index);
+                    studio_mode.active_morph_state = null;
+                }
+                studio_mode.markSourceChanged();
+                studio_mode.setNotice(.none);
+            } else |err| {
+                studio_mode.setNotice(.edit_failed);
+                log.err("Studio property edit failed: {any}", .{err});
+                reparseEditorSource() catch {};
+            }
+            studio_mode.dirty = editorSourceDirty();
+            is_pre_rendered = false;
+        }
+
+        if (studio_mode.capturesInput() and !property_prompt.active and shortcutModifierDown() and rl.isKeyPressed(.z)) {
             // Undo owns the source graph. End a transient pointer gesture before
             // reparsing so it cannot later release stale pre-undo geometry.
             studio_mode.cancelActiveInteraction(studio_items);
@@ -799,7 +936,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             first = false;
         }
 
-        if (rl.isKeyPressed(.f)) {
+        if (!property_prompt.active and rl.isKeyPressed(.f)) {
             if (!manual_fullscreen) {
                 const monitor = rl.getCurrentMonitor();
                 rl.setWindowSize(rl.getMonitorWidth(monitor), rl.getMonitorHeight(monitor));
@@ -828,8 +965,8 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (rl.isKeyPressed(.q) or
-            (rl.isKeyPressed(.escape) and !studio_active_at_frame_start))
+        if (!property_prompt.active and (rl.isKeyPressed(.q) or
+            (rl.isKeyPressed(.escape) and !studio_active_at_frame_start)))
         {
             if (readyToQuitPreservingEdits(&studio_mode)) break;
         }
@@ -850,7 +987,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (rl.isKeyPressed(.b)) {
+        if (!studio_mode.capturesInput() and !property_prompt.active and rl.isKeyPressed(.b)) {
             if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                 banner.reset();
             } else {
@@ -997,7 +1134,7 @@ const AppData = struct {
     slide_renderer: *renderer.SlideshowRenderer = undefined,
     slideshow_filp_buffer: [std.fs.max_path_bytes]u8 = undefined,
     slideshow_filp_to_load_buffer: [std.fs.max_path_bytes]u8 = undefined,
-    slideshow_filp: ?[]const u8 = undefined,
+    slideshow_filp: ?[]const u8 = null,
     slideshow_filp_to_load: ?[]const u8 = null,
     slideshow: *SlideShow = undefined,
     current_slide: i32 = 0,
@@ -1169,6 +1306,17 @@ fn reparseEditorSource() !void {
     G.playback.enterSlide(null, 0, 0, .{}, 1, rl.getTime());
 }
 
+fn initializeUntitledSlideshow() !void {
+    const initial_source = "@slide\n";
+    @memcpy(G.editor_memory[0..initial_source.len], initial_source);
+    G.editor_memory[initial_source.len] = 0;
+    G.source_len = initial_source.len;
+    G.loaded_len = 0;
+    G.slideshow_filp = null;
+    G.hot_reload_last_stat = null;
+    try reparseEditorSource();
+}
+
 fn editorSourceDirty() bool {
     return G.source_len != G.loaded_len or
         !std.mem.eql(u8, G.editor_memory[0..G.source_len], G.loaded_content[0..G.loaded_len]);
@@ -1283,7 +1431,7 @@ fn saveEditorSource() !void {
 }
 
 fn saveEditorSourceCopy() ![]u8 {
-    const path = G.slideshow_filp orelse return error.NoSlideshowPath;
+    const path = G.slideshow_filp orelse "untitled.sld";
     const stem = if (std.mem.endsWith(u8, path, ".sld")) path[0 .. path.len - ".sld".len] else path;
     var sequence: usize = 1;
     const copy_path = while (sequence < 10_000) : (sequence += 1) {
@@ -1308,6 +1456,22 @@ fn saveEditorSourceCopy() ![]u8 {
     errdefer std.Io.Dir.cwd().deleteFile(G.io, copy_path) catch {};
     try writeEditorSourceAtomically(copy_path, null);
     return copy_path;
+}
+
+fn adoptEditorSourcePath(path: []const u8) !void {
+    G.slideshow_filp = try std.fmt.bufPrint(&G.slideshow_filp_buffer, "{s}", .{path});
+    @memcpy(G.loaded_content[0..G.source_len], G.editor_memory[0..G.source_len]);
+    if (G.loaded_len > G.source_len) @memset(G.loaded_content[G.source_len..G.loaded_len], 0);
+    G.loaded_len = G.source_len;
+    const file = try std.Io.Dir.cwd().openFile(G.io, G.slideshow_filp.?, .{});
+    defer file.close(G.io);
+    G.hot_reload_last_stat = try file.stat(G.io);
+}
+
+fn saveUntitledEditorSource() !void {
+    const copy_path = try saveEditorSourceCopy();
+    defer G.allocator.free(copy_path);
+    try adoptEditorSourcePath(copy_path);
 }
 
 /// Quitting should never turn the in-memory source buffer into a data-loss
@@ -1337,22 +1501,14 @@ fn replaceEditorSource(source: []const u8) !void {
     G.source_len = source.len;
 }
 
-fn applyStudioGeometryEdit(history: *StudioHistory, command: studio.GeometryCommand) !void {
-    if (command.source.scope == .none or !command.source.patchable) return error.StudioItemHasNoPatchableSource;
+fn studioItemByIdentity(items: []const slides.SlideItem, identity: usize) ?*const slides.SlideItem {
+    for (items) |*item| if (item.identity == identity) return item;
+    return null;
+}
 
+fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult) !void {
     const before = try G.allocator.dupe(u8, G.editor_memory[0..G.source_len]);
     errdefer G.allocator.free(before);
-    const result = try source_editor.patchGeometry(
-        G.allocator,
-        G.editor_memory[0..G.source_len],
-        command.source.line_offset,
-        .{
-            .x = command.after_position.x,
-            .y = command.after_position.y,
-            .w = if (command.resized) command.after_size.x else null,
-            .h = if (command.resized) command.after_size.y else null,
-        },
-    );
     errdefer result.deinit(G.allocator);
 
     try replaceEditorSource(result.source);
@@ -1366,6 +1522,403 @@ fn applyStudioGeometryEdit(history: *StudioHistory, command: studio.GeometryComm
         reparseEditorSource() catch {};
         return err;
     };
+}
+
+const MorphItemEditTarget = union(enum) {
+    patch: slides.SourceRef,
+    insert_local,
+};
+
+fn itemBornInMorphState(slide: *const slides.Slide, state_index: usize, item: *const slides.SlideItem) bool {
+    _ = slide;
+    return item.creation_morph_state != null and item.creation_morph_state.? == state_index;
+}
+
+fn morphItemEditTarget(slide: *const slides.Slide, state_index: usize, item: *const slides.SlideItem) MorphItemEditTarget {
+    if (item.state_source_state != null and item.state_source_state.? == state_index) {
+        return .{ .patch = item.state_source.? };
+    }
+    if (itemBornInMorphState(slide, state_index, item)) return .{ .patch = item.source };
+    return .insert_local;
+}
+
+fn applyStudioGeometryEdit(
+    history: *StudioHistory,
+    command: studio.GeometryCommand,
+    slide_opt: ?*slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+) !void {
+    var source_ref = command.source;
+    if (morph_state) |state_index| {
+        const slide = slide_opt orelse return error.NoStudioSlide;
+        const item = studioItemByIdentity(items, command.item_identity) orelse return error.StudioItemMissing;
+        switch (morphItemEditTarget(slide, state_index, item)) {
+            .patch => |patch_source| source_ref = patch_source,
+            .insert_local => {
+                const id = item.id orelse return error.MorphItemNeedsId;
+                var directive_buffer: [512]u8 = undefined;
+                const directive = if (command.resized)
+                    try std.fmt.bufPrint(
+                        &directive_buffer,
+                        "@set {s} x={d} y={d} w={d} h={d}",
+                        .{ id, command.after_position.x, command.after_position.y, command.after_size.x, command.after_size.y },
+                    )
+                else
+                    try std.fmt.bufPrint(
+                        &directive_buffer,
+                        "@set {s} x={d} y={d}",
+                        .{ id, command.after_position.x, command.after_position.y },
+                    );
+                const insertion_offset = try source_editor.morphStateEndOffset(
+                    G.editor_memory[0..G.source_len],
+                    slide.morph_states.items[state_index].source.line_offset,
+                );
+                return recordStudioPatch(history, try source_editor.insertDirectiveAt(
+                    G.allocator,
+                    G.editor_memory[0..G.source_len],
+                    insertion_offset,
+                    directive,
+                ));
+            },
+        }
+    }
+    if (source_ref.scope == .none or !source_ref.patchable) return error.StudioItemHasNoPatchableSource;
+
+    return recordStudioPatch(history, try source_editor.patchGeometry(
+        G.allocator,
+        G.editor_memory[0..G.source_len],
+        source_ref.line_offset,
+        .{
+            .x = command.after_position.x,
+            .y = command.after_position.y,
+            .w = if (command.resized) command.after_size.x else null,
+            .h = if (command.resized) command.after_size.y else null,
+        },
+    ));
+}
+
+fn colorLiteral(buffer: *[9]u8, color: rl.Color) []const u8 {
+    const digits = "0123456789abcdef";
+    const components = [_]u8{ color.r, color.g, color.b, color.a };
+    buffer[0] = '#';
+    for (components, 0..) |component, index| {
+        buffer[1 + index * 2] = digits[component >> 4];
+        buffer[2 + index * 2] = digits[component & 0x0f];
+    }
+    return buffer;
+}
+
+fn validReusableName(name: []const u8) bool {
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
+    }
+    return true;
+}
+
+fn reusableNameDefined(name: []const u8) bool {
+    var needle_buffer: [192]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buffer, "@push {s}", .{name}) catch return false;
+    var cursor: usize = 0;
+    const source = G.editor_memory[0..G.source_len];
+    while (std.mem.indexOfPos(u8, source, cursor, needle)) |offset| {
+        const end = offset + needle.len;
+        if ((offset == 0 or source[offset - 1] == '\n') and
+            (end == source.len or source[end] == ' ' or source[end] == '\t' or source[end] == '\r' or source[end] == '\n'))
+        {
+            return true;
+        }
+        cursor = end;
+    }
+    return false;
+}
+
+fn nextStudioItemId(buffer: []u8) ![]const u8 {
+    var serial: usize = G.source_len + 1;
+    while (true) : (serial += 1) {
+        const candidate = try std.fmt.bufPrint(buffer, "studio_{d}", .{serial});
+        var needle_buffer: [96]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buffer, "id={s}", .{candidate});
+        if (std.mem.indexOf(u8, G.editor_memory[0..G.source_len], needle) == null) return candidate;
+    }
+}
+
+fn normalizeBullets(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, input, '\n');
+    var first = true;
+    while (lines.next()) |raw_line| {
+        if (!first) try output.append(allocator, '\n');
+        const line = std.mem.trim(u8, raw_line, " \t");
+        if (line.len > 0 and !std.mem.startsWith(u8, line, "- ")) try output.appendSlice(allocator, "- ");
+        try output.appendSlice(allocator, line);
+        first = false;
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn itemTextSnippet(
+    allocator: std.mem.Allocator,
+    directive_without_text: []const u8,
+    text_value: []const u8,
+) ![]u8 {
+    if (std.mem.indexOfScalar(u8, text_value, '\r') != null) return error.InvalidStudioText;
+    if (std.mem.indexOfScalar(u8, text_value, '\n') == null) {
+        return std.fmt.allocPrint(allocator, "{s} text={s}", .{ directive_without_text, text_value });
+    }
+    var lines = std.mem.splitScalar(u8, text_value, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0 and (line[0] == '@' or line[0] == '#')) return error.InvalidStudioText;
+    }
+    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ directive_without_text, text_value });
+}
+
+fn studioItemInsertionOffset(slide: *const slides.Slide, morph_state: ?usize) !usize {
+    if (morph_state) |state_index| {
+        if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+        return source_editor.morphStateEndOffset(
+            G.editor_memory[0..G.source_len],
+            slide.morph_states.items[state_index].source.line_offset,
+        );
+    }
+    return source_editor.slideItemInsertionOffset(G.editor_memory[0..G.source_len], slide.pos_in_editor);
+}
+
+fn insertStudioSnippet(
+    history: *StudioHistory,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    snippet: []const u8,
+) !void {
+    const offset = try studioItemInsertionOffset(slide, morph_state);
+    return recordStudioPatch(history, try source_editor.insertSnippetAt(
+        G.allocator,
+        G.editor_memory[0..G.source_len],
+        offset,
+        snippet,
+    ));
+}
+
+fn deleteStudioItem(
+    history: *StudioHistory,
+    item: *const slides.SlideItem,
+    directive_offset: usize,
+) !void {
+    const source = G.editor_memory[0..G.source_len];
+    const patch = if (item.id) |id|
+        try source_editor.deleteItemCascadingMorphMutations(G.allocator, source, directive_offset, id)
+    else
+        try source_editor.deleteItem(G.allocator, source, directive_offset);
+    try recordStudioPatch(history, patch);
+}
+
+fn applyStudioLiteralAttribute(
+    history: *StudioHistory,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    item: *const slides.SlideItem,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    var source_ref = item.source;
+    if (morph_state) |state_index| {
+        switch (morphItemEditTarget(slide, state_index, item)) {
+            .patch => |patch_source| source_ref = patch_source,
+            .insert_local => {
+                const id = item.id orelse return error.MorphItemNeedsId;
+                const directive = try std.fmt.allocPrint(G.allocator, "@set {s} {s}={s}", .{ id, key, value });
+                defer G.allocator.free(directive);
+                return insertStudioSnippet(history, slide, morph_state, directive);
+            },
+        }
+    }
+    if (!source_ref.patchable) return error.StudioItemHasNoPatchableSource;
+    const patches = [_]source_editor.LiteralAttributePatch{.{ .key = key, .value = value }};
+    return recordStudioPatch(history, try source_editor.patchLiteralAttributes(
+        G.allocator,
+        G.editor_memory[0..G.source_len],
+        source_ref.line_offset,
+        &patches,
+    ));
+}
+
+fn applyStudioText(
+    history: *StudioHistory,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    item: *const slides.SlideItem,
+    text_value: []const u8,
+) !void {
+    var source_ref = item.source;
+    if (morph_state) |state_index| {
+        switch (morphItemEditTarget(slide, state_index, item)) {
+            .patch => |patch_source| source_ref = patch_source,
+            .insert_local => {
+                const id = item.id orelse return error.MorphItemNeedsId;
+                const directive = try std.fmt.allocPrint(G.allocator, "@set {s}", .{id});
+                defer G.allocator.free(directive);
+                const snippet = try itemTextSnippet(G.allocator, directive, text_value);
+                defer G.allocator.free(snippet);
+                return insertStudioSnippet(history, slide, morph_state, snippet);
+            },
+        }
+    }
+    if (!source_ref.patchable) return error.StudioItemHasNoPatchableSource;
+    return recordStudioPatch(history, try source_editor.patchItemText(
+        G.allocator,
+        G.editor_memory[0..G.source_len],
+        source_ref.line_offset,
+        text_value,
+    ));
+}
+
+fn applyStudioSemanticEdit(
+    history: *StudioHistory,
+    command: studio.SemanticCommand,
+    prompted_text: ?[]const u8,
+    slide_opt: ?*slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+    resolved_bounds: []const studio.ResolvedBounds,
+) !?usize {
+    const slide = slide_opt orelse return error.NoStudioSlide;
+    switch (command) {
+        .add_item => |add| {
+            var id_buffer: [64]u8 = undefined;
+            const id = try nextStudioItemId(&id_buffer);
+            var directive_buffer: [512]u8 = undefined;
+            const directive = switch (add.kind) {
+                .text, .bullets => try std.fmt.bufPrint(
+                    &directive_buffer,
+                    "@box id={s} x={d} y={d} w={d} h={d}",
+                    .{ id, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y },
+                ),
+                .image => blk: {
+                    const path = prompted_text orelse return error.StudioPromptMissing;
+                    if (path.len == 0 or std.mem.indexOfAny(u8, path, " \t\r\n") != null) return error.InvalidStudioImagePath;
+                    break :blk try std.fmt.bufPrint(
+                        &directive_buffer,
+                        "@box id={s} img={s} x={d} y={d} w={d} h={d}",
+                        .{ id, path, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y },
+                    );
+                },
+                .shape => blk: {
+                    var color_buffer: [9]u8 = undefined;
+                    const color = colorLiteral(&color_buffer, studio.paletteColor(add.suggested_color orelse .blue));
+                    break :blk try std.fmt.bufPrint(
+                        &directive_buffer,
+                        "@box id={s} x={d} y={d} w={d} h={d} color={s}",
+                        .{ id, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y, color },
+                    );
+                },
+            };
+            if (add.kind == .text or add.kind == .bullets) {
+                const raw_text = prompted_text orelse return error.StudioPromptMissing;
+                const owned_text = if (add.kind == .bullets)
+                    try normalizeBullets(G.allocator, raw_text)
+                else
+                    try G.allocator.dupe(u8, raw_text);
+                defer G.allocator.free(owned_text);
+                const snippet = try itemTextSnippet(G.allocator, directive, owned_text);
+                defer G.allocator.free(snippet);
+                try insertStudioSnippet(history, slide, morph_state, snippet);
+            } else {
+                try insertStudioSnippet(history, slide, morph_state, directive);
+            }
+        },
+        .delete_item => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (morph_state) |state_index| {
+                if (itemBornInMorphState(slide, state_index, item)) {
+                    try deleteStudioItem(history, item, item.source.line_offset);
+                } else {
+                    const id = item.id orelse return error.MorphItemNeedsId;
+                    const directive = try std.fmt.allocPrint(G.allocator, "@hide {s}", .{id});
+                    defer G.allocator.free(directive);
+                    try insertStudioSnippet(history, slide, morph_state, directive);
+                }
+            } else {
+                try deleteStudioItem(history, item, target.source.line_offset);
+            }
+        },
+        .edit_text => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .textbox and item.kind != .crowd) return error.ItemHasNoEditableText;
+            try applyStudioText(history, slide, morph_state, item, prompted_text orelse return error.StudioPromptMissing);
+        },
+        .set_foreground => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .textbox) return error.ItemHasNoForegroundColor;
+            var color_buffer: [9]u8 = undefined;
+            const color = colorLiteral(&color_buffer, studio.paletteColor(change.color));
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, "color", color);
+        },
+        .set_background => |change| {
+            if (morph_state != null) return error.MorphBackgroundUnsupported;
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            const geometry = studio.itemGeometry(item.*, resolved_bounds);
+            var color_buffer: [9]u8 = undefined;
+            const color = colorLiteral(&color_buffer, studio.paletteColor(change.color));
+            var id_buffer: [64]u8 = undefined;
+            const id = try nextStudioItemId(&id_buffer);
+            const directive = try std.fmt.allocPrint(
+                G.allocator,
+                "@box id={s} x={d} y={d} w={d} h={d} color={s}",
+                .{ id, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y, color },
+            );
+            defer G.allocator.free(directive);
+            const insertion_offset = try source_editor.itemInsertionOffsetBeforeAnimations(
+                G.editor_memory[0..G.source_len],
+                change.target.source.line_offset,
+            );
+            try recordStudioPatch(history, try source_editor.insertDirectiveAt(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                insertion_offset,
+                directive,
+            ));
+        },
+        .promote_to_reusable => |target| {
+            if (morph_state != null) return error.MorphPromotionUnsupported;
+            const name = prompted_text orelse return error.StudioPromptMissing;
+            if (!validReusableName(name)) return error.InvalidReusableName;
+            if (reusableNameDefined(name)) return error.ReusableNameAlreadyDefined;
+            try recordStudioPatch(history, try source_editor.promoteItemToReusable(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                target.source.line_offset,
+                name,
+            ));
+        },
+        .add_reusable => |add| {
+            const name = prompted_text orelse return error.StudioPromptMissing;
+            if (!validReusableName(name)) return error.InvalidReusableName;
+            if (!reusableNameDefined(name)) return error.ReusableNameNotFound;
+            var id_buffer: [64]u8 = undefined;
+            const id = try nextStudioItemId(&id_buffer);
+            const directive = try std.fmt.allocPrint(
+                G.allocator,
+                "@pop {s} id={s} x={d} y={d} w={d} h={d}",
+                .{ name, id, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y },
+            );
+            defer G.allocator.free(directive);
+            try insertStudioSnippet(history, slide, morph_state, directive);
+        },
+        .new_slide => {
+            const insertion_offset = try source_editor.slideEndOffset(G.editor_memory[0..G.source_len], slide.pos_in_editor);
+            try recordStudioPatch(history, try source_editor.insertDirectiveAt(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                insertion_offset,
+                "@slide",
+            ));
+            return @intCast(@as(usize, @intCast(G.current_slide)) + 1);
+        },
+        .select_morph_scene => {},
+    }
+    return null;
 }
 
 fn undoStudioEdit(history: *StudioHistory) !bool {
@@ -1386,11 +1939,12 @@ fn collectStudioBounds(
     output: *std.ArrayList(studio.ResolvedBounds),
     allocator: std.mem.Allocator,
     slide_number: i32,
+    morph_state: ?usize,
     items: []const slides.SlideItem,
 ) !void {
     output.clearRetainingCapacity();
     for (items) |item| {
-        const bounds = G.slide_renderer.itemRenderBounds(slide_number, item.identity) orelse continue;
+        const bounds = G.slide_renderer.itemRenderBoundsForMorphState(slide_number, morph_state, item.identity) orelse continue;
         try output.append(allocator, .{
             .identity = item.identity,
             .position = .{ .x = bounds.x, .y = bounds.y },
