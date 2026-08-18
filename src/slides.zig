@@ -166,11 +166,35 @@ pub const MorphState = struct {
     items: std.ArrayList(SlideItem) = undefined,
 };
 
+/// Describes the authoring construct that owns a logical item's source.
+///
+/// `slide_template` items keep the position of their original item directive,
+/// not the position of the `@pushslide`/`@popslide` that captured or cloned
+/// them. This makes the reference useful for precise source edits.
+pub const SourceScope = enum(u8) {
+    none,
+    direct,
+    component_instance,
+    slide_template,
+    morph_item,
+};
+
+pub const SourceRef = struct {
+    scope: SourceScope = .none,
+    line_number: usize = 0,
+    line_offset: usize = 0,
+    /// False when @let expansion means this physical source line cannot be
+    /// rewritten without a token-to-source mapping.
+    patchable: bool = false,
+};
+
 pub const SlideItem = struct {
     /// Stable within a logical slide and preserved by morph snapshots.
     identity: usize = 0,
     /// Optional author-facing target for @set/@show/@hide.
     id: ?[]const u8 = null,
+    /// Location and authoring scope of the directive that created this item.
+    source: SourceRef = .{},
     kind: SlideItemKind = .background,
     text: ?[]const u8 = null,
     fontSize: ?i32 = null,
@@ -374,6 +398,7 @@ pub const ItemContext = struct {
     bullet_symbol: ?[]const u8 = null,
     line_number: usize = 0,
     line_offset: usize = 0,
+    source_patchable: bool = false,
 
     // Image auto-dimension parameters
     scale: ?f32 = null,

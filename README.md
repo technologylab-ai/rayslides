@@ -15,8 +15,6 @@ Missing but maybe coming soon:
 Missing but probably not coming soon:
 
 - PPTX Export
-- Editor
-- Inspector Gadget
 
 ## Presentation and Slide Navigation
 
@@ -49,8 +47,45 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>O</kbd> | Open or lock the active Crowdplay poll |
 | <kbd>V</kbd> | Reveal or hide Crowdplay results |
 | <kbd>R</kbd> | Reset votes in the active Crowdplay poll |
+| <kbd>E</kbd> | Enter or leave Studio visual editing mode |
 
 **Beast Mode**: removes the 60 FPS limit
+
+## Studio visual editing
+
+Press <kbd>E</kbd> while presenting to turn the current slide into an editing
+canvas. Click an object and drag it to move it, or drag the cyan handle at its
+bottom-right corner to resize it. The arrow keys nudge the selection by one
+logical pixel; hold <kbd>Shift</kbd> to nudge by ten. <kbd>Esc</kbd> cancels an
+active drag, then leaves Studio on the next press.
+
+Studio edits the `.sld` document rather than maintaining a separate opaque
+scene. It rewrites only the effective `x=`, `y=`, `w=`, and `h=` values for the
+selected directive and preserves the rest of the source, including spacing,
+comments, text, and line endings. Objects instantiated with `@pop` are edited
+at that instance; objects inherited from `@pushslide` deliberately edit their
+shared template definition. Shared items use an amber outline and require
+holding <kbd>Alt</kbd> while moving, resizing, or nudging so a deck-wide change
+cannot happen accidentally. Items whose directive is produced through `@let`
+remain selectable but read-only until Studio has token-to-source mapping.
+
+| Studio shortcut | Description |
+| --------------- | ----------- |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Atomically save changes to the original `.sld` file |
+| <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Save an `*.edited.sld` copy |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Undo the last visual edit |
+| <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
+
+The `*` beside `STUDIO` means the in-memory document differs from the original
+file. Automatic file reload is paused while those unsaved changes exist.
+Transitions are paused in Studio, ordinary reveal items are shown, and semantic
+morph slides expose their stable base scene. Editing individual morph states is
+kept separate from base-layout editing for now.
+
+If the original file changes externally, Studio refuses to overwrite it and
+asks you to use Save Copy. Quitting with unsaved work also writes a unique
+`*.edited.sld` recovery copy before closing; if that copy cannot be written,
+the quit is cancelled.
 
 # Slideshow Text Format
 

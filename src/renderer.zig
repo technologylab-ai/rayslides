@@ -104,6 +104,17 @@ pub const TransitionState = struct {
     direction: i8 = 1,
 };
 
+/// One transient Studio gesture. The renderer applies it at draw time, so the
+/// object follows the pointer without reparsing the document on every frame.
+pub const ItemGeometryPreview = struct {
+    owner_identity: usize,
+    before_position: rl.Vector2,
+    before_size: rl.Vector2,
+    after_position: rl.Vector2,
+    after_size: rl.Vector2,
+    resized: bool,
+};
+
 const RenderTransform = struct {
     offset: rl.Vector2 = .{ .x = 0, .y = 0 },
     opacity: f32 = 1.0,
@@ -170,6 +181,7 @@ pub const SlideshowRenderer = struct {
     texture_cache: TextureCache,
     fonts: *my_fonts.AvailableFonts,
     qr_code: qrcode.Code = .{},
+    item_geometry_preview: ?ItemGeometryPreview = null,
 
     pub fn new(allocator: std.mem.Allocator, fonts: *my_fonts.AvailableFonts) !*SlideshowRenderer {
         var self: *SlideshowRenderer = try allocator.create(SlideshowRenderer);
@@ -184,7 +196,7 @@ pub const SlideshowRenderer = struct {
     }
 
     pub fn deinit(self: *SlideshowRenderer) void {
-        self.texture_cache.deinit(self.allocator);
+        self.texture_cache.deinit();
     }
 
     pub fn preRender(self: *SlideshowRenderer, slideshow: *const slides.SlideShow, slideshow_filp: []const u8) !void {
@@ -239,6 +251,23 @@ pub const SlideshowRenderer = struct {
         return self.renderedSlides.items[@intCast(slide_number)].steps.items.len;
     }
 
+    /// Number of ordinary reveal steps before semantic morph states begin.
+    /// Studio shows this stable base scene so every build item is selectable
+    /// without accidentally editing an interpolated or later morph snapshot.
+    pub fn baseRevealStepCount(self: *const SlideshowRenderer, slide_number: i32) usize {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return 0;
+        var count: usize = 0;
+        for (self.renderedSlides.items[@intCast(slide_number)].steps.items) |step| {
+            if (step.kind == .morph) break;
+            count += 1;
+        }
+        return count;
+    }
+
+    pub fn setItemGeometryPreview(self: *SlideshowRenderer, preview: ?ItemGeometryPreview) void {
+        self.item_geometry_preview = preview;
+    }
+
     pub fn stepAt(self: *const SlideshowRenderer, slide_number: i32, step_index: usize) ?animation.Step {
         if (slide_number < 0 or slide_number >= self.renderedSlides.items.len or step_index == 0) return null;
         const steps = self.renderedSlides.items[@intCast(slide_number)].steps.items;
@@ -249,6 +278,38 @@ pub const SlideshowRenderer = struct {
     pub fn transitionForSlide(self: *const SlideshowRenderer, slide_number: i32) animation.Transition {
         if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return .{};
         return self.renderedSlides.items[@intCast(slide_number)].transition;
+    }
+
+    /// Returns the union of the logical render fragments owned by one base
+    /// SlideItem. Studio uses this for objects whose authored size is
+    /// intentionally implicit, most notably auto-dimensioned images.
+    pub fn itemRenderBounds(self: *const SlideshowRenderer, slide_number: i32, owner_identity: usize) ?rl.Rectangle {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return null;
+        const elements = self.renderedSlides.items[@intCast(slide_number)].elements.items;
+        var result: ?rl.Rectangle = null;
+        for (elements) |element| {
+            if (element.owner_identity != owner_identity or element.kind == .background) continue;
+            const right = element.position.x + element.size.x;
+            const bottom = element.position.y + element.size.y;
+            if (result) |bounds| {
+                const left = @min(bounds.x, element.position.x);
+                const top = @min(bounds.y, element.position.y);
+                result = .{
+                    .x = left,
+                    .y = top,
+                    .width = @max(bounds.x + bounds.width, right) - left,
+                    .height = @max(bounds.y + bounds.height, bottom) - top,
+                };
+            } else {
+                result = .{
+                    .x = element.position.x,
+                    .y = element.position.y,
+                    .width = element.size.x,
+                    .height = element.size.y,
+                };
+            }
+        }
+        return result;
     }
 
     fn appendStep(self: *SlideshowRenderer, renderSlide: *RenderedSlide, spec: animation.ItemSpec) !usize {
@@ -1194,24 +1255,29 @@ pub const SlideshowRenderer = struct {
         crowd_snapshot: ?crowdplay.Snapshot,
         crowd_url: []const u8,
     ) void {
+        var previewed = if (self.item_geometry_preview) |preview|
+            elementWithGeometryPreview(element.*, preview)
+        else
+            element.*;
+        const displayed = &previewed;
         var transform = base_transform;
-        transform.opacity *= element.opacity;
+        transform.opacity *= displayed.opacity;
         if (transform.opacity <= 0) return;
-        switch (element.kind) {
+        switch (displayed.kind) {
             .background => {
-                if (element.texture) |texture| {
+                if (displayed.texture) |texture| {
                     renderImg(.{ .x = 0.0, .y = 0.0 }, internal_render_size, texture, .white, .blank, pos, size, internal_render_size, transform);
-                } else if (element.color) |color| {
+                } else if (displayed.color) |color| {
                     renderBgColor(color, pos, size, transform);
                 }
             },
-            .text => self.renderText(element, pos, size, internal_render_size, transform),
+            .text => self.renderText(displayed, pos, size, internal_render_size, transform),
             .image => {
-                if (element.texture) |texture| {
-                    renderImg(element.position, element.size, texture, .white, .blank, pos, size, internal_render_size, transform);
+                if (displayed.texture) |texture| {
+                    renderImg(displayed.position, displayed.size, texture, .white, .blank, pos, size, internal_render_size, transform);
                 }
             },
-            .crowd => self.renderCrowd(element, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),
+            .crowd => self.renderCrowd(displayed, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),
         }
     }
 
@@ -1294,6 +1360,35 @@ pub const SlideshowRenderer = struct {
         }
     }
 };
+
+fn elementWithGeometryPreview(element: RenderElement, preview: ItemGeometryPreview) RenderElement {
+    if (element.kind == .background or element.owner_identity != preview.owner_identity) return element;
+
+    var result = element;
+    const move = rl.Vector2{
+        .x = preview.after_position.x - preview.before_position.x,
+        .y = preview.after_position.y - preview.before_position.y,
+    };
+    result.position.x += move.x;
+    result.position.y += move.y;
+    if (!preview.resized) return result;
+
+    // Images, Crowdplay panels, and color-only rectangles can be resized
+    // faithfully without rebuilding layout. Text keeps its glyph metrics and
+    // reflows once the completed gesture is reparsed.
+    const scalable = element.kind == .image or element.kind == .crowd or
+        (element.kind == .text and element.text == null);
+    if (!scalable or preview.before_size.x <= 0 or preview.before_size.y <= 0) return result;
+
+    const scale_x = preview.after_size.x / preview.before_size.x;
+    const scale_y = preview.after_size.y / preview.before_size.y;
+    result.position = .{
+        .x = preview.after_position.x + (element.position.x - preview.before_position.x) * scale_x,
+        .y = preview.after_position.y + (element.position.y - preview.before_position.y) * scale_y,
+    };
+    result.size = .{ .x = element.size.x * scale_x, .y = element.size.y * scale_y };
+    return result;
+}
 
 fn stableMorphState(slide: *const RenderedSlide, visible_through: usize) ?usize {
     var state_index: ?usize = null;
@@ -1828,6 +1923,47 @@ test "stable semantic state follows morph steps in the shared timeline" {
     try std.testing.expectEqual(@as(?usize, 0), stableMorphState(slide, 2));
     try std.testing.expectEqual(@as(?usize, 1), stableMorphState(slide, 3));
     try std.testing.expectEqual(@as(?usize, 1), stableMorphState(slide, 99));
+}
+
+test "Studio geometry preview moves all fragments and resizes visual surfaces" {
+    const move: ItemGeometryPreview = .{
+        .owner_identity = 7,
+        .before_position = .{ .x = 100, .y = 200 },
+        .before_size = .{ .x = 400, .y = 300 },
+        .after_position = .{ .x = 130, .y = 180 },
+        .after_size = .{ .x = 400, .y = 300 },
+        .resized = false,
+    };
+    const text: RenderElement = .{
+        .kind = .text,
+        .owner_identity = 7,
+        .position = .{ .x = 120, .y = 230 },
+        .size = .{ .x = 80, .y = 30 },
+        .text = "hello",
+    };
+    const moved = elementWithGeometryPreview(text, move);
+    try std.testing.expectApproxEqAbs(@as(f32, 150), moved.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 210), moved.position.y, 0.0001);
+
+    var resize = move;
+    resize.after_position = move.before_position;
+    resize.after_size = .{ .x = 800, .y = 150 };
+    resize.resized = true;
+    const image: RenderElement = .{
+        .kind = .image,
+        .owner_identity = 7,
+        .position = .{ .x = 150, .y = 250 },
+        .size = .{ .x = 200, .y = 100 },
+    };
+    const resized = elementWithGeometryPreview(image, resize);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), resized.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 225), resized.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), resized.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), resized.size.y, 0.0001);
+
+    const text_resize = elementWithGeometryPreview(text, resize);
+    try std.testing.expectEqual(text.position, text_resize.position);
+    try std.testing.expectEqual(text.size, text_resize.size);
 }
 
 pub fn slidePosToRenderPos(pos: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) rl.Vector2 {

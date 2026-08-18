@@ -190,6 +190,7 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
     // log.info("input is: {s}", .{context.input});
 
     const start: usize = if (std.mem.startsWith(u8, context.input, "\xEF\xBB\xBF")) 3 else 0;
+    context.parsed_line_offset = start;
     // All slices retained by SlideItem and template contexts must point into
     // parser-owned storage rather than the caller's transient editor buffer.
     var it = std.mem.splitScalar(u8, context.input[start..], '\n');
@@ -350,6 +351,10 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
                 };
                 parsing_item_context.line_number = context.parsed_line_number;
                 parsing_item_context.line_offset = context.parsed_line_offset;
+                // Expanded @let lines do not have a safe one-to-one mapping
+                // back to their physical tokens. Keep them selectable in
+                // Studio, but explicitly read-only until such a mapping exists.
+                parsing_item_context.source_patchable = line.ptr == line_unprocessed.ptr;
             } else {
                 // add text lines to current parsing context
                 var text: []const u8 = "";
@@ -1157,6 +1162,9 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                 "slide templates cannot contain morph states; add @state(morph) after @popslide",
             );
         } else if (parsing_item_context.context_name) |context_name| {
+            for (context.current_slide.items.?.items) |*item| {
+                item.source.scope = .slide_template;
+            }
             try context.push_slides.put(context_name, context.current_slide);
         }
         context.current_slide = try slides.Slide.new(context.allocator);
@@ -1298,6 +1306,17 @@ fn commitItemToSlide(parsing_item_context: *slides.ItemContext, parser_context: 
         parsing_item_context.id = parsing_item_context.context_name;
     }
     slide_item.applyContext(parsing_item_context.*);
+    slide_item.source = .{
+        .scope = if (parser_context.active_morph_state != null)
+            .morph_item
+        else if (std.mem.eql(u8, parsing_item_context.directive, "@pop"))
+            .component_instance
+        else
+            .direct,
+        .line_number = parsing_item_context.line_number,
+        .line_offset = parsing_item_context.line_offset,
+        .patchable = parsing_item_context.source_patchable,
+    };
     if (parser_context.active_morph_state != null and slide_item.animation != null) {
         reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, parser_context, "items born inside morph states animate as part of the state; anim= is not valid here");
         slide_item.animation = null;
@@ -1740,6 +1759,80 @@ test "item templates merge sparse geometry and reject template ids" {
     try std.testing.expectApproxEqAbs(@as(f32, 80), item.position.y, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 900), item.size.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 200), item.size.y, 0.0001);
+}
+
+test "logical items retain directive source scope line and offset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push title x=100 y=80 w=900 h=120
+        \\@box id=template_box text=From template
+        \\@pushslide content
+        \\@popslide content
+        \\@box id=direct text=Direct
+        \\@pop title text=Component
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), slideshow.slides.items.len);
+
+    const direct = slideshow.slides.items[0].items.?.items[1];
+    try std.testing.expectEqual(slides.SourceScope.direct, direct.source.scope);
+    try std.testing.expect(direct.source.patchable);
+    try std.testing.expectEqual(@as(usize, 5), direct.source.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box id=direct").?, direct.source.line_offset);
+
+    const component = slideshow.slides.items[0].items.?.items[2];
+    try std.testing.expectEqual(slides.SourceScope.component_instance, component.source.scope);
+    try std.testing.expect(component.source.patchable);
+    try std.testing.expectEqual(@as(usize, 6), component.source.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@pop title text=Component").?, component.source.line_offset);
+
+    const template_item = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SourceScope.slide_template, template_item.source.scope);
+    try std.testing.expect(template_item.source.patchable);
+    try std.testing.expectEqual(@as(usize, 2), template_item.source.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box id=template_box").?, template_item.source.line_offset);
+}
+
+test "BOM-aware provenance starts at the physical directive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input = "\xEF\xBB\xBF@slide\n@box x=10 y=20 w=100 h=50 text=BOM\n";
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expect(item.source.patchable);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box").?, item.source.line_offset);
+}
+
+test "let-expanded item directives are explicitly read-only provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        "@let body=text=Hello\n" ++
+        "@slide\n" ++
+        "@box x=10 y=20 w=100 h=50 $body$\n";
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SourceScope.direct, item.source.scope);
+    try std.testing.expect(!item.source.patchable);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box").?, item.source.line_offset);
 }
 
 test "morph states are rejected inside reusable slide templates" {
