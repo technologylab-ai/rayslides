@@ -46,6 +46,8 @@ pub const Slide = struct {
     underline_width: i32 = 1,
     line_height_factor: ?f32 = null,
     transition: animation.Transition = .{},
+    morph_states: std.ArrayList(MorphState) = undefined,
+    next_item_identity: usize = 1,
 
     // .
 
@@ -56,11 +58,14 @@ pub const Slide = struct {
         self.* = .{ .allocator = a };
         log.debug("slide create 3", .{});
         self.items = std.ArrayList(SlideItem).empty;
+        self.morph_states = std.ArrayList(MorphState).empty;
         log.debug("slide create 4", .{});
         return self;
     }
     pub fn deinit(self: *Slide) void {
         self.items.deinit(self.allocator);
+        for (self.morph_states.items) |*state| state.items.deinit(self.allocator);
+        self.morph_states.deinit(self.allocator);
     }
 
     pub fn applyContext(self: *Slide, ctx: *ItemContext) void {
@@ -82,8 +87,29 @@ pub const Slide = struct {
         n.underline_width = orig.underline_width;
         n.line_height_factor = orig.line_height_factor;
         n.transition = orig.transition;
+        n.next_item_identity = orig.next_item_identity;
         try n.items.?.appendSlice(n.allocator, orig.items.?.items);
+        for (orig.morph_states.items) |state| {
+            var cloned_state = MorphState{ .spec = state.spec };
+            cloned_state.items = std.ArrayList(SlideItem).empty;
+            try cloned_state.items.appendSlice(n.allocator, state.items.items);
+            try n.morph_states.append(n.allocator, cloned_state);
+        }
         return n;
+    }
+
+    pub fn currentItems(self: *Slide, active_state: ?usize) *std.ArrayList(SlideItem) {
+        if (active_state) |state_index| return &self.morph_states.items[state_index].items;
+        return &self.items.?;
+    }
+
+    pub fn beginMorphState(self: *Slide, spec: animation.MorphSpec, previous_state: ?usize) !usize {
+        const source = self.currentItems(previous_state);
+        var state = MorphState{ .spec = spec };
+        state.items = std.ArrayList(SlideItem).empty;
+        try state.items.appendSlice(self.allocator, source.items);
+        try self.morph_states.append(self.allocator, state);
+        return self.morph_states.items.len - 1;
     }
 };
 
@@ -126,13 +152,25 @@ pub const CrowdSpec = struct {
     initially_open: bool = true,
 };
 
+pub const crowd_default_position: rl.Vector2 = .{ .x = 100, .y = 80 };
+pub const crowd_default_size: rl.Vector2 = .{ .x = 1720, .y = 920 };
+
 pub const TextShadow = struct {
     enabled: bool = true,
     color: rl.Color = .black,
     offset: rl.Vector2 = .{ .x = 4.0, .y = 4.0 },
 };
 
+pub const MorphState = struct {
+    spec: animation.MorphSpec = .{},
+    items: std.ArrayList(SlideItem) = undefined,
+};
+
 pub const SlideItem = struct {
+    /// Stable within a logical slide and preserved by morph snapshots.
+    identity: usize = 0,
+    /// Optional author-facing target for @set/@show/@hide.
+    id: ?[]const u8 = null,
     kind: SlideItemKind = .background,
     text: ?[]const u8 = null,
     fontSize: ?i32 = null,
@@ -152,6 +190,8 @@ pub const SlideItem = struct {
     animation: ?animation.ItemSpec = null,
     text_shadow: ?TextShadow = null,
     crowd: ?CrowdSpec = null,
+    opacity: f32 = 1.0,
+    visible: bool = true,
 
     pub fn new(a: std.mem.Allocator) !*SlideItem {
         const self = try a.create(SlideItem);
@@ -179,6 +219,40 @@ pub const SlideItem = struct {
         if (context.animation) |anim| self.animation = anim;
         if (context.text_shadow) |shadow| self.text_shadow = shadow;
         if (context.crowd) |crowd| self.crowd = crowd;
+        if (context.id) |id| self.id = id;
+        if (context.opacity) |opacity| self.opacity = opacity;
+        if (context.visible) |visible| self.visible = visible;
+    }
+
+    pub fn applyPatch(self: *SlideItem, context: ItemContext) void {
+        if (context.text) |text| self.text = text;
+        if (context.img_path) |img_path| self.img_path = img_path;
+        if (context.fontSize) |fontsize| self.fontSize = fontsize;
+        if (context.color) |color| self.color = color;
+        if (context.position) |position| {
+            if (context.has_x) self.position.x = position.x;
+            if (context.has_y) self.position.y = position.y;
+        }
+        if (context.size) |size| {
+            if (context.has_w) self.size.x = size.x;
+            if (context.has_h) self.size.y = size.y;
+        }
+        if (context.underline_width) |width| self.underline_width = width;
+        if (context.bullet_color) |color| self.bullet_color = color;
+        if (context.bullet_symbol) |symbol| self.bullet_symbol = symbol;
+        if (context.line_height_factor) |factor| self.line_height_factor = factor;
+        if (context.scale) |scale| self.scale = scale;
+        if (context.ratio) |ratio| self.ratio = ratio;
+        if (context.text_shadow) |patch| {
+            var shadow = self.text_shadow orelse TextShadow{};
+            if (context.has_shadow_enabled) shadow.enabled = patch.enabled;
+            if (context.has_shadow_color) shadow.color = patch.color;
+            if (context.has_shadow_x) shadow.offset.x = patch.offset.x;
+            if (context.has_shadow_y) shadow.offset.y = patch.offset.y;
+            self.text_shadow = shadow;
+        }
+        if (context.opacity) |opacity| self.opacity = opacity;
+        if (context.visible) |visible| self.visible = visible;
     }
     pub fn applySlideDefaultsIfNecessary(self: *SlideItem, slide: *Slide) void {
         if (self.fontSize == null) self.fontSize = slide.fontsize;
@@ -267,6 +341,7 @@ pub const SlideItem = struct {
                 log.info(indent ++ "bsymbl: {any}", .{self.bullet_symbol});
                 log.info(indent ++ "  line_height_factor: {any}", .{self.line_height_factor});
                 log.info(indent ++ " shadow: {any}", .{self.text_shadow});
+                log.info(indent ++ "opacity: {d}", .{self.opacity});
             },
             .crowd => {
                 log.info(indent ++ "Kind: Crowdplay", .{});
@@ -282,6 +357,7 @@ pub const SlideItem = struct {
 pub const ItemContext = struct {
     directive: []const u8 = "", // @push, @slide, ...
     context_name: ?[]const u8 = null,
+    id: ?[]const u8 = null,
     text: ?[]const u8 = null,
     fontSize: ?i32 = null,
     line_height_factor: ?f32 = null,
@@ -289,6 +365,10 @@ pub const ItemContext = struct {
     img_path: ?[]const u8 = null,
     position: ?rl.Vector2 = null,
     size: ?rl.Vector2 = null,
+    has_x: bool = false,
+    has_y: bool = false,
+    has_w: bool = false,
+    has_h: bool = false,
     underline_width: ?i32 = null,
     bullet_color: ?rl.Color = null,
     bullet_symbol: ?[]const u8 = null,
@@ -302,10 +382,20 @@ pub const ItemContext = struct {
     transition: ?animation.Transition = null,
     text_shadow: ?TextShadow = null,
     crowd: ?CrowdSpec = null,
+    has_shadow_enabled: bool = false,
+    has_shadow_color: bool = false,
+    has_shadow_x: bool = false,
+    has_shadow_y: bool = false,
+    morph: ?animation.MorphSpec = null,
+    opacity: ?f32 = null,
+    visible: ?bool = null,
 
     pub fn applyOtherIfNull(self: *ItemContext, other: ItemContext) void {
         if (self.text == null) {
             if (other.text) |text| self.text = text;
+        }
+        if (self.id == null) {
+            if (other.id) |id| self.id = id;
         }
 
         if (self.img_path == null) {
@@ -317,12 +407,30 @@ pub const ItemContext = struct {
         if (self.color == null) {
             if (other.color) |color| self.color = color;
         }
-        if (self.position == null) {
-            if (other.position) |position| self.position = position;
+        if (self.position) |own_position| {
+            if (other.position) |inherited_position| {
+                var merged = own_position;
+                if (!self.has_x) merged.x = inherited_position.x;
+                if (!self.has_y) merged.y = inherited_position.y;
+                self.position = merged;
+            }
+        } else if (other.position) |position| {
+            self.position = position;
         }
-        if (self.size == null) {
-            if (other.size) |size| self.size = size;
+        self.has_x = self.has_x or other.has_x;
+        self.has_y = self.has_y or other.has_y;
+        if (self.size) |own_size| {
+            if (other.size) |inherited_size| {
+                var merged = own_size;
+                if (!self.has_w) merged.x = inherited_size.x;
+                if (!self.has_h) merged.y = inherited_size.y;
+                self.size = merged;
+            }
+        } else if (other.size) |size| {
+            self.size = size;
         }
+        self.has_w = self.has_w or other.has_w;
+        self.has_h = self.has_h or other.has_h;
         if (self.underline_width == null) {
             if (other.underline_width) |w| self.underline_width = w;
         }
@@ -348,8 +456,30 @@ pub const ItemContext = struct {
         if (self.transition == null) {
             if (other.transition) |transition| self.transition = transition;
         }
-        if (self.text_shadow == null) {
-            if (other.text_shadow) |shadow| self.text_shadow = shadow;
+        if (self.crowd == null) {
+            if (other.crowd) |crowd| self.crowd = crowd;
+        }
+        if (self.text_shadow) |own_shadow| {
+            if (other.text_shadow) |inherited_shadow| {
+                var merged = own_shadow;
+                if (!self.has_shadow_enabled) merged.enabled = inherited_shadow.enabled;
+                if (!self.has_shadow_color) merged.color = inherited_shadow.color;
+                if (!self.has_shadow_x) merged.offset.x = inherited_shadow.offset.x;
+                if (!self.has_shadow_y) merged.offset.y = inherited_shadow.offset.y;
+                self.text_shadow = merged;
+            }
+        } else if (other.text_shadow) |shadow| {
+            self.text_shadow = shadow;
+        }
+        self.has_shadow_enabled = self.has_shadow_enabled or other.has_shadow_enabled;
+        self.has_shadow_color = self.has_shadow_color or other.has_shadow_color;
+        self.has_shadow_x = self.has_shadow_x or other.has_shadow_x;
+        self.has_shadow_y = self.has_shadow_y or other.has_shadow_y;
+        if (self.opacity == null) {
+            if (other.opacity) |opacity| self.opacity = opacity;
+        }
+        if (self.visible == null) {
+            if (other.visible) |visible| self.visible = visible;
         }
     }
 };

@@ -713,6 +713,10 @@ fn updateAutomaticReveal(now: f64) void {
 
 fn advancePresentation(now: f64) void {
     G.playback.settle(now);
+    // A repeated forward action must not skip over a step that is still
+    // animating. If the active step is reversing, however, the same action
+    // resumes it from the exact current frame.
+    if (G.playback.active_step != null and !G.playback.active_reverse) return;
     const next_step = G.playback.visible_step + 1;
     if (G.slide_renderer.stepAt(G.current_slide, next_step)) |step| {
         G.playback.reveal(next_step, step, now);
@@ -727,6 +731,9 @@ fn advancePresentation(now: f64) void {
 
 fn reversePresentation(now: f64) void {
     G.playback.settle(now);
+    // Symmetric with advancePresentation: allow changing direction, but do
+    // not skip backward while an existing reverse is still in flight.
+    if (G.playback.active_step != null and G.playback.active_reverse) return;
     if (G.playback.visible_step > 0) {
         const step_index = G.playback.visible_step;
         if (G.slide_renderer.stepAt(G.current_slide, step_index)) |step| {

@@ -54,19 +54,29 @@ pub const State = struct {
     }
 
     pub fn reveal(self: *State, step_index: usize, step: animation.Step, now: f64) void {
+        const duration = effectiveDuration(step);
+        const progress: f32 = if (self.active_step != null and self.active_step.? == step_index)
+            self.activeStepProgress(now)
+        else
+            0.0;
         self.visible_step = step_index;
         self.active_step = step_index;
-        self.active_started_at = now;
-        self.active_duration = effectiveDuration(step);
+        self.active_started_at = now - @as(f64, progress * duration);
+        self.active_duration = duration;
         self.active_reverse = false;
         self.auto_paused = false;
     }
 
     pub fn hide(self: *State, step_index: usize, step: animation.Step, now: f64) void {
+        const duration = effectiveDuration(step);
+        const progress: f32 = if (self.active_step != null and self.active_step.? == step_index)
+            self.activeStepProgress(now)
+        else
+            1.0;
         self.visible_step = step_index - 1;
         self.active_step = step_index;
-        self.active_started_at = now;
-        self.active_duration = effectiveDuration(step);
+        self.active_started_at = now - @as(f64, (1.0 - progress) * duration);
+        self.active_duration = duration;
         self.active_reverse = true;
         self.auto_paused = true;
     }
@@ -92,6 +102,7 @@ pub const State = struct {
     }
 
     fn effectiveDuration(step: animation.Step) f32 {
+        if (step.kind == .morph) return step.duration;
         if (step.effect == .none or step.effect == .appear) return 0;
         return step.duration;
     }
@@ -116,4 +127,22 @@ test "click and timed reveal playback" {
     state.hide(1, clicked, 2.0);
     try std.testing.expectEqual(@as(usize, 0), state.visible_step);
     try std.testing.expect(!state.shouldAutoReveal(timed, 3.0));
+}
+
+test "morph playback reverses without jumping" {
+    const std = @import("std");
+    var state = State{};
+    state.reset(0);
+    const morph = animation.Step.fromMorph(.{ .duration = 1.0 }, 0);
+
+    state.reveal(1, morph, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), state.activeStepProgress(1.3), 0.0001);
+
+    state.hide(1, morph, 1.3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), state.activeStepProgress(1.3), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), state.activeStepProgress(1.5), 0.0001);
+
+    state.reveal(1, morph, 1.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), state.activeStepProgress(1.5), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), state.activeStepProgress(1.9), 0.0001);
 }

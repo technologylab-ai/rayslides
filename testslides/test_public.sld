@@ -204,6 +204,164 @@ _
 @box leftbox x=110 y=800 w=1000 h=800 color=#cd0f2dff
 - with _@box color=... text=..._ you place text boxes with colored text
 
+# -------------------------------------------------------------
+# The three animation layers, shown with the syntax that enables each one.
+@popslide content transition=slide-left duration=0.45
+
+@pop slide_title text=~~**Animation without choreography**~~
+@box x=145 y=145 w=1550 h=70 fontsize=35 color=#606060ff text=Choose what advances. Rayslides handles frames, timing, and reverse playback.
+
+@box x=100 y=240 w=820 h=560 color=#edf4f9ee
+@box x=1000 y=240 w=820 h=560 color=#f7eef4ee
+
+@box x=145 y=275 w=730 h=55 fontsize=31 color=#182f49ff text=**BUILD CONTENT INSIDE A SLIDE**
+@box x=145 y=345 w=730 h=65 fontsize=27 color=#303030ff text=`@anim(fade) by=bullet duration=0.35`
+
+# This is not only an explanation: these bullets actually use the directive
+# printed immediately above them.
+@anim(fade) by=bullet duration=0.35
+@box x=155 y=445 w=700 h=265 fontsize=31 line_height=1.55 color=#303030ff bullet_symbol=•
+- Each bullet becomes one step automatically
+- → reveals; ← hides the same step
+- Add `after=1.0` when no click should be needed
+
+@box x=1045 y=275 w=730 h=55 fontsize=31 color=#56203fff text=**MOVE BETWEEN WHOLE SLIDES**
+@box x=1045 y=345 w=730 h=65 fontsize=27 color=#303030ff text=`@slide transition=slide-left duration=0.45`
+@box x=1055 y=445 w=700 h=265 fontsize=31 line_height=1.55 color=#303030ff bullet_symbol=•
+- The old and new slide animate together
+- Going backward flips the direction
+- The content timeline remains intact
+
+@box x=180 y=865 w=1560 h=90 fontsize=32 color=#993366ff text=`@anim` reveals content   •   `transition=` moves slides   •   `@state(morph)` rearranges objects
+
+# -------------------------------------------------------------
+# Semantic morphing: first teach the tiny mental model.
+@popslide content transition=fade duration=0.4
+
+@pop slide_title text=~~**Semantic morphs: the entire idea**~~
+
+@box x=110 y=205 w=770 h=625 color=#edf4f9ee
+@box x=1040 y=205 w=770 h=625 color=#f7eef4ee
+@box x=150 y=240 w=680 h=70 fontsize=36 color=#182f49ff text=**You describe two snapshots**
+@box x=1080 y=240 w=680 h=70 fontsize=36 color=#56203fff text=**Rayslides creates the journey**
+
+@box x=155 y=335 w=665 h=54 fontsize=25 color=#606060ff text=1. Name the object once
+@box x=155 y=395 w=665 h=75 fontsize=28 color=#303030ff text=`@box id=photo x=1210 y=250 w=610 h=347`
+@box x=155 y=515 w=665 h=54 fontsize=25 color=#606060ff text=2. Describe only its destination
+@box x=155 y=575 w=665 h=54 fontsize=28 color=#303030ff text=`@state(morph)`
+@box x=155 y=640 w=665 h=105 fontsize=28 color=#303030ff text=`@set photo x=0 y=0 w=1920 h=1080`
+
+@box x=915 y=475 w=90 h=110 fontsize=76 color=#f7a41dff text=→
+
+# This list builds itself line by line. It doubles as a quiet reminder that
+# ordinary reveal animation and semantic states share one presentation.
+@anim(fade) by=line duration=0.3 after=0.25
+@box x=1090 y=345 w=650 h=390 fontsize=31 line_height=1.7 color=#303030ff bullet_symbol=•
+- Matches both snapshots by `id=photo`
+- Interpolates position and size
+- Fades objects entering or leaving
+- Reverses the exact same path with ←
+
+@box x=200 y=880 w=1520 h=75 fontsize=34 color=#993366ff text=You author the destination — not timelines, copied slides, or hand-written keyframes.
+
+# -------------------------------------------------------------
+# Now let the audience watch that model operate: one logical slide, four
+# reversible states. One click starts it; the later states schedule themselves.
+@popslide content transition=fade duration=0.4
+
+# These flowchart elements start hidden, but already have stable identities
+# and sit behind the labels they will receive later.
+@box id=flow_card_source visible=false x=80 y=390 w=520 h=220 color=#182f49ee
+@box id=flow_card_state visible=false x=685 y=390 w=550 h=220 color=#56203fee
+@box id=flow_card_story visible=false x=1320 y=390 w=520 h=220 color=#214b35ee
+@box id=flow_arrow_one visible=false x=605 y=445 w=75 h=100 fontsize=76 color=#f7a41dff text=→
+@box id=flow_arrow_two visible=false x=1240 y=445 w=75 h=100 fontsize=76 color=#f7a41dff text=→
+
+@box id=hero_image img=assets/godotscr2.png x=1210 y=250 w=610 h=347
+@pop slide_title id=morph_title x=110 y=135 w=1080 h=150 fontsize=66 color=#202020ff shadow=#ffffffff shadow_offset=3 text=**One click. Then the states run themselves.**
+@box id=morph_tagline x=150 y=340 w=900 h=180 fontsize=39 color=#606060ff text=The image already has `id=hero_image`. We only describe where it should go next.
+@box id=morph_prompt x=150 y=800 w=900 h=100 fontsize=30 color=#993366ff text=Press → once. No keyframes are defined.
+
+# First click: the thumbnail becomes the entire stage while the same title
+# changes position, size, color, and shadow.
+@state(morph) duration=1.0 ease=spring
+@set hero_image x=0 y=0 w=1920 h=1080
+@set morph_title x=85 y=55 w=1700 fontsize=78 color=#f7a41dff shadow=#000000e0 shadow_offset=8
+@hide morph_tagline x=2050
+@hide morph_prompt y=1180
+@box id=fullscreen_panel x=70 y=845 w=1780 h=180 color=#080d18d8
+@box id=fullscreen_code x=120 y=875 w=1680 h=60 fontsize=31 color=#f7a41dff text=`@set hero_image x=0 y=0 w=1920 h=1080`
+@box id=fullscreen_caption x=120 y=945 w=1680 h=55 fontsize=29 color=#ffffffff text=One destination line. Rayslides generates every in-between frame automatically.
+
+# Pull back automatically and introduce three independently addressable
+# bullet items. New objects cross-fade into the next resolved state.
+@state(morph) after=2.4 duration=0.8 ease=smooth
+@set hero_image x=1460 y=805 w=330 h=188 opacity=0.24
+@set morph_title x=110 y=70 w=1500 fontsize=58 color=#202020ff shadow=#ffffffff shadow_offset=3 text=**The next state started itself.**
+@hide fullscreen_panel y=1180
+@hide fullscreen_code y=1180
+@hide fullscreen_caption x=-1800
+@box id=auto_badge x=1320 y=190 w=500 h=105 fontsize=28 color=#993366ff text=`after=2.4` scheduled this scene — no click.
+@box id=point_source x=170 y=330 w=1100 h=100 fontsize=43 color=#202020ff bullet_symbol=• text=- Name an object once with `id=`
+@box id=point_state x=170 y=500 w=1100 h=100 fontsize=43 color=#202020ff bullet_symbol=• text=- Put only changed values in `@set`
+@box id=point_story x=170 y=670 w=1100 h=100 fontsize=43 color=#202020ff bullet_symbol=• text=- Rayslides fills in every frame
+@box id=patch_note x=170 y=825 w=1130 h=70 fontsize=28 color=#606060ff text=Everything you do not mention simply carries forward.
+
+# The bullets are not recreated: the exact same logical objects rearrange
+# themselves into a flowchart as the hidden furniture comes alive.
+@state(morph) after=2.6 duration=1.8 ease=spring
+@show flow_card_source
+@show flow_card_state
+@show flow_card_story
+@show flow_arrow_one
+@show flow_arrow_two
+@set morph_title text=**Those same three bullets become this diagram.**
+@hide auto_badge x=2050
+@set point_source x=125 y=465 w=430 h=110 fontsize=32 color=#ffffffff shadow=#000000b0 shadow_offset=3
+@set point_state x=725 y=465 w=470 h=110 fontsize=32 color=#ffffffff shadow=#000000b0 shadow_offset=3
+@set point_story x=1365 y=465 w=430 h=110 fontsize=32 color=#ffffffff shadow=#000000b0 shadow_offset=3
+@set patch_note x=400 y=720 w=1120 fontsize=29 color=#606060ff text=Same IDs. New coordinates. No copied slide.
+@box id=flow_result x=390 y=805 w=1140 h=100 fontsize=46 color=#f7a41dff shadow=#000000b0 shadow_offset=5 text=**Name it → Patch it → Rayslides animates it**
+
+# Finally, map every tiny author instruction to the automatic behavior it
+# unlocks. Changed text cross-fades; exiting objects move and fade.
+@state(morph) after=3.2 duration=0.9 ease=spring
+@hide hero_image x=2050 y=900
+@hide flow_card_source y=1180
+@hide flow_card_state y=1180
+@hide flow_card_story y=1180
+@hide flow_arrow_one y=1180
+@hide flow_arrow_two y=1180
+@hide point_source y=1180
+@hide point_state y=1180
+@hide point_story y=1180
+@hide patch_note y=1180
+@hide flow_result y=1180
+@set morph_title x=150 y=95 w=1650 fontsize=62 color=#f7a41dff shadow=#000000d0 shadow_offset=5 text=**You describe intent. Rayslides supplies motion.**
+
+@box id=summary_left_heading x=155 y=220 w=680 h=65 fontsize=31 color=#182f49ff text=**YOU WRITE**
+@box id=summary_right_heading x=980 y=220 w=760 h=65 fontsize=31 color=#56203fff text=**RAYSLIDES DOES AUTOMATICALLY**
+
+@box id=summary_row_one x=120 y=300 w=1680 h=90 color=#edf4f9dd
+@box id=summary_row_two x=120 y=410 w=1680 h=90 color=#f7eef4dd
+@box id=summary_row_three x=120 y=520 w=1680 h=90 color=#edf4f9dd
+@box id=summary_row_four x=120 y=630 w=1680 h=90 color=#f7eef4dd
+@box id=summary_row_five x=120 y=740 w=1680 h=90 color=#edf4f9dd
+
+@box id=summary_code_one x=155 y=325 w=670 h=45 fontsize=28 color=#303030ff text=`id=hero_image`
+@box id=summary_code_two x=155 y=435 w=670 h=45 fontsize=28 color=#303030ff text=`@set hero_image x=0 w=1920`
+@box id=summary_code_three x=155 y=545 w=670 h=45 fontsize=28 color=#303030ff text=`@show card` / `@hide caption`
+@box id=summary_code_four x=155 y=655 w=670 h=45 fontsize=28 color=#303030ff text=`@state(morph) after=2.4`
+@box id=summary_code_five x=155 y=765 w=670 h=45 fontsize=28 color=#303030ff text=Press ←
+
+@box id=summary_auto_one x=980 y=325 w=760 h=45 fontsize=28 color=#303030ff text=Matches the same object across states
+@box id=summary_auto_two x=980 y=435 w=760 h=45 fontsize=28 color=#303030ff text=Interpolates every changed property
+@box id=summary_auto_three x=980 y=545 w=760 h=45 fontsize=28 color=#303030ff text=Fades objects in or out
+@box id=summary_auto_four x=980 y=655 w=760 h=45 fontsize=28 color=#303030ff text=Waits, eases, and starts without a click
+@box id=summary_auto_five x=980 y=765 w=760 h=45 fontsize=28 color=#303030ff text=Reconstructs every previous frame in reverse
+
+@box id=summary_footer x=210 y=880 w=1500 h=70 fontsize=32 color=#993366ff text=No timeline editor. No duplicate slides. No hand-authored keyframes.
+
 
 # -------------------------------------------------------------
 @popslide thankyou

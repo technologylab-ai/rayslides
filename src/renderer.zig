@@ -37,7 +37,7 @@ const RenderElement = struct {
     size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     color: ?rl.Color = .blank,
     text: ?[:0]const u8 = null,
-    fontSize: ?i32 = null,
+    fontSize: ?f32 = null,
     fontStyle: my_fonts.FontStyle = .normal,
     underlined: bool = false,
     underline_width: ?i32 = null,
@@ -48,10 +48,35 @@ const RenderElement = struct {
     reveal_step: usize = 0,
     text_shadow: ?slides.TextShadow = null,
     crowd: ?slides.CrowdSpec = null,
+    opacity: f32 = 1.0,
+    owner_identity: usize = 0,
+    part_index: usize = 0,
+};
+
+const RenderedScene = struct {
+    elements: std.ArrayList(RenderElement),
+    plan: MorphPlan,
+};
+
+const MorphDrawKind = enum {
+    interpolate,
+    source_fade,
+    target_fade,
+};
+
+const MorphDraw = struct {
+    kind: MorphDrawKind,
+    source_index: ?usize = null,
+    target_index: ?usize = null,
+};
+
+const MorphPlan = struct {
+    draws: std.ArrayList(MorphDraw),
 };
 
 const RenderedSlide = struct {
     elements: std.ArrayList(RenderElement) = undefined,
+    morph_scenes: std.ArrayList(RenderedScene) = undefined,
     steps: std.ArrayList(animation.Step) = undefined,
     transition: animation.Transition = .{},
 
@@ -59,6 +84,7 @@ const RenderedSlide = struct {
         var self: *RenderedSlide = try allocator.create(RenderedSlide);
         self.* = .{};
         self.elements = std.ArrayList(RenderElement).empty;
+        self.morph_scenes = std.ArrayList(RenderedScene).empty;
         self.steps = std.ArrayList(animation.Step).empty;
         return self;
     }
@@ -82,6 +108,60 @@ const RenderTransform = struct {
     offset: rl.Vector2 = .{ .x = 0, .y = 0 },
     opacity: f32 = 1.0,
 };
+
+const BoundarySpacing = struct {
+    leading: f32 = 0.0,
+    trailing: f32 = 0.0,
+};
+
+fn fontStyleForFlags(styleflags: u8) my_fonts.FontStyle {
+    const bold = styleflags & markdownlineparser.StyleFlags.bold > 0;
+    const italic = styleflags & markdownlineparser.StyleFlags.italic > 0;
+    if (bold and italic) return .bolditalic;
+    if (styleflags & markdownlineparser.StyleFlags.zig > 0) return .zig;
+    if (italic) return .italic;
+    if (bold) return .bold;
+    return .normal;
+}
+
+/// Whitespace at a font boundary uses the wider of the two adjacent space
+/// advances. This is deliberately symmetric: body -> code must not look
+/// cramped, and neither must code -> body merely because the parser assigns
+/// the literal space to the body span.
+fn inlineBoundarySpacing(text: []const u8, current_space: f32, previous_space: ?f32, next_space: ?f32) BoundarySpacing {
+    var leading_count: usize = 0;
+    while (leading_count < text.len and text[leading_count] == ' ') : (leading_count += 1) {}
+
+    // An all-whitespace span is one boundary, not both a leading and trailing
+    // boundary. Compare it with both neighbors and account for it once.
+    if (leading_count == text.len) {
+        const widest = @max(current_space, @max(previous_space orelse current_space, next_space orelse current_space));
+        return .{ .leading = (widest - current_space) * @as(f32, @floatFromInt(leading_count)) };
+    }
+
+    var trailing_start = text.len;
+    while (trailing_start > leading_count and text[trailing_start - 1] == ' ') : (trailing_start -= 1) {}
+    const trailing_count = text.len - trailing_start;
+
+    return .{
+        .leading = (@max(current_space, previous_space orelse current_space) - current_space) * @as(f32, @floatFromInt(leading_count)),
+        .trailing = (@max(current_space, next_space orelse current_space) - current_space) * @as(f32, @floatFromInt(trailing_count)),
+    };
+}
+
+fn boundaryWidth(raw_width: f32, boundary: BoundarySpacing, slice_start: usize, slice_end: usize, span_len: usize) f32 {
+    return raw_width +
+        (if (slice_start == 0) boundary.leading else 0.0) +
+        (if (slice_end == span_len) boundary.trailing else 0.0);
+}
+
+fn boundaryLeadingOffset(boundary: BoundarySpacing, slice_start: usize) f32 {
+    return if (slice_start == 0) boundary.leading else 0.0;
+}
+
+fn boundaryTrailingOffset(boundary: BoundarySpacing, slice_end: usize, span_len: usize) f32 {
+    return if (slice_end == span_len) boundary.trailing else 0.0;
+}
 
 pub const SlideshowRenderer = struct {
     renderedSlides: std.ArrayList(*RenderedSlide) = undefined,
@@ -128,14 +208,24 @@ pub const SlideshowRenderer = struct {
             renderSlide.transition = slide.transition;
 
             if (slide.items) |items| {
-                for (items.items) |item| {
-                    switch (item.kind) {
-                        .background => try self.createBg(renderSlide, item, slideshow_filp),
-                        .textbox => try self.preRenderTextBlock(renderSlide, item, slide_number),
-                        .img => try self.createImg(renderSlide, item, slideshow_filp),
-                        .crowd => try self.createCrowd(renderSlide, item),
-                    }
+                for (items.items) |item| try self.preRenderItem(renderSlide, item, slide_number, slideshow_filp);
+            }
+            for (slide.morph_states.items, 0..) |state, state_index| {
+                const state_render = try RenderedSlide.new(self.allocator);
+                for (state.items.items) |state_item| {
+                    var static_item = state_item;
+                    // Reveal steps belong to the base timeline and must not be
+                    // duplicated while materializing later state snapshots.
+                    static_item.animation = null;
+                    try self.preRenderItem(state_render, static_item, slide_number, slideshow_filp);
                 }
+                const source_elements = if (state_index == 0)
+                    renderSlide.elements.items
+                else
+                    renderSlide.morph_scenes.items[state_index - 1].elements.items;
+                const plan = try buildMorphPlan(self.allocator, source_elements, state_render.elements.items);
+                try renderSlide.morph_scenes.append(self.allocator, .{ .elements = state_render.elements, .plan = plan });
+                try renderSlide.steps.append(self.allocator, animation.Step.fromMorph(state.spec, state_index));
             }
 
             // now add the slide
@@ -169,6 +259,33 @@ pub const SlideshowRenderer = struct {
     fn wholeItemStep(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem) !usize {
         if (item.animation) |spec| return try self.appendStep(renderSlide, spec);
         return 0;
+    }
+
+    fn preRenderItem(
+        self: *SlideshowRenderer,
+        renderSlide: *RenderedSlide,
+        item: slides.SlideItem,
+        slide_number: usize,
+        slideshow_filp: []const u8,
+    ) !void {
+        var rendered_item = item;
+        // Hidden objects remain in state snapshots at zero opacity. Keeping
+        // their geometry and identity makes @set + @hide move while fading,
+        // and makes @show the exact reverse. They must not create dead reveal
+        // clicks while hidden in the base state.
+        if (!rendered_item.visible) rendered_item.animation = null;
+        const first_element = renderSlide.elements.items.len;
+        switch (rendered_item.kind) {
+            .background => try self.createBg(renderSlide, rendered_item, slideshow_filp),
+            .textbox => try self.preRenderTextBlock(renderSlide, rendered_item, slide_number),
+            .img => try self.createImg(renderSlide, rendered_item, slideshow_filp),
+            .crowd => try self.createCrowd(renderSlide, rendered_item),
+        }
+        for (renderSlide.elements.items[first_element..], 0..) |*element, part_index| {
+            element.owner_identity = rendered_item.identity;
+            element.part_index = part_index;
+            element.opacity = if (rendered_item.visible) rendered_item.opacity else 0.0;
+        }
     }
 
     fn createBg(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
@@ -283,9 +400,7 @@ pub const SlideshowRenderer = struct {
             };
 
             // slide number
-            var slideNumStr: [10]u8 = undefined;
-            _ = try std.fmt.bufPrintZ(&slideNumStr, "{d}", .{slide_number});
-            const new_t = try std.mem.replaceOwned(u8, self.allocator, t, "$slide_number", &slideNumStr);
+            const new_t = try replaceSlideNumber(self.allocator, t, slide_number);
 
             // split into lines
             var it = std.mem.splitScalar(u8, new_t, '\n');
@@ -322,7 +437,7 @@ pub const SlideshowRenderer = struct {
                         .kind = .text,
                         .position = .{ .x = tl_pos.x + indent_in_pixels, .y = layoutContext.current_pos.y },
                         .size = .{ .x = available_width, .y = layoutContext.available_size.y },
-                        .fontSize = fontSize,
+                        .fontSize = @floatFromInt(fontSize),
                         .underline_width = underline_width,
                         .text = bulletSymbol,
                         .color = bulletColor,
@@ -372,6 +487,21 @@ pub const SlideshowRenderer = struct {
         text_shadow: ?slides.TextShadow = null,
     };
 
+    fn fontForStyle(self: *const SlideshowRenderer, style: my_fonts.FontStyle) rl.Font {
+        return switch (style) {
+            .normal => self.fonts.normal,
+            .bold => self.fonts.bold,
+            .italic => self.fonts.italic,
+            .bolditalic => self.fonts.bolditalic,
+            .zig => self.fonts.zig,
+        };
+    }
+
+    fn spaceAdvanceForStyle(self: *const SlideshowRenderer, style: my_fonts.FontStyle, nominal_font_size: f32) f32 {
+        const display_font_size = self.fonts.displaySizeForStyle(style, nominal_font_size);
+        return self.fonts.measureTextWithFallback(self.fontForStyle(style), " ", display_font_size, 0).x;
+    }
+
     fn renderMdBlock(self: *SlideshowRenderer, renderSlide: *RenderedSlide, layoutContext: *TextLayoutContext) !void {
         //     remember original pos. its X will need to be reset at every line wrap
         //     for span in spans:
@@ -403,38 +533,41 @@ pub const SlideshowRenderer = struct {
                 .kind = .text,
                 .size = layoutContext.available_size,
                 .color = default_color,
-                .fontSize = layoutContext.fontSize,
+                .fontSize = @floatFromInt(layoutContext.fontSize),
                 .underline_width = @intCast(layoutContext.underline_width),
                 .reveal_step = layoutContext.reveal_step,
                 .text_shadow = layoutContext.text_shadow,
             };
 
-            for (spans.items) |span| {
+            for (spans.items, 0..) |span, span_index| {
                 if (span.text.?[0] == 0) {
                     log.debug("SKIPPING ZERO LENGTH SPAN", .{});
                     continue;
                 }
                 log.debug("new span, len=: `{d}`", .{span.text.?.len});
                 // work out the font
-                var font_used: rl.Font = self.fonts.normal;
-                element.fontStyle = .normal;
+                element.fontStyle = fontStyleForFlags(span.styleflags);
+                const font_used = self.fontForStyle(element.fontStyle);
                 element.underlined = span.styleflags & markdownlineparser.StyleFlags.underline > 0;
-
-                if (span.styleflags & markdownlineparser.StyleFlags.bold > 0) {
-                    element.fontStyle = .bold;
-                    font_used = self.fonts.bold;
-                }
-                if (span.styleflags & markdownlineparser.StyleFlags.italic > 0) {
-                    element.fontStyle = .italic;
-                    font_used = self.fonts.italic;
-                }
-                if (span.styleflags & markdownlineparser.StyleFlags.zig > 0) {
-                    element.fontStyle = .zig;
-                    font_used = self.fonts.zig;
-                }
-                if (span.styleflags & (markdownlineparser.StyleFlags.bold | markdownlineparser.StyleFlags.italic) == (markdownlineparser.StyleFlags.bold | markdownlineparser.StyleFlags.italic)) {
-                    element.fontStyle = .bolditalic;
-                    font_used = self.fonts.bolditalic;
+                const nominal_font_size: f32 = @floatFromInt(layoutContext.fontSize);
+                const display_font_size = self.fonts.displaySizeForStyle(element.fontStyle, nominal_font_size);
+                const baseline_offset = self.fonts.baselineOffsetForStyle(element.fontStyle, nominal_font_size);
+                element.fontSize = display_font_size;
+                const current_space = self.spaceAdvanceForStyle(element.fontStyle, nominal_font_size);
+                const previous_space = if (span_index > 0)
+                    self.spaceAdvanceForStyle(fontStyleForFlags(spans.items[span_index - 1].styleflags), nominal_font_size)
+                else
+                    null;
+                const next_space = if (span_index + 1 < spans.items.len)
+                    self.spaceAdvanceForStyle(fontStyleForFlags(spans.items[span_index + 1].styleflags), nominal_font_size)
+                else
+                    null;
+                const boundary_spacing = inlineBoundarySpacing(span.text.?, current_space, previous_space, next_space);
+                if (boundary_spacing.leading > 0 or boundary_spacing.trailing > 0) {
+                    log.debug(
+                        "font-boundary spacing `{s}`: leading +{d:.2}px, trailing +{d:.2}px",
+                        .{ span.text.?, boundary_spacing.leading, boundary_spacing.trailing },
+                    );
                 }
 
                 // work out the color
@@ -475,18 +608,21 @@ pub const SlideshowRenderer = struct {
 
                 var attempted_span_size: rl.Vector2 = undefined;
                 var available_width: f32 = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
-                var render_text_c = try self.styledTextblockSize_toCstring(span.text.?, layoutContext.fontSize, font_used, &attempted_span_size);
-                log.debug("available_width: {d}, attempted_span_size: {d:3.0}", .{ available_width, attempted_span_size.x });
-                if (attempted_span_size.x < available_width) {
+                var render_text_c = try self.styledTextblockSize_toCstring(span.text.?, display_font_size, font_used, &attempted_span_size);
+                const whole_span_width = boundaryWidth(attempted_span_size.x, boundary_spacing, 0, span.text.?.len, span.text.?.len);
+                log.debug("available_width: {d}, attempted_span_size: {d:3.0}", .{ available_width, whole_span_width });
+                if (whole_span_width < available_width) {
                     // we did not wrap so the entire span can be output!
                     element.text = render_text_c;
                     element.position = layoutContext.current_pos;
-                    element.size.x = attempted_span_size.x;
+                    element.position.x += boundary_spacing.leading;
+                    element.position.y += baseline_offset;
+                    element.size.x = attempted_span_size.x + boundary_spacing.trailing;
                     //element.size = attempted_span_size;
                     log.debug(">>>>>>> appending non-wrapping text element: {?s}@{d:3.0},{d:3.0}", .{ element.text, element.position.x, element.position.y });
                     try renderSlide.elements.append(self.allocator, element);
                     // advance render pos
-                    layoutContext.current_pos.x += attempted_span_size.x;
+                    layoutContext.current_pos.x += whole_span_width;
                     // if something is rendered into the currend line, then adjust the line height if necessary
                     if (attempted_span_size.y > layoutContext.current_line_height) {
                         // TODO: check if this is correct: we multiply the new line height by the line_height_factor.
@@ -546,9 +682,10 @@ pub const SlideshowRenderer = struct {
                         log.debug("current idx of spc {d}", .{currentIdxOfSpace});
                         // try if we fit. if we don't -> render up until last idx
                         var render_text = span.text.?[lastConsumedIdx..currentIdxOfSpace];
-                        render_text_c = try self.styledTextblockSize_toCstring(render_text, layoutContext.fontSize, font_used, &attempted_span_size);
-                        log.debug("   current available_width: {d}, attempted_span_size: {d:3.0}", .{ available_width, attempted_span_size.x });
-                        if (attempted_span_size.x > available_width and wordCount > 1) {
+                        render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                        const candidate_width = boundaryWidth(attempted_span_size.x, boundary_spacing, lastConsumedIdx, currentIdxOfSpace, span.text.?.len);
+                        log.debug("   current available_width: {d}, attempted_span_size: {d:3.0}", .{ available_width, candidate_width });
+                        if (candidate_width > available_width and wordCount > 1) {
                             // we wrapped!
                             // so render everything up until the last word
                             // then, render the new word in the new line?
@@ -561,17 +698,21 @@ pub const SlideshowRenderer = struct {
                                 available_width = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
                                 const end_of_string_pos = if (lastIdxOfSpace > span.text.?.len) span.text.?.len else lastIdxOfSpace;
                                 render_text = span.text.?[lastConsumedIdx..end_of_string_pos];
-                                render_text_c = try self.styledTextblockSize_toCstring(render_text, layoutContext.fontSize, font_used, &attempted_span_size);
+                                render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                                const rendered_slice_start = lastConsumedIdx;
+                                const rendered_width = boundaryWidth(attempted_span_size.x, boundary_spacing, rendered_slice_start, end_of_string_pos, span.text.?.len);
                                 lastConsumedIdx = lastIdxOfSpace;
                                 lastIdxOfSpace = currentIdxOfSpace;
                                 element.text = render_text_c;
                                 element.position = layoutContext.current_pos;
-                                element.size.x = attempted_span_size.x;
+                                element.position.x += boundaryLeadingOffset(boundary_spacing, rendered_slice_start);
+                                element.position.y += baseline_offset;
+                                element.size.x = attempted_span_size.x + boundaryTrailingOffset(boundary_spacing, end_of_string_pos, span.text.?.len);
                                 // element.size = attempted_span_size;
-                                log.debug(">>>>>>> appending wrapping text element: {?s} width={d:3.0}", .{ element.text, attempted_span_size.x });
+                                log.debug(">>>>>>> appending wrapping text element: {?s} width={d:3.0}", .{ element.text, rendered_width });
                                 try renderSlide.elements.append(self.allocator, element);
                                 // advance render pos
-                                layoutContext.current_pos.x += attempted_span_size.x;
+                                layoutContext.current_pos.x += rendered_width;
                                 // something is rendered into the currend line, so adjust the line height if necessary
                                 if (attempted_span_size.y > layoutContext.current_line_height) {
                                     layoutContext.current_line_height = attempted_span_size.y * layoutContext.current_line_height_factor;
@@ -591,17 +732,21 @@ pub const SlideshowRenderer = struct {
                             if (lastIdxOfSpace >= currentIdxOfSpace) {
                                 available_width = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
                                 render_text = span.text.?[lastConsumedIdx..currentIdxOfSpace];
-                                render_text_c = try self.styledTextblockSize_toCstring(render_text, layoutContext.fontSize, font_used, &attempted_span_size);
+                                render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                                const rendered_slice_start = lastConsumedIdx;
+                                const rendered_width = boundaryWidth(attempted_span_size.x, boundary_spacing, rendered_slice_start, currentIdxOfSpace, span.text.?.len);
                                 lastConsumedIdx = lastIdxOfSpace;
                                 lastIdxOfSpace = currentIdxOfSpace;
                                 element.text = render_text_c;
                                 element.position = layoutContext.current_pos;
+                                element.position.x += boundaryLeadingOffset(boundary_spacing, rendered_slice_start);
+                                element.position.y += baseline_offset;
                                 // element.size = attempted_span_size;
-                                log.debug(">>>>>>> appending final text element: {?s} width={d:3.0}", .{ element.text, attempted_span_size.x });
-                                element.size.x = attempted_span_size.x;
+                                log.debug(">>>>>>> appending final text element: {?s} width={d:3.0}", .{ element.text, rendered_width });
+                                element.size.x = attempted_span_size.x + boundaryTrailingOffset(boundary_spacing, currentIdxOfSpace, span.text.?.len);
                                 try renderSlide.elements.append(self.allocator, element);
                                 // advance render pos
-                                layoutContext.current_pos.x += attempted_span_size.x;
+                                layoutContext.current_pos.x += rendered_width;
                                 // something is rendered into the currend line, so adjust the line height if necessary
                                 if (attempted_span_size.y > layoutContext.current_line_height) {
                                     layoutContext.current_line_height = attempted_span_size.y * layoutContext.current_line_height_factor;
@@ -637,16 +782,15 @@ pub const SlideshowRenderer = struct {
     }
 
     fn lineHightAndBulletWidthForFontSize(self: *SlideshowRenderer, font: rl.Font, fontsize: i32) rl.Vector2 {
-        _ = self;
         var size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 };
         var ret: rl.Vector2 = .{ .x = 0.0, .y = 0.0 };
         // TODO: this might be inaccurate if we use different fonts in the text block
         // whose pixel sizes vary significantly for given font sizes
         const text = "FontCheck";
-        size = rl.measureTextEx(font, text, @floatFromInt(fontsize), 0);
+        size = self.fonts.measureTextWithFallback(font, text, @floatFromInt(fontsize), 0);
         ret.y = size.y;
         const bullet_text = "> "; // TODO this should ideally honor the real bullet symbol but I don't care atm
-        size = rl.measureTextEx(font, bullet_text, @floatFromInt(fontsize), 0);
+        size = self.fonts.measureTextWithFallback(font, bullet_text, @floatFromInt(fontsize), 0);
         ret.x = size.x;
         return ret;
     }
@@ -677,7 +821,7 @@ pub const SlideshowRenderer = struct {
         return try self.allocator.dupeZ(u8, text);
     }
 
-    fn styledTextblockSize_toCstring(self: *SlideshowRenderer, text: []const u8, fontsize: i32, font: rl.Font, size_out: *rl.Vector2) ![:0]const u8 {
+    fn styledTextblockSize_toCstring(self: *SlideshowRenderer, text: []const u8, fontsize: f32, font: rl.Font, size_out: *rl.Vector2) ![:0]const u8 {
         const ctext = try self.toCString(text);
         log.debug("cstring: of {s} = `{s}`", .{ text, ctext });
         if (ctext[0] == 0) {
@@ -685,7 +829,7 @@ pub const SlideshowRenderer = struct {
             size_out.y = 0;
             return ctext;
         }
-        size_out.* = rl.measureTextEx(font, ctext, @floatFromInt(fontsize), 0);
+        size_out.* = self.fonts.measureTextWithFallback(font, ctext, fontsize, 0);
         return ctext;
     }
 
@@ -793,6 +937,37 @@ pub const SlideshowRenderer = struct {
         if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return;
         const slide = self.renderedSlides.items[@intCast(slide_number)];
 
+        if (reveal.active_step) |active_step| {
+            if (active_step > 0 and active_step <= slide.steps.items.len) {
+                const step = slide.steps.items[active_step - 1];
+                if (step.kind == .morph and step.morph_state < slide.morph_scenes.items.len) {
+                    const source_elements = if (step.morph_state == 0)
+                        slide.elements.items
+                    else
+                        slide.morph_scenes.items[step.morph_state - 1].elements.items;
+                    const target_elements = slide.morph_scenes.items[step.morph_state].elements.items;
+                    self.renderMorph(
+                        source_elements,
+                        target_elements,
+                        &slide.morph_scenes.items[step.morph_state].plan,
+                        animation.applyEasing(step.easing, reveal.active_progress),
+                        slide_transform,
+                        pos,
+                        size,
+                        internal_render_size,
+                        crowd_snapshot,
+                        crowd_url,
+                    );
+                    return;
+                }
+            }
+        }
+
+        if (stableMorphState(slide, reveal.visible_through)) |state_index| {
+            self.renderStaticElements(slide.morph_scenes.items[state_index].elements.items, slide_transform, pos, size, internal_render_size, crowd_snapshot, crowd_url);
+            return;
+        }
+
         for (slide.elements.items) |element| {
             var progress: f32 = 1.0;
             if (element.reveal_step > 0) {
@@ -809,21 +984,70 @@ pub const SlideshowRenderer = struct {
             const transform = combineTransforms(slide_transform, item_transform);
             if (transform.opacity <= 0) continue;
 
-            switch (element.kind) {
-                .background => {
-                    if (element.texture) |texture| {
-                        renderImg(.{ .x = 0.0, .y = 0.0 }, internal_render_size, texture, .white, .blank, pos, size, internal_render_size, transform);
-                    } else if (element.color) |color| {
-                        renderBgColor(color, pos, size, transform);
-                    }
+            self.renderElement(&element, pos, size, internal_render_size, transform, crowd_snapshot, crowd_url);
+        }
+    }
+
+    fn renderStaticElements(
+        self: *SlideshowRenderer,
+        elements: []const RenderElement,
+        slide_transform: RenderTransform,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+        crowd_snapshot: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
+    ) void {
+        for (elements) |element| self.renderElement(&element, pos, size, internal_render_size, slide_transform, crowd_snapshot, crowd_url);
+    }
+
+    fn renderMorph(
+        self: *SlideshowRenderer,
+        source: []const RenderElement,
+        target: []const RenderElement,
+        plan: *const MorphPlan,
+        progress: f32,
+        slide_transform: RenderTransform,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+        crowd_snapshot: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
+    ) void {
+        const opacity_progress = animation.clampProgress(progress);
+
+        // Exact endpoints also preserve the source and target scenes' precise
+        // stacking order if a future directive ever permits owner reordering.
+        if (progress == 0.0) {
+            self.renderStaticElements(source, slide_transform, pos, size, internal_render_size, crowd_snapshot, crowd_url);
+            return;
+        }
+        if (progress == 1.0) {
+            self.renderStaticElements(target, slide_transform, pos, size, internal_render_size, crowd_snapshot, crowd_url);
+            return;
+        }
+
+        // Commands are precomputed in target owner order. Incompatible source
+        // fragments are immediately adjacent to their target fragments, so a
+        // compatible background cannot be painted over a foreground crossfade.
+        for (plan.draws.items) |draw| {
+            switch (draw.kind) {
+                .interpolate => {
+                    const source_element = &source[draw.source_index.?];
+                    const target_element = &target[draw.target_index.?];
+                    const interpolated = interpolateElement(source_element, target_element, progress);
+                    self.renderElement(&interpolated, pos, size, internal_render_size, slide_transform, crowd_snapshot, crowd_url);
                 },
-                .text => self.renderText(&element, pos, size, internal_render_size, transform),
-                .image => {
-                    if (element.texture) |texture| {
-                        renderImg(element.position, element.size, texture, .white, .blank, pos, size, internal_render_size, transform);
-                    }
+                .source_fade => {
+                    var transform = slide_transform;
+                    transform.opacity *= 1.0 - opacity_progress;
+                    self.renderElement(&source[draw.source_index.?], pos, size, internal_render_size, transform, crowd_snapshot, crowd_url);
                 },
-                .crowd => self.renderCrowd(&element, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),
+                .target_fade => {
+                    var transform = slide_transform;
+                    transform.opacity *= opacity_progress;
+                    self.renderElement(&target[draw.target_index.?], pos, size, internal_render_size, transform, crowd_snapshot, crowd_url);
+                },
             }
         }
     }
@@ -843,12 +1067,12 @@ pub const SlideshowRenderer = struct {
         var logical_pos = item.position;
         var logical_size = item.size;
         if (logical_size.x <= 0) {
-            logical_pos.x = 100;
-            logical_size.x = internal_render_size.x - 200;
+            if (logical_pos.x == 0) logical_pos.x = slides.crowd_default_position.x;
+            logical_size.x = slides.crowd_default_size.x;
         }
         if (logical_size.y <= 0) {
-            logical_pos.y = 80;
-            logical_size.y = internal_render_size.y - 160;
+            if (logical_pos.y == 0) logical_pos.y = slides.crowd_default_position.y;
+            logical_size.y = slides.crowd_default_size.y;
         }
         const screen_pos = translated(slidePosToRenderPos(logical_pos, slide_tl, slide_size, internal_render_size), transform.offset);
         const screen_size = slideSizeToRenderSize(logical_size, slide_size, internal_render_size);
@@ -960,6 +1184,37 @@ pub const SlideshowRenderer = struct {
         drawCrowdText(self.fonts.normal, controls, .{ .x = panel.x + 66 * scale, .y = panel.y + panel.height - 65 * scale }, 21 * scale, colorWithOpacity(.{ .r = 137, .g = 144, .b = 177, .a = 255 }, opacity));
     }
 
+    fn renderElement(
+        self: *SlideshowRenderer,
+        element: *const RenderElement,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+        base_transform: RenderTransform,
+        crowd_snapshot: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
+    ) void {
+        var transform = base_transform;
+        transform.opacity *= element.opacity;
+        if (transform.opacity <= 0) return;
+        switch (element.kind) {
+            .background => {
+                if (element.texture) |texture| {
+                    renderImg(.{ .x = 0.0, .y = 0.0 }, internal_render_size, texture, .white, .blank, pos, size, internal_render_size, transform);
+                } else if (element.color) |color| {
+                    renderBgColor(color, pos, size, transform);
+                }
+            },
+            .text => self.renderText(element, pos, size, internal_render_size, transform),
+            .image => {
+                if (element.texture) |texture| {
+                    renderImg(element.position, element.size, texture, .white, .blank, pos, size, internal_render_size, transform);
+                }
+            },
+            .crowd => self.renderCrowd(element, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),
+        }
+    }
+
     fn renderText(self: *SlideshowRenderer, item: *const RenderElement, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2, transform: RenderTransform) void {
         if (item.text == null and item.color == null) {
             return;
@@ -992,7 +1247,7 @@ pub const SlideshowRenderer = struct {
 
         // imgui.igPushTextWrapPos(slidePosToRenderPos(wrap_pos, slide_tl, slide_size, internal_render_size).x);
         const fs = item.fontSize.?;
-        const fsize = @as(f32, @floatFromInt(fs)) * slide_size.y / internal_render_size.y;
+        const fsize = fs * slide_size.y / internal_render_size.y;
         const col = item.color;
 
         const font = switch (item.fontStyle) {
@@ -1012,10 +1267,10 @@ pub const SlideshowRenderer = struct {
             if (shadow.enabled) {
                 const shadow_offset = slideSizeToRenderSize(shadow.offset, slide_size, internal_render_size);
                 const shadow_pos = translated(startpos, shadow_offset);
-                rl.drawTextEx(font, @as([:0]const u8, t), shadow_pos, fsize, 0.0, colorWithOpacity(shadow.color, transform.opacity));
+                self.fonts.drawTextWithFallback(font, t, shadow_pos, fsize, 0.0, colorWithOpacity(shadow.color, transform.opacity));
             }
         }
-        rl.drawTextEx(font, @as([:0]const u8, t), startpos, fsize, 0.0, color);
+        self.fonts.drawTextWithFallback(font, t, startpos, fsize, 0.0, color);
 
         // imgui.igPushStyleColor_Vec4(imgui.ImGuiCol_Text, col.?);
         // imgui.igText(t);
@@ -1026,7 +1281,7 @@ pub const SlideshowRenderer = struct {
         if (item.underlined) {
             // how to draw the line?
             var tl = item.position;
-            tl.y += @as(f32, @floatFromInt(fs)) + 2.0;
+            tl.y += fs + 2.0;
             var br = tl;
             br.x += item.size.x;
 
@@ -1034,10 +1289,202 @@ pub const SlideshowRenderer = struct {
 
             const line_startpos = translated(slidePosToRenderPos(tl, slide_tl, slide_size, internal_render_size), transform.offset);
             const line_endpos = translated(slidePosToRenderPos(br, slide_tl, slide_size, internal_render_size), transform.offset);
-            rl.drawLineEx(line_startpos, line_endpos, 2.0, color);
+            const underline_width = @as(f32, @floatFromInt(item.underline_width orelse 2)) * slide_size.y / internal_render_size.y;
+            rl.drawLineEx(line_startpos, line_endpos, underline_width, color);
         }
     }
 };
+
+fn stableMorphState(slide: *const RenderedSlide, visible_through: usize) ?usize {
+    var state_index: ?usize = null;
+    const step_count = @min(visible_through, slide.steps.items.len);
+    for (slide.steps.items[0..step_count]) |step| {
+        if (step.kind == .morph) state_index = step.morph_state;
+    }
+    return state_index;
+}
+
+fn optionalTextEqual(a: ?[:0]const u8, b: ?[:0]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn optionalTextureEqual(a: ?rl.Texture2D, b: ?rl.Texture2D) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.id == b.?.id;
+}
+
+fn elementPayloadCompatible(a: *const RenderElement, b: *const RenderElement) bool {
+    return a.kind == b.kind and
+        optionalTextEqual(a.text, b.text) and
+        optionalTextureEqual(a.texture, b.texture) and
+        a.fontStyle == b.fontStyle and
+        a.underlined == b.underlined;
+}
+
+const ElementGroup = struct {
+    first: usize,
+    len: usize,
+};
+
+fn indexOwnerGroups(groups: *std.AutoHashMap(usize, ElementGroup), elements: []const RenderElement) !void {
+    var first: usize = 0;
+    while (first < elements.len) {
+        const owner_identity = elements[first].owner_identity;
+        var end = first + 1;
+        while (end < elements.len and elements[end].owner_identity == owner_identity) : (end += 1) {}
+        try groups.put(owner_identity, .{ .first = first, .len = end - first });
+        first = end;
+    }
+}
+
+fn groupsCompatible(source: []const RenderElement, source_group: ElementGroup, target: []const RenderElement, target_group: ElementGroup) bool {
+    if (source_group.len == 0 or source_group.len != target_group.len) return false;
+    for (0..source_group.len) |offset| {
+        const source_element = &source[source_group.first + offset];
+        const target_element = &target[target_group.first + offset];
+        if (source_element.part_index != target_element.part_index or
+            !elementPayloadCompatible(source_element, target_element)) return false;
+    }
+    return true;
+}
+
+fn buildMorphPlan(allocator: std.mem.Allocator, source: []const RenderElement, target: []const RenderElement) !MorphPlan {
+    var plan = MorphPlan{ .draws = std.ArrayList(MorphDraw).empty };
+    var source_groups = std.AutoHashMap(usize, ElementGroup).init(allocator);
+    defer source_groups.deinit();
+    var target_groups = std.AutoHashMap(usize, ElementGroup).init(allocator);
+    defer target_groups.deinit();
+    try indexOwnerGroups(&source_groups, source);
+    try indexOwnerGroups(&target_groups, target);
+
+    // Each owner's compatibility is computed once. Render elements belonging
+    // to an item are contiguous and part-indexed by preRenderItem, so matching
+    // is linear in the total number of generated fragments.
+    var target_first: usize = 0;
+    while (target_first < target.len) {
+        const owner_identity = target[target_first].owner_identity;
+        const target_group = target_groups.get(owner_identity).?;
+        if (source_groups.get(owner_identity)) |source_group| {
+            if (groupsCompatible(source, source_group, target, target_group)) {
+                for (0..target_group.len) |offset| {
+                    try plan.draws.append(allocator, .{
+                        .kind = .interpolate,
+                        .source_index = source_group.first + offset,
+                        .target_index = target_group.first + offset,
+                    });
+                }
+            } else {
+                for (0..source_group.len) |offset| {
+                    try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_group.first + offset });
+                }
+                for (0..target_group.len) |offset| {
+                    try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_group.first + offset });
+                }
+            }
+        } else {
+            for (0..target_group.len) |offset| {
+                try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_group.first + offset });
+            }
+        }
+        target_first += target_group.len;
+    }
+
+    // A failed/removed renderable has no target group. Normal @hide keeps the
+    // owner with zero opacity and therefore takes the order-preserving path
+    // above; this fallback only handles genuinely absent generated elements.
+    var source_first: usize = 0;
+    while (source_first < source.len) {
+        const owner_identity = source[source_first].owner_identity;
+        const source_group = source_groups.get(owner_identity).?;
+        if (!target_groups.contains(owner_identity)) {
+            for (0..source_group.len) |offset| {
+                try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_group.first + offset });
+            }
+        }
+        source_first += source_group.len;
+    }
+    return plan;
+}
+
+fn lerpF32(from: f32, to: f32, progress: f32) f32 {
+    return from + (to - from) * progress;
+}
+
+fn lerpVector(from: rl.Vector2, to: rl.Vector2, progress: f32) rl.Vector2 {
+    return .{
+        .x = lerpF32(from.x, to.x, progress),
+        .y = lerpF32(from.y, to.y, progress),
+    };
+}
+
+fn lerpChannel(from: u8, to: u8, progress: f32) u8 {
+    const p = animation.clampProgress(progress);
+    const value = lerpF32(@floatFromInt(from), @floatFromInt(to), p);
+    return @intFromFloat(@round(@max(0.0, @min(255.0, value))));
+}
+
+fn lerpColor(from: rl.Color, to: rl.Color, progress: f32) rl.Color {
+    return .{
+        .r = lerpChannel(from.r, to.r, progress),
+        .g = lerpChannel(from.g, to.g, progress),
+        .b = lerpChannel(from.b, to.b, progress),
+        .a = lerpChannel(from.a, to.a, progress),
+    };
+}
+
+fn invisibleShadow(reference: slides.TextShadow) slides.TextShadow {
+    var result = reference;
+    result.enabled = true;
+    result.color.a = 0;
+    return result;
+}
+
+fn effectiveShadow(value: ?slides.TextShadow, fallback: slides.TextShadow) slides.TextShadow {
+    if (value) |shadow| {
+        if (shadow.enabled) return shadow;
+        return invisibleShadow(shadow);
+    }
+    return invisibleShadow(fallback);
+}
+
+fn lerpShadow(from: ?slides.TextShadow, to: ?slides.TextShadow, progress: f32) ?slides.TextShadow {
+    if (progress == 0.0) return from;
+    if (progress == 1.0) return to;
+    if (from == null and to == null) return null;
+    const fallback = from orelse to.?;
+    const source = effectiveShadow(from, fallback);
+    const target = effectiveShadow(to, fallback);
+    return .{
+        .enabled = true,
+        .color = lerpColor(source.color, target.color, progress),
+        .offset = lerpVector(source.offset, target.offset, progress),
+    };
+}
+
+fn interpolateElement(from: *const RenderElement, to: *const RenderElement, progress: f32) RenderElement {
+    if (progress == 0.0) return from.*;
+    if (progress == 1.0) return to.*;
+    const clamped = animation.clampProgress(progress);
+    var result = to.*;
+    result.position = lerpVector(from.position, to.position, progress);
+    result.size = lerpVector(from.size, to.size, progress);
+    result.size.x = @max(0.0, result.size.x);
+    result.size.y = @max(0.0, result.size.y);
+    result.opacity = lerpF32(from.opacity, to.opacity, clamped);
+    if (from.color != null and to.color != null) result.color = lerpColor(from.color.?, to.color.?, clamped);
+    if (from.fontSize != null and to.fontSize != null) result.fontSize = @max(1.0, lerpF32(from.fontSize.?, to.fontSize.?, progress));
+    if (from.underline_width != null and to.underline_width != null) {
+        result.underline_width = @intFromFloat(@round(lerpF32(
+            @floatFromInt(from.underline_width.?),
+            @floatFromInt(to.underline_width.?),
+            clamped,
+        )));
+    }
+    result.text_shadow = lerpShadow(from.text_shadow, to.text_shadow, progress);
+    result.reveal_step = 0;
+    return result;
+}
 
 const SlideTransitionTransforms = struct {
     incoming: RenderTransform = .{},
@@ -1232,6 +1679,12 @@ fn startsLineStep(grouping: animation.Grouping, is_bulleted: bool) bool {
     return grouping == .line or (grouping == .bullet and is_bulleted);
 }
 
+fn replaceSlideNumber(allocator: std.mem.Allocator, text: []const u8, slide_number: usize) ![]u8 {
+    var buffer: [20]u8 = undefined;
+    const number = try std.fmt.bufPrint(&buffer, "{d}", .{slide_number});
+    return std.mem.replaceOwned(u8, allocator, text, "$slide_number", number);
+}
+
 test "line and bullet grouping leave surrounding content static" {
     try std.testing.expect(startsLineStep(.line, false));
     try std.testing.expect(startsLineStep(.line, true));
@@ -1240,10 +1693,141 @@ test "line and bullet grouping leave surrounding content static" {
     try std.testing.expect(!startsLineStep(.item, true));
 }
 
+test "slide number replacement excludes unused formatter bytes" {
+    const rendered = try replaceSlideNumber(std.testing.allocator, "page $slide_number of $slide_number", 6);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("page 6 of 6", rendered);
+}
+
+test "inline font boundaries use the wider neighboring space in both directions" {
+    const before_chunky = inlineBoundarySpacing("Add ", 4, null, 10);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), before_chunky.leading, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 6), before_chunky.trailing, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 18), boundaryWidth(12, before_chunky, 0, 4, 4), 0.0001);
+
+    const after_chunky = inlineBoundarySpacing(" when", 4, 10, null);
+    try std.testing.expectApproxEqAbs(@as(f32, 6), after_chunky.leading, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), after_chunky.trailing, 0.0001);
+
+    const dense_on_both_sides = inlineBoundarySpacing(" ", 4, 10, 8);
+    try std.testing.expectApproxEqAbs(@as(f32, 6), dense_on_both_sides.leading, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), dense_on_both_sides.trailing, 0.0001);
+}
+
 test "poll participant anchors to a valid selected choice before reveal" {
     try std.testing.expectEqual(@as(?usize, 1), pollChoiceCard(1, 4));
     try std.testing.expectEqual(@as(?usize, null), pollChoiceCard(null, 4));
     try std.testing.expectEqual(@as(?usize, null), pollChoiceCard(4, 4));
+}
+
+test "semantic morph interpolation preserves identity and continuous properties" {
+    const same_text: [:0]const u8 = "same";
+    const source = RenderElement{
+        .kind = .text,
+        .owner_identity = 7,
+        .part_index = 0,
+        .position = .{ .x = 100, .y = 200 },
+        .size = .{ .x = 300, .y = 100 },
+        .color = .{ .r = 0, .g = 10, .b = 20, .a = 100 },
+        .text = same_text,
+        .fontSize = 20,
+        .opacity = 0.5,
+    };
+    const target = RenderElement{
+        .kind = .text,
+        .owner_identity = 7,
+        .part_index = 0,
+        .position = .{ .x = 300, .y = 400 },
+        .size = .{ .x = 500, .y = 200 },
+        .color = .{ .r = 100, .g = 110, .b = 120, .a = 200 },
+        .text = same_text,
+        .fontSize = 60,
+        .opacity = 1.0,
+        .text_shadow = .{ .color = .{ .r = 20, .g = 30, .b = 40, .a = 200 }, .offset = .{ .x = 8, .y = 10 } },
+    };
+
+    const halfway = interpolateElement(&source, &target, 0.5);
+    try std.testing.expectEqual(@as(usize, 7), halfway.owner_identity);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), halfway.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), halfway.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), halfway.fontSize.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), halfway.opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 50), halfway.color.?.r);
+    try std.testing.expectEqual(@as(u8, 100), halfway.text_shadow.?.color.a);
+    try std.testing.expectEqual(source.position, interpolateElement(&source, &target, 0).position);
+    try std.testing.expectEqual(target.position, interpolateElement(&source, &target, 1).position);
+    const spring_position = interpolateElement(&source, &target, animation.applyEasing(.spring, 0.3)).position;
+    try std.testing.expect(spring_position.x > target.position.x);
+}
+
+test "semantic morph matching survives reordered owners and rejects changed text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const one: [:0]const u8 = "one";
+    const two: [:0]const u8 = "two";
+    const changed: [:0]const u8 = "changed";
+    const source = [_]RenderElement{
+        .{ .kind = .text, .owner_identity = 1, .part_index = 0, .text = one },
+        .{ .kind = .text, .owner_identity = 2, .part_index = 0, .text = two },
+    };
+    const reordered = [_]RenderElement{
+        .{ .kind = .text, .owner_identity = 2, .part_index = 0, .text = two },
+        .{ .kind = .text, .owner_identity = 1, .part_index = 0, .text = one },
+    };
+    const reordered_plan = try buildMorphPlan(allocator, &source, &reordered);
+    try std.testing.expectEqual(@as(usize, 2), reordered_plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, reordered_plan.draws.items[0].kind);
+    try std.testing.expectEqual(@as(?usize, 1), reordered_plan.draws.items[0].source_index);
+    try std.testing.expectEqual(@as(?usize, 0), reordered_plan.draws.items[1].source_index);
+
+    var changed_target = reordered;
+    changed_target[1].text = changed;
+    const changed_plan = try buildMorphPlan(allocator, &source, &changed_target);
+    try std.testing.expectEqual(@as(usize, 3), changed_plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, changed_plan.draws.items[0].kind);
+    try std.testing.expectEqual(MorphDrawKind.source_fade, changed_plan.draws.items[1].kind);
+    try std.testing.expectEqual(MorphDrawKind.target_fade, changed_plan.draws.items[2].kind);
+}
+
+test "semantic morph plan keeps a changed foreground above its background" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const old_text: [:0]const u8 = "old";
+    const new_text: [:0]const u8 = "new";
+    const source = [_]RenderElement{
+        .{ .kind = .background, .owner_identity = 1, .part_index = 0, .color = .black },
+        .{ .kind = .text, .owner_identity = 2, .part_index = 0, .text = old_text },
+    };
+    const target = [_]RenderElement{
+        .{ .kind = .background, .owner_identity = 1, .part_index = 0, .color = .white },
+        .{ .kind = .text, .owner_identity = 2, .part_index = 0, .text = new_text },
+    };
+
+    const plan = try buildMorphPlan(allocator, &source, &target);
+    try std.testing.expectEqual(@as(usize, 3), plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, plan.draws.items[0].kind);
+    try std.testing.expectEqual(@as(?usize, 0), plan.draws.items[0].target_index);
+    try std.testing.expectEqual(MorphDrawKind.source_fade, plan.draws.items[1].kind);
+    try std.testing.expectEqual(@as(?usize, 1), plan.draws.items[1].source_index);
+    try std.testing.expectEqual(MorphDrawKind.target_fade, plan.draws.items[2].kind);
+    try std.testing.expectEqual(@as(?usize, 1), plan.draws.items[2].target_index);
+}
+
+test "stable semantic state follows morph steps in the shared timeline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slide = try RenderedSlide.new(allocator);
+    try slide.steps.append(allocator, animation.Step.fromItem(.{ .effect = .fade }));
+    try slide.steps.append(allocator, animation.Step.fromMorph(.{}, 0));
+    try slide.steps.append(allocator, animation.Step.fromMorph(.{}, 1));
+
+    try std.testing.expectEqual(@as(?usize, null), stableMorphState(slide, 1));
+    try std.testing.expectEqual(@as(?usize, 0), stableMorphState(slide, 2));
+    try std.testing.expectEqual(@as(?usize, 1), stableMorphState(slide, 3));
+    try std.testing.expectEqual(@as(?usize, 1), stableMorphState(slide, 99));
 }
 
 pub fn slidePosToRenderPos(pos: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) rl.Vector2 {
