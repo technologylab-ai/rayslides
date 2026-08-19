@@ -276,16 +276,35 @@ image texture, and complete slide in the same process. A separate 1600×900
 Studio capture was verified on exact workspace 12 in floating layout and exited
 without leaving an application process behind.
 
+## Completed tranche: Distribution and first-run polish
+
+- [x] Package a reproducible, non-notarized macOS application bundle with
+  version metadata, a showcase-derived icon, `.sld` document registration, a
+  local identity-free ad-hoc seal, and a macOS 13 deployment target without
+  replacing the ordinary CLI artifact.
+- [x] Handle cold Finder launches, Open With, and live window drops through the
+  same transactional loader, preserving relative deck assets and refusing to
+  replace dirty or actively edited Studio source.
+- [x] Keep the default build and positional CLI workflow unchanged on macOS,
+  Linux, and Windows while adding release-grade `--help`, `--version`, unknown
+  option handling, and a `--` positional sentinel.
+- [x] Define deterministic recovery locations: beside writable named decks;
+  otherwise `~/Library/Application Support/Rayslides/Recovery` for the macOS
+  app, with the historical current-directory behavior retained for untitled
+  terminal sessions.
+- [x] Validate the packaged app from outside the checkout, including a true
+  cold LaunchServices document event, custom relative fonts/images, exact
+  Aerospace workspace 12 placement, and clean process shutdown.
+
+Developer-ID signing and notarization are deliberately outside this personal
+open-source project's scope. The local ad-hoc seal merely keeps the assembled
+bundle internally valid; the app is a build convenience, not a replacement for
+the portable command-line application or a second document format.
+
 ## Planned tranches
 
-### Distribution and first-run polish
-
-- Package a reproducible macOS application bundle with version metadata,
-  embedded assets, signing/notarization hooks, and downloadable release
-  artifacts without changing the existing CLI workflow.
-- Make first launch and recovery locations explicit, add `--version` and a
-  release-grade `--help`, and validate a clean-machine launch independently of
-  the development checkout.
+The next tranche will be selected after this distribution boundary has shipped
+and accumulated real first-run feedback.
 
 ## Deliberate non-goals
 

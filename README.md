@@ -10,6 +10,44 @@ Due to the new [raylib](https://github.com/raysan5/raylib) dep, builds should wo
 
 ![Rayslides Studio showing the source-aware Objects and layers inspector](docs/images/rayslides-studio-objects.jpg)
 
+## Build and run
+
+Rayslides remains a command-line application on macOS, Linux, and Windows. The
+ordinary build installs the executable at `zig-out/bin/rayslides`:
+
+```sh
+zig build -Doptimize=ReleaseSafe
+zig-out/bin/rayslides talk.sld
+```
+
+During development, the equivalent run step is:
+
+```sh
+zig build run -- talk.sld
+```
+
+Run `rayslides --help` for the complete option list or `rayslides --version`
+for the version. A positional `.sld` path works before or after options; use
+`--` before a filename that itself begins with a hyphen.
+
+On macOS, an additional build step creates a self-contained application bundle
+without replacing or changing the CLI executable:
+
+```sh
+zig build -Doptimize=ReleaseSafe macos-app
+open zig-out/Rayslides.app
+```
+
+The bundle is written to `zig-out/Rayslides.app`. It uses the Studio showcase's
+light-sculpture artwork as its icon and registers Rayslides `.sld` documents,
+so decks can be opened with Finder, **Open With → Rayslides**, or by dropping a
+`.sld` onto the live window. It has only the local ad-hoc seal required for a
+structurally valid Apple Silicon app—no signing identity, certificate,
+Developer ID, account, or notarization. After copying it to another Mac, macOS
+may require one right-click **Open** before ordinary double-click launches are
+allowed. See the [macOS app notes](docs/MACOS_APP.md) for file opening and
+recovery locations.
+
 Missing but maybe coming soon:
 
 - SDF-based font scaling
@@ -406,7 +444,11 @@ template.
 If the original file changes externally, Studio refuses to overwrite it and
 asks you to use Save Copy. Quitting with unsaved work also writes a unique
 `*.edited.sld` recovery copy before closing; if that copy cannot be written,
-the quit is cancelled.
+the quit is cancelled. A named deck first recovers beside its source. The
+macOS app falls back—and stores untitled recovery copies—in
+`~/Library/Application Support/Rayslides/Recovery`; it does not use Documents
+or request Documents-folder access. Direct CLI launches retain the traditional
+behavior of recovering an untitled deck into their current working directory.
 
 # Slideshow Text Format
 

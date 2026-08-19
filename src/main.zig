@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const rl = @import("raylib");
 const rg = @import("raygui");
 const c = @cImport({
@@ -22,6 +23,77 @@ const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const SlideShow = slides.SlideShow;
 const studio_ui_font_data = @embedFile("assets/Calibri Regular.ttf");
 const pristine_untitled_source = "@slide\n";
+const cli_help =
+    \\Rayslides {s}
+    \\Usage: rayslides [options] [deck.sld]
+    \\
+    \\Open a source-native presentation from a terminal, or start Studio with
+    \\no deck and choose a starter. Existing command-line workflows remain the
+    \\same on macOS, Linux, and Windows.
+    \\
+    \\Core options:
+    \\  --studio                         Start with Studio authoring open
+    \\  --no-startup-banner              Skip the four-second presentation banner
+    \\  --no-crowd                       Disable the Crowdplay server
+    \\  --crowd-host=HOST                Bind Crowdplay to HOST
+    \\  --crowd-port=PORT                Bind Crowdplay to PORT (default 7331)
+    \\  -h, --help                       Show this help and exit
+    \\  -v, --version                    Show the version and exit
+    \\
+    \\Diagnostics and visual QA:
+    \\  --diagnostics                    Show the diagnostics HUD
+    \\  --diagnostics-command-palette    Open Studio with Commands visible
+    \\  --diagnostics-command-tooltip    Show deterministic command hover help
+    \\  --diagnostics-precision-view     Show rulers, guides, and precision tools
+    \\  --diagnostics-large-deck=N       Generate an N-slide stress deck (1-200)
+    \\  --diagnostics-incremental-edit=N Edit slide N after the initial render
+    \\  --diagnostics-window=WIDTHxHEIGHT
+    \\  --diagnostics-select=ID
+    \\  --diagnostics-find-slide=QUERY
+    \\  --diagnostics-capture=PNG
+    \\  --diagnostics-report=JSON
+    \\  --diagnostics-capture-scenario=NAME
+    \\  --diagnostics-capture-gate=PATH
+    \\  --diagnostics-capture-settle=N
+    \\  --diagnostics-exit-after-capture
+    \\  --diagnostics-hide-hud
+    \\
+    \\A positional deck path may appear before or after options. Use `--` before
+    \\a deck whose filename begins with a hyphen.
+    \\
+;
+
+const MacOpenDocuments = struct {
+    extern fn rayslides_macos_install_open_document_handler() void;
+    extern fn rayslides_macos_take_open_document(buffer: [*]u8, capacity: usize) usize;
+
+    fn install() void {
+        if (comptime builtin.os.tag == .macos) rayslides_macos_install_open_document_handler();
+    }
+
+    fn take(buffer: []u8) usize {
+        if (comptime builtin.os.tag == .macos) {
+            return rayslides_macos_take_open_document(buffer.ptr, buffer.len);
+        }
+        return 0;
+    }
+};
+
+fn isMacosAppExecutable(path: []const u8) bool {
+    return std.mem.indexOf(u8, path, ".app/Contents/MacOS/") != null;
+}
+
+test "macOS app detection does not change ordinary command-line binaries" {
+    try std.testing.expect(isMacosAppExecutable("/Applications/Rayslides.app/Contents/MacOS/rayslides"));
+    try std.testing.expect(!isMacosAppExecutable("/usr/local/bin/rayslides"));
+    try std.testing.expect(!isMacosAppExecutable("zig-out/bin/rayslides"));
+}
+
+test "build version and CLI help stay available without opening a window" {
+    try std.testing.expect(build_options.version.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, cli_help, "Usage: rayslides") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cli_help, "deck.sld") != null);
+}
 
 comptime {
     if (studio.max_selection_items > renderer.max_item_geometry_previews)
@@ -1231,6 +1303,27 @@ pub fn main(init: std.process.Init) anyerror!void {
     const gpa = init.gpa;
     const io = init.io;
 
+    var executable_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const executable_path_len = std.process.executablePath(io, &executable_path_buffer) catch 0;
+    const launched_from_macos_bundle = builtin.os.tag == .macos and
+        isMacosAppExecutable(executable_path_buffer[0..executable_path_len]);
+    var app_recovery_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var app_recovery_dir: ?[]const u8 = null;
+    if (launched_from_macos_bundle) {
+        if (init.environ_map.get("HOME")) |home| {
+            if (std.Io.Dir.openDirAbsolute(io, home, .{})) |home_dir| {
+                defer home_dir.close(io);
+                std.process.setCurrentDir(io, home_dir) catch |err|
+                    log.warn("Could not use the home directory as the app working directory: {any}", .{err});
+            } else |_| {}
+            app_recovery_dir = std.fmt.bufPrint(
+                &app_recovery_dir_buffer,
+                "{s}/Library/Application Support/Rayslides/Recovery",
+                .{home},
+            ) catch null;
+        }
+    }
+
     //--------------------------------------------------------------------------------------
 
     var crowd_options = CrowdOptions{};
@@ -1267,65 +1360,78 @@ pub fn main(init: std.process.Init) anyerror!void {
         defer args_it.deinit();
         _ = args_it.skip();
         var slideshow_arg: ?[]const u8 = null;
+        var positional_only = false;
         while (args_it.next()) |arg| {
-            if (std.mem.startsWith(u8, arg, "--crowd-host=")) {
+            if (!positional_only and (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help"))) {
+                var output: [8192]u8 = undefined;
+                const rendered = try std.fmt.bufPrint(&output, cli_help, .{build_options.version});
+                try std.Io.File.stdout().writeStreamingAll(io, rendered);
+                return;
+            } else if (!positional_only and (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version"))) {
+                var output: [128]u8 = undefined;
+                const rendered = try std.fmt.bufPrint(&output, "rayslides {s}\n", .{build_options.version});
+                try std.Io.File.stdout().writeStreamingAll(io, rendered);
+                return;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--")) {
+                positional_only = true;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--crowd-host=")) {
                 crowd_options.host = try std.fmt.bufPrint(&crowd_host_buffer, "{s}", .{arg["--crowd-host=".len..]});
                 crowd_options.host_explicit = true;
-            } else if (std.mem.startsWith(u8, arg, "--crowd-port=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--crowd-port=")) {
                 crowd_options.port = std.fmt.parseInt(u16, arg["--crowd-port=".len..], 10) catch std.process.fatal("Invalid --crowd-port value", .{});
-            } else if (std.mem.eql(u8, arg, "--no-crowd")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--no-crowd")) {
                 crowd_options.enabled = false;
-            } else if (std.mem.eql(u8, arg, "--studio")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--studio")) {
                 launch_studio = true;
-            } else if (std.mem.eql(u8, arg, "--no-startup-banner")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--no-startup-banner")) {
                 suppress_startup_banner = true;
-            } else if (std.mem.eql(u8, arg, "--diagnostics")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics")) {
                 diagnostics_enabled = true;
-            } else if (std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
                 diagnostics_enabled = true;
                 diagnostics_command_palette = true;
                 launch_studio = true;
-            } else if (std.mem.eql(u8, arg, "--diagnostics-command-tooltip")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-command-tooltip")) {
                 diagnostics_enabled = true;
                 diagnostics_command_tooltip = true;
                 launch_studio = true;
-            } else if (std.mem.eql(u8, arg, "--diagnostics-precision-view")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-precision-view")) {
                 diagnostics_enabled = true;
                 diagnostics_precision_view = true;
                 launch_studio = true;
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-large-deck=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-large-deck=")) {
                 const value = arg["--diagnostics-large-deck=".len..];
                 const count = std.fmt.parseInt(usize, value, 10) catch return error.InvalidDiagnosticSlideCount;
                 if (count == 0 or count > 200) return error.InvalidDiagnosticSlideCount;
                 diagnostics_enabled = true;
                 diagnostics_large_deck_count = count;
                 launch_studio = true;
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-incremental-edit=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-incremental-edit=")) {
                 const value = arg["--diagnostics-incremental-edit=".len..];
                 const one_based_slide = std.fmt.parseInt(usize, value, 10) catch return error.InvalidDiagnosticSlideIndex;
                 if (one_based_slide == 0) return error.InvalidDiagnosticSlideIndex;
                 diagnostics_enabled = true;
                 launch_studio = true;
                 diagnostics_incremental_edit_slide = one_based_slide - 1;
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-window=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-window=")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
                 diagnostics_window_size = parseDiagnosticWindowSize(arg["--diagnostics-window=".len..]) orelse
                     std.process.fatal("Invalid diagnostics window size; use WIDTHxHEIGHT (minimum 900x506)", .{});
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-capture=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-capture=")) {
                 diagnostics_capture_path = std.fmt.bufPrint(
                     &diagnostics_capture_path_buffer,
                     "{s}",
                     .{arg["--diagnostics-capture=".len..]},
                 ) catch std.process.fatal("Diagnostics capture path is too long", .{});
                 launch_studio = true;
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-report=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-report=")) {
                 diagnostics_report_path = std.fmt.bufPrint(
                     &diagnostics_report_path_buffer,
                     "{s}",
                     .{arg["--diagnostics-report=".len..]},
                 ) catch std.process.fatal("Diagnostics report path is too long", .{});
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-capture-scenario=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-capture-scenario=")) {
                 const scenario = arg["--diagnostics-capture-scenario=".len..];
                 if (!validDiagnosticScenarioName(scenario)) return error.InvalidDiagnosticScenario;
                 diagnostics_capture_scenario = std.fmt.bufPrint(
@@ -1333,7 +1439,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                     "{s}",
                     .{scenario},
                 ) catch return error.InvalidDiagnosticScenario;
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-capture-settle=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-capture-settle=")) {
                 diagnostics_capture_settle_frames = std.fmt.parseInt(
                     usize,
                     arg["--diagnostics-capture-settle=".len..],
@@ -1341,17 +1447,17 @@ pub fn main(init: std.process.Init) anyerror!void {
                 ) catch return error.InvalidDiagnosticCaptureSettle;
                 if (diagnostics_capture_settle_frames == 0 or diagnostics_capture_settle_frames > 600)
                     return error.InvalidDiagnosticCaptureSettle;
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-capture-gate=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-capture-gate=")) {
                 diagnostics_capture_gate_path = std.fmt.bufPrint(
                     &diagnostics_capture_gate_buffer,
                     "{s}",
                     .{arg["--diagnostics-capture-gate=".len..]},
                 ) catch std.process.fatal("Diagnostics capture gate path is too long", .{});
-            } else if (std.mem.eql(u8, arg, "--diagnostics-exit-after-capture")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-exit-after-capture")) {
                 diagnostics_exit_after_capture = true;
-            } else if (std.mem.eql(u8, arg, "--diagnostics-hide-hud")) {
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-hide-hud")) {
                 diagnostics_hide_hud = true;
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-select=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-select=")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
                 diagnostics_select_id = std.fmt.bufPrint(
@@ -1359,7 +1465,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                     "{s}",
                     .{arg["--diagnostics-select=".len..]},
                 ) catch std.process.fatal("Diagnostics selection ID is too long", .{});
-            } else if (std.mem.startsWith(u8, arg, "--diagnostics-find-slide=")) {
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-find-slide=")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
                 diagnostics_find_slide_query = std.fmt.bufPrint(
@@ -1367,6 +1473,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                     "{s}",
                     .{arg["--diagnostics-find-slide=".len..]},
                 ) catch std.process.fatal("Diagnostics slide query is too long", .{});
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "-")) {
+                std.process.fatal("Unknown option: {s} (use --help)", .{arg});
             } else if (slideshow_arg == null) {
                 slideshow_arg = arg;
             } else {
@@ -1390,6 +1498,9 @@ pub fn main(init: std.process.Init) anyerror!void {
     // Present complete frames on the monitor refresh boundary. The old 61 Hz
     // software-only cap could tear visibly on macOS while Studio continuously
     // redraws its canvas and chrome, even when the scene itself was static.
+    // Register before GLFW finishes launching NSApplication: LaunchServices
+    // may deliver the initial Finder/Open With document during initWindow.
+    MacOpenDocuments.install();
     rl.setConfigFlags(.{ .window_resizable = true, .vsync_hint = true });
     rl.initWindow(screenWidth, screenHeight, "rayslides");
     rl.setWindowMinSize(900, 506);
@@ -1416,6 +1527,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     // Initialize GPU-backed resources after the window and unload them before it closes.
     try G.init(gpa, io);
     defer G.deinit();
+    if (app_recovery_dir) |path| G.setRecoveryDirectory(path);
     if (slideshow_to_load) |path| {
         G.slideshow_filp_to_load = path;
     } else if (diagnostics_large_deck_count) |slide_count| {
@@ -1576,6 +1688,31 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (!text_input_active_at_frame_start and rl.isKeyPressed(.f3)) {
             frame_diagnostics.enabled = !frame_diagnostics.enabled;
             log.info("frame diagnostics {s}", .{if (frame_diagnostics.enabled) "enabled" else "disabled"});
+        }
+
+        // Finder/Open With arrives as a macOS open-documents Apple event,
+        // while dropping onto the live window is exposed by Raylib on every
+        // desktop platform. Both paths copy the transient OS string before
+        // queuing the same ordinary slideshow reload.
+        var external_open_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const external_open_len = MacOpenDocuments.take(&external_open_buffer);
+        if (external_open_len > 0) {
+            _ = queueExternalDeckOpen(
+                external_open_buffer[0..external_open_len],
+                text_input_active_at_frame_start,
+                &studio_mode,
+            );
+        }
+        if (rl.isFileDropped()) {
+            const dropped = rl.loadDroppedFiles();
+            defer rl.unloadDroppedFiles(dropped);
+            var index: usize = 0;
+            while (index < dropped.count) : (index += 1) {
+                const raw_path = dropped.paths[index];
+                if (raw_path == null) continue;
+                const path = std.mem.span(raw_path);
+                if (queueExternalDeckOpen(path, text_input_active_at_frame_start, &studio_mode)) break;
+            }
         }
 
         // (re-) load slideshow
@@ -2772,6 +2909,51 @@ fn checkAutoReload() !bool {
     return false;
 }
 
+fn isSlideshowDocumentPath(path: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".sld");
+}
+
+fn pristineUntitledCanBeReplaced() bool {
+    return G.slideshow_filp == null and
+        std.mem.eql(u8, G.editor_memory[0..G.source_len], pristine_untitled_source);
+}
+
+/// Copies a transient Finder/drop path into AppData and schedules the same
+/// transactional load used by the command line and hot reload. A meaningful
+/// unsaved Studio document is never replaced implicitly.
+fn queueExternalDeckOpen(path: []const u8, text_input_active: bool, studio_mode: *studio.Studio) bool {
+    if (!isSlideshowDocumentPath(path)) {
+        studio_mode.setNotice(.open_requires_sld);
+        log.warn("Ignored non-.sld document: {s}", .{path});
+        return false;
+    }
+    if (text_input_active) {
+        studio_mode.setNotice(.open_refused_editing);
+        log.warn("Document open deferred/refused while a text field is active: {s}", .{path});
+        return false;
+    }
+    if (editorSourceDirty() and !pristineUntitledCanBeReplaced()) {
+        studio_mode.setNotice(.open_refused_dirty);
+        log.warn("Document open refused because the current source has unsaved changes: {s}", .{path});
+        return false;
+    }
+    if (G.slideshow_filp_to_load != null) return false;
+    G.slideshow_filp_to_load = std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{path}) catch {
+        studio_mode.setNotice(.open_requires_sld);
+        log.err("Document path is too long: {s}", .{path});
+        return false;
+    };
+    log.info("Opening external deck {s}", .{path});
+    return true;
+}
+
+test "external document filtering preserves CLI and desktop file semantics" {
+    try std.testing.expect(isSlideshowDocumentPath("deck.sld"));
+    try std.testing.expect(isSlideshowDocumentPath("/tmp/DECK.SLD"));
+    try std.testing.expect(!isSlideshowDocumentPath("deck.txt"));
+    try std.testing.expect(!isSlideshowDocumentPath("sld"));
+}
+
 /// A parser graph built beside the live application state. Its arena lives at
 /// a stable heap address so every allocator retained by SlideShow and
 /// ParserContext remains valid when ownership moves into AppData.
@@ -2879,6 +3061,8 @@ const AppData = struct {
     hot_reload_next_time: f64 = 0.0,
     hot_reload_interval_seconds: f64 = 1.0,
     hot_reload_last_stat: ?std.Io.File.Stat = undefined,
+    recovery_dir_buffer: [std.fs.max_path_bytes]u8 = undefined,
+    recovery_dir: ?[]const u8 = null,
 
     fn init(self: *AppData, gpa: std.mem.Allocator, io: std.Io) !void {
         self.allocator = gpa;
@@ -2947,6 +3131,14 @@ const AppData = struct {
         // Keep zero as the never-observed/default generation so an overflow
         // cannot accidentally make a populated cache look pristine.
         if (self.source_revision == 0) self.source_revision = 1;
+    }
+
+    fn setRecoveryDirectory(self: *AppData, path: []const u8) void {
+        const stored = std.fmt.bufPrint(&self.recovery_dir_buffer, "{s}", .{path}) catch {
+            self.recovery_dir = null;
+            return;
+        };
+        self.recovery_dir = stored;
     }
 };
 
@@ -3294,14 +3486,44 @@ fn writeRecoveryCopy(
     return copy_path;
 }
 
+fn writeRecoveryCopyInDirectory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    recovery_dir: []const u8,
+    source_name: []const u8,
+    source: []const u8,
+) ![]u8 {
+    try dir.createDirPath(io, recovery_dir);
+    const base_name = std.fs.path.basename(source_name);
+    const recovery_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ recovery_dir, base_name });
+    defer allocator.free(recovery_path);
+    return writeRecoveryCopy(allocator, io, dir, recovery_path, source);
+}
+
 fn saveEditorSourceCopy() ![]u8 {
-    return writeRecoveryCopy(
-        G.allocator,
-        G.io,
-        std.Io.Dir.cwd(),
-        G.slideshow_filp orelse "untitled.sld",
-        G.editor_memory[0..G.source_len],
-    );
+    const cwd = std.Io.Dir.cwd();
+    const source = G.editor_memory[0..G.source_len];
+    if (G.slideshow_filp) |path| {
+        return writeRecoveryCopy(G.allocator, G.io, cwd, path, source) catch |primary_error| {
+            const recovery_dir = G.recovery_dir orelse return primary_error;
+            log.warn("Could not save beside {s}; using {s}: {any}", .{ path, recovery_dir, primary_error });
+            return writeRecoveryCopyInDirectory(G.allocator, G.io, cwd, recovery_dir, path, source);
+        };
+    }
+    if (G.recovery_dir) |recovery_dir| {
+        return writeRecoveryCopyInDirectory(
+            G.allocator,
+            G.io,
+            cwd,
+            recovery_dir,
+            "untitled.sld",
+            source,
+        );
+    }
+    // Preserve the historical terminal behavior on every platform: a direct
+    // CLI launch with an untitled deck recovers into its working directory.
+    return writeRecoveryCopy(G.allocator, G.io, cwd, "untitled.sld", source);
 }
 
 fn adoptEditorSourcePath(path: []const u8) !void {
@@ -3445,6 +3667,27 @@ test "recovery copies are unique and preserve every source byte" {
     defer allocator.free(second_source);
     try std.testing.expectEqualStrings(source, first_source);
     try std.testing.expectEqualStrings(source, second_source);
+}
+
+test "configured recovery directory is created and uses only the deck basename" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const recovery = try writeRecoveryCopyInDirectory(
+        allocator,
+        io,
+        tmp.dir,
+        "Application Support/Rayslides/Recovery",
+        "/read-only/talk.sld",
+        "@slide\n",
+    );
+    defer allocator.free(recovery);
+    try std.testing.expectEqualStrings("Application Support/Rayslides/Recovery/talk.edited.sld", recovery);
+    const contents = try tmp.dir.readFileAlloc(io, recovery, allocator, .unlimited);
+    defer allocator.free(contents);
+    try std.testing.expectEqualStrings("@slide\n", contents);
 }
 
 /// Quitting should never turn the in-memory source buffer into a data-loss

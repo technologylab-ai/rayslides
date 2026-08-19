@@ -5,6 +5,12 @@ cannot fully exercise: native input focus, Spaces/monitors, window transitions,
 GPU resources, and isolation between Studio chrome and presentation/export.
 Run it from a clean worktree with a ReleaseSafe build.
 
+Build the non-notarized Finder application separately with:
+
+```sh
+zig build -Doptimize=ReleaseSafe macos-app
+```
+
 ## Automated gate
 
 ```sh
@@ -25,6 +31,16 @@ section below passed. Attach `zig-out/studio-baselines/*.log` and any
 
 ## 1. Launch, focus, and monitor placement
 
+- [ ] Copy `zig-out/Rayslides.app` and a deck with relative fonts/images to a
+      temporary directory outside the checkout. Cold-open the deck through
+      Finder/Open With and require the external deck plus every relative asset
+      to load.
+- [ ] The app launch does not request broad Documents-folder access. Its
+      neutral working directory is `$HOME`; app recovery uses
+      `~/Library/Application Support/Rayslides/Recovery`.
+- [ ] Verify the bundle icon is the Studio light-sculpture artwork, the `.sld`
+      type is advertised, and `--version`/`--help` work from both the ordinary
+      CLI and the executable inside the bundle without opening a window.
 - [ ] Launch `zig-out/bin/rayslides testslides/studio-showcase.sld --studio --no-startup-banner`.
 - [ ] Query the launched PID with
       `aerospace list-windows --monitor all --pid PID --format '%{window-id}|%{workspace}|%{app-name}|%{window-layout}'`.
@@ -75,8 +91,11 @@ section below passed. Attach `zig-out/studio-baselines/*.log` and any
 - [ ] Externally change a named deck, then save the stale Studio buffer. The
       conflict notice recommends Save Copy and preserves both versions.
 - [ ] Close a dirty deck without saving. Exactly one unique `.edited.sld`
-      recovery copy is created; its bytes reparse cleanly. If recovery cannot
-      be written, quitting is cancelled and the source stays open.
+      recovery copy is created beside a writable named source; its bytes
+      reparse cleanly. Verify an untitled app session and an unwritable named
+      source fall back to `~/Library/Application Support/Rayslides/Recovery`.
+      Direct CLI untitled recovery remains in its current directory. If no
+      recovery can be written, quitting is cancelled and the source stays open.
 
 ## 5. Presentation and export isolation
 
