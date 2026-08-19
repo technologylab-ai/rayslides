@@ -59,12 +59,22 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 The current direction and upcoming implementation tranches are tracked in the
 [Studio roadmap](STUDIO_ROADMAP.md).
 
-Run rayslides without a slide file to begin with a blank, untitled slide in
-Studio, pass `--studio` with a slide file to open that deck directly in Studio,
-or press <kbd>E</kbd> while presenting an existing deck. Studio is a visual
-authoring surface backed by the ordinary `.sld` source: every completed action
-rewrites and reparses the document, so the GUI and text formats remain two
-views of the same file.
+Run rayslides without a slide file to open the **Create your first deck**
+chooser in Studio. Choose Blank, Midnight, Editorial, or Aurora with a click
+or keys <kbd>1</kbd>–<kbd>4</kbd>. Blank starts with one clean slide; the three
+designed starters create two immediately useful slides plus source-native
+`@pushslide` layouts, a reusable `@pushgroup` footer, stable item IDs, and live
+`$slide_number` fields. Nothing is hidden in a project format: the result is
+ordinary readable `.sld` source and one Undo returns to the pristine chooser.
+
+Press <kbd>Cmd/Ctrl-S</kbd> on an untitled deck to choose its path. Rayslides
+adds `.sld` when needed and refuses to overwrite an existing file. After the
+deck has a name, the same shortcut atomically saves it and
+<kbd>Shift-Cmd/Ctrl-S</kbd> writes a unique `*.edited.sld` copy. Pass `--studio`
+with a slide file to open that deck directly in Studio, or press <kbd>E</kbd>
+while presenting an existing deck. Studio is a visual authoring surface backed
+by the ordinary `.sld` source: every completed action rewrites and reparses the
+document, so the GUI and text formats remain two views of the same file.
 
 Studio opens in a monitor-aware editing window (up to 1600×900) and fits the
 16:9 slide into the space left by its chrome, so permanent controls never cover
@@ -229,8 +239,9 @@ scoped, so a library item can only be placed after its definition.
 
 | Studio shortcut | Description |
 | --------------- | ----------- |
-| <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Atomically save changes to the original `.sld` file |
-| <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Save an `*.edited.sld` copy |
+| <kbd>1</kbd>–<kbd>4</kbd> on the new-deck chooser | Create Blank, Midnight, Editorial, or Aurora |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, then atomically save changes to its `.sld` file |
+| <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, or save an `*.edited.sld` copy of a named deck |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Undo the last visual edit |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
 | <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |

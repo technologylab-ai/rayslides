@@ -14,6 +14,9 @@
 const std = @import("std");
 const rl = @import("raylib");
 const slides = @import("slides.zig");
+const studio_new_deck = @import("studio_new_deck.zig");
+
+pub const NewDeckPreset = studio_new_deck.Preset;
 
 pub const default_logical_size: rl.Vector2 = .{ .x = 1920, .y = 1080 };
 pub const default_handle_size: f32 = 14;
@@ -1158,6 +1161,9 @@ pub const LibraryEntry = struct {
 /// only API for tests and alternate frontends.
 pub const Workspace = struct {
     visible: bool = false,
+    /// True only for the pristine no-file placeholder. Studio draws a
+    /// source-backed starter chooser over the otherwise empty canvas.
+    new_deck: bool = false,
     slides: []const SlideSummary = &.{},
     current_slide: usize = 0,
     library: []const LibraryEntry = &.{},
@@ -1167,6 +1173,9 @@ pub const Workspace = struct {
 /// GeometryCommand, these never mutate SlideItem; the integration layer can
 /// prompt for text/path details and atomically rewrite/reparse the `.sld`.
 pub const SemanticCommand = union(enum) {
+    /// Replaces the pristine untitled placeholder with an ordinary starter
+    /// `.sld` source in one undoable edit.
+    create_starter_deck: NewDeckPreset,
     add_item: AddItemCommand,
     duplicate_item: CommandTarget,
     duplicate_items: ItemBatchCommand,
@@ -1502,6 +1511,121 @@ pub fn libraryRowRect(layout: WorkspaceLayout, visible_slot: usize) ?rl.Rectangl
         .width = layout.library_rows_clip.width,
         .height = library_row_height,
     };
+}
+
+/// First-run chooser geometry is derived solely from the fitted slide area,
+/// keeping it clear of permanent Studio chrome at every responsive mode.
+pub const NewDeckLayout = struct {
+    panel: rl.Rectangle,
+    cards: [studio_new_deck.all.len]rl.Rectangle,
+    compact: bool,
+};
+
+pub fn newDeckLayout(viewport: Viewport) NewDeckLayout {
+    const bounds: rl.Rectangle = .{
+        .x = viewport.slide_top_left.x,
+        .y = viewport.slide_top_left.y,
+        .width = @max(0, viewport.slide_size.x),
+        .height = @max(0, viewport.slide_size.y),
+    };
+    const margin: f32 = @min(24, @max(8, bounds.width * 0.025));
+    const panel_width = @min(@as(f32, 940), @max(0, bounds.width - margin * 2));
+    const panel_height = @min(@as(f32, 570), @max(0, bounds.height - margin * 2));
+    const panel: rl.Rectangle = .{
+        .x = bounds.x + (bounds.width - panel_width) / 2,
+        .y = bounds.y + (bounds.height - panel_height) / 2,
+        .width = panel_width,
+        .height = panel_height,
+    };
+    const compact = panel.height < 410 or panel.width < 700;
+    const padding: f32 = if (compact) 14 else 22;
+    const header_height: f32 = if (compact) 62 else 102;
+    const gap: f32 = if (compact) 8 else 14;
+    const card_width = @max(0, (panel.width - padding * 2 - gap) / 2);
+    const card_height = @max(0, (panel.height - padding * 2 - header_height - gap) / 2);
+    var cards: [studio_new_deck.all.len]rl.Rectangle = undefined;
+    for (&cards, 0..) |*card, index| {
+        const column: f32 = @floatFromInt(index % 2);
+        const row: f32 = @floatFromInt(index / 2);
+        card.* = .{
+            .x = panel.x + padding + column * (card_width + gap),
+            .y = panel.y + padding + header_height + row * (card_height + gap),
+            .width = card_width,
+            .height = card_height,
+        };
+    }
+    return .{ .panel = panel, .cards = cards, .compact = compact };
+}
+
+const StarterPalette = struct {
+    background: rl.Color,
+    panel: rl.Color,
+    accent: rl.Color,
+    text: rl.Color,
+};
+
+fn starterPalette(preset: NewDeckPreset) StarterPalette {
+    return switch (preset) {
+        .blank => .{
+            .background = .{ .r = 11, .g = 18, .b = 32, .a = 255 },
+            .panel = .{ .r = 26, .g = 38, .b = 56, .a = 255 },
+            .accent = .{ .r = 112, .g = 218, .b = 255, .a = 255 },
+            .text = .{ .r = 232, .g = 238, .b = 247, .a = 255 },
+        },
+        .midnight => .{
+            .background = .{ .r = 7, .g = 17, .b = 31, .a = 255 },
+            .panel = .{ .r = 18, .g = 37, .b = 59, .a = 255 },
+            .accent = .{ .r = 255, .g = 181, .b = 71, .a = 255 },
+            .text = .{ .r = 97, .g = 218, .b = 251, .a = 255 },
+        },
+        .paper => .{
+            .background = .{ .r = 243, .g = 238, .b = 229, .a = 255 },
+            .panel = .{ .r = 38, .g = 52, .b = 61, .a = 255 },
+            .accent = .{ .r = 178, .g = 83, .b = 62, .a = 255 },
+            .text = .{ .r = 32, .g = 40, .b = 47, .a = 255 },
+        },
+        .aurora => .{
+            .background = .{ .r = 7, .g = 20, .b = 38, .a = 255 },
+            .panel = .{ .r = 20, .g = 43, .b = 72, .a = 255 },
+            .accent = .{ .r = 113, .g = 229, .b = 255, .a = 255 },
+            .text = .{ .r = 232, .g = 79, .b = 217, .a = 255 },
+        },
+    };
+}
+
+fn drawStarterPreview(rect: rl.Rectangle, preset: NewDeckPreset, colors: StarterPalette) void {
+    if (rect.width <= 0 or rect.height <= 0) return;
+    rl.drawRectangleRounded(rect, 0.035, 8, colors.background);
+    const unit = @min(rect.width / 16, rect.height / 9);
+    const left = rect.x + unit * 0.75;
+    const top = rect.y + unit * 0.65;
+    switch (preset) {
+        .blank => {
+            const center: rl.Vector2 = .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 };
+            rl.drawCircleV(center, @max(5, unit * 0.42), .{ .r = colors.panel.r, .g = colors.panel.g, .b = colors.panel.b, .a = 220 });
+            rl.drawRectangleRec(.{ .x = center.x - unit * 0.32, .y = center.y - 1, .width = unit * 0.64, .height = 2 }, colors.accent);
+            rl.drawRectangleRec(.{ .x = center.x - 1, .y = center.y - unit * 0.32, .width = 2, .height = unit * 0.64 }, colors.accent);
+        },
+        .midnight => {
+            rl.drawRectangleRec(.{ .x = left, .y = top, .width = unit * 4.2, .height = @max(2, unit * 0.22) }, colors.text);
+            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 1.0, .width = unit * 9.8, .height = unit * 1.35 }, .white);
+            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 2.75, .width = unit * 7.1, .height = unit * 0.44 }, .{ .r = 159, .g = 181, .b = 201, .a = 255 });
+            rl.drawRectangleRec(.{ .x = left, .y = rect.y + rect.height - unit * 1.2, .width = unit * 3.4, .height = @max(2, unit * 0.18) }, colors.accent);
+        },
+        .paper => {
+            rl.drawRectangleRec(.{ .x = left, .y = top, .width = unit * 2.1, .height = @max(2, unit * 0.18) }, colors.accent);
+            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 1.1, .width = unit * 10.5, .height = unit * 1.25 }, colors.text);
+            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 2.8, .width = unit * 7.6, .height = unit * 0.28 }, .{ .r = 108, .g = 102, .b = 95, .a = 255 });
+            rl.drawRectangleRec(.{ .x = left, .y = rect.y + rect.height - unit * 1.25, .width = rect.width - unit * 1.5, .height = @max(2, unit * 0.12) }, colors.accent);
+        },
+        .aurora => {
+            rl.drawCircleV(.{ .x = rect.x + rect.width * 0.76, .y = rect.y + rect.height * 0.37 }, unit * 2.3, .{ .r = 42, .g = 104, .b = 255, .a = 100 });
+            rl.drawCircleV(.{ .x = rect.x + rect.width * 0.83, .y = rect.y + rect.height * 0.57 }, unit * 1.55, .{ .r = colors.text.r, .g = colors.text.g, .b = colors.text.b, .a = 120 });
+            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 0.4, .width = unit * 4.1, .height = @max(2, unit * 0.19) }, colors.accent);
+            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 1.5, .width = unit * 7.7, .height = unit * 1.45 }, .white);
+            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 3.35, .width = unit * 5.9, .height = unit * 0.28 }, .{ .r = 169, .g = 196, .b = 220, .a = 255 });
+        },
+    }
 }
 
 pub const object_row_height: f32 = 54;
@@ -2111,6 +2235,8 @@ pub const FrameInput = struct {
     use_library_pressed: bool = false,
     rename_library_pressed: bool = false,
     delete_library_pressed: bool = false,
+    /// Number keys 1-4 activate the matching first-run starter card.
+    new_deck_choice: ?NewDeckPreset = null,
     /// Positive/negative wheel delta; routed to the panel under the pointer.
     workspace_scroll: f32 = 0,
 
@@ -2203,6 +2329,16 @@ pub const FrameInput = struct {
             .use_library_pressed = rl.isKeyPressed(.enter),
             .rename_library_pressed = rl.isKeyPressed(.f2),
             .delete_library_pressed = shift and rl.isKeyPressed(.delete),
+            .new_deck_choice = if (rl.isKeyPressed(.one))
+                .blank
+            else if (rl.isKeyPressed(.two))
+                .midnight
+            else if (rl.isKeyPressed(.three))
+                .paper
+            else if (rl.isKeyPressed(.four))
+                .aurora
+            else
+                null,
             .workspace_scroll = rl.getMouseWheelMove(),
         };
         while (result.inline_chars_len < result.inline_chars.len) {
@@ -3503,6 +3639,9 @@ pub const Studio = struct {
             self.snap_guides = .{};
             return null;
         }
+
+        if (workspace.visible and workspace.new_deck and
+            self.handleNewDeckChooser(items, viewport, input)) return null;
 
         self.normalizeObjects(items, viewport);
         self.handleObjectsScroll(items, viewport, input);
@@ -4805,6 +4944,46 @@ pub const Studio = struct {
         }
         // Empty sidebar space is an input shield, never a canvas click.
         return true;
+    }
+
+    fn handleNewDeckChooser(
+        self: *Studio,
+        items: []slides.SlideItem,
+        viewport: Viewport,
+        input: FrameInput,
+    ) bool {
+        if (input.new_deck_choice) |preset| {
+            if (self.interaction != .idle) self.cancelInteraction(items);
+            self.clearSelection(items);
+            self.tool = .select;
+            self.pending_semantic_command = .{ .create_starter_deck = preset };
+            self.notice = .none;
+            return true;
+        }
+        // Aside from the explicit 1-4 choices and the already-handled global
+        // Studio/Focus toggles, the welcome surface owns keyboard input. This
+        // prevents an accidental tool, delete, or slide shortcut from
+        // changing the pristine source behind the chooser.
+        if (!input.pointer_pressed) return true;
+        const layout = newDeckLayout(viewport);
+        for (layout.cards, studio_new_deck.all) |card, preset| {
+            if (!pointInRectangle(input.pointer_screen, card)) continue;
+            if (self.interaction != .idle) self.cancelInteraction(items);
+            self.clearSelection(items);
+            self.tool = .select;
+            self.pending_semantic_command = .{ .create_starter_deck = preset };
+            self.notice = .none;
+            return true;
+        }
+        // The chooser owns the fitted slide while visible. Chrome and docks
+        // remain interactive, but a miss cannot accidentally start a marquee
+        // or place an item behind the welcome surface.
+        return pointInRectangle(input.pointer_screen, .{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        });
     }
 
     const LibraryAction = enum { use, rename, delete };
@@ -6652,6 +6831,93 @@ pub const Studio = struct {
             else
                 .{ .r = 168, .g = 179, .b = 198, .a = 255 });
             rl.endScissorMode();
+        }
+        if (workspace.new_deck) self.drawNewDeckChooser(viewport);
+    }
+
+    fn drawNewDeckChooser(self: Studio, viewport: Viewport) void {
+        const layout = newDeckLayout(viewport);
+        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        const heading_font: i32 = if (layout.compact) 22 else 30;
+        const body_font: i32 = if (layout.compact) UiTypography.compact else UiTypography.body;
+        const card_title_font: i32 = if (layout.compact) UiTypography.compact else UiTypography.heading;
+
+        rl.drawRectangleRec(.{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        }, .{ .r = 3, .g = 7, .b = 14, .a = 238 });
+        rl.drawRectangleRounded(layout.panel, 0.035, 12, .{ .r = 12, .g = 18, .b = 31, .a = 252 });
+        rl.drawRectangleRoundedLinesEx(layout.panel, 0.035, 12, 2, .{ .r = 80, .g = 215, .b = 255, .a = 220 });
+
+        const left = layout.panel.x + @as(f32, if (layout.compact) 14 else 22);
+        const top = layout.panel.y + @as(f32, if (layout.compact) 11 else 18);
+        self.drawUiText("Create your first deck", .{ .x = left, .y = top }, heading_font, .white);
+        if (!layout.compact) {
+            self.drawUiText(
+                "Choose a source-native starter. Everything remains editable .sld text.",
+                .{ .x = left, .y = top + 42 },
+                body_font,
+                .{ .r = 173, .g = 190, .b = 211, .a = 255 },
+            );
+            self.drawUiText(
+                "Keys 1–4 choose instantly · Cmd/Ctrl-S names and saves the deck",
+                .{ .x = left, .y = top + 67 },
+                UiTypography.compact,
+                .{ .r = 114, .g = 226, .b = 255, .a = 255 },
+            );
+        } else {
+            self.drawUiText(
+                "Choose a starter · keys 1–4",
+                .{ .x = left, .y = top + 29 },
+                UiTypography.compact,
+                .{ .r = 114, .g = 226, .b = 255, .a = 255 },
+            );
+        }
+
+        for (layout.cards, studio_new_deck.all, 0..) |card, preset, index| {
+            const colors = starterPalette(preset);
+            rl.drawRectangleRounded(card, 0.055, 8, .{ .r = 23, .g = 31, .b = 47, .a = 255 });
+            rl.drawRectangleRoundedLinesEx(card, 0.055, 8, 1, .{ .r = 91, .g = 110, .b = 139, .a = 230 });
+            const inset: f32 = if (layout.compact) 7 else 10;
+            const preview_height = @max(30, card.height * @as(f32, if (layout.compact) 0.43 else 0.52));
+            const preview: rl.Rectangle = .{
+                .x = card.x + inset,
+                .y = card.y + inset,
+                .width = card.width - inset * 2,
+                .height = @min(preview_height, card.height - inset * 2),
+            };
+            drawStarterPreview(preview, preset, colors);
+
+            var shortcut_buffer: [4]u8 = undefined;
+            const shortcut = std.fmt.bufPrintZ(&shortcut_buffer, "{d}", .{index + 1}) catch "";
+            const shortcut_rect: rl.Rectangle = .{
+                .x = card.x + card.width - 29,
+                .y = card.y + 9,
+                .width = 20,
+                .height = 20,
+            };
+            rl.drawRectangleRounded(shortcut_rect, 0.25, 6, .{ .r = 7, .g = 12, .b = 22, .a = 220 });
+            self.drawUiText(shortcut, .{ .x = shortcut_rect.x + 6, .y = shortcut_rect.y + 2 }, UiTypography.compact, .white);
+
+            const text_y = preview.y + preview.height + @as(f32, if (layout.compact) 5 else 9);
+            self.drawUiText(studio_new_deck.title(preset), .{ .x = card.x + inset, .y = text_y }, card_title_font, .white);
+            if (!layout.compact or card.height >= 100) {
+                var description_buffer: [128]u8 = undefined;
+                const description = self.fitUiText(
+                    &description_buffer,
+                    studio_new_deck.description(preset),
+                    UiTypography.compact,
+                    card.width - inset * 2,
+                );
+                self.drawUiText(
+                    description,
+                    .{ .x = card.x + inset, .y = text_y + @as(f32, @floatFromInt(card_title_font)) + 3 },
+                    UiTypography.compact,
+                    .{ .r = 174, .g = 188, .b = 210, .a = 255 },
+                );
+            }
         }
     }
 
@@ -11997,6 +12263,88 @@ test "Focus Canvas hides chrome but preserves selection and restores with Tab" {
     try std.testing.expect(!studio.focus_canvas);
     try std.testing.expectEqual(@as(?usize, 502), studio.selected_identity);
     try std.testing.expect(studio.layoutFrame(content).chrome.visible);
+}
+
+test "new deck chooser stays inside the fitted canvas at responsive sizes" {
+    const sizes = [_]rl.Rectangle{
+        .{ .x = 0, .y = 0, .width = 900, .height = 506 },
+        .{ .x = 0, .y = 0, .width = 1280, .height = 720 },
+        .{ .x = 0, .y = 0, .width = 1600, .height = 900 },
+    };
+    for (sizes) |content| {
+        const studio: Studio = .{ .enabled = true, .active_dock = .slides };
+        const frame = studio.layoutFrame(content);
+        const canvas: rl.Rectangle = .{
+            .x = frame.viewport.slide_top_left.x,
+            .y = frame.viewport.slide_top_left.y,
+            .width = frame.viewport.slide_size.x,
+            .height = frame.viewport.slide_size.y,
+        };
+        const layout = newDeckLayout(frame.viewport);
+        try expectRectangleContained(canvas, layout.panel);
+        for (layout.cards) |card| {
+            try expectRectangleContained(layout.panel, card);
+            try std.testing.expect(card.width > 0 and card.height > 0);
+        }
+    }
+}
+
+test "new deck chooser emits exact card and keyboard presets" {
+    const workspace: Workspace = .{ .visible = true, .new_deck = true };
+    const frame = frameLayout(
+        .{ .x = 0, .y = 0, .width = 1280, .height = 720 },
+        true,
+        false,
+        .slides,
+    );
+    const layout = newDeckLayout(frame.viewport);
+    for (studio_new_deck.all, 0..) |preset, index| {
+        var card_studio: Studio = .{ .enabled = true, .active_dock = .slides };
+        var no_items: [0]slides.SlideItem = .{};
+        _ = card_studio.updateWithWorkspace(&no_items, &.{}, frame.viewport, workspace, .{
+            .pointer_screen = rectangleCenter(layout.cards[index]),
+            .pointer_pressed = true,
+        });
+        switch (card_studio.takeSemanticCommand().?) {
+            .create_starter_deck => |chosen| try std.testing.expectEqual(preset, chosen),
+            else => return error.UnexpectedSemanticCommand,
+        }
+
+        var keyboard_studio: Studio = .{ .enabled = true, .active_dock = .slides };
+        _ = keyboard_studio.updateWithWorkspace(&no_items, &.{}, frame.viewport, workspace, .{
+            .new_deck_choice = preset,
+        });
+        switch (keyboard_studio.takeSemanticCommand().?) {
+            .create_starter_deck => |chosen| try std.testing.expectEqual(preset, chosen),
+            else => return error.UnexpectedSemanticCommand,
+        }
+    }
+}
+
+test "new deck surface shields empty canvas gestures" {
+    var studio: Studio = .{ .enabled = true, .active_dock = .slides };
+    var no_items: [0]slides.SlideItem = .{};
+    const workspace: Workspace = .{ .visible = true, .new_deck = true };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = newDeckLayout(frame.viewport);
+    const canvas_corner: rl.Vector2 = .{
+        .x = frame.viewport.slide_top_left.x + 2,
+        .y = frame.viewport.slide_top_left.y + 2,
+    };
+    try std.testing.expect(!pointInRectangle(canvas_corner, layout.panel));
+    _ = studio.updateWithWorkspace(&no_items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = canvas_corner,
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expect(!studio.marquee.active);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    _ = studio.updateWithWorkspace(&no_items, &.{}, frame.viewport, workspace, .{
+        .new_slide_pressed = true,
+        .delete_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
 }
 
 test "canvas selection does not move a responsive dock during pointer gesture" {

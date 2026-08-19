@@ -14,6 +14,7 @@ pub const Kind = enum {
     color,
     font_size,
     opacity,
+    document_path,
 };
 
 pub const Outcome = enum {
@@ -36,6 +37,9 @@ pub const Notice = enum {
     invalid_initial_utf8,
     invalid_append_utf8,
     invalid_value,
+    invalid_path,
+    path_exists,
+    save_failed,
 
     fn blocksEditing(self: Notice) bool {
         return self == .initial_overflow or self == .invalid_initial_utf8;
@@ -89,6 +93,21 @@ pub const Prompt = struct {
     pub fn rejectValue(self: *Prompt) void {
         self.active = true;
         self.notice = .invalid_value;
+    }
+
+    pub fn rejectInvalidPath(self: *Prompt) void {
+        self.active = true;
+        self.notice = .invalid_path;
+    }
+
+    pub fn rejectExistingPath(self: *Prompt) void {
+        self.active = true;
+        self.notice = .path_exists;
+    }
+
+    pub fn rejectSaveFailure(self: *Prompt) void {
+        self.active = true;
+        self.notice = .save_failed;
     }
 
     pub fn text(self: *const Prompt) []const u8 {
@@ -224,6 +243,9 @@ pub const Prompt = struct {
             .invalid_initial_utf8 => "Text is not valid UTF-8; nothing was changed. Esc cancels.",
             .invalid_append_utf8 => "Input rejected: it is not valid UTF-8. Existing text was kept.",
             .invalid_value => "That value is invalid. Correct it and press Enter; the slide is unchanged.",
+            .invalid_path => "Choose a non-empty single-line file path. The deck is still untitled.",
+            .path_exists => "That file already exists. Choose another name; nothing was overwritten.",
+            .save_failed => "The deck could not be saved there. Check the path and try again.",
         };
     }
 };
@@ -256,6 +278,7 @@ fn promptTitle(kind: Kind) [:0]const u8 {
         .color => "Set custom color",
         .font_size => "Set font size",
         .opacity => "Set opacity",
+        .document_path => "Name and save your deck",
     };
 }
 
@@ -271,6 +294,7 @@ fn promptHint(kind: Kind) [:0]const u8 {
         .color => "Use #RRGGBB or #RRGGBBAA · Enter commits · Esc cancels",
         .font_size => "Positive whole-number pixels · Enter commits · Esc cancels",
         .opacity => "Use 0–1 or 0–100% · transparent items remain selectable in Objects",
+        .document_path => "Relative or absolute .sld path · Enter saves · Esc keeps it untitled",
     };
 }
 

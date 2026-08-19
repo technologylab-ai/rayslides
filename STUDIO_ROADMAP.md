@@ -89,14 +89,22 @@ definitions to a fixed point and commits one undoable rewrite. Definitions
 whose parser-context ownership cannot be proven remain in source and are
 reported as blocked rather than guessed away.
 
+## Completed tranche: New-deck experience
+
+- [x] Open no-file launches directly into a visual starter chooser inside
+  Studio, with click and 1–4 keyboard selection.
+- [x] Provide Blank, Midnight, Editorial, and Aurora starters as ordinary,
+  parser-tested `.sld` source rather than an opaque template format.
+- [x] Seed designed decks with reusable `@pushslide` layouts, a shared
+  `@pushgroup` footer, stable object IDs, and `$slide_number` fields that remain
+  editable through the existing Library, Objects, and Properties surfaces.
+- [x] Apply starter creation as one atomic history entry; Undo returns to the
+  pristine chooser without special project state.
+- [x] Give untitled decks an explicit Save As prompt, append `.sld` when
+  needed, and refuse existing destinations instead of silently overwriting or
+  inventing a filename.
+
 ## Planned tranches
-
-### New-deck experience
-
-- Create a deck from an empty document entirely in Studio.
-- Build and manage themes, slide templates, title/page-number roles, and common
-  reusable blocks in the same source file.
-- Provide useful starter layouts without hiding their generated `.sld` syntax.
 
 ### Morph and transition timeline
 

@@ -16,10 +16,12 @@ const crowdplay = @import("crowdplay.zig");
 const source_editor = @import("source_editor.zig");
 const studio = @import("studio.zig");
 const studio_catalog = @import("studio_catalog.zig");
+const studio_new_deck = @import("studio_new_deck.zig");
 const studio_prompt = @import("studio_prompt.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const SlideShow = slides.SlideShow;
 const studio_ui_font_data = @embedFile("assets/Calibri Regular.ttf");
+const pristine_untitled_source = "@slide\n";
 
 comptime {
     if (studio.max_selection_items > renderer.max_item_geometry_previews)
@@ -35,6 +37,7 @@ test {
     std.testing.refAllDecls(source_editor);
     std.testing.refAllDecls(studio);
     std.testing.refAllDecls(studio_catalog);
+    std.testing.refAllDecls(studio_new_deck);
     std.testing.refAllDecls(studio_prompt);
     std.testing.refAllDecls(studio_roundtrip_test);
 }
@@ -816,6 +819,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     };
     var property_prompt: studio_prompt.Prompt = .{};
     var pending_semantic_command: ?studio.SemanticCommand = null;
+    var pending_save_as = false;
     var studio_history = StudioHistory.init(gpa);
     defer studio_history.deinit();
     var studio_clipboard = StudioClipboard.init(gpa);
@@ -883,20 +887,12 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (!text_input_active_at_frame_start and rl.isKeyPressed(.s)) {
             if (studio_mode.capturesInput() or (editorSourceDirty() and shortcutModifierDown())) {
                 if (shortcutModifierDown()) {
-                    if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
+                    if (G.slideshow_filp == null) {
+                        pending_save_as = true;
+                        property_prompt.begin(.document_path, "untitled.sld");
+                    } else if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                         if (saveEditorSourceCopy()) |copy_path| {
-                            if (G.slideshow_filp == null) {
-                                adoptEditorSourcePath(copy_path) catch |err| {
-                                    studio_mode.setNotice(.save_failed);
-                                    log.err("Studio could not adopt saved document: {any}", .{err});
-                                    gpa.free(copy_path);
-                                    continue;
-                                };
-                                studio_mode.markSaved();
-                                studio_mode.setNotice(.saved);
-                            } else {
-                                studio_mode.markCopySaved();
-                            }
+                            studio_mode.markCopySaved();
                             log.info("Studio copy saved to {s}", .{copy_path});
                             gpa.free(copy_path);
                         } else |err| {
@@ -904,8 +900,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                             log.err("Studio Save Copy failed: {any}", .{err});
                         }
                     } else {
-                        const saved = if (G.slideshow_filp == null) saveUntitledEditorSource() else saveEditorSource();
-                        if (saved) |_| {
+                        if (saveEditorSource()) |_| {
                             studio_mode.markSaved();
                             studio_mode.setNotice(.saved);
                             log.info("Studio source saved", .{});
@@ -1098,6 +1093,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .slides = studio_slide_summaries.items,
                 .current_slide = if (G.current_slide >= 0) @intCast(G.current_slide) else 0,
                 .library = studio_library_entries.items,
+                .new_deck = pristineUntitledDeck(),
             };
         }
         studio_mode.setCompositionContext(if (studio_mode.capturesInput() and current_slide != null)
@@ -1123,13 +1119,31 @@ pub fn main(init: std.process.Init) anyerror!void {
             switch (property_prompt.updateFromRaylib()) {
                 .none => {},
                 .submitted => {
-                    semantic_to_apply = pending_semantic_command;
-                    semantic_text = property_prompt.text();
-                    pending_semantic_command = null;
+                    if (pending_save_as) {
+                        if (saveUntitledEditorSourceAs(property_prompt.text())) |_| {
+                            pending_save_as = false;
+                            studio_mode.markSaved();
+                            studio_mode.setNotice(.saved);
+                            log.info("Studio deck saved as {s}", .{G.slideshow_filp.?});
+                        } else |err| {
+                            switch (err) {
+                                error.InvalidStudioSavePath => property_prompt.rejectInvalidPath(),
+                                error.PathAlreadyExists => property_prompt.rejectExistingPath(),
+                                else => property_prompt.rejectSaveFailure(),
+                            }
+                            studio_mode.setNotice(.none);
+                            log.err("Studio Save As failed: {any}", .{err});
+                        }
+                    } else {
+                        semantic_to_apply = pending_semantic_command;
+                        semantic_text = property_prompt.text();
+                        pending_semantic_command = null;
+                    }
                     window_close_seen = false;
                 },
                 .cancelled => {
                     pending_semantic_command = null;
+                    pending_save_as = false;
                     window_close_seen = false;
                 },
             }
@@ -2122,14 +2136,18 @@ fn reparseEditorSource() !void {
 }
 
 fn initializeUntitledSlideshow() !void {
-    const initial_source = "@slide\n";
-    @memcpy(G.editor_memory[0..initial_source.len], initial_source);
-    G.editor_memory[initial_source.len] = 0;
-    G.source_len = initial_source.len;
+    @memcpy(G.editor_memory[0..pristine_untitled_source.len], pristine_untitled_source);
+    G.editor_memory[pristine_untitled_source.len] = 0;
+    G.source_len = pristine_untitled_source.len;
     G.loaded_len = 0;
     G.slideshow_filp = null;
     G.hot_reload_last_stat = null;
     try reparseEditorSource();
+}
+
+fn pristineUntitledDeck() bool {
+    return G.slideshow_filp == null and
+        std.mem.eql(u8, G.editor_memory[0..G.source_len], pristine_untitled_source);
 }
 
 fn editorSourceDirty() bool {
@@ -2283,10 +2301,87 @@ fn adoptEditorSourcePath(path: []const u8) !void {
     G.hot_reload_last_stat = try file.stat(G.io);
 }
 
-fn saveUntitledEditorSource() !void {
-    const copy_path = try saveEditorSourceCopy();
-    defer G.allocator.free(copy_path);
-    try adoptEditorSourcePath(copy_path);
+fn normalizeUntitledSavePath(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw_path, " \t");
+    if (trimmed.len == 0 or
+        trimmed.len > std.fs.max_path_bytes - ".sld".len or
+        !std.unicode.utf8ValidateSlice(trimmed) or
+        std.mem.indexOfAny(u8, trimmed, "\x00\r\n") != null)
+    {
+        return error.InvalidStudioSavePath;
+    }
+    if (std.ascii.endsWithIgnoreCase(trimmed, ".sld")) return allocator.dupe(u8, trimmed);
+    return std.fmt.allocPrint(allocator, "{s}.sld", .{trimmed});
+}
+
+fn writeNewSourceFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    source: []const u8,
+) !void {
+    const reservation = try dir.createFile(io, path, .{ .exclusive = true });
+    errdefer dir.deleteFile(io, path) catch {};
+    const reserved_stat = blk: {
+        defer reservation.close(io);
+        break :blk try reservation.stat(io);
+    };
+    try writeSourceAtomically(allocator, io, dir, path, source, reserved_stat);
+}
+
+fn saveUntitledEditorSourceAs(raw_path: []const u8) !void {
+    if (G.slideshow_filp != null) return error.SlideshowAlreadyNamed;
+    const path = try normalizeUntitledSavePath(G.allocator, raw_path);
+    defer G.allocator.free(path);
+
+    try writeNewSourceFile(
+        G.allocator,
+        G.io,
+        std.Io.Dir.cwd(),
+        path,
+        G.editor_memory[0..G.source_len],
+    );
+    try adoptEditorSourcePath(path);
+}
+
+test "untitled Save As normalizes a safe explicit sld path" {
+    const allocator = std.testing.allocator;
+    const appended = try normalizeUntitledSavePath(allocator, "  my-talk  ");
+    defer allocator.free(appended);
+    try std.testing.expectEqualStrings("my-talk.sld", appended);
+
+    const preserved = try normalizeUntitledSavePath(allocator, "decks/keynote.SLD");
+    defer allocator.free(preserved);
+    try std.testing.expectEqualStrings("decks/keynote.SLD", preserved);
+
+    try std.testing.expectError(error.InvalidStudioSavePath, normalizeUntitledSavePath(allocator, " \t"));
+    try std.testing.expectError(error.InvalidStudioSavePath, normalizeUntitledSavePath(allocator, "bad\nname"));
+    try std.testing.expectError(error.InvalidStudioSavePath, normalizeUntitledSavePath(allocator, "bad\x00name"));
+}
+
+test "untitled Save As creates once and never overwrites an existing deck" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "taken.sld", .data = "keep me\n" });
+    try std.testing.expectError(error.PathAlreadyExists, writeNewSourceFile(
+        allocator,
+        io,
+        tmp.dir,
+        "taken.sld",
+        "replacement\n",
+    ));
+    const preserved = try tmp.dir.readFileAlloc(io, "taken.sld", allocator, .unlimited);
+    defer allocator.free(preserved);
+    try std.testing.expectEqualStrings("keep me\n", preserved);
+
+    try writeNewSourceFile(allocator, io, tmp.dir, "new.sld", "@slide\n");
+    const created = try tmp.dir.readFileAlloc(io, "new.sld", allocator, .unlimited);
+    defer allocator.free(created);
+    try std.testing.expectEqualStrings("@slide\n", created);
 }
 
 /// Quitting should never turn the in-memory source buffer into a data-loss
@@ -2747,6 +2842,30 @@ fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult)
         reparseEditorSource() catch {};
         return err;
     };
+}
+
+fn starterDeckPatch(
+    allocator: std.mem.Allocator,
+    current_source: []const u8,
+    preset: studio.NewDeckPreset,
+) !source_editor.PatchResult {
+    const replacement = studio_new_deck.source(preset);
+    const new_length = std.math.cast(isize, replacement.len) orelse return error.StudioSourceTooLarge;
+    const old_length = std.math.cast(isize, current_source.len) orelse return error.StudioSourceTooLarge;
+    return .{
+        .source = try allocator.dupe(u8, replacement),
+        .byte_delta = new_length - old_length,
+    };
+}
+
+test "starter deck replacement is one owned source patch" {
+    const patch = try starterDeckPatch(std.testing.allocator, pristine_untitled_source, .aurora);
+    defer patch.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(studio_new_deck.source(.aurora), patch.source);
+    try std.testing.expectEqual(
+        @as(isize, @intCast(patch.source.len)) - @as(isize, @intCast(pristine_untitled_source.len)),
+        patch.byte_delta,
+    );
 }
 
 fn recordStudioCatalogPatch(history: *StudioHistory, result: studio_catalog.EditResult) !void {
@@ -4526,6 +4645,15 @@ fn applyStudioSemanticEdit(
 ) !StudioSemanticEditResult {
     const slide = slide_opt orelse return error.NoStudioSlide;
     switch (command) {
+        .create_starter_deck => |preset| {
+            if (!pristineUntitledDeck()) return error.StarterDeckUnavailable;
+            try recordStudioPatch(history, try starterDeckPatch(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                preset,
+            ));
+            return .{ .slide_index = 0 };
+        },
         .add_item => |add| {
             var id_buffer: [64]u8 = undefined;
             const id = try nextStudioItemId(&id_buffer);
