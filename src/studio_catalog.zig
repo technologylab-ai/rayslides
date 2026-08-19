@@ -118,7 +118,36 @@ pub const EditError = error{
     LiveUses,
     UnsafeGroupDelete,
     UnsafeSlideTemplateDelete,
+    NoCleanupCandidates,
     SourceTooLarge,
+};
+
+pub const CleanupSummary = struct {
+    /// Definitions that can be removed together without changing any rendered
+    /// use or leaving a live definition with a missing dependency.
+    removable_count: usize = 0,
+    /// Unreferenced definitions whose physical ownership is too ambiguous to
+    /// rewrite automatically. These remain visible for manual inspection.
+    blocked_count: usize = 0,
+};
+
+const CleanupEdge = struct {
+    owner: usize,
+    dependency: usize,
+};
+
+const CleanupAnalysis = struct {
+    catalog: Catalog,
+    removable: []bool,
+    owner_spans: []?Span,
+    summary: CleanupSummary,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: CleanupAnalysis) void {
+        self.catalog.deinit();
+        self.allocator.free(self.removable);
+        self.allocator.free(self.owner_spans);
+    }
 };
 
 const Line = struct {
@@ -343,6 +372,442 @@ pub fn deleteDefinition(
     }
 
     return removeSpans(allocator, source, removals.items);
+}
+
+/// Analyze parser-scoped reusable dependencies and report one conservative
+/// fixed-point cleanup. A physical use in a rendered/root region keeps its
+/// exact source-order-resolved definition alive. Uses inside a reachable group
+/// or direct slide-template definition keep their dependencies alive; uses
+/// owned only by dead definitions do not. Dynamic structural names reject the
+/// analysis instead of guessing through @let expansion.
+pub fn cleanupSummary(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) (std.mem.Allocator.Error || EditError)!CleanupSummary {
+    const analysis = try analyzeCleanup(allocator, source);
+    defer analysis.deinit();
+    return analysis.summary;
+}
+
+/// Remove every safely unreachable reusable definition in one atomic source
+/// rewrite. Element definitions retain standalone comments/blank formatting;
+/// group blocks and direct slide-template captures are removed as complete
+/// source-owned units. The graph is resolved before any bytes move.
+pub fn cleanupUnusedDefinitions(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) (std.mem.Allocator.Error || EditError)!EditResult {
+    const analysis = try analyzeCleanup(allocator, source);
+    defer analysis.deinit();
+    if (analysis.summary.removable_count == 0) return error.NoCleanupCandidates;
+
+    var removals = std.ArrayList(Span).empty;
+    defer removals.deinit(allocator);
+    for (analysis.catalog.entries, 0..) |entry, index| {
+        if (!analysis.removable[index]) continue;
+        switch (entry.kind) {
+            .element => try appendElementDefinitionRemovalSpans(allocator, source, entry, &removals),
+            .group, .slide => try removals.append(
+                allocator,
+                analysis.owner_spans[index] orelse return error.InvalidEntry,
+            ),
+        }
+    }
+    sortSpans(removals.items);
+    var cursor: usize = 0;
+    for (removals.items) |span| {
+        if (span.start < cursor or span.end < span.start or span.end > source.len) {
+            return error.InvalidEntry;
+        }
+        cursor = span.end;
+    }
+    return removeSpans(allocator, source, removals.items);
+}
+
+fn analyzeCleanup(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) (std.mem.Allocator.Error || EditError)!CleanupAnalysis {
+    try rejectDynamicNames(source, .element);
+    try rejectDynamicNames(source, .group);
+    try rejectDynamicNames(source, .slide);
+
+    const catalog = try discover(allocator, source);
+    errdefer catalog.deinit();
+    const count = catalog.entries.len;
+    const removable = try allocator.alloc(bool, count);
+    errdefer allocator.free(removable);
+    @memset(removable, false);
+    const owner_spans = try allocator.alloc(?Span, count);
+    errdefer allocator.free(owner_spans);
+    @memset(owner_spans, null);
+    const safe = try allocator.alloc(bool, count);
+    defer allocator.free(safe);
+    const reachable = try allocator.alloc(bool, count);
+    defer allocator.free(reachable);
+    const incoming = try allocator.alloc(bool, count);
+    defer allocator.free(incoming);
+    @memset(safe, false);
+    @memset(reachable, false);
+    @memset(incoming, false);
+
+    for (catalog.entries, 0..) |entry, index| {
+        if (!entry.placeable) continue;
+        switch (entry.kind) {
+            .element => safe[index] = true,
+            .group => if (safeGroupDefinitionSpan(source, entry)) |span| {
+                safe[index] = true;
+                owner_spans[index] = span;
+            },
+            .slide => if (safeSlideTemplateDefinitionSpan(source, entry)) |span| {
+                safe[index] = true;
+                owner_spans[index] = span;
+            },
+        }
+    }
+
+    var edges = std.ArrayList(CleanupEdge).empty;
+    defer edges.deinit(allocator);
+    var scan_cursor = sourceStart(source);
+    while (scan_cursor < source.len) {
+        const line = physicalLineAt(source, scan_cursor);
+        if (parseContextDirective(source, line)) |directive| {
+            if (directive.role == .use) {
+                if (resolveDefinitionIndex(
+                    catalog.entries,
+                    directive.kind,
+                    directive.name,
+                    line.start,
+                )) |dependency| {
+                    incoming[dependency] = true;
+                    if (cleanupOwnerIndex(owner_spans, line.start)) |owner| {
+                        try edges.append(allocator, .{ .owner = owner, .dependency = dependency });
+                    } else {
+                        reachable[dependency] = true;
+                    }
+                }
+            }
+        }
+        scan_cursor = line.full_end;
+    }
+
+    // An unsafe definition stays in source and therefore acts as a root. Its
+    // physical uses were deliberately not assigned an owner span above, so
+    // they already keep their resolved dependencies alive as well.
+    for (safe, 0..) |is_safe, index| {
+        if (!is_safe) reachable[index] = true;
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (edges.items) |edge| {
+            if (reachable[edge.owner] and !reachable[edge.dependency]) {
+                reachable[edge.dependency] = true;
+                changed = true;
+            }
+        }
+    }
+
+    const context_blocked = retainContextBarrierDefinitions(
+        source,
+        catalog.entries,
+        safe,
+        owner_spans,
+        reachable,
+    );
+
+    var summary = CleanupSummary{ .blocked_count = context_blocked };
+    for (catalog.entries, 0..) |_, index| {
+        if (safe[index] and !reachable[index]) {
+            removable[index] = true;
+            summary.removable_count += 1;
+        } else if (!safe[index] and !incoming[index]) {
+            summary.blocked_count += 1;
+        }
+    }
+    return .{
+        .catalog = catalog,
+        .removable = removable,
+        .owner_spans = owner_spans,
+        .summary = summary,
+        .allocator = allocator,
+    };
+}
+
+/// Unused @push directives still clear the parser's persistent item context.
+/// Keep exactly those that are required as semantic barriers after the other
+/// planned definition spans disappear. This avoids a dead definition making
+/// a later literal @box or reusable definition inherit an earlier @pop.
+fn retainContextBarrierDefinitions(
+    source: []const u8,
+    entries: []const Entry,
+    safe: []const bool,
+    owner_spans: []const ?Span,
+    reachable: []bool,
+) usize {
+    var context_may_be_nonempty = false;
+    var blocked: usize = 0;
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        var skipped = false;
+        for (entries, 0..) |entry, index| {
+            const span = owner_spans[index] orelse continue;
+            if (span.start != cursor) continue;
+            if (entry.kind == .group) {
+                cursor = span.end;
+                skipped = true;
+                break;
+            }
+            if (entry.kind == .slide and safe[index] and !reachable[index]) {
+                cursor = span.end;
+                skipped = true;
+                break;
+            }
+        }
+        if (skipped) continue;
+
+        const line = physicalLineAt(source, cursor);
+        const text = source[line.start..line.trimmed_end];
+        const token = firstToken(text);
+        if (std.mem.eql(u8, token, "@slide") or
+            std.mem.eql(u8, token, "@popslide") or
+            std.mem.eql(u8, token, "@state") or
+            (std.mem.startsWith(u8, token, "@state(") and std.mem.endsWith(u8, token, ")")))
+        {
+            context_may_be_nonempty = false;
+        } else if (std.mem.eql(u8, token, "@pop") or std.mem.eql(u8, token, "@popgroup")) {
+            context_may_be_nonempty = true;
+        } else if (std.mem.eql(u8, token, "@push")) {
+            if (definitionIndexAt(entries, line.start)) |index| {
+                if (safe[index] and !reachable[index]) {
+                    if (context_may_be_nonempty) {
+                        reachable[index] = true;
+                        blocked += 1;
+                        context_may_be_nonempty = false;
+                    }
+                } else {
+                    context_may_be_nonempty = false;
+                }
+            } else {
+                context_may_be_nonempty = false;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return blocked;
+}
+
+fn definitionIndexAt(entries: []const Entry, offset: usize) ?usize {
+    for (entries, 0..) |entry, index| {
+        if (entry.directive_offset == offset) return index;
+        if (entry.directive_offset > offset) break;
+    }
+    return null;
+}
+
+fn safeGroupDefinitionSpan(source: []const u8, entry: Entry) ?Span {
+    const definition = validateEntry(source, entry) catch return null;
+    if (entry.kind != .group or !validName(definition.name)) return null;
+    return safeGroupBlockSpanAt(source, definition.line.start);
+}
+
+fn safeGroupBlockSpanAt(source: []const u8, definition_offset: usize) ?Span {
+    const opening = physicalLineAt(source, definition_offset);
+    const opening_text = source[opening.start..opening.trimmed_end];
+    if (!std.mem.eql(u8, firstToken(opening_text), "@pushgroup") or
+        std.mem.indexOfScalar(u8, opening_text, '$') != null)
+    {
+        return null;
+    }
+    var member_count: usize = 0;
+    var cursor = opening.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[line.start..line.trimmed_end];
+        if (std.mem.indexOfScalar(u8, text, '$') != null) return null;
+        const token = firstToken(text);
+        if (std.mem.eql(u8, token, "@endgroup")) {
+            if (std.mem.trim(u8, text[token.len..], " \t").len != 0 or member_count == 0) {
+                return null;
+            }
+            return .{ .start = opening.start, .end = line.full_end };
+        }
+        if (token.len > 0 and token[0] == '@') {
+            if (!isSafeGroupBodyDirective(token)) return null;
+            if (std.mem.eql(u8, token, "@box") or std.mem.eql(u8, token, "@pop")) {
+                member_count += 1;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return null;
+}
+
+fn safeSlideTemplateDefinitionSpan(source: []const u8, entry: Entry) ?Span {
+    const definition = validateEntry(source, entry) catch return null;
+    if (entry.kind != .slide or !validName(definition.name)) return null;
+    const definition_text = source[definition.line.start..definition.line.trimmed_end];
+    if (std.mem.indexOfScalar(u8, definition_text, '$') != null) return null;
+
+    var scan_start = sourceStart(source);
+    var cursor = sourceStart(source);
+    while (cursor < definition.line.start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > definition.line.start) return null;
+        if (line.trimmed_end > line.start and source[line.start] == '@' and
+            std.mem.eql(u8, firstToken(source[line.start..line.trimmed_end]), "@pushslide"))
+        {
+            scan_start = line.full_end;
+        }
+        cursor = line.full_end;
+    }
+    if (cursor != definition.line.start) return null;
+
+    var capture_start = definition.line.start;
+    var saw_item = false;
+    var pending_animation = false;
+    cursor = scan_start;
+    while (cursor < definition.line.start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > definition.line.start) return null;
+        const text = source[line.start..line.trimmed_end];
+        if (std.mem.indexOfScalar(u8, text, '$') != null) return null;
+        const token = firstToken(text);
+        if (token.len == 0 or token[0] == '#') {
+            cursor = line.full_end;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "@pushgroup")) {
+            if (saw_item or pending_animation) return null;
+            const group_span = safeGroupBlockSpanAt(source, line.start) orelse return null;
+            if (group_span.end > definition.line.start) return null;
+            cursor = group_span.end;
+            continue;
+        }
+        if (token[0] != '@') {
+            cursor = line.full_end;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "@push")) {
+            if (saw_item or pending_animation) return null;
+            cursor = line.full_end;
+            continue;
+        }
+        if (isAnimationToken(token)) {
+            if (pending_animation) return null;
+            if (!saw_item) capture_start = line.start;
+            pending_animation = true;
+            cursor = line.full_end;
+            continue;
+        }
+        if (isDirectSlideTemplateItemToken(token)) {
+            if (!saw_item and !pending_animation) capture_start = line.start;
+            saw_item = true;
+            pending_animation = false;
+            cursor = line.full_end;
+            continue;
+        }
+        return null;
+    }
+    if (pending_animation) return null;
+
+    // Capturing a slide can leave the final @pop/@popgroup item context active
+    // in the parser. Removing the capture is equivalent only when no later
+    // context-sensitive directive can observe it before an explicit rendered
+    // slide boundary clears the context.
+    cursor = definition.line.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[line.start..line.trimmed_end];
+        const token = firstToken(text);
+        if (token.len == 0 or token[0] == '#') {
+            cursor = line.full_end;
+            continue;
+        }
+        if (token[0] != '@') return null;
+        if (!std.mem.eql(u8, token, "@slide") and !std.mem.eql(u8, token, "@popslide")) {
+            return null;
+        }
+        break;
+    }
+    return .{ .start = capture_start, .end = definition.line.full_end };
+}
+
+fn isAnimationToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "@anim") or
+        (std.mem.startsWith(u8, token, "@anim(") and std.mem.endsWith(u8, token, ")"));
+}
+
+fn isDirectSlideTemplateItemToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "@box") or
+        std.mem.eql(u8, token, "@pop") or
+        std.mem.eql(u8, token, "@popgroup") or
+        std.mem.eql(u8, token, "@bg") or
+        std.mem.eql(u8, token, "@crowd");
+}
+
+fn resolveDefinitionIndex(
+    entries: []const Entry,
+    kind: Kind,
+    name: []const u8,
+    before_offset: usize,
+) ?usize {
+    var resolved: ?usize = null;
+    for (entries, 0..) |entry, index| {
+        if (entry.directive_offset >= before_offset) break;
+        if (entry.kind == kind and std.mem.eql(u8, entry.name, name)) resolved = index;
+    }
+    return resolved;
+}
+
+fn cleanupOwnerIndex(owner_spans: []const ?Span, offset: usize) ?usize {
+    var owner: ?usize = null;
+    var owner_size: usize = std.math.maxInt(usize);
+    for (owner_spans, 0..) |span_opt, index| {
+        const span = span_opt orelse continue;
+        if (offset < span.start or offset >= span.end) continue;
+        const size = span.end - span.start;
+        if (size < owner_size) {
+            owner = index;
+            owner_size = size;
+        }
+    }
+    return owner;
+}
+
+fn appendElementDefinitionRemovalSpans(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    entry: Entry,
+    removals: *std.ArrayList(Span),
+) (std.mem.Allocator.Error || EditError)!void {
+    const definition = try validateEntry(source, entry);
+    if (entry.kind != .element) return error.InvalidEntry;
+    try removals.append(allocator, .{
+        .start = definition.line.start,
+        .end = definition.line.full_end,
+    });
+    var cursor = definition.line.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (line.trimmed_end > line.start and source[line.start] == '@') break;
+        const content = source[line.start..line.trimmed_end];
+        if (content.len > 0 and content[0] != '#') {
+            try removals.append(allocator, .{ .start = line.start, .end = line.full_end });
+        }
+        cursor = line.full_end;
+    }
+}
+
+fn sortSpans(spans: []Span) void {
+    for (1..spans.len) |index| {
+        const value = spans[index];
+        var destination = index;
+        while (destination > 0 and spans[destination - 1].start > value.start) : (destination -= 1) {
+            spans[destination] = spans[destination - 1];
+        }
+        spans[destination] = value;
+    }
 }
 
 const ValidatedEntry = struct {
@@ -723,6 +1188,114 @@ test "group catalog refuses live and malformed block deletion" {
         error.UnsafeGroupDelete,
         deleteDefinition(std.testing.allocator, forbidden, forbidden_catalog.entries[0]),
     );
+}
+
+test "cleanup sweeps an unreachable reusable dependency chain to a fixed point" {
+    const source =
+        "\xEF\xBB\xBF@push atom x=10 y=20 text=Atom\r\n" ++
+        "# component documentation survives\r\n" ++
+        "@pushgroup pair\r\n" ++
+        "@pop atom id=left x=100\r\n" ++
+        "@box id=right x=500 text=Right\r\n" ++
+        "@endgroup\r\n" ++
+        "@push live text=Live\r\n" ++
+        "@popgroup pair id=template_instance\r\n" ++
+        "@pushslide unused_layout\r\n" ++
+        "@slide\r\n" ++
+        "@pop live id=visible\r\n";
+    const summary = try cleanupSummary(std.testing.allocator, source);
+    try std.testing.expectEqual(@as(usize, 3), summary.removable_count);
+    try std.testing.expectEqual(@as(usize, 0), summary.blocked_count);
+
+    const cleaned = try cleanupUnusedDefinitions(std.testing.allocator, source);
+    defer cleaned.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "@push atom") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "@pushgroup pair") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "@pushslide unused_layout") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "template_instance") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "# component documentation survives\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "@push live text=Live\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "@pop live id=visible\r\n") != null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(cleaned.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deck.slides.items.len);
+    try std.testing.expectEqualStrings("visible", deck.slides.items[0].items.?.items[0].id.?);
+}
+
+test "cleanup keeps dependencies of live and structurally blocked slide templates" {
+    const live =
+        "@push atom text=Atom\n" ++
+        "@pushgroup pair\n" ++
+        "@pop atom id=left\n" ++
+        "@box id=right text=Right\n" ++
+        "@endgroup\n" ++
+        "@popgroup pair id=template_instance\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n";
+    const live_summary = try cleanupSummary(std.testing.allocator, live);
+    try std.testing.expectEqual(@as(usize, 0), live_summary.removable_count);
+    try std.testing.expectError(
+        error.NoCleanupCandidates,
+        cleanupUnusedDefinitions(std.testing.allocator, live),
+    );
+
+    const blocked =
+        "@push atom text=Atom\n" ++
+        "@box id=owned text=Owned\n" ++
+        "@color fg=#ffffffff\n" ++
+        "@pop atom id=inside\n" ++
+        "@pushslide unsafe\n" ++
+        "@slide\n" ++
+        "@box id=visible text=Visible\n";
+    const blocked_summary = try cleanupSummary(std.testing.allocator, blocked);
+    try std.testing.expectEqual(@as(usize, 0), blocked_summary.removable_count);
+    try std.testing.expectEqual(@as(usize, 1), blocked_summary.blocked_count);
+
+    const leaking_context =
+        "@push atom x=10 color=#112233ff\n" ++
+        "@pop atom id=inside text=Inside\n" ++
+        "@pushslide unsafe\n" ++
+        "@box id=following y=200 text=Following\n";
+    const leaking_summary = try cleanupSummary(std.testing.allocator, leaking_context);
+    try std.testing.expectEqual(@as(usize, 0), leaking_summary.removable_count);
+    try std.testing.expectEqual(@as(usize, 1), leaking_summary.blocked_count);
+}
+
+test "cleanup retains an unused push that clears a live persistent component context" {
+    const source =
+        "@push base x=10 color=#112233ff\n" ++
+        "@slide\n" ++
+        "@pop base id=first text=First\n" ++
+        "@push unused text=Only a context barrier\n" ++
+        "@box id=following y=200 text=Following\n";
+    const summary = try cleanupSummary(std.testing.allocator, source);
+    try std.testing.expectEqual(@as(usize, 0), summary.removable_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.blocked_count);
+    try std.testing.expectError(
+        error.NoCleanupCandidates,
+        cleanupUnusedDefinitions(std.testing.allocator, source),
+    );
+}
+
+test "cleanup resolves shadowed definition uses exactly" {
+    const source =
+        "@push card text=Old\n" ++
+        "@push card text=New\n" ++
+        "@slide\n" ++
+        "@pop card id=visible\n";
+    const summary = try cleanupSummary(std.testing.allocator, source);
+    try std.testing.expectEqual(@as(usize, 1), summary.removable_count);
+    const cleaned = try cleanupUnusedDefinitions(std.testing.allocator, source);
+    defer cleaned.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "text=Old") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "text=New") != null);
 }
 
 test "rename rejects target collisions and dynamic context tokens" {

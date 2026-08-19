@@ -1293,6 +1293,24 @@ pub fn main(init: std.process.Init) anyerror!void {
                         }
                     },
                     .delete_library_entry => semantic_to_apply = command,
+                    .preview_library_cleanup => {
+                        if (studio_catalog.cleanupSummary(
+                            gpa,
+                            G.editor_memory[0..G.source_len],
+                        )) |summary| {
+                            studio_mode.setLibraryCleanupPreview(
+                                summary.removable_count,
+                                summary.blocked_count,
+                            );
+                        } else |err| {
+                            studio_mode.setNotice(switch (err) {
+                                error.DynamicContextName => .structural_source_locked,
+                                else => .edit_failed,
+                            });
+                            log.err("Studio Library cleanup preview failed: {any}", .{err});
+                        }
+                    },
+                    .cleanup_library => semantic_to_apply = command,
                     .add_reusable => |add| {
                         if (add.library_entry_index) |library_index| {
                             if (studioLibraryName(
@@ -1646,6 +1664,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                         error.LiveUses => .library_entry_in_use,
                         error.UnsafeSlideTemplateDelete => .library_delete_unsupported,
                         error.UnsafeGroupDelete => .library_delete_unsupported,
+                        error.NoCleanupCandidates => .library_cleanup_empty,
                         error.DynamicContextName => .structural_source_locked,
                         error.UnsupportedSlidePromotion => .slide_template_promotion_locked,
                         else => .edit_failed,
@@ -5099,6 +5118,19 @@ fn applyStudioSemanticEdit(
                 G.editor_memory[0..G.source_len],
                 entry,
             ));
+        },
+        .preview_library_cleanup => return .{ .source_changed = false },
+        .cleanup_library => {
+            const summary = try studio_catalog.cleanupSummary(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+            );
+            if (summary.removable_count == 0) return .{ .source_changed = false };
+            try recordStudioCatalogPatch(history, try studio_catalog.cleanupUnusedDefinitions(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+            ));
+            return .{ .preserve_selection = true };
         },
         .add_reusable => |add| {
             const name = prompted_text orelse return error.StudioPromptMissing;

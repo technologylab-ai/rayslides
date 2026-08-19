@@ -850,6 +850,9 @@ pub const Notice = enum {
     library_name_conflict,
     library_entry_in_use,
     library_delete_unsupported,
+    library_cleanup_ready,
+    library_cleanup_empty,
+    library_cleanup_blocked,
     slide_template_promotion_locked,
     group_reusable_needs_source_support,
     override_reset_unsupported,
@@ -1209,6 +1212,10 @@ pub const SemanticCommand = union(enum) {
     /// Requests safe deletion of the indexed source definition. The source
     /// layer remains responsible for rejecting live or unsafe uses.
     delete_library_entry: usize,
+    /// Analyze exact source-order dependencies without changing source.
+    preview_library_cleanup: void,
+    /// Apply the previously previewed fixed-point reusable cleanup atomically.
+    cleanup_library: void,
     /// The integration layer prompts for an existing @push name and inserts
     /// the corresponding @pop instance at this visual placement.
     add_reusable: AddReusableCommand,
@@ -1303,6 +1310,7 @@ pub const WorkspaceLayout = struct {
     library_use: rl.Rectangle,
     library_rename: rl.Rectangle,
     library_delete: rl.Rectangle,
+    library_cleanup: rl.Rectangle,
     library_rows_clip: rl.Rectangle,
     library_page_previous: rl.Rectangle,
     library_page_next: rl.Rectangle,
@@ -1349,6 +1357,7 @@ fn emptyWorkspaceLayout() WorkspaceLayout {
         .library_use = empty_frame_rectangle,
         .library_rename = empty_frame_rectangle,
         .library_delete = empty_frame_rectangle,
+        .library_cleanup = empty_frame_rectangle,
         .library_rows_clip = empty_frame_rectangle,
         .library_page_previous = empty_frame_rectangle,
         .library_page_next = empty_frame_rectangle,
@@ -1398,11 +1407,17 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32) WorkspaceLayout {
     };
     const library_action_gap: f32 = 4;
     const library_action_width: f32 = 40;
-    const library_delete: rl.Rectangle = .{
+    const library_cleanup: rl.Rectangle = .{
         .x = library.x + library.width - 12 - library_action_width,
         .y = library.y + 5,
         .width = library_action_width,
         .height = 26,
+    };
+    const library_delete: rl.Rectangle = .{
+        .x = library_cleanup.x - library_action_gap - library_action_width,
+        .y = library_cleanup.y,
+        .width = library_action_width,
+        .height = library_cleanup.height,
     };
     const library_rename: rl.Rectangle = .{
         .x = library_delete.x - library_action_gap - library_action_width,
@@ -1446,6 +1461,7 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32) WorkspaceLayout {
         .library_use = library_use,
         .library_rename = library_rename,
         .library_delete = library_delete,
+        .library_cleanup = library_cleanup,
         .library_rows_clip = library_rows_clip,
         .library_page_previous = library_page_previous,
         .library_page_next = library_page_next,
@@ -2348,6 +2364,9 @@ pub const Studio = struct {
     objects_first_visible: usize = 0,
     last_objects_primary: ?usize = null,
     selected_library_index: ?usize = null,
+    library_cleanup_preview_count: usize = 0,
+    library_cleanup_blocked_count: usize = 0,
+    library_cleanup_preview_ready: bool = false,
     last_workspace_slide: ?usize = null,
 
     pub fn capturesInput(self: Studio) bool {
@@ -2367,6 +2386,24 @@ pub const Studio = struct {
     /// integration can prove them safe again.
     pub fn setCompositionContext(self: *Studio, context: ?CompositionContext) void {
         self.composition_context = context;
+    }
+
+    /// Completes the read-only cleanup preview requested by the Library.
+    /// A second click changes the button to Apply and emits the source edit.
+    pub fn setLibraryCleanupPreview(
+        self: *Studio,
+        removable_count: usize,
+        blocked_count: usize,
+    ) void {
+        self.library_cleanup_preview_count = removable_count;
+        self.library_cleanup_blocked_count = blocked_count;
+        self.library_cleanup_preview_ready = removable_count > 0;
+        self.notice = if (removable_count > 0)
+            .library_cleanup_ready
+        else if (blocked_count > 0)
+            .library_cleanup_blocked
+        else
+            .library_cleanup_empty;
     }
 
     pub fn inlineEditActive(self: Studio) bool {
@@ -3091,6 +3128,9 @@ pub const Studio = struct {
         // can reorder the catalog, so a prior selection must not silently
         // resolve to a different reusable afterward.
         self.selected_library_index = null;
+        self.library_cleanup_preview_count = 0;
+        self.library_cleanup_blocked_count = 0;
+        self.library_cleanup_preview_ready = false;
     }
 
     pub fn setNotice(self: *Studio, notice: Notice) void {
@@ -4717,6 +4757,17 @@ pub const Studio = struct {
         }
         if (pointInRectangle(pointer, layout.library_delete)) {
             self.emitLibraryAction(items, workspace, .delete);
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.library_cleanup)) {
+            if (self.interaction != .idle) self.cancelInteraction(items);
+            self.tool = .select;
+            if (self.library_cleanup_preview_ready and self.library_cleanup_preview_count > 0) {
+                self.pending_semantic_command = .{ .cleanup_library = {} };
+                self.library_cleanup_preview_ready = false;
+            } else {
+                self.pending_semantic_command = .{ .preview_library_cleanup = {} };
+            }
             return true;
         }
         if (pointInRectangle(pointer, layout.library_page_previous)) {
@@ -6540,6 +6591,11 @@ pub const Studio = struct {
         drawCompactButton(self, layout.library_use, "Use");
         drawCompactButton(self, layout.library_rename, "Ren");
         drawCompactButton(self, layout.library_delete, "Del");
+        drawCompactButton(
+            self,
+            layout.library_cleanup,
+            if (self.library_cleanup_preview_ready) "Apply" else "Clean",
+        );
         drawCompactButton(self, layout.library_page_previous, "Prev");
         drawCompactButton(self, layout.library_page_next, "Next");
         for (0..libraryRowCapacity(layout)) |visible_slot| {
@@ -7375,6 +7431,7 @@ pub const Studio = struct {
                 .{ .r = 185, .g = 196, .b = 215, .a = 255 },
             );
         }
+        var notice_buffer: [256]u8 = undefined;
         const notice_text: ?[:0]const u8 = switch (self.notice) {
             .none => null,
             .saved => "Saved to the original .sld",
@@ -7403,6 +7460,20 @@ pub const Studio = struct {
             .library_name_conflict => "That library name is already defined",
             .library_entry_in_use => "Cannot delete: later source instances still use this reusable",
             .library_delete_unsupported => "Slide-template deletion is not source-safe yet",
+            .library_cleanup_ready => std.fmt.bufPrintZ(
+                &notice_buffer,
+                "Cleanup preview: {d} safe to remove · {d} blocked · click Apply",
+                .{ self.library_cleanup_preview_count, self.library_cleanup_blocked_count },
+            ) catch "Cleanup preview ready - click Apply",
+            .library_cleanup_empty => "Library cleanup found no safely unreachable definitions",
+            .library_cleanup_blocked => std.fmt.bufPrintZ(
+                &notice_buffer,
+                "Library cleanup: {d} unreachable definition{s} blocked by source context",
+                .{
+                    self.library_cleanup_blocked_count,
+                    if (self.library_cleanup_blocked_count == 1) "" else "s",
+                },
+            ) catch "Unused definitions need manual cleanup",
             .slide_template_promotion_locked => "This slide cannot be promoted without changing its source semantics",
             .group_reusable_needs_source_support => "Group reusable needs explicit component-group source-format support",
             .override_reset_unsupported => "That local property cannot be reset safely; no source change was made",
@@ -7410,7 +7481,8 @@ pub const Studio = struct {
         };
         if (notice_text) |message| {
             const notice_color: rl.Color = switch (self.notice) {
-                .saved, .copy_saved => .{ .r = 126, .g = 231, .b = 177, .a = 255 },
+                .saved, .copy_saved, .library_cleanup_empty => .{ .r = 126, .g = 231, .b = 177, .a = 255 },
+                .library_cleanup_ready => .{ .r = 255, .g = 190, .b = 105, .a = 255 },
                 else => .{ .r = 255, .g = 145, .b = 132, .a = 255 },
             };
             self.drawUiText(message, .{ .x = panel.x + 12 * scale, .y = panel.y + @as(f32, if (compact_status) 43 else 89) * scale }, body_font, notice_color);
@@ -10256,6 +10328,57 @@ test "library management buttons and shortcuts target the persistent selection" 
         .rename_library_entry => |entry_index| try std.testing.expectEqual(@as(usize, 0), entry_index),
         else => return error.UnexpectedSemanticCommand,
     }
+}
+
+test "library cleanup previews then applies without dropping canvas selection" {
+    var items = [_]slides.SlideItem{testItem(139, .textbox, 100, 100, 200, 80)};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const entries = [_]LibraryEntry{.{ .kind = .element, .name = "unused" }};
+    const workspace: Workspace = .{
+        .visible = true,
+        .slides = &summaries,
+        .current_slide = 0,
+        .library = &entries,
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = workspaceLayout(viewport);
+    try std.testing.expect(layout.library_cleanup.x >= layout.library_delete.x + layout.library_delete.width);
+    try std.testing.expect(layout.library_cleanup.x + layout.library_cleanup.width <= layout.library.x + layout.library.width);
+    var studio: Studio = .{ .enabled = true, .selected_identity = 139 };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.library_cleanup),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .preview_library_cleanup => {},
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(@as(?usize, 139), studio.selected_identity);
+
+    studio.setLibraryCleanupPreview(3, 1);
+    try std.testing.expectEqual(Notice.library_cleanup_ready, studio.notice);
+    try std.testing.expect(studio.library_cleanup_preview_ready);
+    try std.testing.expectEqual(@as(usize, 3), studio.library_cleanup_preview_count);
+    try std.testing.expectEqual(@as(usize, 1), studio.library_cleanup_blocked_count);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.library_cleanup),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .cleanup_library => {},
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(@as(?usize, 139), studio.selected_identity);
+
+    studio.markSourceChanged();
+    try std.testing.expect(!studio.library_cleanup_preview_ready);
+    try std.testing.expectEqual(@as(usize, 0), studio.library_cleanup_preview_count);
+    try std.testing.expectEqual(@as(usize, 0), studio.library_cleanup_blocked_count);
+    studio.setLibraryCleanupPreview(0, 0);
+    try std.testing.expectEqual(Notice.library_cleanup_empty, studio.notice);
+    studio.setLibraryCleanupPreview(0, 2);
+    try std.testing.expectEqual(Notice.library_cleanup_blocked, studio.notice);
 }
 
 test "library Enter activation yields to selected canvas item editing" {

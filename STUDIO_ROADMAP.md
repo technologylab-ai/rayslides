@@ -50,7 +50,7 @@ sessions.
 - Synchronized redraw, atomic render-graph replacement, explicit render-text
   ownership, and opt-in frame/rebuild/arena diagnostics for live authoring QA.
 
-## Active tranche: Reusable composition
+## Completed tranche: Reusable composition
 
 - [x] Inspect exact component, slide-template-instance, and current morph-state
   overrides; reset one property by removing every contribution from that
@@ -65,7 +65,7 @@ sessions.
   group instance without changing paint/reveal order.
 - [x] Discover, place, rename, and safely detach reusable groups through the
   Library and Properties UI.
-- [ ] Improve dependency-aware rename, delete, and fixed-point cleanup across
+- [x] Improve dependency-aware rename, delete, and fixed-point cleanup across
   element, group, and slide-template definitions.
 
 The explicit group syntax is intentional. Existing `@push`/`@pop` represents
@@ -81,6 +81,13 @@ badge and place source-order-resolved instances; Properties identifies group
 members and detaches the complete instance into ordinary local boxes. Rename,
 unused deletion, placement, promotion, and detach all preserve exact definition
 provenance and fail atomically when source ownership is ambiguous.
+
+The Library's **Clean** action first previews the exact number of unreachable
+definitions, then requires an explicit **Apply**. Its source-order dependency
+graph follows live uses through element, group, and direct slide-template
+definitions to a fixed point and commits one undoable rewrite. Definitions
+whose parser-context ownership cannot be proven remain in source and are
+reported as blocked rather than guessed away.
 
 ## Planned tranches
 

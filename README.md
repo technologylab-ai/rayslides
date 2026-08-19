@@ -462,8 +462,12 @@ result as **GROUP** and can place additional absolute-position instances;
 Properties identifies inherited group members and **Detach** expands the whole
 instance into ordinary local boxes. Group rename, unused deletion, placement,
 promotion, and detach all retain exact source-order definition provenance and
-refuse ambiguous structures atomically. The remaining dependency-cleanup work
-is tracked in [the Studio roadmap](STUDIO_ROADMAP.md).
+refuse ambiguous structures atomically. Library **Clean** previews how many
+unreachable element, group, and direct slide-template definitions are safe to
+remove; **Apply** then follows their exact source-order dependencies to a fixed
+point and removes them in one undoable edit. Ambiguous parser-context ownership
+is reported as blocked and left untouched. See [the Studio roadmap](STUDIO_ROADMAP.md)
+for the next authoring tranches.
 
 ## Slide-template instance overrides
 
