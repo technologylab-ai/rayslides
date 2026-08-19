@@ -173,7 +173,7 @@ pub const Prompt = struct {
         rl.drawText(visible, @intFromFloat(editor.x + 12), @intFromFloat(editor.y + 12), 21, .{ .r = 235, .g = 241, .b = 252, .a = 255 });
 
         if (!self.notice.blocksEditing()) {
-            const cursor_x = editor.x + 12 + @as(f32, @floatFromInt(rl.measureText(lastLine(self.text()), 21)));
+            const cursor_x = editor.x + 12 + @as(f32, @floatFromInt(rl.measureText(lastLine(self.buffer[0..self.len :0]), 21)));
             const line_count = 1 + std.mem.count(u8, self.text(), "\n");
             const cursor_y = editor.y + 12 + @as(f32, @floatFromInt(line_count - 1)) * 24;
             if (@mod(@as(i64, @intFromFloat(rl.getTime() * 2)), 2) == 0) {
@@ -228,11 +228,20 @@ pub const Prompt = struct {
     }
 };
 
-fn lastLine(value: []const u8) [:0]const u8 {
-    // Raylib needs a sentinel. The caller's value always points into Prompt's
-    // sentinel-terminated buffer, so its final subslice retains that sentinel.
+fn lastLine(value: [:0]const u8) [:0]const u8 {
+    // Keep the sentinel in the type. Reconstructing a sentinel slice from an
+    // ordinary `[]const u8` forces a bounds check at `len`, even when the
+    // backing Prompt buffer really does contain the terminator there.
     const start = if (std.mem.lastIndexOfScalar(u8, value, '\n')) |index| index + 1 else 0;
     return value[start.. :0];
+}
+
+test "last prompt line retains its sentinel at every boundary" {
+    try std.testing.expectEqualStrings("", lastLine(""));
+    try std.testing.expectEqualStrings("one", lastLine("one"));
+    try std.testing.expectEqualStrings("two", lastLine("one\ntwo"));
+    try std.testing.expectEqualStrings("", lastLine("one\n"));
+    try std.testing.expectEqualStrings("€", lastLine("one\n€"));
 }
 
 fn promptTitle(kind: Kind) [:0]const u8 {

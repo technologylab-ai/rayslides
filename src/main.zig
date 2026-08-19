@@ -583,6 +583,125 @@ const Banner = struct {
     }
 };
 
+/// Raylib keeps the native close flag asserted after a close-button click.
+/// When an inline draft deferred that click, clear our edge-detection latch as
+/// soon as the draft closes or its synchronous commit is resolved so the next
+/// frame can route the still-asserted request through source recovery.
+fn releaseDeferredInlineCloseLatch(
+    window_close_seen: *bool,
+    inline_was_active: bool,
+    inline_is_active: bool,
+    inline_commit_completed: bool,
+) void {
+    if (inline_was_active and (!inline_is_active or inline_commit_completed)) {
+        window_close_seen.* = false;
+    }
+}
+
+test "inline completion releases a deferred native close request" {
+    var close_seen = true;
+    releaseDeferredInlineCloseLatch(&close_seen, true, false, false);
+    try std.testing.expect(!close_seen);
+
+    close_seen = true;
+    releaseDeferredInlineCloseLatch(&close_seen, true, true, true);
+    try std.testing.expect(!close_seen);
+
+    close_seen = true;
+    releaseDeferredInlineCloseLatch(&close_seen, true, true, false);
+    try std.testing.expect(close_seen);
+
+    close_seen = true;
+    releaseDeferredInlineCloseLatch(&close_seen, false, false, true);
+    try std.testing.expect(close_seen);
+}
+
+const FrameDiagnostics = struct {
+    enabled: bool = false,
+    last_frame_at: f64 = 0,
+    sample_started_at: f64 = 0,
+    latest_frame_ms: f64 = 0,
+    building_peak_ms: f64 = 0,
+    building_slow_frames: usize = 0,
+    sampled_peak_ms: f64 = 0,
+    sampled_slow_frames: usize = 0,
+    last_pre_render_ms: f64 = 0,
+    slideshow_arena_bytes: usize = 0,
+    pre_render_count: usize = 0,
+    last_slow_log_at: f64 = -10,
+
+    fn observeFrame(self: *FrameDiagnostics, now: f64) void {
+        if (self.sample_started_at == 0) self.sample_started_at = now;
+        if (self.last_frame_at != 0) {
+            self.latest_frame_ms = (now - self.last_frame_at) * 1000;
+            self.building_peak_ms = @max(self.building_peak_ms, self.latest_frame_ms);
+            if (self.latest_frame_ms > 1000.0 / 30.0) self.building_slow_frames += 1;
+            if (self.enabled and self.latest_frame_ms > 50 and now - self.last_slow_log_at >= 1) {
+                log.warn("slow frame: {d:.1} ms", .{self.latest_frame_ms});
+                self.last_slow_log_at = now;
+            }
+        }
+        self.last_frame_at = now;
+        if (now - self.sample_started_at >= 1) {
+            self.sampled_peak_ms = self.building_peak_ms;
+            self.sampled_slow_frames = self.building_slow_frames;
+            self.building_peak_ms = 0;
+            self.building_slow_frames = 0;
+            self.sample_started_at = now;
+        }
+    }
+
+    fn recordPreRender(self: *FrameDiagnostics, elapsed_seconds: f64, arena_bytes: usize) void {
+        self.last_pre_render_ms = elapsed_seconds * 1000;
+        self.slideshow_arena_bytes = arena_bytes;
+        self.pre_render_count += 1;
+        log.debug(
+            "render graph rebuild #{d}: {d:.1} ms, slideshow arena {d:.1} KiB",
+            .{ self.pre_render_count, self.last_pre_render_ms, @as(f64, @floatFromInt(arena_bytes)) / 1024.0 },
+        );
+    }
+
+    fn draw(self: FrameDiagnostics, font: rl.Font, beast_mode: bool, origin: rl.Vector2) void {
+        if (!self.enabled) return;
+        var frame_buffer: [192]u8 = undefined;
+        var graph_buffer: [192]u8 = undefined;
+        var input_buffer: [192]u8 = undefined;
+        const frame_text = std.fmt.bufPrintZ(
+            &frame_buffer,
+            "FRAME {d:.1} ms   PEAK {d:.1} ms   SLOW {d}/s   {s}",
+            .{ self.latest_frame_ms, self.sampled_peak_ms, self.sampled_slow_frames, if (beast_mode) "UNCAPPED" else "VSYNC" },
+        ) catch return;
+        const graph_text = std.fmt.bufPrintZ(
+            &graph_buffer,
+            "REBUILD {d:.1} ms   ARENA {d:.1} KiB   BUILDS {d}",
+            .{ self.last_pre_render_ms, @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0, self.pre_render_count },
+        ) catch return;
+        const mouse = rl.getMousePosition();
+        const input_text = std.fmt.bufPrintZ(
+            &input_buffer,
+            "MOUSE {d:.0}, {d:.0}   WINDOW {d} x {d}",
+            .{ mouse.x, mouse.y, rl.getScreenWidth(), rl.getScreenHeight() },
+        ) catch return;
+        const x: i32 = @intFromFloat(origin.x + 8);
+        const y: i32 = @intFromFloat(origin.y + 8);
+        rl.drawRectangle(x, y, 560, 78, .{ .r = 5, .g = 11, .b = 22, .a = 230 });
+        rl.drawRectangleLines(x, y, 560, 78, .{ .r = 119, .g = 226, .b = 255, .a = 210 });
+        rl.drawTextEx(font, frame_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 7) }, 16, 0, .white);
+        rl.drawTextEx(font, graph_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 30) }, 14, 0, .{ .r = 170, .g = 205, .b = 222, .a = 255 });
+        rl.drawTextEx(font, input_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 50) }, 14, 0, .{ .r = 170, .g = 205, .b = 222, .a = 255 });
+    }
+};
+
+test "frame diagnostics rolls peak and slow-frame counts" {
+    var diagnostics = FrameDiagnostics{};
+    diagnostics.observeFrame(1.0);
+    diagnostics.observeFrame(1.016);
+    diagnostics.observeFrame(1.056);
+    diagnostics.observeFrame(2.1);
+    try std.testing.expectApproxEqAbs(@as(f64, 1044), diagnostics.sampled_peak_ms, 0.001);
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.sampled_slow_frames);
+}
+
 pub fn main(init: std.process.Init) anyerror!void {
     const gpa = init.gpa;
     const io = init.io;
@@ -593,6 +712,9 @@ pub fn main(init: std.process.Init) anyerror!void {
     var crowd_host_buffer: [256]u8 = undefined;
     crowd_options.host = defaultCrowdHost(&crowd_host_buffer);
     var launch_studio = false;
+    var diagnostics_enabled = false;
+    var diagnostics_select_buffer: [128]u8 = undefined;
+    var diagnostics_select_id: ?[]const u8 = null;
 
     // get args
     const slideshow_to_load: ?[]const u8 = blk: {
@@ -610,6 +732,16 @@ pub fn main(init: std.process.Init) anyerror!void {
                 crowd_options.enabled = false;
             } else if (std.mem.eql(u8, arg, "--studio")) {
                 launch_studio = true;
+            } else if (std.mem.eql(u8, arg, "--diagnostics")) {
+                diagnostics_enabled = true;
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-select=")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_select_id = std.fmt.bufPrint(
+                    &diagnostics_select_buffer,
+                    "{s}",
+                    .{arg["--diagnostics-select=".len..]},
+                ) catch std.process.fatal("Diagnostics selection ID is too long", .{});
             } else if (slideshow_arg == null) {
                 slideshow_arg = arg;
             } else {
@@ -627,7 +759,10 @@ pub fn main(init: std.process.Init) anyerror!void {
     var screenWidth: i32 = windowWidth;
     var screenHeight: i32 = windowHeight;
 
-    rl.setConfigFlags(.{ .window_resizable = true });
+    // Present complete frames on the monitor refresh boundary. The old 61 Hz
+    // software-only cap could tear visibly on macOS while Studio continuously
+    // redraws its canvas and chrome, even when the scene itself was static.
+    rl.setConfigFlags(.{ .window_resizable = true, .vsync_hint = true });
     rl.initWindow(screenWidth, screenHeight, "rayslides");
     rl.setWindowMinSize(900, 506);
     if (starts_in_studio) {
@@ -648,7 +783,6 @@ pub fn main(init: std.process.Init) anyerror!void {
     // Studio owns Escape while editing (cancel drag, then leave Studio). Keep
     // Raylib from closing the process before the frame can consume the key.
     rl.setExitKey(.null);
-    var first: bool = true;
     defer rl.closeWindow(); // Close window and OpenGL context
 
     // Initialize GPU-backed resources after the window and unload them before it closes.
@@ -662,8 +796,10 @@ pub fn main(init: std.process.Init) anyerror!void {
     var crowd_runtime = try crowdplay.Runtime.init(gpa, io);
     defer crowd_runtime.stop();
 
-    rl.setTargetFPS(61);
+    rl.setTargetFPS(60);
     var beast_mode: bool = false;
+    var frame_diagnostics = FrameDiagnostics{ .enabled = diagnostics_enabled };
+    var diagnostics_selection_pending = diagnostics_select_id;
 
     // Main game loop
     var is_pre_rendered: bool = false;
@@ -699,14 +835,17 @@ pub fn main(init: std.process.Init) anyerror!void {
     var window_close_seen = false;
 
     while (true) {
+        frame_diagnostics.observeFrame(rl.getTime());
         const window_close_now = rl.windowShouldClose();
         const window_close_requested = window_close_now and !window_close_seen;
         window_close_seen = window_close_now;
-        // A modal property edit is not part of the persisted source yet. Do
-        // not let the OS close button silently throw that draft away; after
-        // submitting or cancelling it, Q/Escape (or a fresh close request)
+        const inline_edit_active_at_frame_start = studio_mode.inlineEditActive();
+        const text_input_active_at_frame_start = property_prompt.active or inline_edit_active_at_frame_start;
+        // A modal or inline property draft is not part of the persisted source
+        // yet. Do not let the OS close button silently throw it away; after
+        // submitting or cancelling, Q/Escape (or a fresh close request)
         // follows the normal source-recovery path below.
-        if (window_close_requested and !property_prompt.active and readyToQuitPreservingEdits(&studio_mode)) break;
+        if (window_close_requested and !text_input_active_at_frame_start and readyToQuitPreservingEdits(&studio_mode)) break;
 
         const studio_active_at_frame_start = studio_mode.capturesInput();
         // Update
@@ -741,7 +880,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!property_prompt.active and rl.isKeyPressed(.s)) {
+        if (!text_input_active_at_frame_start and rl.isKeyPressed(.s)) {
             if (studio_mode.capturesInput() or (editorSourceDirty() and shortcutModifierDown())) {
                 if (shortcutModifierDown()) {
                     if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
@@ -791,19 +930,13 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        // Draw
-        //----------------------------------------------------------------------------------
-        rl.beginDrawing();
-        defer rl.endDrawing();
-
-        rl.clearBackground(.blank);
+        if (!text_input_active_at_frame_start and rl.isKeyPressed(.f3)) {
+            frame_diagnostics.enabled = !frame_diagnostics.enabled;
+            log.info("frame diagnostics {s}", .{if (frame_diagnostics.enabled) "enabled" else "disabled"});
+        }
 
         // (re-) load slideshow
         if (G.slideshow_filp_to_load) |filp| {
-            studio_mode = .{
-                .enabled = launch_studio,
-                .ui_font = G.studio_ui_font,
-            };
             studio_history.clear();
             // Component clipboard entries carry source-order definition
             // provenance. Never let them cross a document reload where the
@@ -811,6 +944,13 @@ pub fn main(init: std.process.Init) anyerror!void {
             studio_clipboard.clear();
             studio_bounds.clearRetainingCapacity();
             try loadSlideshow(filp);
+            // loadSlideshow recreates every GPU-backed font. Rebind Studio
+            // only after that succeeds so it never retains stale glyph or
+            // texture metadata from the previous AppData generation.
+            studio_mode = .{
+                .enabled = launch_studio,
+                .ui_font = G.studio_ui_font,
+            };
             is_pre_rendered = false;
         }
 
@@ -819,9 +959,14 @@ pub fn main(init: std.process.Init) anyerror!void {
                 const slideshow_filp = G.slideshow_filp orelse "untitled.sld";
                 log.info("LOADED!!!", .{});
                 log.debug("I AM GOING TO PRE-RENDER!", .{});
+                const pre_render_started_at = rl.getTime();
                 G.slide_renderer.preRender(G.slideshow, slideshow_filp) catch |err| {
                     log.err("Pre-rendering failed: {any}", .{err});
                 };
+                frame_diagnostics.recordPreRender(
+                    rl.getTime() - pre_render_started_at,
+                    G.slideshow_arena.queryCapacity(),
+                );
                 const deck_has_crowd = slideshowHasCrowd(G.slideshow);
                 const host_is_usable = builtin.os.tag != .windows or crowd_options.host_explicit;
                 if (crowd_options.enabled and deck_has_crowd and !host_is_usable) {
@@ -912,6 +1057,15 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
         try collectStudioBounds(&studio_bounds, gpa, G.current_slide, studio_mode.active_morph_state, studio_items);
+        if (diagnostics_selection_pending) |item_id| {
+            if (studio_mode.selectItemByIdOrSource(studio_items, item_id, .{})) {
+                studio_mode.active_dock = .properties;
+                studio_mode.inspector_panel = .properties;
+            } else {
+                log.warn("diagnostics could not select unique item id={s}", .{item_id});
+            }
+            diagnostics_selection_pending = null;
+        }
         if (rl.isWindowResized()) studio_mode.cancelActiveInteraction(studio_items);
 
         studio_slide_summaries.clearRetainingCapacity();
@@ -949,6 +1103,8 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         var semantic_to_apply: ?studio.SemanticCommand = null;
         var semantic_text: ?[]const u8 = null;
+        var inline_field_to_finish: ?studio.InlineField = null;
+        var inline_commit_completed = false;
         var studio_slide_to_select: ?usize = null;
         var source_graph_reparsed_this_frame = false;
         const prompt_was_active = property_prompt.active;
@@ -1171,6 +1327,26 @@ pub fn main(init: std.process.Init) anyerror!void {
                             studio_mode.setNotice(.edit_failed);
                         }
                     },
+                    .commit_inline => |commit| {
+                        // The borrowed command is resolved synchronously below,
+                        // either by accepting it or by returning a field-local
+                        // rejection. In both cases a close request deferred by
+                        // the draft must be eligible for a fresh poll.
+                        inline_commit_completed = true;
+                        if (validateInlineCommit(commit)) |reason| {
+                            studio_mode.rejectInlineCommit(commit.field, reason);
+                            studio_mode.setNotice(.none);
+                        } else if (!inlineCommitChangesValue(commit, studio_items, studio_bounds.items)) {
+                            // Accepting a pristine field refreshes/traverses
+                            // the editor without touching source or history.
+                            studio_mode.acceptInlineCommit(commit.field);
+                        } else {
+                            const mapped = inlineSemanticEdit(commit);
+                            inline_field_to_finish = commit.field;
+                            semantic_to_apply = mapped.command;
+                            semantic_text = mapped.value;
+                        }
+                    },
                     .select_slide => |slide_index| studio_slide_to_select = slide_index,
                     .select_morph_scene => {},
                     else => semantic_to_apply = command,
@@ -1226,39 +1402,64 @@ pub fn main(init: std.process.Init) anyerror!void {
             const previous_slide = G.playback.previous_slide orelse break :blk null;
             break :blk crowd_runtime.snapshotFor(crowdSpecForSlide(G.slideshow, previous_slide));
         } else null;
-        try G.slide_renderer.render(
-            G.current_slide,
-            reveal_state,
-            transition_state,
-            slide_tl,
-            slide_size_in_window,
-            internal_render_size,
-            crowd_snapshot,
-            previous_crowd_snapshot,
-            crowd_runtime.public_url.slice(),
-        );
-        if (!export_controller.running) {
-            studio_mode.draw(studio_items, studio_bounds.items, studio_viewport);
-            studio_mode.drawWorkspaceBackground(studio_viewport, studio_workspace);
-            var preview_slot: usize = 0;
-            while (studio_mode.visibleSlidePreview(studio_viewport, studio_workspace, preview_slot)) |preview| : (preview_slot += 1) {
-                rl.beginScissorMode(
-                    @intFromFloat(preview.rect.x),
-                    @intFromFloat(preview.rect.y),
-                    @intFromFloat(preview.rect.width),
-                    @intFromFloat(preview.rect.height),
-                );
-                G.slide_renderer.renderStudioThumbnail(
-                    @intCast(preview.slide_index),
-                    .{ .x = preview.rect.x, .y = preview.rect.y },
-                    .{ .x = preview.rect.width, .y = preview.rect.height },
-                    internal_render_size,
-                ) catch |err| log.err("Studio thumbnail render failed: {any}", .{err});
-                rl.endScissorMode();
+
+        // Keep parsing, pre-rendering, workspace collection, and input updates
+        // outside the acquired draw frame. Inspector commits can rebuild the
+        // complete render graph; beginning the frame only when pixels are
+        // ready prevents a partially held back buffer from presenting as a
+        // redraw flash on macOS.
+        {
+            rl.beginDrawing();
+            defer rl.endDrawing();
+            rl.clearBackground(.blank);
+
+            try G.slide_renderer.render(
+                G.current_slide,
+                reveal_state,
+                transition_state,
+                slide_tl,
+                slide_size_in_window,
+                internal_render_size,
+                crowd_snapshot,
+                previous_crowd_snapshot,
+                crowd_runtime.public_url.slice(),
+            );
+            if (!export_controller.running) {
+                studio_mode.draw(studio_items, studio_bounds.items, studio_viewport);
+                studio_mode.drawWorkspaceBackground(studio_viewport, studio_workspace);
+                var preview_slot: usize = 0;
+                while (studio_mode.visibleSlidePreview(studio_viewport, studio_workspace, preview_slot)) |preview| : (preview_slot += 1) {
+                    rl.beginScissorMode(
+                        @intFromFloat(preview.rect.x),
+                        @intFromFloat(preview.rect.y),
+                        @intFromFloat(preview.rect.width),
+                        @intFromFloat(preview.rect.height),
+                    );
+                    G.slide_renderer.renderStudioThumbnail(
+                        @intCast(preview.slide_index),
+                        .{ .x = preview.rect.x, .y = preview.rect.y },
+                        .{ .x = preview.rect.width, .y = preview.rect.height },
+                        internal_render_size,
+                    ) catch |err| log.err("Studio thumbnail render failed: {any}", .{err});
+                    rl.endScissorMode();
+                }
+                studio_mode.drawWorkspaceOverlay(studio_viewport, studio_workspace);
             }
-            studio_mode.drawWorkspaceOverlay(studio_viewport, studio_workspace);
+            if (beast_mode) rl.drawFPS(20, 20);
+
+            if (export_controller.final_messagebox_message) |msg| {
+                if (rg.messageBox(.{ .x = @floatFromInt(@divTrunc(screenWidth - 400, 2)), .y = 300, .width = 400, .height = 100 }, "Slideshow Export", msg, "OK") >= 0) {
+                    gpa.free(msg);
+                    export_controller.final_messagebox_message = null;
+                }
+            }
+            if (laser_pointer.show and !studio_mode.capturesInput()) try laser_pointer.draw();
+            if (banner.show) banner.render();
+
+            frame_diagnostics.draw(G.studio_ui_font, beast_mode, slide_tl);
+            property_prompt.draw(window_size);
         }
-        property_prompt.draw(window_size);
+
         if (studio_geometry_batch) |batch| {
             if (applyStudioGeometryBatchEdit(&studio_history, batch, current_slide, studio_mode.active_morph_state, studio_items)) |_| {} else |err| {
                 studio_mode.setNotice(.edit_failed);
@@ -1338,6 +1539,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                         );
                     }
                 }
+                if (inline_field_to_finish) |field| studio_mode.acceptInlineCommit(field);
                 studio_mode.setNotice(if (customized_shared_property) .shared_template_customized else .none);
             } else |err| {
                 const invalid_prompt_value = switch (err) {
@@ -1349,7 +1551,38 @@ pub fn main(init: std.process.Init) anyerror!void {
                     => true,
                     else => false,
                 };
-                if (invalid_prompt_value) {
+                if (inline_field_to_finish) |field| {
+                    const reason = inlineErrorForSemanticFailure(field, err);
+                    studio_mode.rejectInlineCommit(field, reason);
+                    if (reason == .source_edit_failed) {
+                        semantic_source_changed = true;
+                        studio_mode.setNotice(switch (err) {
+                            error.AmbiguousSlideTemplateLayout,
+                            error.AmbiguousSlideTemplateDependency,
+                            error.UnsafeSlideGlobalDirective,
+                            error.UnsupportedSlideTemplateOverride,
+                            error.UnsupportedSharedTemplateDeletion,
+                            error.UnsupportedItemDuplication,
+                            error.TemplateInstanceDuplicationUnsupported,
+                            error.MorphItemDuplicationUnsupported,
+                            error.AmbiguousItemLayer,
+                            error.InvalidItemScene,
+                            error.UnsupportedItemLayerMove,
+                            error.UnsupportedClipboardItem,
+                            error.UnsupportedBatchDeletion,
+                            => .structural_source_locked,
+                            error.StudioClipboardEmpty => .clipboard_empty,
+                            error.LockedLayerBarrier,
+                            error.StudioItemLocked,
+                            => .locked_item,
+                            else => .edit_failed,
+                        });
+                        log.err("Studio inline edit failed: {any}", .{err});
+                        reparseEditorSource() catch {};
+                    } else {
+                        studio_mode.setNotice(.none);
+                    }
+                } else if (invalid_prompt_value) {
                     property_prompt.rejectValue();
                     pending_semantic_command = command;
                     studio_mode.setNotice(.none);
@@ -1393,7 +1626,17 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!source_graph_reparsed_this_frame and studio_mode.capturesInput() and !property_prompt.active and shortcutModifierDown() and rl.isKeyPressed(.z)) {
+        releaseDeferredInlineCloseLatch(
+            &window_close_seen,
+            inline_edit_active_at_frame_start,
+            studio_mode.inlineEditActive(),
+            inline_commit_completed,
+        );
+
+        if (!source_graph_reparsed_this_frame and studio_mode.capturesInput() and
+            !property_prompt.active and !studio_mode.inlineEditActive() and
+            shortcutModifierDown() and rl.isKeyPressed(.z))
+        {
             // Undo owns the source graph. End a transient pointer gesture before
             // reparsing so it cannot later release stale pre-undo geometry.
             // Source history may remove an item and recycle its numeric
@@ -1416,26 +1659,6 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
             studio_mode.dirty = editorSourceDirty();
         }
-        // try G.slide_renderer.render(G.current_slide, .{ .x = 0.0, .y = 0.0 }, .{ .x = @floatFromInt(screenWidth), .y = @floatFromInt(screenHeight) }, .{ .x = 1920, .y = 1080 });
-        if (beast_mode) {
-            rl.drawFPS(20, 20);
-        }
-
-        if (export_controller.final_messagebox_message) |msg| {
-            if (rg.messageBox(.{ .x = @floatFromInt(@divTrunc(screenWidth - 400, 2)), .y = 300, .width = 400, .height = 100 }, "Slideshow Export", msg, "OK") >= 0) {
-                gpa.free(msg);
-                export_controller.final_messagebox_message = null;
-            }
-        }
-
-        if (laser_pointer.show and !studio_mode.capturesInput()) {
-            try laser_pointer.draw();
-        }
-
-        if (banner.show) {
-            banner.render();
-        }
-
         //
         // hanlde keys
         //
@@ -1457,14 +1680,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             _ = crowd_runtime.resetActive();
         }
 
-        // hack for M1 macbook 14" with low resolution set to : 1512 x 981
-        if (first) {
-            rl.toggleBorderlessWindowed();
-            rl.toggleBorderlessWindowed();
-            first = false;
-        }
-
-        if (!property_prompt.active and rl.isKeyPressed(.f)) {
+        if (!property_prompt.active and !studio_mode.inlineEditActive() and rl.isKeyPressed(.f)) {
             if (!manual_fullscreen) {
                 windowed_width = screenWidth;
                 windowed_height = screenHeight;
@@ -1495,7 +1711,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!property_prompt.active and (rl.isKeyPressed(.q) or
+        if (!property_prompt.active and !studio_mode.inlineEditActive() and (rl.isKeyPressed(.q) or
             (rl.isKeyPressed(.escape) and !studio_active_at_frame_start)))
         {
             if (readyToQuitPreservingEdits(&studio_mode)) break;
@@ -1523,9 +1739,11 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else {
                 beast_mode = !beast_mode;
                 if (beast_mode) {
+                    rl.clearWindowState(.{ .vsync_hint = true });
                     rl.setTargetFPS(0);
                 } else {
-                    rl.setTargetFPS(61);
+                    rl.setWindowState(.{ .vsync_hint = true });
+                    rl.setTargetFPS(60);
                 }
             }
         }
@@ -2678,14 +2896,7 @@ fn canonicalStudioColor(input: []const u8, buffer: *[9]u8) ![]const u8 {
 }
 
 fn canonicalStudioOpacity(input: []const u8, buffer: []u8) ![]const u8 {
-    const value = std.mem.trim(u8, input, " \t\r\n");
-    if (value.len == 0) return error.InvalidStudioOpacity;
-    const opacity = if (value[value.len - 1] == '%') blk: {
-        const percent = try parseStudioFiniteFloat(value[0 .. value.len - 1]);
-        break :blk percent / 100;
-    } else try parseStudioFiniteFloat(value);
-    if (opacity < 0 or opacity > 1) return error.InvalidStudioOpacity;
-    return formatStudioFloat(buffer, opacity);
+    return formatStudioFloat(buffer, try canonicalOpacityValue(input));
 }
 
 fn canonicalStudioFontSize(input: []const u8, buffer: []u8) ![]const u8 {
@@ -2693,6 +2904,149 @@ fn canonicalStudioFontSize(input: []const u8, buffer: []u8) ![]const u8 {
     const size = std.fmt.parseInt(i32, value, 10) catch return error.InvalidStudioFontSize;
     if (size <= 0 or size > 4096) return error.InvalidStudioFontSize;
     return std.fmt.bufPrint(buffer, "{d}", .{size});
+}
+
+const InlineSemanticEdit = struct {
+    command: studio.SemanticCommand,
+    value: []const u8,
+};
+
+/// Convert a dock-owned inline commit into the established source-edit
+/// command surface. Keeping the mapping here means legacy modal actions and
+/// inline fields share exactly the same ownership, canonicalization, history,
+/// and reparse implementation.
+fn inlineSemanticEdit(commit: studio.InlineCommit) InlineSemanticEdit {
+    const command: studio.SemanticCommand = switch (commit.field) {
+        .text => .{ .edit_text = commit.target },
+        .x => .{ .edit_numeric_geometry = .{ .target = commit.target, .field = .x } },
+        .y => .{ .edit_numeric_geometry = .{ .target = commit.target, .field = .y } },
+        .width => .{ .edit_numeric_geometry = .{ .target = commit.target, .field = .width } },
+        .height => .{ .edit_numeric_geometry = .{ .target = commit.target, .field = .height } },
+        .foreground => .{ .set_custom_foreground = commit.target },
+        .background => if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, commit.value, " \t\r\n"), "none"))
+            .{ .clear_background = commit.target }
+        else
+            .{ .set_custom_background = commit.target },
+        .font_size => .{ .set_font_size = commit.target },
+        .opacity => .{ .set_opacity = commit.target },
+    };
+    return .{ .command = command, .value = commit.value };
+}
+
+/// Inline input never reaches the source layer until its complete value is
+/// known to be valid. This supplies field-specific feedback without closing
+/// the dock editor or perturbing the selection/source history.
+fn validateInlineCommit(commit: studio.InlineCommit) ?studio.InlineError {
+    if (commit.value.len > studio.max_inline_input_bytes) return .too_long;
+    if (!std.unicode.utf8ValidateSlice(commit.value)) return .invalid_utf8;
+
+    switch (commit.field) {
+        .text => validateStudioTextValue(commit.value) catch return .invalid_text,
+        .x, .y => _ = parseStudioFiniteFloat(commit.value) catch return .invalid_number,
+        .width, .height => {
+            const value = parseStudioFiniteFloat(commit.value) catch return .invalid_number;
+            if (value < studio.default_min_item_size) return .non_positive_dimension;
+        },
+        .foreground => {
+            var buffer: [9]u8 = undefined;
+            _ = canonicalStudioColor(commit.value, &buffer) catch return .invalid_color;
+        },
+        .background => {
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, commit.value, " \t\r\n"), "none")) {
+                var buffer: [9]u8 = undefined;
+                _ = canonicalStudioColor(commit.value, &buffer) catch return .invalid_color;
+            }
+        },
+        .font_size => {
+            var buffer: [32]u8 = undefined;
+            _ = canonicalStudioFontSize(commit.value, &buffer) catch return .invalid_font_size;
+        },
+        .opacity => {
+            var buffer: [64]u8 = undefined;
+            _ = canonicalStudioOpacity(commit.value, &buffer) catch return .invalid_opacity;
+        },
+    }
+    return null;
+}
+
+/// A pristine Enter/Tab must not manufacture source churn or an undo entry.
+/// Compare against the captured edit layer: shared-template fields use their
+/// immutable shared values even when a local override masks them onscreen.
+fn inlineCommitChangesValue(
+    commit: studio.InlineCommit,
+    items: []const slides.SlideItem,
+    resolved_bounds: []const studio.ResolvedBounds,
+) bool {
+    const item = studioItemByIdentity(items, commit.target.item_identity) orelse return true;
+    const shared = if (commit.target.edit_scope == .shared_template) item.sharedTemplateValues() else null;
+    const geometry = if (shared) |values|
+        studio.Geometry{ .position = values.position, .size = values.size }
+    else
+        studio.itemGeometry(item.*, resolved_bounds);
+
+    return switch (commit.field) {
+        .text => !std.mem.eql(
+            u8,
+            if (shared) |values| values.text orelse "" else item.text orelse "",
+            commit.value,
+        ),
+        .x => geometry.position.x != (parseStudioFiniteFloat(commit.value) catch return true),
+        .y => geometry.position.y != (parseStudioFiniteFloat(commit.value) catch return true),
+        .width => geometry.size.x != (parseStudioFiniteFloat(commit.value) catch return true),
+        .height => geometry.size.y != (parseStudioFiniteFloat(commit.value) catch return true),
+        .foreground => changed: {
+            const current = if (shared) |values| values.color else item.color;
+            const color = current orelse break :changed true;
+            var current_buffer: [9]u8 = undefined;
+            var submitted_buffer: [9]u8 = undefined;
+            const submitted = canonicalStudioColor(commit.value, &submitted_buffer) catch return true;
+            break :changed !std.mem.eql(u8, colorLiteral(&current_buffer, color), submitted);
+        },
+        .background => changed: {
+            const current = if (shared) |values| values.background_color else item.background_color;
+            const submitted = std.mem.trim(u8, commit.value, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(submitted, "none")) break :changed current != null;
+            const color = current orelse break :changed true;
+            var current_buffer: [9]u8 = undefined;
+            var submitted_buffer: [9]u8 = undefined;
+            const canonical = canonicalStudioColor(submitted, &submitted_buffer) catch return true;
+            break :changed !std.mem.eql(u8, colorLiteral(&current_buffer, color), canonical);
+        },
+        .font_size => changed: {
+            const current = if (shared) |values| values.font_size else item.fontSize;
+            const submitted = std.fmt.parseInt(i32, std.mem.trim(u8, commit.value, " \t\r\n"), 10) catch return true;
+            break :changed current == null or current.? != submitted;
+        },
+        .opacity => changed: {
+            const current = if (shared) |values| values.opacity else item.opacity;
+            const submitted = canonicalOpacityValue(commit.value) catch return true;
+            break :changed @abs(current - submitted) > 0.000001;
+        },
+    };
+}
+
+fn canonicalOpacityValue(input: []const u8) !f32 {
+    const value = std.mem.trim(u8, input, " \t\r\n");
+    if (value.len == 0) return error.InvalidStudioOpacity;
+    const opacity = if (value[value.len - 1] == '%') blk: {
+        const percent = try parseStudioFiniteFloat(value[0 .. value.len - 1]);
+        break :blk percent / 100;
+    } else try parseStudioFiniteFloat(value);
+    if (opacity < 0 or opacity > 1) return error.InvalidStudioOpacity;
+    return opacity;
+}
+
+fn inlineErrorForSemanticFailure(field: studio.InlineField, err: anyerror) studio.InlineError {
+    return switch (err) {
+        error.InvalidStudioNumber => .invalid_number,
+        error.InvalidStudioDimension => .non_positive_dimension,
+        error.InvalidStudioColor => .invalid_color,
+        error.InvalidStudioFontSize => .invalid_font_size,
+        error.InvalidStudioOpacity => .invalid_opacity,
+        error.InvalidStudioText => .invalid_text,
+        error.InvalidLiteralValue => if (field == .text) .invalid_text else .source_edit_failed,
+        else => .source_edit_failed,
+    };
 }
 
 test "Studio custom property values canonicalize safely" {
@@ -2711,6 +3065,162 @@ test "Studio custom property values canonicalize safely" {
     try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("101%", &number_buffer));
     try std.testing.expectEqualStrings("48", try canonicalStudioFontSize("48", &number_buffer));
     try std.testing.expectError(error.InvalidStudioFontSize, canonicalStudioFontSize("0", &number_buffer));
+}
+
+test "Studio inline commits map to legacy atomic semantic edits" {
+    const target: studio.CommandTarget = .{
+        .item_identity = 42,
+        .source = .{ .scope = .direct, .line_offset = 12, .patchable = true },
+    };
+    const cases = [_]struct {
+        field: studio.InlineField,
+        value: []const u8,
+        tag: std.meta.Tag(studio.SemanticCommand),
+    }{
+        .{ .field = .text, .value = "Hello", .tag = .edit_text },
+        .{ .field = .x, .value = "10", .tag = .edit_numeric_geometry },
+        .{ .field = .y, .value = "20", .tag = .edit_numeric_geometry },
+        .{ .field = .width, .value = "300", .tag = .edit_numeric_geometry },
+        .{ .field = .height, .value = "200", .tag = .edit_numeric_geometry },
+        .{ .field = .foreground, .value = "#aabbccff", .tag = .set_custom_foreground },
+        .{ .field = .background, .value = "#01020304", .tag = .set_custom_background },
+        .{ .field = .background, .value = " NoNe ", .tag = .clear_background },
+        .{ .field = .font_size, .value = "48", .tag = .set_font_size },
+        .{ .field = .opacity, .value = "75%", .tag = .set_opacity },
+    };
+    for (cases) |case| {
+        const mapped = inlineSemanticEdit(.{ .target = target, .field = case.field, .value = case.value });
+        try std.testing.expectEqual(case.tag, std.meta.activeTag(mapped.command));
+        try std.testing.expectEqualStrings(case.value, mapped.value);
+    }
+}
+
+test "Studio inline validation reports the exact field without touching source" {
+    const target: studio.CommandTarget = .{ .item_identity = 1, .source = .{} };
+    const invalid_utf8 = [_]u8{ 0xe2, 0x82 };
+    try std.testing.expectEqual(studio.InlineError.invalid_utf8, validateInlineCommit(.{
+        .target = target,
+        .field = .text,
+        .value = &invalid_utf8,
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_number, validateInlineCommit(.{
+        .target = target,
+        .field = .x,
+        .value = "left",
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.non_positive_dimension, validateInlineCommit(.{
+        .target = target,
+        .field = .width,
+        .value = "0",
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_color, validateInlineCommit(.{
+        .target = target,
+        .field = .foreground,
+        .value = "red",
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_font_size, validateInlineCommit(.{
+        .target = target,
+        .field = .font_size,
+        .value = "12.5",
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_opacity, validateInlineCommit(.{
+        .target = target,
+        .field = .opacity,
+        .value = "101%",
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_text, validateInlineCommit(.{
+        .target = target,
+        .field = .text,
+        .value = "Safe\n@slide",
+    }).?);
+    try std.testing.expect(validateInlineCommit(.{
+        .target = target,
+        .field = .background,
+        .value = "none",
+    }) == null);
+    try std.testing.expect(validateInlineCommit(.{
+        .target = target,
+        .field = .opacity,
+        .value = "0%",
+    }) == null);
+}
+
+test "Studio pristine inline commits compare against the captured ownership layer" {
+    const item: slides.SlideItem = .{
+        .identity = 7,
+        .id = "hero",
+        .source = .{ .scope = .slide_template, .line_offset = 10, .patchable = true },
+        .instance_source = .{ .scope = .slide_instance_override, .line_offset = 100, .patchable = true },
+        .shared_template_values = .{
+            .text = "Shared",
+            .font_size = 40,
+            .color = .{ .r = 1, .g = 2, .b = 3, .a = 255 },
+            .background_color = .{ .r = 10, .g = 20, .b = 30, .a = 40 },
+            .position = .{ .x = 10, .y = 20 },
+            .size = .{ .x = 300, .y = 200 },
+            .opacity = 0.75,
+        },
+        .kind = .textbox,
+        .text = "Local",
+        .fontSize = 52,
+        .color = .{ .r = 9, .g = 8, .b = 7, .a = 255 },
+        .background_color = null,
+        .position = .{ .x = 100, .y = 120 },
+        .size = .{ .x = 320, .y = 220 },
+        .opacity = 0.5,
+    };
+    const items = [_]slides.SlideItem{item};
+    const bounds = [_]studio.ResolvedBounds{.{
+        .identity = 7,
+        .position = item.position,
+        .size = item.size,
+    }};
+    const local_target: studio.CommandTarget = .{
+        .item_identity = 7,
+        .source = item.instance_source.?,
+        .edit_scope = .local_instance,
+    };
+    const shared_target: studio.CommandTarget = .{
+        .item_identity = 7,
+        .source = item.source,
+        .edit_scope = .shared_template,
+    };
+
+    try std.testing.expect(!inlineCommitChangesValue(.{
+        .target = local_target,
+        .field = .x,
+        .value = "100.000",
+    }, &items, &bounds));
+    try std.testing.expect(!inlineCommitChangesValue(.{
+        .target = local_target,
+        .field = .background,
+        .value = "NONE",
+    }, &items, &bounds));
+    try std.testing.expect(!inlineCommitChangesValue(.{
+        .target = shared_target,
+        .field = .x,
+        .value = "10",
+    }, &items, &bounds));
+    try std.testing.expect(!inlineCommitChangesValue(.{
+        .target = shared_target,
+        .field = .text,
+        .value = "Shared",
+    }, &items, &bounds));
+    try std.testing.expect(!inlineCommitChangesValue(.{
+        .target = shared_target,
+        .field = .opacity,
+        .value = "75%",
+    }, &items, &bounds));
+    try std.testing.expect(inlineCommitChangesValue(.{
+        .target = shared_target,
+        .field = .x,
+        .value = "100",
+    }, &items, &bounds));
+    try std.testing.expect(inlineCommitChangesValue(.{
+        .target = shared_target,
+        .field = .text,
+        .value = "Local",
+    }, &items, &bounds));
 }
 
 fn validReusableName(name: []const u8) bool {
@@ -2852,18 +3362,24 @@ fn normalizeBullets(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return output.toOwnedSlice(allocator);
 }
 
+fn validateStudioTextValue(text_value: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(text_value)) return error.InvalidStudioText;
+    if (std.mem.indexOfScalar(u8, text_value, '\r') != null) return error.InvalidStudioText;
+    if (std.mem.indexOfScalar(u8, text_value, '\n') == null) return;
+    var lines = std.mem.splitScalar(u8, text_value, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0 and (line[0] == '@' or line[0] == '#')) return error.InvalidStudioText;
+    }
+}
+
 fn itemTextSnippet(
     allocator: std.mem.Allocator,
     directive_without_text: []const u8,
     text_value: []const u8,
 ) ![]u8 {
-    if (std.mem.indexOfScalar(u8, text_value, '\r') != null) return error.InvalidStudioText;
+    try validateStudioTextValue(text_value);
     if (std.mem.indexOfScalar(u8, text_value, '\n') == null) {
         return std.fmt.allocPrint(allocator, "{s} text={s}", .{ directive_without_text, text_value });
-    }
-    var lines = std.mem.splitScalar(u8, text_value, '\n');
-    while (lines.next()) |line| {
-        if (line.len > 0 and (line[0] == '@' or line[0] == '#')) return error.InvalidStudioText;
     }
     return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ directive_without_text, text_value });
 }
@@ -3866,6 +4382,7 @@ fn applyStudioSemanticEdit(
             };
             try recordStudioPatch(history, patch);
         },
+        .commit_inline => return error.NonSourceStudioCommand,
         .copy_items => return error.NonSourceStudioCommand,
         .paste_items => |paste| {
             if (clipboard.items.items.len == 0) return error.StudioClipboardEmpty;

@@ -48,6 +48,7 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>V</kbd> | Reveal or hide Crowdplay results |
 | <kbd>R</kbd> | Reset votes in the active Crowdplay poll |
 | <kbd>E</kbd> | Enter or leave Studio visual editing mode |
+| <kbd>F3</kbd> | Toggle frame/rebuild diagnostics |
 
 **Beast Mode**: removes the 60 FPS limit
 
@@ -80,6 +81,16 @@ buttons for atomic paint-order changes. Full-slide background rows remain
 visible as read-only paint barriers. Switch to **Properties** in the same dock
 for exact values and styling. Opacity accepts the inclusive range `0`–`1` or
 `0%`–`100%`; visibility remains a separate source property.
+
+Properties are edited inline without covering the canvas. Click a field, or
+press <kbd>Enter</kbd> on a single selected text object while Properties is
+visible. <kbd>Enter</kbd> commits, <kbd>Tab</kbd> and
+<kbd>Shift-Tab</kbd> commit and traverse, <kbd>Shift-Enter</kbd> inserts a text
+line, and <kbd>Esc</kbd> cancels the draft. Invalid values remain focused with
+a field-local explanation; neither source nor history changes until validation
+succeeds. Long and multiline values scroll with the caret. Multi-selection
+shows truthful common/Mixed values but property mutation remains deliberately
+single-object and atomic.
 
 The top toolbar contains these one-shot canvas tools:
 
@@ -168,10 +179,23 @@ its original deck position. Promotion is intentionally conservative: Studio
 refuses template-backed slides or source whose global/default context cannot
 be moved without changing semantics.
 
-Text, bullet, image, and reusable-name actions open a small modal editor.
+New text/bullet/image creation and reusable-name actions open a small modal
+editor; editing an existing object's ordinary properties uses the inline
+inspector described above.
 <kbd>Enter</kbd> commits, <kbd>Shift-Enter</kbd> inserts a line in text fields,
 <kbd>Cmd/Ctrl-V</kbd> pastes, and <kbd>Esc</kbd> cancels without touching the
 source.
+
+### Rendering diagnostics
+
+Press <kbd>F3</kbd>, or launch with `--diagnostics`, to show frame time, the
+one-second peak and slow-frame count, render-graph rebuild time, slideshow
+arena capacity, mouse coordinates, and window size. Slow frames are also
+rate-limited in the log while diagnostics are active.
+`--diagnostics-select=ID` opens Studio with the unique authored `id=` selected
+in Properties; this is a non-mutating QA aid. Normal playback uses synchronized
+presentation plus a 60 Hz fallback; Beast Mode intentionally disables both
+limits.
 
 Studio edits the `.sld` document rather than maintaining a separate opaque
 scene. It changes only the source owned by the selected object and preserves

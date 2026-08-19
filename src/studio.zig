@@ -997,6 +997,39 @@ pub const NumericGeometryRequest = struct {
     field: GeometryField,
 };
 
+pub const InlineField = enum {
+    text,
+    x,
+    y,
+    width,
+    height,
+    foreground,
+    background,
+    font_size,
+    opacity,
+};
+
+pub const InlineError = enum {
+    invalid_utf8,
+    too_long,
+    invalid_number,
+    non_positive_dimension,
+    invalid_color,
+    invalid_font_size,
+    invalid_opacity,
+    invalid_text,
+    source_edit_failed,
+};
+
+/// A same-frame borrowed view into Studio's fixed inline editor buffer. The
+/// integration must consume `value` synchronously before the next Studio
+/// update; accept/reject then completes the handshake without a modal prompt.
+pub const InlineCommit = struct {
+    target: CommandTarget,
+    field: InlineField,
+    value: []const u8,
+};
+
 pub const MorphSceneCommand = struct {
     /// null selects the authored base scene; otherwise this is a zero-based
     /// morph-state index.
@@ -1082,6 +1115,7 @@ pub const SemanticCommand = union(enum) {
     paste_items: PasteItemsCommand,
     set_locked: SetLockedCommand,
     set_visible: SetVisibleCommand,
+    commit_inline: InlineCommit,
     promote_to_reusable: CommandTarget,
     select_morph_scene: MorphSceneCommand,
     new_slide: void,
@@ -1141,6 +1175,7 @@ pub const UiLayout = struct {
     clear_background: rl.Rectangle,
     font_size: rl.Rectangle = empty_ui_rectangle,
     opacity: rl.Rectangle = empty_ui_rectangle,
+    inline_error: rl.Rectangle = empty_ui_rectangle,
     align_buttons: [6]rl.Rectangle,
     distribute_buttons: [2]rl.Rectangle,
     layer_buttons: [4]rl.Rectangle,
@@ -1616,7 +1651,153 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     };
     if (!docked)
         properties.height = @min(properties.height, @max(0, statusPanel(viewport).y - gap - properties.y));
-    const compact_properties = properties.height < 520 * scale;
+    const compact_properties = properties.height < 480 * scale;
+    if (docked) {
+        const inset: f32 = 10 * scale;
+        const inner_width = @max(0, properties.width - inset * 2);
+        const field_height: f32 = @as(f32, if (compact_properties) 32 else 34) * scale;
+        const action_gap: f32 = 5 * scale;
+        const action_width = (inner_width - action_gap * 3) / 4;
+        const action_y = properties.y + 42 * scale;
+        const duplicate_item: rl.Rectangle = .{ .x = properties.x + inset, .y = action_y, .width = action_width, .height = 28 * scale };
+        const delete_item: rl.Rectangle = .{ .x = duplicate_item.x + action_width + action_gap, .y = action_y, .width = action_width, .height = duplicate_item.height };
+        const promote: rl.Rectangle = .{ .x = delete_item.x + action_width + action_gap, .y = action_y, .width = action_width, .height = duplicate_item.height };
+        const lock_item: rl.Rectangle = .{ .x = promote.x + action_width + action_gap, .y = action_y, .width = action_width, .height = duplicate_item.height };
+        const edit_text: rl.Rectangle = .{
+            .x = properties.x + inset,
+            .y = properties.y + 78 * scale,
+            .width = inner_width,
+            .height = @as(f32, if (compact_properties) 36 else 54) * scale,
+        };
+
+        const geometry_gap: f32 = 5 * scale;
+        const compact_geometry = compact_properties;
+        const geometry_columns: usize = if (compact_geometry) 4 else 2;
+        const geometry_rows: usize = if (compact_geometry) 1 else 2;
+        const geometry_width = (inner_width - geometry_gap * @as(f32, @floatFromInt(geometry_columns - 1))) /
+            @as(f32, @floatFromInt(geometry_columns));
+        const geometry_y = edit_text.y + edit_text.height + 8 * scale;
+        var geometry_fields: [4]rl.Rectangle = undefined;
+        for (&geometry_fields, 0..) |*field, index| field.* = .{
+            .x = properties.x + inset + @as(f32, @floatFromInt(index % geometry_columns)) * (geometry_width + geometry_gap),
+            .y = geometry_y + @as(f32, @floatFromInt(index / geometry_columns)) * (field_height + geometry_gap),
+            .width = geometry_width,
+            .height = field_height,
+        };
+        const geometry_bottom = geometry_y + @as(f32, @floatFromInt(geometry_rows)) * field_height +
+            @as(f32, @floatFromInt(geometry_rows - 1)) * geometry_gap;
+
+        const custom_width: f32 = 100 * scale;
+        const custom_foreground: rl.Rectangle = .{
+            .x = properties.x + inset,
+            .y = geometry_bottom + 8 * scale,
+            .width = custom_width,
+            .height = field_height,
+        };
+        const swatch_gap: f32 = 4 * scale;
+        const swatch_size = @min(@as(f32, 24) * scale, (inner_width - swatch_gap * 7) / 8);
+        var foreground_swatches: [palette.len]rl.Rectangle = undefined;
+        for (&foreground_swatches, 0..) |*swatch, index| swatch.* = .{
+            .x = properties.x + inset + @as(f32, @floatFromInt(index)) * (swatch_size + swatch_gap),
+            .y = custom_foreground.y + custom_foreground.height + 4 * scale,
+            .width = swatch_size,
+            .height = swatch_size,
+        };
+
+        const custom_background: rl.Rectangle = .{
+            .x = properties.x + inset + 64 * scale,
+            .y = foreground_swatches[0].y + swatch_size + 6 * scale,
+            .width = custom_width,
+            .height = field_height,
+        };
+        const clear_background: rl.Rectangle = .{
+            .x = properties.x + inset,
+            .y = custom_background.y,
+            .width = 56 * scale,
+            .height = field_height,
+        };
+        var background_swatches: [palette.len]rl.Rectangle = undefined;
+        for (&background_swatches, 0..) |*swatch, index| swatch.* = .{
+            .x = properties.x + inset + @as(f32, @floatFromInt(index)) * (swatch_size + swatch_gap),
+            .y = custom_background.y + custom_background.height + 4 * scale,
+            .width = swatch_size,
+            .height = swatch_size,
+        };
+
+        const scalar_gap: f32 = 8 * scale;
+        const scalar_width = (inner_width - scalar_gap) / 2;
+        const scalar_y = background_swatches[0].y + swatch_size + 6 * scale;
+        const font_size: rl.Rectangle = .{ .x = properties.x + inset, .y = scalar_y, .width = scalar_width, .height = field_height };
+        const opacity: rl.Rectangle = .{ .x = font_size.x + scalar_width + scalar_gap, .y = scalar_y, .width = scalar_width, .height = field_height };
+        const inline_error: rl.Rectangle = .{
+            .x = properties.x + inset,
+            .y = scalar_y + field_height + 4 * scale,
+            .width = inner_width,
+            .height = @min(@as(f32, 34) * scale, @max(@as(f32, 0), properties.y + properties.height - (scalar_y + field_height + 4 * scale) - 4 * scale)),
+        };
+
+        const lower_y = inline_error.y + inline_error.height + 10 * scale;
+        const lower_available = properties.y + properties.height - lower_y;
+        const minimal_properties = lower_available < 118 * scale;
+        const align_gap: f32 = 5 * scale;
+        const align_width = (inner_width - align_gap * 5) / 6;
+        var align_buttons: [6]rl.Rectangle = undefined;
+        for (&align_buttons, 0..) |*button, index| button.* = .{
+            .x = if (minimal_properties) properties.x else properties.x + inset + @as(f32, @floatFromInt(index)) * (align_width + align_gap),
+            .y = if (minimal_properties) properties.y else lower_y,
+            .width = if (minimal_properties) 0 else align_width,
+            .height = if (minimal_properties) 0 else 30 * scale,
+        };
+        const distribute_gap: f32 = 8 * scale;
+        const distribute_width = (inner_width - distribute_gap) / 2;
+        const distribute_y = lower_y + 38 * scale;
+        const distribute_buttons = [2]rl.Rectangle{
+            .{ .x = if (minimal_properties) properties.x else properties.x + inset, .y = if (minimal_properties) properties.y else distribute_y, .width = if (minimal_properties) 0 else distribute_width, .height = if (minimal_properties) 0 else 30 * scale },
+            .{ .x = if (minimal_properties) properties.x else properties.x + inset + distribute_width + distribute_gap, .y = if (minimal_properties) properties.y else distribute_y, .width = if (minimal_properties) 0 else distribute_width, .height = if (minimal_properties) 0 else 30 * scale },
+        };
+        const layer_y = lower_y + 76 * scale;
+        const layer_width = (inner_width - align_gap * 3) / 4;
+        var layer_buttons: [4]rl.Rectangle = undefined;
+        for (&layer_buttons, 0..) |*button, index| button.* = .{
+            .x = if (minimal_properties) properties.x else properties.x + inset + @as(f32, @floatFromInt(index)) * (layer_width + align_gap),
+            .y = if (minimal_properties) properties.y else layer_y,
+            .width = if (minimal_properties) 0 else layer_width,
+            .height = if (minimal_properties) 0 else 28 * scale,
+        };
+        return .{
+            .scale = scale,
+            .compact_properties = compact_properties,
+            .minimal_properties = minimal_properties,
+            .toolbar = toolbar,
+            .tool_buttons = tool_buttons,
+            .new_slide = new_slide,
+            .grid_toggle = grid_toggle,
+            .scene_previous = scene_previous,
+            .scene_label = scene_label,
+            .scene_next = scene_next,
+            .slides_dock_toggle = slides_dock_toggle,
+            .properties_dock_toggle = properties_dock_toggle,
+            .focus_canvas = focus_canvas,
+            .properties = properties,
+            .edit_text = edit_text,
+            .duplicate_item = duplicate_item,
+            .delete_item = delete_item,
+            .promote = promote,
+            .geometry_fields = geometry_fields,
+            .foreground_swatches = foreground_swatches,
+            .custom_foreground = custom_foreground,
+            .background_swatches = background_swatches,
+            .custom_background = custom_background,
+            .clear_background = clear_background,
+            .font_size = font_size,
+            .opacity = opacity,
+            .inline_error = inline_error,
+            .align_buttons = align_buttons,
+            .distribute_buttons = distribute_buttons,
+            .layer_buttons = layer_buttons,
+            .lock_item = lock_item,
+        };
+    }
     // The compact align/distribute/layer stack ends just below 450 px. Below
     // that height retain the primary geometry/color/type controls and lock,
     // rather than allowing the last row to leak into the status dock.
@@ -1785,6 +1966,18 @@ fn statusPanel(viewport: Viewport) rl.Rectangle {
 /// A testable input snapshot. `updateFromRaylib` is the convenient runtime
 /// adapter; tests and other frontends can call `update` directly.
 pub const FrameInput = struct {
+    inline_chars: [256]u8 = [_]u8{0} ** 256,
+    inline_chars_len: usize = 0,
+    inline_paste: ?[]const u8 = null,
+    inline_backspace_pressed: bool = false,
+    inline_delete_pressed: bool = false,
+    inline_left_pressed: bool = false,
+    inline_right_pressed: bool = false,
+    inline_home_pressed: bool = false,
+    inline_end_pressed: bool = false,
+    inline_submit_pressed: bool = false,
+    shortcut_modifier_down: bool = false,
+    shift_down: bool = false,
     toggle_pressed: bool = false,
     toggle_focus_canvas_pressed: bool = false,
     cancel_pressed: bool = false,
@@ -1856,7 +2049,17 @@ pub const FrameInput = struct {
             .add_reusable
         else
             null;
-        return .{
+        var result: FrameInput = .{
+            .inline_paste = if (shortcut_modifier and rl.isKeyPressed(.v)) rl.getClipboardText() else null,
+            .inline_backspace_pressed = keyPressedOrRepeated(.backspace),
+            .inline_delete_pressed = keyPressedOrRepeated(.delete),
+            .inline_left_pressed = keyPressedOrRepeated(.left),
+            .inline_right_pressed = keyPressedOrRepeated(.right),
+            .inline_home_pressed = keyPressedOrRepeated(.home),
+            .inline_end_pressed = keyPressedOrRepeated(.end),
+            .inline_submit_pressed = rl.isKeyPressed(.enter),
+            .shortcut_modifier_down = shortcut_modifier,
+            .shift_down = shift,
             .toggle_pressed = rl.isKeyPressed(.e),
             .toggle_focus_canvas_pressed = rl.isKeyPressed(.tab),
             .cancel_pressed = rl.isKeyPressed(.escape),
@@ -1911,6 +2114,18 @@ pub const FrameInput = struct {
             .delete_library_pressed = shift and rl.isKeyPressed(.delete),
             .workspace_scroll = rl.getMouseWheelMove(),
         };
+        while (result.inline_chars_len < result.inline_chars.len) {
+            const pressed = rl.getCharPressed();
+            if (pressed <= 0) break;
+            const codepoint = std.math.cast(u21, pressed) orelse continue;
+            if (codepoint < 32 or codepoint == 127) continue;
+            var encoded: [4]u8 = undefined;
+            const encoded_len = std.unicode.utf8Encode(codepoint, &encoded) catch continue;
+            if (encoded_len > result.inline_chars.len - result.inline_chars_len) break;
+            @memcpy(result.inline_chars[result.inline_chars_len .. result.inline_chars_len + encoded_len], encoded[0..encoded_len]);
+            result.inline_chars_len += encoded_len;
+        }
+        return result;
     }
 };
 
@@ -1977,6 +2192,34 @@ const SelectionGeometry = struct {
     edit_scope: EditScope,
 };
 
+pub const max_inline_input_bytes: usize = 8192;
+
+const InlineEditor = struct {
+    active: bool = false,
+    field: InlineField = .x,
+    target: CommandTarget = .{ .item_identity = 0, .source = .{} },
+    buffer: [max_inline_input_bytes + 1]u8 = [_]u8{0} ** (max_inline_input_bytes + 1),
+    opening_buffer: [max_inline_input_bytes + 1]u8 = [_]u8{0} ** (max_inline_input_bytes + 1),
+    len: usize = 0,
+    opening_len: usize = 0,
+    cursor: usize = 0,
+    select_all: bool = false,
+    blocked_initial: bool = false,
+    dirty: bool = false,
+    awaiting_commit: bool = false,
+    refresh_pending: bool = false,
+    advance_after_accept: i8 = 0,
+    next_field_after_accept: ?InlineField = null,
+    next_scope_after_accept: ?EditScope = null,
+    blur_after_accept: bool = false,
+    stable_id_hash: ?u64 = null,
+    error_value: ?InlineError = null,
+
+    fn text(self: *const InlineEditor) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
 pub const Studio = struct {
     enabled: bool = false,
     /// Focus Canvas keeps editing/selection live while hiding all permanent
@@ -2019,6 +2262,7 @@ pub const Studio = struct {
     pending_semantic_command: ?SemanticCommand = null,
     pending_geometry_command: ?GeometryCommand = null,
     pending_geometry_batch: ?GeometryBatchCommand = null,
+    inline_editor: InlineEditor = .{},
     group_drag: [max_selection_items]GroupDragMember = undefined,
     group_drag_count: usize = 0,
     group_bounds_before: Geometry = .{ .position = .zero(), .size = .zero() },
@@ -2042,10 +2286,615 @@ pub const Studio = struct {
         self.ui_font = font;
     }
 
+    pub fn inlineEditActive(self: Studio) bool {
+        return self.inline_editor.active;
+    }
+
+    pub fn inlineEditField(self: Studio) ?InlineField {
+        return if (self.inline_editor.active) self.inline_editor.field else null;
+    }
+
+    pub fn inlineEditText(self: *const Studio) []const u8 {
+        return if (self.inline_editor.active) self.inline_editor.text() else "";
+    }
+
+    pub fn inlineEditError(self: Studio) ?InlineError {
+        return if (self.inline_editor.active) self.inline_editor.error_value else null;
+    }
+
+    /// Completes a synchronous integration commit. The editor deliberately
+    /// remains active; the next update refreshes the canonical value from the
+    /// reparsed item before applying queued Tab traversal.
+    pub fn acceptInlineCommit(self: *Studio, field: InlineField) void {
+        if (!self.inline_editor.active or self.inline_editor.field != field or
+            !self.inline_editor.awaiting_commit) return;
+        self.inline_editor.awaiting_commit = false;
+        self.inline_editor.refresh_pending = true;
+        self.inline_editor.error_value = null;
+        self.inline_editor.dirty = false;
+    }
+
+    /// Leaves the user's exact UTF-8 buffer and caret intact so a rejected
+    /// value can be corrected without reopening or retyping the field.
+    pub fn rejectInlineCommit(self: *Studio, field: InlineField, reason: InlineError) void {
+        if (!self.inline_editor.active or self.inline_editor.field != field or
+            !self.inline_editor.awaiting_commit) return;
+        self.inline_editor.awaiting_commit = false;
+        self.inline_editor.refresh_pending = false;
+        self.inline_editor.advance_after_accept = 0;
+        self.inline_editor.next_field_after_accept = null;
+        self.inline_editor.next_scope_after_accept = null;
+        self.inline_editor.blur_after_accept = false;
+        self.inline_editor.error_value = reason;
+    }
+
+    fn cancelInlineEdit(self: *Studio) void {
+        self.inline_editor = .{};
+    }
+
+    fn setInlineBuffer(self: *Studio, value: []const u8) bool {
+        if (!std.unicode.utf8ValidateSlice(value)) {
+            self.inline_editor.len = 0;
+            self.inline_editor.opening_len = 0;
+            self.inline_editor.cursor = 0;
+            self.inline_editor.buffer[0] = 0;
+            self.inline_editor.opening_buffer[0] = 0;
+            self.inline_editor.error_value = .invalid_utf8;
+            self.inline_editor.blocked_initial = true;
+            return false;
+        }
+        if (value.len > max_inline_input_bytes) {
+            self.inline_editor.len = 0;
+            self.inline_editor.opening_len = 0;
+            self.inline_editor.cursor = 0;
+            self.inline_editor.buffer[0] = 0;
+            self.inline_editor.opening_buffer[0] = 0;
+            self.inline_editor.error_value = .too_long;
+            self.inline_editor.blocked_initial = true;
+            return false;
+        }
+        @memcpy(self.inline_editor.buffer[0..value.len], value);
+        @memcpy(self.inline_editor.opening_buffer[0..value.len], value);
+        self.inline_editor.buffer[value.len] = 0;
+        self.inline_editor.opening_buffer[value.len] = 0;
+        self.inline_editor.len = value.len;
+        self.inline_editor.opening_len = value.len;
+        self.inline_editor.cursor = value.len;
+        self.inline_editor.error_value = null;
+        self.inline_editor.blocked_initial = false;
+        return true;
+    }
+
+    fn formatInlineFloat(buffer: []u8, value: f32) []const u8 {
+        const raw = std.fmt.bufPrint(buffer, "{d:.3}", .{value}) catch return "";
+        var end = raw.len;
+        while (end > 0 and raw[end - 1] == '0') end -= 1;
+        if (end > 0 and raw[end - 1] == '.') end -= 1;
+        return raw[0..end];
+    }
+
+    fn formatInlineColor(buffer: *[9]u8, color: rl.Color) []const u8 {
+        const digits = "0123456789abcdef";
+        const components = [_]u8{ color.r, color.g, color.b, color.a };
+        buffer[0] = '#';
+        for (components, 0..) |component, index| {
+            buffer[1 + index * 2] = digits[component >> 4];
+            buffer[2 + index * 2] = digits[component & 0x0f];
+        }
+        return buffer;
+    }
+
+    fn inlineFieldApplies(field: InlineField, item: slides.SlideItem) bool {
+        if (item.kind == .background) return false;
+        return switch (field) {
+            .text, .foreground, .font_size => item.kind == .textbox,
+            .x, .y, .width, .height, .background, .opacity => true,
+        };
+    }
+
+    fn inlineInitialValue(
+        _: Studio,
+        item: slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        field: InlineField,
+        edit_scope: EditScope,
+        scalar_buffer: []u8,
+        color_buffer: *[9]u8,
+    ) []const u8 {
+        const shared = if (edit_scope == .shared_template) item.sharedTemplateValues() else null;
+        const geometry = if (shared) |values|
+            Geometry{ .position = values.position, .size = values.size }
+        else
+            itemGeometry(item, resolved_bounds);
+        return switch (field) {
+            .text => if (shared) |values| values.text orelse "" else item.text orelse "",
+            .x => formatInlineFloat(scalar_buffer, geometry.position.x),
+            .y => formatInlineFloat(scalar_buffer, geometry.position.y),
+            .width => formatInlineFloat(scalar_buffer, geometry.size.x),
+            .height => formatInlineFloat(scalar_buffer, geometry.size.y),
+            .foreground => formatInlineColor(color_buffer, if (shared) |values| values.color orelse .white else item.color orelse .white),
+            .background => if (shared) |values|
+                if (values.background_color) |color| formatInlineColor(color_buffer, color) else "none"
+            else if (item.background_color) |color|
+                formatInlineColor(color_buffer, color)
+            else
+                "none",
+            .font_size => if (shared) |values|
+                if (values.font_size) |size| std.fmt.bufPrint(scalar_buffer, "{d}", .{size}) catch "" else ""
+            else if (item.fontSize) |size|
+                std.fmt.bufPrint(scalar_buffer, "{d}", .{size}) catch ""
+            else
+                "",
+            .opacity => formatInlineFloat(scalar_buffer, if (shared) |values| values.opacity else item.opacity),
+        };
+    }
+
+    fn beginInlineEdit(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        field: InlineField,
+        allow_shared_edit: bool,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() != 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (!inlineFieldApplies(field, item)) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target: CommandTarget = .{
+            .item_identity = item.identity,
+            .source = self.commandSource(item, edit_scope),
+            .edit_scope = edit_scope,
+        };
+        self.inline_editor = .{
+            .active = true,
+            .field = field,
+            .target = target,
+            .stable_id_hash = if (item.id != null and itemIdIsUnique(items, index))
+                std.hash.Wyhash.hash(0, item.id.?)
+            else
+                null,
+        };
+        var scalar_buffer: [64]u8 = undefined;
+        var color_buffer: [9]u8 = undefined;
+        const initial = self.inlineInitialValue(item, resolved_bounds, field, edit_scope, &scalar_buffer, &color_buffer);
+        _ = self.setInlineBuffer(initial);
+        self.inline_editor.dirty = false;
+        self.notice = .none;
+        return true;
+    }
+
+    fn inlineValueError(field: InlineField, raw_value: []const u8) ?InlineError {
+        if (!std.unicode.utf8ValidateSlice(raw_value)) return .invalid_utf8;
+        const value = std.mem.trim(u8, raw_value, " \t\r\n");
+        return switch (field) {
+            .text => blk: {
+                if (std.mem.indexOfScalar(u8, raw_value, '\r') != null) break :blk .invalid_text;
+                if (std.mem.indexOfScalar(u8, raw_value, '\n') == null) break :blk null;
+                var lines = std.mem.splitScalar(u8, raw_value, '\n');
+                while (lines.next()) |line| {
+                    if (line.len > 0 and (line[0] == '@' or line[0] == '#')) break :blk .invalid_text;
+                }
+                break :blk null;
+            },
+            .x, .y => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_number;
+                break :blk if (std.math.isFinite(parsed)) null else .invalid_number;
+            },
+            .width, .height => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_number;
+                if (!std.math.isFinite(parsed)) break :blk .invalid_number;
+                break :blk if (parsed >= default_min_item_size) null else .non_positive_dimension;
+            },
+            .foreground, .background => blk: {
+                if (field == .background and std.ascii.eqlIgnoreCase(value, "none")) break :blk null;
+                if ((value.len != 7 and value.len != 9) or value[0] != '#') break :blk .invalid_color;
+                for (value[1..]) |byte| if (!std.ascii.isHex(byte)) break :blk .invalid_color;
+                break :blk null;
+            },
+            .font_size => blk: {
+                const parsed = std.fmt.parseInt(i32, value, 10) catch break :blk .invalid_font_size;
+                break :blk if (parsed > 0 and parsed <= 4096) null else .invalid_font_size;
+            },
+            .opacity => blk: {
+                if (value.len == 0) break :blk .invalid_opacity;
+                const percent = value[value.len - 1] == '%';
+                const number = if (percent) std.mem.trim(u8, value[0 .. value.len - 1], " \t") else value;
+                const parsed = std.fmt.parseFloat(f32, number) catch break :blk .invalid_opacity;
+                if (!std.math.isFinite(parsed)) break :blk .invalid_opacity;
+                const maximum: f32 = if (percent) 100 else 1;
+                break :blk if (parsed >= 0 and parsed <= maximum) null else .invalid_opacity;
+            },
+        };
+    }
+
+    fn insertInlineBytes(self: *Studio, value: []const u8) bool {
+        if (!std.unicode.utf8ValidateSlice(value)) {
+            self.inline_editor.error_value = .invalid_utf8;
+            return false;
+        }
+        const retained_len = if (self.inline_editor.select_all) 0 else self.inline_editor.len;
+        if (value.len > max_inline_input_bytes - retained_len) {
+            self.inline_editor.error_value = .too_long;
+            return false;
+        }
+        if (self.inline_editor.select_all) {
+            self.inline_editor.len = 0;
+            self.inline_editor.cursor = 0;
+            self.inline_editor.select_all = false;
+        }
+        const cursor = self.inline_editor.cursor;
+        const old_len = self.inline_editor.len;
+        std.mem.copyBackwards(
+            u8,
+            self.inline_editor.buffer[cursor + value.len .. old_len + value.len],
+            self.inline_editor.buffer[cursor..old_len],
+        );
+        @memcpy(self.inline_editor.buffer[cursor .. cursor + value.len], value);
+        self.inline_editor.len += value.len;
+        self.inline_editor.cursor += value.len;
+        self.inline_editor.buffer[self.inline_editor.len] = 0;
+        self.updateInlineDirty();
+        self.inline_editor.error_value = null;
+        return true;
+    }
+
+    fn clearInlineSelection(self: *Studio) bool {
+        if (!self.inline_editor.select_all) return false;
+        self.inline_editor.len = 0;
+        self.inline_editor.cursor = 0;
+        self.inline_editor.buffer[0] = 0;
+        self.inline_editor.select_all = false;
+        self.updateInlineDirty();
+        self.inline_editor.error_value = null;
+        return true;
+    }
+
+    fn removeInlineBeforeCursor(self: *Studio) void {
+        if (self.clearInlineSelection() or self.inline_editor.cursor == 0) return;
+        const cursor = self.inline_editor.cursor;
+        var start = cursor - 1;
+        while (start > 0 and self.inline_editor.buffer[start] & 0xc0 == 0x80) start -= 1;
+        std.mem.copyForwards(
+            u8,
+            self.inline_editor.buffer[start .. self.inline_editor.len - (cursor - start)],
+            self.inline_editor.buffer[cursor..self.inline_editor.len],
+        );
+        self.inline_editor.len -= cursor - start;
+        self.inline_editor.cursor = start;
+        self.inline_editor.buffer[self.inline_editor.len] = 0;
+        self.updateInlineDirty();
+        self.inline_editor.error_value = null;
+    }
+
+    fn removeInlineAtCursor(self: *Studio) void {
+        if (self.clearInlineSelection() or self.inline_editor.cursor >= self.inline_editor.len) return;
+        const cursor = self.inline_editor.cursor;
+        var end = cursor + 1;
+        while (end < self.inline_editor.len and self.inline_editor.buffer[end] & 0xc0 == 0x80) end += 1;
+        std.mem.copyForwards(
+            u8,
+            self.inline_editor.buffer[cursor .. self.inline_editor.len - (end - cursor)],
+            self.inline_editor.buffer[end..self.inline_editor.len],
+        );
+        self.inline_editor.len -= end - cursor;
+        self.inline_editor.buffer[self.inline_editor.len] = 0;
+        self.updateInlineDirty();
+        self.inline_editor.error_value = null;
+    }
+
+    fn moveInlineCursor(self: *Studio, direction: i8) void {
+        self.inline_editor.select_all = false;
+        if (direction < 0 and self.inline_editor.cursor > 0) {
+            self.inline_editor.cursor -= 1;
+            while (self.inline_editor.cursor > 0 and self.inline_editor.buffer[self.inline_editor.cursor] & 0xc0 == 0x80)
+                self.inline_editor.cursor -= 1;
+        } else if (direction > 0 and self.inline_editor.cursor < self.inline_editor.len) {
+            self.inline_editor.cursor += 1;
+            while (self.inline_editor.cursor < self.inline_editor.len and self.inline_editor.buffer[self.inline_editor.cursor] & 0xc0 == 0x80)
+                self.inline_editor.cursor += 1;
+        }
+    }
+
+    fn updateInlineDirty(self: *Studio) void {
+        self.inline_editor.dirty = self.inline_editor.len != self.inline_editor.opening_len or
+            !std.mem.eql(
+                u8,
+                self.inline_editor.buffer[0..self.inline_editor.len],
+                self.inline_editor.opening_buffer[0..self.inline_editor.opening_len],
+            );
+    }
+
+    fn queueInlineCommit(
+        self: *Studio,
+        advance: i8,
+        next_field: ?InlineField,
+        next_scope: ?EditScope,
+    ) bool {
+        if (!self.inline_editor.active or self.inline_editor.awaiting_commit) return true;
+        if (self.inline_editor.blocked_initial) return true;
+        if (inlineValueError(self.inline_editor.field, self.inline_editor.text())) |reason| {
+            self.inline_editor.error_value = reason;
+            self.inline_editor.advance_after_accept = 0;
+            self.inline_editor.next_field_after_accept = null;
+            self.inline_editor.next_scope_after_accept = null;
+            self.inline_editor.blur_after_accept = false;
+            return true;
+        }
+        self.inline_editor.advance_after_accept = advance;
+        self.inline_editor.next_field_after_accept = next_field;
+        self.inline_editor.next_scope_after_accept = next_scope;
+        self.inline_editor.awaiting_commit = true;
+        self.inline_editor.error_value = null;
+        self.pending_semantic_command = .{ .commit_inline = .{
+            .target = self.inline_editor.target,
+            .field = self.inline_editor.field,
+            .value = self.inline_editor.text(),
+        } };
+        return true;
+    }
+
+    fn nextInlineField(field: InlineField, direction: i8, item: slides.SlideItem) InlineField {
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
+        var current: usize = 0;
+        for (fields, 0..) |candidate, index| if (candidate == field) {
+            current = index;
+            break;
+        };
+        var step: usize = 0;
+        while (step < fields.len) : (step += 1) {
+            current = if (direction < 0)
+                if (current == 0) fields.len - 1 else current - 1
+            else
+                (current + 1) % fields.len;
+            if (inlineFieldApplies(fields[current], item)) return fields[current];
+        }
+        return field;
+    }
+
+    fn inlineFieldRect(layout: UiLayout, field: InlineField) rl.Rectangle {
+        return switch (field) {
+            .text => layout.edit_text,
+            .x => layout.geometry_fields[0],
+            .y => layout.geometry_fields[1],
+            .width => layout.geometry_fields[2],
+            .height => layout.geometry_fields[3],
+            .foreground => layout.custom_foreground,
+            .background => layout.custom_background,
+            .font_size => layout.font_size,
+            .opacity => layout.opacity,
+        };
+    }
+
+    fn inlineFieldAtPoint(layout: UiLayout, item: slides.SlideItem, pointer: rl.Vector2) ?InlineField {
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
+        for (fields) |field| {
+            if (inlineFieldApplies(field, item) and pointInRectangle(pointer, inlineFieldRect(layout, field))) return field;
+        }
+        return null;
+    }
+
+    fn inlinePropertiesVisible(self: Studio, viewport: Viewport) bool {
+        const chrome = viewport.chrome orelse return false;
+        return chrome.visible and chrome.right_visible and !self.focus_canvas and
+            self.inspector_panel == .properties;
+    }
+
+    fn revealInlineProperties(self: *Studio) void {
+        self.focus_canvas = false;
+        self.active_dock = .properties;
+        self.inspector_panel = .properties;
+        self.notice = .none;
+    }
+
+    fn inlineTargetStillMatches(self: Studio, items: []const slides.SlideItem, item_index: usize) bool {
+        const item = items[item_index];
+        if (self.inline_editor.stable_id_hash) |wanted_hash| {
+            const id = item.id orelse return false;
+            return itemIdIsUnique(items, item_index) and std.hash.Wyhash.hash(0, id) == wanted_hash;
+        }
+        return item.identity == self.inline_editor.target.item_identity;
+    }
+
+    fn refreshInlineEditor(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+    ) void {
+        if (!self.inline_editor.active or !self.inline_editor.refresh_pending) return;
+        self.inline_editor.refresh_pending = false;
+        const item_index = self.selectedIndex(items) orelse {
+            self.inline_editor.error_value = .source_edit_failed;
+            self.inline_editor.advance_after_accept = 0;
+            self.inline_editor.next_field_after_accept = null;
+            self.inline_editor.next_scope_after_accept = null;
+            self.inline_editor.blur_after_accept = false;
+            return;
+        };
+        if (self.selectionCount() != 1 or !self.inlineTargetStillMatches(items, item_index)) {
+            self.inline_editor.error_value = .source_edit_failed;
+            self.inline_editor.advance_after_accept = 0;
+            self.inline_editor.next_field_after_accept = null;
+            self.inline_editor.next_scope_after_accept = null;
+            self.inline_editor.blur_after_accept = false;
+            return;
+        }
+        const item = items[item_index];
+        const previous_field = self.inline_editor.field;
+        const previous_scope = self.inline_editor.target.edit_scope;
+        const requested_next = self.inline_editor.next_field_after_accept;
+        const requested_next_scope = self.inline_editor.next_scope_after_accept;
+        const advance = self.inline_editor.advance_after_accept;
+        const blur = self.inline_editor.blur_after_accept;
+        self.inline_editor.target = .{
+            .item_identity = item.identity,
+            .source = self.commandSource(item, previous_scope),
+            .edit_scope = previous_scope,
+        };
+        var scalar_buffer: [64]u8 = undefined;
+        var color_buffer: [9]u8 = undefined;
+        const canonical = self.inlineInitialValue(
+            item,
+            resolved_bounds,
+            previous_field,
+            previous_scope,
+            &scalar_buffer,
+            &color_buffer,
+        );
+        _ = self.setInlineBuffer(canonical);
+        self.inline_editor.dirty = false;
+        self.inline_editor.select_all = true;
+        self.inline_editor.advance_after_accept = 0;
+        self.inline_editor.next_field_after_accept = null;
+        self.inline_editor.next_scope_after_accept = null;
+        self.inline_editor.blur_after_accept = false;
+        if (blur) {
+            self.cancelInlineEdit();
+            return;
+        }
+        const next_field = requested_next orelse if (advance != 0)
+            nextInlineField(previous_field, advance, item)
+        else
+            return;
+        const next_scope = requested_next_scope orelse previous_scope;
+        _ = self.beginInlineEdit(items, resolved_bounds, next_field, next_scope == .shared_template);
+        if (!self.inline_editor.active or self.inline_editor.target.edit_scope != next_scope) {
+            self.inline_editor.error_value = .source_edit_failed;
+            return;
+        }
+        self.inline_editor.select_all = true;
+    }
+
+    fn handleInlineEditor(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        input: FrameInput,
+    ) bool {
+        self.refreshInlineEditor(items, resolved_bounds);
+        if (!self.inline_editor.active) return false;
+        if (input.cancel_pressed) {
+            self.cancelInlineEdit();
+            self.notice = .none;
+            return true;
+        }
+        if (self.inline_editor.blocked_initial or self.inline_editor.awaiting_commit) return true;
+
+        const item_index = self.selectedIndex(items) orelse {
+            self.cancelInlineEdit();
+            return true;
+        };
+        if (self.selectionCount() != 1 or !self.inlineTargetStillMatches(items, item_index)) {
+            self.cancelInlineEdit();
+            self.notice = .edit_failed;
+            return true;
+        }
+        const item = items[item_index];
+        const layout = uiLayout(viewport);
+        if (input.pointer_pressed) {
+            if (inlineFieldAtPoint(layout, item, input.pointer_screen)) |field| {
+                if (field == self.inline_editor.field) {
+                    self.inline_editor.select_all = true;
+                    return true;
+                }
+                if (self.inline_editor.dirty) {
+                    const next_scope = self.editScopeForItem(items, item_index, input.allow_shared_edit) orelse return true;
+                    self.inline_editor.blur_after_accept = false;
+                    return self.queueInlineCommit(0, field, next_scope);
+                }
+                _ = self.beginInlineEdit(items, resolved_bounds, field, input.allow_shared_edit);
+                self.inline_editor.select_all = true;
+                return true;
+            }
+            if (self.inline_editor.dirty) {
+                self.inline_editor.blur_after_accept = true;
+                _ = self.queueInlineCommit(0, null, null);
+            } else {
+                self.cancelInlineEdit();
+                return false;
+            }
+            return true;
+        }
+
+        if (input.select_all_pressed) {
+            self.inline_editor.select_all = true;
+            return true;
+        }
+        if (input.copy_pressed) {
+            const text: [:0]const u8 = self.inline_editor.buffer[0..self.inline_editor.len :0];
+            rl.setClipboardText(text);
+            return true;
+        }
+        if (input.inline_paste) |paste| _ = self.insertInlineBytes(paste);
+        if (input.inline_home_pressed) {
+            self.inline_editor.cursor = 0;
+            self.inline_editor.select_all = false;
+        }
+        if (input.inline_end_pressed) {
+            self.inline_editor.cursor = self.inline_editor.len;
+            self.inline_editor.select_all = false;
+        }
+        if (input.inline_left_pressed) self.moveInlineCursor(-1);
+        if (input.inline_right_pressed) self.moveInlineCursor(1);
+        if (input.inline_backspace_pressed) self.removeInlineBeforeCursor();
+        if (input.inline_delete_pressed) self.removeInlineAtCursor();
+        if (!input.shortcut_modifier_down and input.inline_chars_len > 0)
+            _ = self.insertInlineBytes(input.inline_chars[0..input.inline_chars_len]);
+
+        if (input.toggle_focus_canvas_pressed) {
+            const direction: i8 = if (input.shift_down) -1 else 1;
+            if (self.inline_editor.dirty) {
+                self.inline_editor.blur_after_accept = false;
+                return self.queueInlineCommit(direction, null, null);
+            }
+            const next_field = nextInlineField(self.inline_editor.field, direction, item);
+            _ = self.beginInlineEdit(
+                items,
+                resolved_bounds,
+                next_field,
+                self.inline_editor.target.edit_scope == .shared_template,
+            );
+            self.inline_editor.select_all = true;
+            return true;
+        }
+        if (input.inline_submit_pressed) {
+            if (self.inline_editor.field == .text and input.shift_down) {
+                _ = self.insertInlineBytes("\n");
+            } else if (self.inline_editor.dirty) {
+                self.inline_editor.blur_after_accept = false;
+                return self.queueInlineCommit(0, null, null);
+            } else {
+                self.inline_editor.select_all = true;
+            }
+            return true;
+        }
+        return true;
+    }
+
     fn measureUiText(self: Studio, text: [:0]const u8, font_size: i32) f32 {
-        if (self.ui_font) |font|
-            return rl.measureTextEx(font, text, @floatFromInt(font_size), 0).x;
-        return @floatFromInt(rl.measureText(text, font_size));
+        const measured: f32 = if (self.ui_font) |font|
+            rl.measureTextEx(font, text, @floatFromInt(font_size), 0).x
+        else
+            @floatFromInt(rl.measureText(text, font_size));
+        if (measured > 0 or text.len == 0) return measured;
+        // Unit tests and minimal embedders may ask for layout before raylib's
+        // default font is initialized. A codepoint-based fallback keeps the
+        // containment and caret logic deterministic without treating UTF-8
+        // continuation bytes as separate glyphs.
+        const codepoints = std.unicode.utf8CountCodepoints(text) catch text.len;
+        return @as(f32, @floatFromInt(codepoints)) * @as(f32, @floatFromInt(font_size)) * 0.56;
     }
 
     fn drawUiText(self: Studio, text: [:0]const u8, position: rl.Vector2, font_size: i32, color: rl.Color) void {
@@ -2173,6 +3022,7 @@ pub const Studio = struct {
         else
             null;
         if (self.active_morph_state == normalized) return;
+        self.cancelInlineEdit();
         self.clearSelection(items);
         self.active_morph_state = normalized;
         self.snap_guides = .{};
@@ -2203,6 +3053,7 @@ pub const Studio = struct {
     }
 
     pub fn toggle(self: *Studio, items: []slides.SlideItem) void {
+        self.cancelInlineEdit();
         if (self.enabled and self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.enabled = !self.enabled;
@@ -2220,6 +3071,7 @@ pub const Studio = struct {
     }
 
     pub fn disable(self: *Studio, items: []slides.SlideItem) void {
+        self.cancelInlineEdit();
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.enabled = false;
@@ -2235,6 +3087,7 @@ pub const Studio = struct {
     }
 
     pub fn clearSelection(self: *Studio, items: []slides.SlideItem) void {
+        self.cancelInlineEdit();
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.selected_identity = null;
@@ -2461,11 +3314,22 @@ pub const Studio = struct {
         input: FrameInput,
     ) ?GeometryCommand {
         if (input.pointer_pressed or input.nudge.x != 0 or input.nudge.y != 0) self.notice = .none;
+        if (!self.enabled) {
+            if (input.toggle_pressed) self.toggle(items);
+            return null;
+        }
+
+        self.validateSelection(items, resolved_bounds);
+        if (self.inline_editor.active and workspace.visible and self.last_workspace_slide != null and
+            self.last_workspace_slide.? != workspace.current_slide)
+        {
+            self.cancelInlineEdit();
+        }
+        if (self.handleInlineEditor(items, resolved_bounds, viewport, input)) return null;
         if (input.toggle_pressed) {
             self.toggle(items);
             return null;
         }
-        if (!self.enabled) return null;
         if (input.toggle_focus_canvas_pressed) {
             if (self.interaction != .idle) self.cancelInteraction(items);
             self.marquee.active = false;
@@ -2474,7 +3338,6 @@ pub const Studio = struct {
             return null;
         }
 
-        self.validateSelection(items, resolved_bounds);
         self.normalizeObjects(items, viewport);
         self.handleObjectsScroll(items, viewport, input);
 
@@ -2574,7 +3437,13 @@ pub const Studio = struct {
             return null;
         }
         if (input.edit_text_pressed) {
-            _ = self.emitSelectedCommand(items, input.allow_shared_edit, .edit_text);
+            if (self.inlinePropertiesVisible(viewport)) {
+                _ = self.beginInlineEdit(items, resolved_bounds, .text, input.allow_shared_edit);
+            } else if (viewport.chrome != null) {
+                self.revealInlineProperties();
+            } else {
+                _ = self.emitSelectedCommand(items, input.allow_shared_edit, .edit_text);
+            }
             return null;
         }
         if (input.promote_pressed) {
@@ -3841,8 +4710,12 @@ pub const Studio = struct {
             }
             if (self.selected_identity == null) return true;
         }
+        const inline_properties = viewport.chrome != null;
         if (pointInRectangle(pointer, layout.edit_text))
-            return self.emitSelectedCommand(items, allow_shared_edit, .edit_text);
+            return if (inline_properties)
+                self.beginInlineEdit(items, resolved_bounds, .text, allow_shared_edit)
+            else
+                self.emitSelectedCommand(items, allow_shared_edit, .edit_text);
         if (pointInRectangle(pointer, layout.duplicate_item))
             return self.emitDuplicateItem(items, allow_shared_edit);
         if (pointInRectangle(pointer, layout.delete_item))
@@ -3851,16 +4724,25 @@ pub const Studio = struct {
             return self.emitSelectedCommand(items, allow_shared_edit, .promote_to_reusable);
         for (layout.geometry_fields, 0..) |button, index| {
             if (pointInRectangle(pointer, button))
-                return self.emitPropertyRequest(items, allow_shared_edit, .{ .numeric_geometry = @enumFromInt(index) });
+                return if (inline_properties)
+                    self.beginInlineEdit(items, resolved_bounds, @enumFromInt(index + 1), allow_shared_edit)
+                else
+                    self.emitPropertyRequest(items, allow_shared_edit, .{ .numeric_geometry = @enumFromInt(index) });
         }
         if (pointInRectangle(pointer, layout.custom_foreground))
-            return self.emitPropertyRequest(items, allow_shared_edit, .custom_foreground);
+            return if (inline_properties)
+                self.beginInlineEdit(items, resolved_bounds, .foreground, allow_shared_edit)
+            else
+                self.emitPropertyRequest(items, allow_shared_edit, .custom_foreground);
         for (layout.foreground_swatches, 0..) |swatch, index| {
             if (pointInRectangle(pointer, swatch))
                 return self.emitColorCommand(items, allow_shared_edit, palette[index], false);
         }
         if (pointInRectangle(pointer, layout.custom_background))
-            return self.emitPropertyRequest(items, allow_shared_edit, .custom_background);
+            return if (inline_properties)
+                self.beginInlineEdit(items, resolved_bounds, .background, allow_shared_edit)
+            else
+                self.emitPropertyRequest(items, allow_shared_edit, .custom_background);
         for (layout.background_swatches, 0..) |swatch, index| {
             if (pointInRectangle(pointer, swatch))
                 return self.emitColorCommand(items, allow_shared_edit, palette[index], true);
@@ -3868,9 +4750,15 @@ pub const Studio = struct {
         if (pointInRectangle(pointer, layout.clear_background))
             return self.emitClearBackgroundCommand(items, allow_shared_edit);
         if (pointInRectangle(pointer, layout.font_size))
-            return self.emitPropertyRequest(items, allow_shared_edit, .font_size);
+            return if (inline_properties)
+                self.beginInlineEdit(items, resolved_bounds, .font_size, allow_shared_edit)
+            else
+                self.emitPropertyRequest(items, allow_shared_edit, .font_size);
         if (pointInRectangle(pointer, layout.opacity))
-            return self.emitPropertyRequest(items, allow_shared_edit, .opacity);
+            return if (inline_properties)
+                self.beginInlineEdit(items, resolved_bounds, .opacity, allow_shared_edit)
+            else
+                self.emitPropertyRequest(items, allow_shared_edit, .opacity);
         for (layout.align_buttons, 0..) |button, index| {
             if (pointInRectangle(pointer, button)) {
                 self.pending_geometry_command = self.alignSelected(
@@ -5661,6 +6549,275 @@ pub const Studio = struct {
         drawActionButton(self, layout.focus_canvas, "Focus");
     }
 
+    fn inlineItemsEqual(
+        field: InlineField,
+        a: slides.SlideItem,
+        b: slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+    ) bool {
+        if (!inlineFieldApplies(field, a) or !inlineFieldApplies(field, b)) return false;
+        const a_geometry = itemGeometry(a, resolved_bounds);
+        const b_geometry = itemGeometry(b, resolved_bounds);
+        return switch (field) {
+            .text => std.mem.eql(u8, a.text orelse "", b.text orelse ""),
+            .x => a_geometry.position.x == b_geometry.position.x,
+            .y => a_geometry.position.y == b_geometry.position.y,
+            .width => a_geometry.size.x == b_geometry.size.x,
+            .height => a_geometry.size.y == b_geometry.size.y,
+            .foreground => std.meta.eql(a.color, b.color),
+            .background => std.meta.eql(a.background_color, b.background_color),
+            .font_size => a.fontSize == b.fontSize,
+            .opacity => a.opacity == b.opacity,
+        };
+    }
+
+    fn inlineDisplayValue(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        field: InlineField,
+        scalar_buffer: []u8,
+        color_buffer: *[9]u8,
+    ) []const u8 {
+        const primary_index = self.selectedIndex(items) orelse return "—";
+        const primary = items[primary_index];
+        if (!inlineFieldApplies(field, primary)) return "—";
+        if (self.selectionCount() > 1) {
+            if (field == .text) return "Mixed";
+            for (1..self.selectionCount()) |selection_index| {
+                const identity = self.selectedIdentityAt(selection_index) orelse return "Mixed";
+                const index = itemIndexByIdentity(items, identity) orelse return "Mixed";
+                if (!inlineItemsEqual(field, primary, items[index], resolved_bounds)) return "Mixed";
+            }
+        }
+        return self.inlineInitialValue(primary, resolved_bounds, field, .direct, scalar_buffer, color_buffer);
+    }
+
+    const InlineDrawWindow = struct {
+        display_start: usize,
+        draw_x: f32,
+        cursor_x: f32,
+        cursor_y: f32,
+        line_height: f32,
+        horizontal_offset: f32,
+    };
+
+    fn inlineLineStart(value: []const u8, line_index: usize) usize {
+        if (line_index == 0) return 0;
+        var seen: usize = 0;
+        for (value, 0..) |byte, index| {
+            if (byte != '\n') continue;
+            seen += 1;
+            if (seen == line_index) return index + 1;
+        }
+        return value.len;
+    }
+
+    fn inlineDrawWindow(
+        self: Studio,
+        rect: rl.Rectangle,
+        value_x: f32,
+        value_y: f32,
+        value_font: i32,
+        multiline: bool,
+    ) InlineDrawWindow {
+        const before_cursor = self.inline_editor.buffer[0..self.inline_editor.cursor];
+        const cursor_line_start = if (std.mem.lastIndexOfScalar(u8, before_cursor, '\n')) |index| index + 1 else 0;
+        const cursor_line = before_cursor[cursor_line_start..];
+        var cursor_buffer: [max_inline_input_bytes + 1]u8 = undefined;
+        @memcpy(cursor_buffer[0..cursor_line.len], cursor_line);
+        cursor_buffer[cursor_line.len] = 0;
+        const cursor_text: [:0]const u8 = cursor_buffer[0..cursor_line.len :0];
+        const cursor_width = self.measureUiText(cursor_text, value_font);
+        const available_width = @max(0, rect.x + rect.width - value_x - 6);
+        const horizontal_offset = @max(0, cursor_width - @max(0, available_width - 2));
+
+        const line_height = @as(f32, @floatFromInt(value_font + 2));
+        const cursor_line_index = std.mem.count(u8, before_cursor, "\n");
+        const available_height = @max(0, rect.y + rect.height - value_y - 4);
+        const line_capacity = @max(
+            @as(usize, 1),
+            @as(usize, @intFromFloat(@floor(available_height / line_height))),
+        );
+        const first_line = if (multiline)
+            cursor_line_index - @min(cursor_line_index, line_capacity - 1)
+        else
+            cursor_line_index;
+        const display_start = inlineLineStart(self.inline_editor.text(), first_line);
+        const relative_line = cursor_line_index - first_line;
+        const maximum_cursor_x = @max(value_x, value_x + available_width - 2);
+        return .{
+            .display_start = display_start,
+            .draw_x = value_x - horizontal_offset,
+            .cursor_x = std.math.clamp(value_x + cursor_width - horizontal_offset, value_x, maximum_cursor_x),
+            .cursor_y = value_y + @as(f32, @floatFromInt(relative_line)) * line_height,
+            .line_height = line_height,
+            .horizontal_offset = horizontal_offset,
+        };
+    }
+
+    fn drawInlineField(
+        self: Studio,
+        rect: rl.Rectangle,
+        label: [:0]const u8,
+        value: []const u8,
+        active: bool,
+        invalid: bool,
+        multiline: bool,
+        viewport: Viewport,
+    ) void {
+        if (rect.width <= 0 or rect.height <= 0) return;
+        const fill: rl.Color = if (active)
+            .{ .r = 22, .g = 52, .b = 65, .a = 255 }
+        else
+            .{ .r = 25, .g = 31, .b = 45, .a = 250 };
+        const border: rl.Color = if (invalid)
+            .{ .r = 255, .g = 128, .b = 114, .a = 255 }
+        else if (active)
+            .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+        else
+            .{ .r = 103, .g = 117, .b = 140, .a = 220 };
+        rl.drawRectangleRec(rect, fill);
+        rl.drawRectangleLinesEx(rect, if (active) 2 else 1, border);
+        const label_font = @max(@as(i32, 14), scaledUiFont(uiScale(viewport), UiTypography.compact));
+        const value_font = @max(@as(i32, 16), scaledUiFont(uiScale(viewport), UiTypography.body));
+        const label_width = self.measureUiText(label, label_font);
+        const value_x = if (multiline) rect.x + 7 else rect.x + 7 + label_width + 7;
+        const value_y = inlineFieldValueY(rect, multiline, value_font);
+        const draw_window: InlineDrawWindow = if (active)
+            self.inlineDrawWindow(rect, value_x, value_y, value_font, multiline)
+        else
+            .{
+                .display_start = 0,
+                .draw_x = value_x,
+                .cursor_x = value_x,
+                .cursor_y = value_y,
+                .line_height = @floatFromInt(value_font + 2),
+                .horizontal_offset = 0,
+            };
+        self.drawUiText(label, .{ .x = rect.x + 7, .y = rect.y + if (multiline) 3 else (rect.height - @as(f32, @floatFromInt(label_font))) / 2 }, label_font, .{ .r = 164, .g = 180, .b = 204, .a = 255 });
+        rl.beginScissorMode(
+            @intFromFloat(@floor(value_x)),
+            @intFromFloat(@floor(value_y)),
+            @intFromFloat(@ceil(@max(0, rect.x + rect.width - value_x - 6))),
+            @intFromFloat(@ceil(@max(0, rect.y + rect.height - value_y - 4))),
+        );
+        var display_buffer: [max_inline_input_bytes + 1]u8 = undefined;
+        const bounded_len = @min(value.len, max_inline_input_bytes);
+        const display_start = @min(draw_window.display_start, bounded_len);
+        const display_len = bounded_len - display_start;
+        @memcpy(display_buffer[0..display_len], value[display_start..bounded_len]);
+        display_buffer[display_len] = 0;
+        const display: [:0]const u8 = display_buffer[0..display_len :0];
+        self.drawUiText(display, .{ .x = draw_window.draw_x, .y = value_y }, value_font, if (std.mem.eql(u8, value, "Mixed"))
+            .{ .r = 255, .g = 190, .b = 104, .a = 255 }
+        else
+            .white);
+        if (active and !self.inline_editor.blocked_initial and @mod(@as(i64, @intFromFloat(rl.getTime() * 2)), 2) == 0) {
+            const cursor_height = @min(
+                draw_window.line_height,
+                @max(0, rect.y + rect.height - 4 - draw_window.cursor_y),
+            );
+            rl.drawRectangleRec(.{
+                .x = draw_window.cursor_x,
+                .y = draw_window.cursor_y,
+                .width = 2,
+                .height = cursor_height,
+            }, border);
+        }
+        rl.endScissorMode();
+    }
+
+    fn inlineTextIsMultiline(layout: UiLayout) bool {
+        return !layout.compact_properties;
+    }
+
+    fn inlineFieldValueY(rect: rl.Rectangle, multiline: bool, value_font: i32) f32 {
+        return if (multiline)
+            rect.y + 20
+        else
+            rect.y + (rect.height - @as(f32, @floatFromInt(value_font))) / 2;
+    }
+
+    fn drawInlineProperties(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        selected_locked: bool,
+    ) void {
+        const layout = uiLayout(viewport);
+        drawCompactButton(self, layout.duplicate_item, "Dup");
+        drawCompactButton(self, layout.delete_item, "Del");
+        drawCompactButton(self, layout.promote, "Reuse");
+        drawCompactButton(self, layout.lock_item, if (selected_locked) "Unlock" else "Lock");
+
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
+        const labels = [_][:0]const u8{ "TEXT", "X", "Y", "W", "H", "FG", "BG", "FONT", "OPACITY" };
+        for (fields, labels) |field, label| {
+            var scalar_buffer: [max_inline_input_bytes]u8 = undefined;
+            var color_buffer: [9]u8 = undefined;
+            const active = self.inline_editor.active and self.inline_editor.field == field;
+            const value = if (active)
+                self.inline_editor.text()
+            else
+                self.inlineDisplayValue(items, resolved_bounds, field, &scalar_buffer, &color_buffer);
+            self.drawInlineField(
+                inlineFieldRect(layout, field),
+                label,
+                value,
+                active,
+                active and self.inline_editor.error_value != null,
+                field == .text and inlineTextIsMultiline(layout),
+                viewport,
+            );
+        }
+        const selected_item: ?slides.SlideItem = if (self.selectionCount() == 1)
+            if (self.selectedIndex(items)) |index| items[index] else null
+        else
+            null;
+        drawSwatches(layout.foreground_swatches, if (selected_item) |item| item.color else null);
+        drawCompactButton(self, layout.clear_background, "None");
+        drawSwatches(layout.background_swatches, if (selected_item) |item| item.background_color else null);
+
+        const error_font = @max(@as(i32, 14), scaledUiFont(layout.scale, UiTypography.compact));
+        if (layout.inline_error.height >= @as(f32, @floatFromInt(error_font))) {
+            const message: ?[:0]const u8 = if (self.inline_editor.active) inline_error: {
+                if (self.inline_editor.awaiting_commit) break :inline_error "Saving…";
+                if (self.inline_editor.error_value) |reason| break :inline_error inlineErrorMessage(reason);
+                if (self.inline_editor.target.edit_scope == .shared_template) break :inline_error "Shared template · Enter commits · Esc cancels";
+                break :inline_error "Enter commits · Shift-Enter adds a text line · Tab moves";
+            } else if (self.selectionCount() > 1)
+                "Mixed values shown; select one object to edit"
+            else if (self.selectionCount() == 0)
+                "Select an object to edit its properties"
+            else
+                null;
+            if (message) |text_value| {
+                var fitted_buffer: [192]u8 = undefined;
+                const fitted = self.fitUiText(&fitted_buffer, text_value, error_font, layout.inline_error.width);
+                self.drawUiText(
+                    fitted,
+                    .{ .x = layout.inline_error.x, .y = layout.inline_error.y + 2 },
+                    error_font,
+                    if (self.inline_editor.error_value != null)
+                        .{ .r = 255, .g = 150, .b = 126, .a = 255 }
+                    else
+                        .{ .r = 177, .g = 192, .b = 214, .a = 255 },
+                );
+            }
+        }
+
+        if (!layout.minimal_properties) {
+            const align_labels = [_][:0]const u8{ "L", "HC", "R", "T", "VC", "B" };
+            for (layout.align_buttons, align_labels) |button, label| drawCompactButton(self, button, label);
+            const distribute_labels = [_][:0]const u8{ "H EQUAL GAP", "V EQUAL GAP" };
+            for (layout.distribute_buttons, distribute_labels) |button, label| drawCompactButton(self, button, label);
+            const layer_labels = [_][:0]const u8{ "Back", "Down", "Up", "Front" };
+            for (layout.layer_buttons, layer_labels) |button, label| drawCompactButton(self, button, label);
+        }
+    }
+
     fn drawProperties(
         self: Studio,
         items: []const slides.SlideItem,
@@ -5674,10 +6831,13 @@ pub const Studio = struct {
         const body_font = scaledUiFont(layout.scale, UiTypography.body);
         const secondary: rl.Color = .{ .r = 205, .g = 214, .b = 230, .a = 255 };
         drawStudioPanel(layout.properties);
-        if (viewport.chrome != null)
-            self.drawInspectorTabs(viewport)
-        else
+        if (viewport.chrome != null) {
+            self.drawInspectorTabs(viewport);
+            self.drawInlineProperties(items, resolved_bounds, viewport, selected_locked);
+            return;
+        } else {
             self.drawUiText("PROPERTIES", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + 11 * layout.scale }, heading_font, .white);
+        }
         drawActionButton(self, layout.edit_text, "Text");
         drawActionButton(self, layout.duplicate_item, "Dup");
         drawActionButton(self, layout.delete_item, "Del");
@@ -5866,6 +7026,20 @@ fn toolLabel(tool: Tool) [:0]const u8 {
         .add_image => "IMG",
         .add_shape => "RECT",
         .add_reusable => "LIB",
+    };
+}
+
+fn inlineErrorMessage(reason: InlineError) [:0]const u8 {
+    return switch (reason) {
+        .invalid_utf8 => "Invalid UTF-8; Esc cancels without changing source",
+        .too_long => "Value exceeds 8 KiB; Esc cancels without changing source",
+        .invalid_number => "Enter a finite number, such as 120 or -12.5",
+        .non_positive_dimension => "Width and height must be at least 8",
+        .invalid_color => "Use #RRGGBB, #RRGGBBAA, or none for BG",
+        .invalid_font_size => "Font size must be a positive whole number",
+        .invalid_opacity => "Use 0–1 or 0–100%",
+        .invalid_text => "Text value is invalid; correct it and press Enter",
+        .source_edit_failed => "Source changed; Esc cancels this guarded draft",
     };
 }
 
@@ -9361,6 +10535,578 @@ test "medium dock controls switch reserved space without overlaying the canvas" 
     try std.testing.expect(!canvas_frame.chrome.right_visible);
     try std.testing.expect(canvas_frame.canvas_area.width > objects_frame.canvas_area.width);
     try std.testing.expect(canvas_frame.viewport.slide_size.x >= objects_frame.viewport.slide_size.x);
+}
+
+test "inline property layout stays legible and contained at compact minimum" {
+    const frame = frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 506 }, true, false, .properties);
+    const layout = uiLayout(frame.viewport);
+    try std.testing.expect(frame.chrome.right_visible);
+    const fields = [_]rl.Rectangle{
+        layout.edit_text,
+        layout.geometry_fields[0],
+        layout.geometry_fields[1],
+        layout.geometry_fields[2],
+        layout.geometry_fields[3],
+        layout.custom_foreground,
+        layout.custom_background,
+        layout.font_size,
+        layout.opacity,
+    };
+    for (fields) |field| {
+        try expectRectangleContained(layout.properties, field);
+        try std.testing.expect(field.height >= 32);
+    }
+    try std.testing.expect(layout.compact_properties);
+    try std.testing.expect(!Studio.inlineTextIsMultiline(layout));
+    const compact_value_font: i32 = 16;
+    const compact_value_y = Studio.inlineFieldValueY(layout.edit_text, false, compact_value_font);
+    try std.testing.expect(compact_value_y >= layout.edit_text.y);
+    try std.testing.expect(compact_value_y + @as(f32, @floatFromInt(compact_value_font)) <=
+        layout.edit_text.y + layout.edit_text.height);
+    try expectRectangleContained(layout.properties, layout.inline_error);
+    try std.testing.expect(layout.inline_error.height >= 14);
+    for (layout.foreground_swatches) |swatch| try expectRectangleContained(layout.properties, swatch);
+    for (layout.background_swatches) |swatch| try expectRectangleContained(layout.properties, swatch);
+}
+
+test "roomy inspector uses two-row geometry fields with representative values" {
+    const frame = frameLayout(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, true, false, .properties);
+    const layout = uiLayout(frame.viewport);
+    try std.testing.expect(!layout.compact_properties);
+    try std.testing.expectEqual(layout.geometry_fields[0].y, layout.geometry_fields[1].y);
+    try std.testing.expect(layout.geometry_fields[2].y > layout.geometry_fields[0].y);
+    try std.testing.expectEqual(layout.geometry_fields[2].y, layout.geometry_fields[3].y);
+
+    const labels = [_][:0]const u8{ "X", "Y", "W", "H" };
+    const samples = [_][:0]const u8{ "1920", "-1080", "123.456", "-987.654" };
+    const studio: Studio = .{};
+    for (layout.geometry_fields, labels, samples) |field, label, sample| {
+        const value_x = field.x + 7 + studio.measureUiText(label, 14) + 7;
+        const available = field.x + field.width - value_x - 6;
+        try std.testing.expect(studio.measureUiText(sample, 16) <= available);
+    }
+}
+
+test "inline draw window keeps long ASCII caret inside compact scalar field" {
+    const frame = frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 506 }, true, false, .properties);
+    const layout = uiLayout(frame.viewport);
+    try std.testing.expect(layout.compact_properties);
+    var studio: Studio = .{};
+    studio.inline_editor.active = true;
+    studio.inline_editor.field = .x;
+    var long_value: [256]u8 = undefined;
+    @memset(&long_value, '9');
+    try std.testing.expect(studio.setInlineBuffer(&long_value));
+    const field = layout.geometry_fields[0];
+    const value_x = field.x + 7 + studio.measureUiText("X", 14) + 7;
+    const value_y = Studio.inlineFieldValueY(field, false, 16);
+    const window = studio.inlineDrawWindow(field, value_x, value_y, 16, false);
+    try std.testing.expect(window.horizontal_offset > 0);
+    try std.testing.expect(window.draw_x < value_x);
+    try std.testing.expect(window.cursor_x >= value_x);
+    try std.testing.expect(window.cursor_x + 2 <= field.x + field.width - 6);
+    try std.testing.expect(window.cursor_y >= field.y);
+    try std.testing.expect(window.cursor_y + window.line_height <= field.y + field.height - 4);
+}
+
+test "inline draw window keeps multibyte tail and active multiline line visible" {
+    const frame = frameLayout(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, true, false, .properties);
+    const layout = uiLayout(frame.viewport);
+    try std.testing.expect(!layout.compact_properties);
+    try std.testing.expect(Studio.inlineTextIsMultiline(layout));
+    var studio: Studio = .{};
+    studio.inline_editor.active = true;
+    studio.inline_editor.field = .text;
+    var value: [512]u8 = undefined;
+    const prefix = "first line\nsecond line\n";
+    @memcpy(value[0..prefix.len], prefix);
+    var value_len = prefix.len;
+    for (0..100) |_| {
+        @memcpy(value[value_len..][0..3], "€");
+        value_len += 3;
+    }
+    try std.testing.expect(studio.setInlineBuffer(value[0..value_len]));
+    const field = layout.edit_text;
+    const value_x = field.x + 7;
+    const value_y = Studio.inlineFieldValueY(field, true, 16);
+    const window = studio.inlineDrawWindow(field, value_x, value_y, 16, true);
+    try std.testing.expect(window.display_start >= prefix.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(studio.inlineEditText()[window.display_start..]));
+    try std.testing.expect(window.horizontal_offset > 0);
+    try std.testing.expect(window.cursor_x >= value_x);
+    try std.testing.expect(window.cursor_x + 2 <= field.x + field.width - 6);
+    try std.testing.expect(window.cursor_y >= value_y);
+    try std.testing.expect(window.cursor_y + window.line_height <= field.y + field.height - 4);
+}
+
+test "docked property click starts inline edit and captures shared ownership" {
+    var items = [_]slides.SlideItem{testItem(640, .textbox, 100, 120, 300, 80)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_offset = 10, .patchable = true };
+    items[0].shared_template_values = .{
+        .position = .{ .x = 20, .y = 30 },
+        .size = .{ .x = 200, .y = 60 },
+    };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 640,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[0]),
+        .pointer_pressed = true,
+        .allow_shared_edit = true,
+    });
+    try std.testing.expect(studio.inlineEditActive());
+    try std.testing.expectEqual(@as(?InlineField, .x), studio.inlineEditField());
+    try std.testing.expectEqualStrings("20", studio.inlineEditText());
+    try std.testing.expectEqual(EditScope.shared_template, studio.inline_editor.target.edit_scope);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "pristine inline click away reaches the intended palette action" {
+    var items = [_]slides.SlideItem{testItem(648, .textbox, 100, 120, 300, 80)};
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 648,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[0]),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.inlineEditActive());
+
+    const cyan_index = @intFromEnum(PaletteColor.cyan);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.foreground_swatches[cyan_index]),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(!studio.inlineEditActive());
+    switch (studio.takeSemanticCommand().?) {
+        .set_foreground => |command| {
+            try std.testing.expectEqual(PaletteColor.cyan, command.color);
+            try std.testing.expectEqual(@as(usize, 648), command.target.item_identity);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "dirty inline field switch preserves the clicked shared scope after accept" {
+    var items = [_]slides.SlideItem{testItem(649, .textbox, 100, 120, 300, 80)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_offset = 10, .patchable = true };
+    items[0].shared_template_values = .{
+        .position = .{ .x = 20, .y = 30 },
+        .size = .{ .x = 200, .y = 60 },
+    };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 649,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[0]),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(EditScope.local_instance, studio.inline_editor.target.edit_scope);
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .select_all_pressed = true });
+    var typed = FrameInput{};
+    @memcpy(typed.inline_chars[0..3], "125");
+    typed.inline_chars_len = 3;
+    _ = studio.update(&items, &.{}, frame.viewport, typed);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[1]),
+        .pointer_pressed = true,
+        .allow_shared_edit = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .commit_inline => |commit| {
+            try std.testing.expectEqual(InlineField.x, commit.field);
+            try std.testing.expectEqual(EditScope.local_instance, commit.target.edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    items[0].position.x = 125;
+    studio.acceptInlineCommit(.x);
+    _ = studio.update(&items, &.{}, frame.viewport, .{});
+    try std.testing.expectEqual(@as(?InlineField, .y), studio.inlineEditField());
+    try std.testing.expectEqual(EditScope.shared_template, studio.inline_editor.target.edit_scope);
+    try std.testing.expectEqualStrings("30", studio.inlineEditText());
+}
+
+test "active inline editor consumes Studio toggle key and receives its text" {
+    var items = [_]slides.SlideItem{testItem(650, .textbox, 100, 120, 300, 80)};
+    items[0].text = "original";
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 650,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(uiLayout(frame.viewport).edit_text),
+        .pointer_pressed = true,
+    });
+    var typed = FrameInput{ .toggle_pressed = true };
+    typed.inline_chars[0] = 'e';
+    typed.inline_chars_len = 1;
+    _ = studio.update(&items, &.{}, frame.viewport, typed);
+    try std.testing.expect(studio.enabled);
+    try std.testing.expect(studio.inlineEditActive());
+    try std.testing.expectEqualStrings("originale", studio.inlineEditText());
+}
+
+test "docked textbox click and Enter both open the inline text field" {
+    var items = [_]slides.SlideItem{testItem(653, .textbox, 100, 120, 300, 80)};
+    items[0].text = "editable";
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 653,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(uiLayout(frame.viewport).edit_text),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?InlineField, .text), studio.inlineEditField());
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .cancel_pressed = true });
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .edit_text_pressed = true });
+    try std.testing.expectEqual(@as(?InlineField, .text), studio.inlineEditField());
+    try std.testing.expectEqualStrings("editable", studio.inlineEditText());
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "docked Enter reveals Properties before opening an inline editor" {
+    var items = [_]slides.SlideItem{testItem(654, .textbox, 100, 120, 300, 80)};
+    items[0].text = "editable";
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0 };
+    const content: rl.Rectangle = .{ .x = 0, .y = 0, .width = 900, .height = 506 };
+
+    var slides_studio: Studio = .{
+        .enabled = true,
+        .active_dock = .slides,
+        .inspector_panel = .properties,
+        .selected_identity = 654,
+    };
+    const slides_frame = slides_studio.layoutFrame(content);
+    try std.testing.expect(!slides_frame.chrome.right_visible);
+    _ = slides_studio.updateWithWorkspace(&items, &.{}, slides_frame.viewport, workspace, .{ .edit_text_pressed = true });
+    try std.testing.expect(!slides_studio.inlineEditActive());
+    try std.testing.expectEqual(DockPanel.properties, slides_studio.active_dock);
+    try std.testing.expectEqual(InspectorPanel.properties, slides_studio.inspector_panel);
+
+    var objects_studio: Studio = .{
+        .enabled = true,
+        .active_dock = .objects,
+        .inspector_panel = .objects,
+        .selected_identity = 654,
+    };
+    const objects_frame = objects_studio.layoutFrame(content);
+    try std.testing.expect(objects_frame.chrome.right_visible);
+    _ = objects_studio.updateWithWorkspace(&items, &.{}, objects_frame.viewport, workspace, .{ .edit_text_pressed = true });
+    try std.testing.expect(!objects_studio.inlineEditActive());
+    try std.testing.expectEqual(DockPanel.properties, objects_studio.active_dock);
+    try std.testing.expectEqual(InspectorPanel.properties, objects_studio.inspector_panel);
+
+    var focus_studio: Studio = .{
+        .enabled = true,
+        .focus_canvas = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 654,
+    };
+    const focus_frame = focus_studio.layoutFrame(content);
+    try std.testing.expect(!focus_frame.chrome.visible);
+    _ = focus_studio.updateWithWorkspace(&items, &.{}, focus_frame.viewport, workspace, .{ .edit_text_pressed = true });
+    try std.testing.expect(!focus_studio.inlineEditActive());
+    try std.testing.expect(!focus_studio.focus_canvas);
+    try std.testing.expectEqual(DockPanel.properties, focus_studio.active_dock);
+
+    var properties_studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 654,
+    };
+    const properties_frame = properties_studio.layoutFrame(content);
+    try std.testing.expect(properties_frame.chrome.right_visible);
+    _ = properties_studio.updateWithWorkspace(&items, &.{}, properties_frame.viewport, workspace, .{ .edit_text_pressed = true });
+    try std.testing.expectEqual(@as(?InlineField, .text), properties_studio.inlineEditField());
+}
+
+test "inline Tab commits then advances only after accept and consumes Focus Canvas" {
+    var items = [_]slides.SlideItem{testItem(641, .textbox, 100, 120, 300, 80)};
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 641,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[0]),
+        .pointer_pressed = true,
+    });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .select_all_pressed = true });
+    var typed = FrameInput{};
+    @memcpy(typed.inline_chars[0..3], "125");
+    typed.inline_chars_len = 3;
+    _ = studio.update(&items, &.{}, frame.viewport, typed);
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .toggle_focus_canvas_pressed = true });
+    try std.testing.expectEqual(@as(?InlineField, .x), studio.inlineEditField());
+    try std.testing.expect(!studio.focus_canvas);
+    switch (studio.takeSemanticCommand().?) {
+        .commit_inline => |commit| {
+            try std.testing.expectEqual(InlineField.x, commit.field);
+            try std.testing.expectEqualStrings("125", commit.value);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    items[0].position.x = 125;
+    studio.acceptInlineCommit(.x);
+    _ = studio.update(&items, &.{}, frame.viewport, .{});
+    try std.testing.expectEqual(@as(?InlineField, .y), studio.inlineEditField());
+    try std.testing.expectEqualStrings("120", studio.inlineEditText());
+    try std.testing.expect(studio.inline_editor.select_all);
+}
+
+test "pristine auto-sized field traverses without invalid write" {
+    var items = [_]slides.SlideItem{testItem(642, .img, 100, 120, 0, 0)};
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 642,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[2]),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqualStrings("0", studio.inlineEditText());
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .toggle_focus_canvas_pressed = true });
+    try std.testing.expectEqual(@as(?InlineField, .height), studio.inlineEditField());
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .toggle_focus_canvas_pressed = true,
+        .shift_down = true,
+    });
+    try std.testing.expectEqual(@as(?InlineField, .width), studio.inlineEditField());
+    try std.testing.expect(!studio.focus_canvas);
+}
+
+test "invalid inline draft retains exact bytes focus and caret contract" {
+    var items = [_]slides.SlideItem{testItem(643, .textbox, 100, 120, 300, 80)};
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 643,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.opacity),
+        .pointer_pressed = true,
+    });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .select_all_pressed = true });
+    var typed = FrameInput{};
+    @memcpy(typed.inline_chars[0..4], "101%");
+    typed.inline_chars_len = 4;
+    _ = studio.update(&items, &.{}, frame.viewport, typed);
+    const cursor_before = studio.inline_editor.cursor;
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_submit_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(@as(?InlineError, .invalid_opacity), studio.inlineEditError());
+    try std.testing.expectEqualStrings("101%", studio.inlineEditText());
+    try std.testing.expectEqual(cursor_before, studio.inline_editor.cursor);
+    try std.testing.expect(studio.inlineEditActive());
+}
+
+test "inline text validation permits single-line markers and blocks multiline source bodies" {
+    try std.testing.expect(Studio.inlineValueError(.text, "@slide") == null);
+    try std.testing.expect(Studio.inlineValueError(.text, "#hashtag") == null);
+    try std.testing.expectEqual(
+        @as(?InlineError, .invalid_text),
+        Studio.inlineValueError(.text, "Safe\n@slide"),
+    );
+    try std.testing.expectEqual(
+        @as(?InlineError, .invalid_text),
+        Studio.inlineValueError(.text, "Safe\n# comment"),
+    );
+}
+
+test "oversized initial inline text is blocked except Escape" {
+    var oversized: [max_inline_input_bytes + 1]u8 = undefined;
+    @memset(&oversized, 'x');
+    var items = [_]slides.SlideItem{testItem(644, .textbox, 100, 120, 300, 80)};
+    items[0].text = &oversized;
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 644,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.edit_text),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.inlineEditActive());
+    try std.testing.expect(studio.inline_editor.blocked_initial);
+    try std.testing.expectEqual(@as(?InlineError, .too_long), studio.inlineEditError());
+    var typed = FrameInput{};
+    typed.inline_chars[0] = 'y';
+    typed.inline_chars_len = 1;
+    _ = studio.update(&items, &.{}, frame.viewport, typed);
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_submit_pressed = true });
+    try std.testing.expectEqualStrings("", studio.inlineEditText());
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .cancel_pressed = true });
+    try std.testing.expect(!studio.inlineEditActive());
+}
+
+test "oversized UTF-8 replacement preserves pristine inline selection" {
+    var oversized: [max_inline_input_bytes + 1]u8 = undefined;
+    for (0..oversized.len / 3) |index|
+        @memcpy(oversized[index * 3 ..][0..3], "€");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(&oversized));
+
+    var items = [_]slides.SlideItem{testItem(651, .textbox, 100, 120, 300, 80)};
+    items[0].text = "unchanged";
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 651,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(uiLayout(frame.viewport).edit_text),
+        .pointer_pressed = true,
+    });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .select_all_pressed = true });
+    const cursor_before = studio.inline_editor.cursor;
+    try std.testing.expect(!studio.inline_editor.dirty);
+    try std.testing.expect(studio.inline_editor.select_all);
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_paste = &oversized });
+    try std.testing.expectEqualStrings("unchanged", studio.inlineEditText());
+    try std.testing.expectEqual(cursor_before, studio.inline_editor.cursor);
+    try std.testing.expect(studio.inline_editor.select_all);
+    try std.testing.expect(!studio.inline_editor.dirty);
+    try std.testing.expectEqual(@as(?InlineError, .too_long), studio.inlineEditError());
+}
+
+test "oversized UTF-8 replacement preserves dirty inline draft and selection" {
+    var oversized: [max_inline_input_bytes + 1]u8 = undefined;
+    for (0..oversized.len / 3) |index|
+        @memcpy(oversized[index * 3 ..][0..3], "€");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(&oversized));
+
+    var items = [_]slides.SlideItem{testItem(652, .textbox, 100, 120, 300, 80)};
+    items[0].text = "opening";
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 652,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(uiLayout(frame.viewport).edit_text),
+        .pointer_pressed = true,
+    });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .select_all_pressed = true });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_paste = "€" });
+    try std.testing.expect(studio.inline_editor.dirty);
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .select_all_pressed = true });
+    const cursor_before = studio.inline_editor.cursor;
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_paste = &oversized });
+    try std.testing.expectEqualStrings("€", studio.inlineEditText());
+    try std.testing.expectEqual(cursor_before, studio.inline_editor.cursor);
+    try std.testing.expect(studio.inline_editor.select_all);
+    try std.testing.expect(studio.inline_editor.dirty);
+    try std.testing.expectEqual(@as(?InlineError, .too_long), studio.inlineEditError());
+}
+
+test "inline multi-selection reports homogeneous and Mixed values but refuses edits" {
+    var items = [_]slides.SlideItem{
+        testItem(645, .textbox, 100, 120, 300, 80),
+        testItem(646, .textbox, 100, 220, 300, 80),
+    };
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .direct, .line_offset = 20, .patchable = true };
+    var studio: Studio = .{ .enabled = true, .active_dock = .properties, .inspector_panel = .properties };
+    setTestSelection(&studio, &items, &.{ 645, 646 });
+    var scalar_buffer: [64]u8 = undefined;
+    var color_buffer: [9]u8 = undefined;
+    try std.testing.expectEqualStrings("100", studio.inlineDisplayValue(&items, &.{}, .x, &scalar_buffer, &color_buffer));
+    try std.testing.expectEqualStrings("Mixed", studio.inlineDisplayValue(&items, &.{}, .y, &scalar_buffer, &color_buffer));
+    try std.testing.expectEqualStrings("Mixed", studio.inlineDisplayValue(&items, &.{}, .text, &scalar_buffer, &color_buffer));
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(uiLayout(frame.viewport).geometry_fields[0]),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(!studio.inlineEditActive());
+    try std.testing.expectEqual(Notice.multi_selection_property_unsupported, studio.notice);
+}
+
+test "Crowd text click and Enter share the truthful unavailable result" {
+    var items = [_]slides.SlideItem{testItem(647, .crowd, 100, 120, 300, 80)};
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    items[0].crowd = .{ .kind = .join, .prompt = "Join this room" };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 647,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(uiLayout(frame.viewport).edit_text),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(!studio.inlineEditActive());
+    try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    studio.notice = .none;
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .edit_text_pressed = true });
+    try std.testing.expect(!studio.inlineEditActive());
+    try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
 }
 
 test "objects inspector mirrors reverse paint order including background barriers" {

@@ -42,17 +42,15 @@ sessions.
   recovery from the Objects list.
 - Safe layer-order operations, pinned background barriers, and actionable
   explanations when another source barrier atomically refuses an operation.
+- Inline Properties fields for text, exact geometry, foreground/background,
+  font size, and opacity, with keyboard traversal, caret-following scrolling,
+  and validation that retains invalid drafts without touching source/history.
+- Compact color editing, truthful common/Mixed multi-selection values, and
+  selection/focus preservation across non-structural property edits.
+- Synchronized redraw, atomic render-graph replacement, explicit render-text
+  ownership, and opt-in frame/rebuild/arena diagnostics for live authoring QA.
 
-## Active tranche: Inspector workflow
-
-- Replace modal property prompts with inline fields, keyboard traversal, and
-  validation that keeps invalid input open with an actionable message.
-- Add a compact color editor and improve mixed-value multi-selection feedback.
-- Preserve selection and focus across every non-structural property edit.
-
-## Planned tranches
-
-### Reusable composition
+## Active tranche: Reusable composition
 
 - Promote a selected group to a reusable component.
 - Inspect local overrides and reset individual properties to their shared
@@ -60,6 +58,8 @@ sessions.
 - Detach an instance into direct objects when that transformation is
   source-safe.
 - Improve dependency-aware rename, delete, and template cleanup.
+
+## Planned tranches
 
 ### New-deck experience
 

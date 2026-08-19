@@ -57,6 +57,13 @@ const RenderElement = struct {
 const RenderedScene = struct {
     elements: std.ArrayList(RenderElement),
     plan: MorphPlan,
+    owned_text: std.ArrayList([:0]const u8),
+
+    fn deinit(self: *RenderedScene, allocator: std.mem.Allocator) void {
+        self.elements.deinit(allocator);
+        self.plan.draws.deinit(allocator);
+        freeOwnedText(allocator, &self.owned_text);
+    }
 };
 
 const MorphDrawKind = enum {
@@ -79,6 +86,10 @@ const RenderedSlide = struct {
     elements: std.ArrayList(RenderElement) = undefined,
     morph_scenes: std.ArrayList(RenderedScene) = undefined,
     steps: std.ArrayList(animation.Step) = undefined,
+    /// Every heap-backed string referenced by base-scene RenderElements.
+    /// Individual strings may be shared by several elements (bullet glyphs),
+    /// so ownership lives here rather than on RenderElement itself.
+    owned_text: std.ArrayList([:0]const u8) = undefined,
     transition: animation.Transition = .{},
 
     fn new(allocator: std.mem.Allocator) !*RenderedSlide {
@@ -87,9 +98,23 @@ const RenderedSlide = struct {
         self.elements = std.ArrayList(RenderElement).empty;
         self.morph_scenes = std.ArrayList(RenderedScene).empty;
         self.steps = std.ArrayList(animation.Step).empty;
+        self.owned_text = std.ArrayList([:0]const u8).empty;
         return self;
     }
+
+    fn deinit(self: *RenderedSlide, allocator: std.mem.Allocator) void {
+        self.elements.deinit(allocator);
+        for (self.morph_scenes.items) |*scene| scene.deinit(allocator);
+        self.morph_scenes.deinit(allocator);
+        self.steps.deinit(allocator);
+        freeOwnedText(allocator, &self.owned_text);
+    }
 };
+
+fn freeOwnedText(allocator: std.mem.Allocator, owned_text: *std.ArrayList([:0]const u8)) void {
+    for (owned_text.items) |text| allocator.free(text);
+    owned_text.deinit(allocator);
+}
 
 pub const RevealState = struct {
     visible_through: usize = 0,
@@ -202,17 +227,41 @@ pub const SlideshowRenderer = struct {
     }
 
     pub fn deinit(self: *SlideshowRenderer) void {
+        self.deinitRenderedSlides(&self.renderedSlides);
+        self.md_parser.deinit();
         self.texture_cache.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn destroyRenderedSlide(self: *SlideshowRenderer, rendered_slide: *RenderedSlide) void {
+        rendered_slide.deinit(self.allocator);
+        self.allocator.destroy(rendered_slide);
+    }
+
+    fn deinitRenderedSlides(self: *SlideshowRenderer, rendered_slides: *std.ArrayList(*RenderedSlide)) void {
+        for (rendered_slides.items) |rendered_slide| self.destroyRenderedSlide(rendered_slide);
+        rendered_slides.deinit(self.allocator);
+        rendered_slides.* = std.ArrayList(*RenderedSlide).empty;
+    }
+
+    fn ownRenderedText(self: *SlideshowRenderer, render_slide: *RenderedSlide, text: []const u8) ![:0]const u8 {
+        const owned = try self.allocator.dupeZ(u8, text);
+        errdefer self.allocator.free(owned);
+        try render_slide.owned_text.append(self.allocator, owned);
+        return owned;
     }
 
     pub fn preRender(self: *SlideshowRenderer, slideshow: *const slides.SlideShow, slideshow_filp: []const u8) !void {
         log.debug("ENTER preRender", .{});
         if (slideshow.slides.items.len == 0) {
             log.warn("NO SLIDED!!!", .{});
-            return;
         }
 
-        self.renderedSlides.shrinkRetainingCapacity(0);
+        // Build beside the live render graph. A failed image/text/morph build
+        // leaves the currently displayed deck intact; success swaps ownership
+        // and tears the previous graph down in one place.
+        var rebuilt = std.ArrayList(*RenderedSlide).empty;
+        errdefer self.deinitRenderedSlides(&rebuilt);
 
         for (slideshow.slides.items, 0..) |slide, i| {
             const slide_number = i + 1;
@@ -223,6 +272,8 @@ pub const SlideshowRenderer = struct {
 
             // add a renderedSlide
             const renderSlide = try RenderedSlide.new(self.allocator);
+            var render_slide_owned = true;
+            errdefer if (render_slide_owned) self.destroyRenderedSlide(renderSlide);
             renderSlide.transition = slide.transition;
 
             if (slide.items) |items| {
@@ -230,6 +281,8 @@ pub const SlideshowRenderer = struct {
             }
             for (slide.morph_states.items, 0..) |state, state_index| {
                 const state_render = try RenderedSlide.new(self.allocator);
+                var state_render_owned = true;
+                errdefer if (state_render_owned) self.destroyRenderedSlide(state_render);
                 for (state.items.items) |state_item| {
                     var static_item = state_item;
                     // Reveal steps belong to the base timeline and must not be
@@ -241,14 +294,30 @@ pub const SlideshowRenderer = struct {
                     renderSlide.elements.items
                 else
                     renderSlide.morph_scenes.items[state_index - 1].elements.items;
-                const plan = try buildMorphPlan(self.allocator, source_elements, state_render.elements.items);
-                try renderSlide.morph_scenes.append(self.allocator, .{ .elements = state_render.elements, .plan = plan });
+                var plan = try buildMorphPlan(self.allocator, source_elements, state_render.elements.items);
+                var plan_owned = true;
+                errdefer if (plan_owned) plan.draws.deinit(self.allocator);
+                try renderSlide.morph_scenes.ensureUnusedCapacity(self.allocator, 1);
+                renderSlide.morph_scenes.appendAssumeCapacity(.{
+                    .elements = state_render.elements,
+                    .plan = plan,
+                    .owned_text = state_render.owned_text,
+                });
+                plan_owned = false;
+                state_render.elements = std.ArrayList(RenderElement).empty;
+                state_render.owned_text = std.ArrayList([:0]const u8).empty;
+                state_render_owned = false;
+                self.destroyRenderedSlide(state_render);
                 try renderSlide.steps.append(self.allocator, animation.Step.fromMorph(state.spec, state_index));
             }
 
             // now add the slide
-            try self.renderedSlides.append(self.allocator, renderSlide);
+            try rebuilt.append(self.allocator, renderSlide);
+            render_slide_owned = false;
         }
+        var previous = self.renderedSlides;
+        self.renderedSlides = rebuilt;
+        self.deinitRenderedSlides(&previous);
         log.debug("LEAVE preRender with {d} slides", .{self.renderedSlides.items.len});
     }
 
@@ -493,7 +562,7 @@ pub const SlideshowRenderer = struct {
         // not sure I want to allocate here, though
         var bulletSymbol: [:0]const u8 = undefined;
         if (item.bullet_symbol) |bs| {
-            bulletSymbol = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{bs}, 0);
+            bulletSymbol = try self.ownRenderedText(renderSlide, bs);
         } else {
             // no bullet symbol - error
             log.err("No bullet symbol for text {?s}", .{item.text});
@@ -522,6 +591,7 @@ pub const SlideshowRenderer = struct {
 
             // slide number
             const new_t = try replaceSlideNumber(self.allocator, t, slide_number);
+            defer self.allocator.free(new_t);
 
             // split into lines
             var it = std.mem.splitScalar(u8, new_t, '\n');
@@ -729,7 +799,7 @@ pub const SlideshowRenderer = struct {
 
                 var attempted_span_size: rl.Vector2 = undefined;
                 var available_width: f32 = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
-                var render_text_c = try self.styledTextblockSize_toCstring(span.text.?, display_font_size, font_used, &attempted_span_size);
+                var render_text_c = try self.styledTextblockSize_toCstring(renderSlide, span.text.?, display_font_size, font_used, &attempted_span_size);
                 const whole_span_width = boundaryWidth(attempted_span_size.x, boundary_spacing, 0, span.text.?.len, span.text.?.len);
                 log.debug("available_width: {d}, attempted_span_size: {d:3.0}", .{ available_width, whole_span_width });
                 if (whole_span_width < available_width) {
@@ -803,7 +873,7 @@ pub const SlideshowRenderer = struct {
                         log.debug("current idx of spc {d}", .{currentIdxOfSpace});
                         // try if we fit. if we don't -> render up until last idx
                         var render_text = span.text.?[lastConsumedIdx..currentIdxOfSpace];
-                        render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                        render_text_c = try self.styledTextblockSize_toCstring(renderSlide, render_text, display_font_size, font_used, &attempted_span_size);
                         const candidate_width = boundaryWidth(attempted_span_size.x, boundary_spacing, lastConsumedIdx, currentIdxOfSpace, span.text.?.len);
                         log.debug("   current available_width: {d}, attempted_span_size: {d:3.0}", .{ available_width, candidate_width });
                         if (candidate_width > available_width and wordCount > 1) {
@@ -819,7 +889,7 @@ pub const SlideshowRenderer = struct {
                                 available_width = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
                                 const end_of_string_pos = if (lastIdxOfSpace > span.text.?.len) span.text.?.len else lastIdxOfSpace;
                                 render_text = span.text.?[lastConsumedIdx..end_of_string_pos];
-                                render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                                render_text_c = try self.styledTextblockSize_toCstring(renderSlide, render_text, display_font_size, font_used, &attempted_span_size);
                                 const rendered_slice_start = lastConsumedIdx;
                                 const rendered_width = boundaryWidth(attempted_span_size.x, boundary_spacing, rendered_slice_start, end_of_string_pos, span.text.?.len);
                                 lastConsumedIdx = lastIdxOfSpace;
@@ -853,7 +923,7 @@ pub const SlideshowRenderer = struct {
                             if (lastIdxOfSpace >= currentIdxOfSpace) {
                                 available_width = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
                                 render_text = span.text.?[lastConsumedIdx..currentIdxOfSpace];
-                                render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                                render_text_c = try self.styledTextblockSize_toCstring(renderSlide, render_text, display_font_size, font_used, &attempted_span_size);
                                 const rendered_slice_start = lastConsumedIdx;
                                 const rendered_width = boundaryWidth(attempted_span_size.x, boundary_spacing, rendered_slice_start, currentIdxOfSpace, span.text.?.len);
                                 lastConsumedIdx = lastIdxOfSpace;
@@ -938,12 +1008,8 @@ pub const SlideshowRenderer = struct {
         return false;
     }
 
-    fn toCString(self: *SlideshowRenderer, text: []const u8) ![:0]const u8 {
-        return try self.allocator.dupeZ(u8, text);
-    }
-
-    fn styledTextblockSize_toCstring(self: *SlideshowRenderer, text: []const u8, fontsize: f32, font: rl.Font, size_out: *rl.Vector2) ![:0]const u8 {
-        const ctext = try self.toCString(text);
+    fn styledTextblockSize_toCstring(self: *SlideshowRenderer, render_slide: *RenderedSlide, text: []const u8, fontsize: f32, font: rl.Font, size_out: *rl.Vector2) ![:0]const u8 {
+        const ctext = try self.ownRenderedText(render_slide, text);
         log.debug("cstring: of {s} = `{s}`", .{ text, ctext });
         if (ctext[0] == 0) {
             size_out.x = 0;
@@ -1663,6 +1729,7 @@ fn appendOwnerMorphDraws(
 
 fn buildMorphPlan(allocator: std.mem.Allocator, source: []const RenderElement, target: []const RenderElement) !MorphPlan {
     var plan = MorphPlan{ .draws = std.ArrayList(MorphDraw).empty };
+    errdefer plan.draws.deinit(allocator);
     var source_groups = std.AutoHashMap(usize, ElementGroup).init(allocator);
     defer source_groups.deinit();
     var target_groups = std.AutoHashMap(usize, ElementGroup).init(allocator);
@@ -1994,6 +2061,57 @@ test "slide number replacement excludes unused formatter bytes" {
     const rendered = try replaceSlideNumber(std.testing.allocator, "page $slide_number of $slide_number", 6);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("page 6 of 6", rendered);
+}
+
+test "repeated preRender releases slides morph scenes plans and owned text" {
+    const allocator = std.testing.allocator;
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(allocator, &unused_fonts);
+    defer renderer.deinit();
+
+    var slideshow: slides.SlideShow = .{ .slides = std.ArrayList(*slides.Slide).empty };
+    defer slideshow.slides.deinit(allocator);
+    var slide: slides.Slide = .{ .allocator = allocator };
+    slide.items = std.ArrayList(slides.SlideItem).empty;
+    slide.morph_states = std.ArrayList(slides.MorphState).empty;
+    defer {
+        slide.items.?.deinit(allocator);
+        for (slide.morph_states.items) |*morph_state| morph_state.items.deinit(allocator);
+        slide.morph_states.deinit(allocator);
+    }
+
+    try slide.items.?.append(allocator, .{
+        .identity = 1,
+        .kind = .background,
+        .color = .black,
+    });
+    var state: slides.MorphState = .{};
+    state.items = std.ArrayList(slides.SlideItem).empty;
+    try state.items.append(allocator, .{
+        .identity = 1,
+        .kind = .background,
+        .color = .white,
+    });
+    try slide.morph_states.append(allocator, state);
+    try slideshow.slides.append(allocator, &slide);
+
+    for (0..8) |_| {
+        try renderer.preRender(&slideshow, "");
+        try std.testing.expectEqual(@as(usize, 1), renderer.renderedSlides.items.len);
+        const rendered_slide = renderer.renderedSlides.items[0];
+        try std.testing.expectEqual(@as(usize, 1), rendered_slide.morph_scenes.items.len);
+        try std.testing.expectEqual(@as(usize, 1), rendered_slide.steps.items.len);
+        _ = try renderer.ownRenderedText(rendered_slide, "owned base text");
+        const scene_text = try allocator.dupeZ(u8, "owned morph text");
+        errdefer allocator.free(scene_text);
+        try rendered_slide.morph_scenes.items[0].owned_text.append(allocator, scene_text);
+    }
+
+    // An empty successful rebuild is still a rebuild: it must retire the
+    // previous graph rather than leave stale slides alive.
+    slideshow.slides.clearRetainingCapacity();
+    try renderer.preRender(&slideshow, "");
+    try std.testing.expectEqual(@as(usize, 0), renderer.renderedSlides.items.len);
 }
 
 test "inline font boundaries use the wider neighboring space in both directions" {
