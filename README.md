@@ -6,7 +6,9 @@ This port is minimalistic, and I wrote it to be able to edit, present, and PDF-e
 
 Due to the new [raylib](https://github.com/raysan5/raylib) dep, builds should work on all 3 major platforms now.
 
-![screenshot](rayslides.jpg)
+![Rayslides Studio editing a polished slide with inline typography, color, geometry, and layout controls](docs/images/rayslides-studio-properties.jpg)
+
+![Rayslides Studio showing the source-aware Objects and layers inspector](docs/images/rayslides-studio-objects.jpg)
 
 Missing but maybe coming soon:
 
@@ -428,6 +430,35 @@ Internal render buffer resolution is 1920x1080. So always use coordinates in thi
 
 More documentation to follow.
 
+## Reusable groups
+
+`@push`/`@pop` represents one reusable item. A reusable composition of several
+objects uses an explicit block so its ownership and member IDs remain clear:
+
+```text
+@pushgroup feature
+@box id=title x=120 y=120 w=760 h=100 fontsize=64 text=Fast by design
+@box id=art img=assets/feature.png x=1040 y=120 w=680 h=680
+@endgroup
+
+@slide
+@popgroup feature id=intro
+
+@state(morph)
+@set intro.title y=420
+```
+
+Every member and every `@popgroup` use must have an explicit literal `id=`.
+Emitted IDs are qualified as `INSTANCE.MEMBER`, so two uses remain independent
+and morph mutations can target one exact member. Definitions become visible
+only after `@endgroup`; later definitions with the same name shadow earlier
+ones in normal source order. The initial format deliberately keeps absolute
+member coordinates and refuses nested, generated, background, Crowdplay, or
+malformed group bodies rather than guessing at ownership.
+
+Studio group promotion and Library placement build on this syntax and are
+tracked in [the Studio roadmap](STUDIO_ROADMAP.md).
+
 ## Slide-template instance overrides
 
 Items in a reusable `@pushslide` template can be changed on one slide without
@@ -459,6 +490,15 @@ a customized instance: Studio keeps the shared authored value layer separate
 from effective local values. Shared deletion removes source-resolved local and
 morph mutations together; ambiguous or generated dependencies are refused
 atomically.
+
+The Properties inspector marks locally authored fields with **L** and offers
+an **R** reset when the exact source layer can be removed safely. Reset deletes
+all contributions for that property in the current instance or morph state,
+so the shared or previous-state value truly resurfaces. A source-safe single
+`@pop` component can also be **Detached** into a fully materialized direct
+`@box`; the operation preserves its effective appearance, animation, comments,
+selection, and one-step undo history. Ambiguous persistent component context is
+left shared and explained instead of being rewritten.
 
 For nested reusable elements, give `@pop` an explicit `id=` when local slide
 overrides refer to it. That ID remains stable if the reusable definition is

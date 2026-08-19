@@ -52,12 +52,27 @@ sessions.
 
 ## Active tranche: Reusable composition
 
-- Promote a selected group to a reusable component.
-- Inspect local overrides and reset individual properties to their shared
-  values.
-- Detach an instance into direct objects when that transformation is
-  source-safe.
-- Improve dependency-aware rename, delete, and template cleanup.
+- [x] Inspect exact component, slide-template-instance, and current morph-state
+  overrides; reset one property by removing every contribution from that
+  source layer so the inherited value genuinely resurfaces.
+- [x] Detach a source-safe single `@pop` component instance into one fully
+  materialized direct `@box`, retaining formatting, animation ownership,
+  selection, history, and renderer semantics.
+- [x] Add the explicit reusable-group grammar and parser model:
+  `@pushgroup NAME` … `@endgroup`, used by `@popgroup NAME id=INSTANCE`, with
+  member IDs namespaced as `INSTANCE.MEMBER`.
+- [ ] Promote a contiguous selected group into one group definition and one
+  group instance without changing paint/reveal order.
+- [ ] Discover, place, rename, and safely detach reusable groups through the
+  Library and Properties UI.
+- [ ] Improve dependency-aware rename, delete, and fixed-point cleanup across
+  element, group, and slide-template definitions.
+
+The explicit group syntax is intentional. Existing `@push`/`@pop` represents
+exactly one item, so Studio will not pretend that several unrelated component
+definitions form one reusable object. The first group release uses absolute
+member coordinates and requires literal, stable member and instance IDs;
+translation/scaling overrides can build on that source contract later.
 
 ## Planned tranches
 

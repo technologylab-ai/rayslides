@@ -792,6 +792,7 @@ fn sourceScopeLabel(scope: slides.SourceScope) []const u8 {
         .none => "source unknown",
         .direct => "direct item",
         .component_instance => "component instance",
+        .group_instance_member => "group instance member",
         .slide_template => "shared layout item",
         .slide_instance_override => "local template override",
         .morph_item => "morph item",
@@ -850,6 +851,9 @@ pub const Notice = enum {
     library_entry_in_use,
     library_delete_unsupported,
     slide_template_promotion_locked,
+    group_reusable_needs_source_support,
+    override_reset_unsupported,
+    detach_instance_unsupported,
 };
 
 /// The active canvas tool. Creation tools are deliberately one-shot: after a
@@ -1030,6 +1034,70 @@ pub const InlineCommit = struct {
     value: []const u8,
 };
 
+/// Exact Inspector properties whose effective value can be inherited from a
+/// reusable definition and selectively restored by removing one local key.
+pub const PropertyOverrideSet = struct {
+    bits: u16 = 0,
+
+    pub fn fromFields(fields: []const InlineField) PropertyOverrideSet {
+        var result: PropertyOverrideSet = .{};
+        for (fields) |field| result.set(field);
+        return result;
+    }
+
+    pub fn set(self: *PropertyOverrideSet, field: InlineField) void {
+        self.bits |= @as(u16, 1) << @intCast(@intFromEnum(field));
+    }
+
+    pub fn contains(self: PropertyOverrideSet, field: InlineField) bool {
+        return self.bits & (@as(u16, 1) << @intCast(@intFromEnum(field))) != 0;
+    }
+
+    pub fn empty(self: PropertyOverrideSet) bool {
+        return self.bits == 0;
+    }
+};
+
+pub const ReusableInstanceKind = enum {
+    none,
+    component,
+    slide_template,
+};
+
+pub const CompositionBlockReason = enum {
+    none,
+    not_instance,
+    generated_source,
+    morph_scene,
+    ambiguous_instance,
+    dependent_structure,
+    integration_unavailable,
+};
+
+/// Integration-authored capability snapshot for the selected runtime item.
+/// Studio copies this value and rechecks both identity and the selected item's
+/// physical source before showing or emitting any composition action.
+pub const CompositionContext = struct {
+    item_identity: usize,
+    selection_source: slides.SourceRef,
+    kind: ReusableInstanceKind,
+    local_overrides: PropertyOverrideSet = .{},
+    resettable_overrides: PropertyOverrideSet = .{},
+    reset_target: ?CommandTarget = null,
+    detach_target: ?CommandTarget = null,
+    detach_block: CompositionBlockReason = .not_instance,
+};
+
+pub const ResetOverrideCommand = struct {
+    target: CommandTarget,
+    field: InlineField,
+};
+
+pub const DetachInstanceCommand = struct {
+    target: CommandTarget,
+    kind: ReusableInstanceKind,
+};
+
 pub const MorphSceneCommand = struct {
     /// null selects the authored base scene; otherwise this is a zero-based
     /// morph-state index.
@@ -1116,6 +1184,8 @@ pub const SemanticCommand = union(enum) {
     set_locked: SetLockedCommand,
     set_visible: SetVisibleCommand,
     commit_inline: InlineCommit,
+    reset_local_override: ResetOverrideCommand,
+    detach_reusable_instance: DetachInstanceCommand,
     promote_to_reusable: CommandTarget,
     select_morph_scene: MorphSceneCommand,
     new_slide: void,
@@ -2263,6 +2333,7 @@ pub const Studio = struct {
     pending_geometry_command: ?GeometryCommand = null,
     pending_geometry_batch: ?GeometryBatchCommand = null,
     inline_editor: InlineEditor = .{},
+    composition_context: ?CompositionContext = null,
     group_drag: [max_selection_items]GroupDragMember = undefined,
     group_drag_count: usize = 0,
     group_bounds_before: Geometry = .{ .position = .zero(), .size = .zero() },
@@ -2284,6 +2355,13 @@ pub const Studio = struct {
 
     pub fn setUiFont(self: *Studio, font: ?rl.Font) void {
         self.ui_font = font;
+    }
+
+    /// Copies capability metadata; no borrowed strings or slices survive the
+    /// call. Passing null deliberately disables reset/detach until the
+    /// integration can prove them safe again.
+    pub fn setCompositionContext(self: *Studio, context: ?CompositionContext) void {
+        self.composition_context = context;
     }
 
     pub fn inlineEditActive(self: Studio) bool {
@@ -2685,6 +2763,21 @@ pub const Studio = struct {
         return null;
     }
 
+    fn inlineOverrideFieldAtPoint(
+        self: Studio,
+        items: []const slides.SlideItem,
+        layout: UiLayout,
+        pointer: rl.Vector2,
+    ) ?InlineField {
+        const context = self.compositionContextForSelection(items) orelse return null;
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
+        for (fields) |field| {
+            if (!context.local_overrides.contains(field)) continue;
+            if (pointInRectangle(pointer, inlineResetRect(inlineFieldRect(layout, field)))) return field;
+        }
+        return null;
+    }
+
     fn inlinePropertiesVisible(self: Studio, viewport: Viewport) bool {
         const chrome = viewport.chrome orelse return false;
         return chrome.visible and chrome.right_visible and !self.focus_canvas and
@@ -2696,6 +2789,22 @@ pub const Studio = struct {
         self.active_dock = .properties;
         self.inspector_panel = .properties;
         self.notice = .none;
+    }
+
+    fn compositionContextForSelection(
+        self: Studio,
+        items: []const slides.SlideItem,
+    ) ?CompositionContext {
+        if (self.selectionCount() != 1) return null;
+        const context = self.composition_context orelse return null;
+        const item_index = self.selectedIndex(items) orelse return null;
+        const item = items[item_index];
+        if (context.item_identity != item.identity) return null;
+        const source_matches = sourceEqual(context.selection_source, item.source) or
+            sourceEqual(context.selection_source, item.effectiveBaseSource()) or
+            sourceEqual(context.selection_source, item.effectiveSource());
+        if (!source_matches) return null;
+        return context;
     }
 
     fn inlineTargetStillMatches(self: Studio, items: []const slides.SlideItem, item_index: usize) bool {
@@ -2804,6 +2913,15 @@ pub const Studio = struct {
         const item = items[item_index];
         const layout = uiLayout(viewport);
         if (input.pointer_pressed) {
+            if (self.inlineOverrideFieldAtPoint(items, layout, input.pointer_screen)) |field| {
+                if (self.inline_editor.dirty) {
+                    self.inline_editor.blur_after_accept = true;
+                    return self.queueInlineCommit(0, null, null);
+                }
+                self.cancelInlineEdit();
+                _ = self.emitResetOverride(items, field);
+                return true;
+            }
             if (inlineFieldAtPoint(layout, item, input.pointer_screen)) |field| {
                 if (field == self.inline_editor.field) {
                     self.inline_editor.select_all = true;
@@ -3058,6 +3176,7 @@ pub const Studio = struct {
         self.marquee.active = false;
         self.enabled = !self.enabled;
         if (!self.enabled) {
+            self.composition_context = null;
             self.focus_canvas = false;
             self.tool = .select;
             self.active_morph_state = null;
@@ -3074,6 +3193,7 @@ pub const Studio = struct {
         self.cancelInlineEdit();
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
+        self.composition_context = null;
         self.enabled = false;
         self.focus_canvas = false;
         self.tool = .select;
@@ -3090,6 +3210,7 @@ pub const Studio = struct {
         self.cancelInlineEdit();
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
+        self.composition_context = null;
         self.selected_identity = null;
         self.selected_source = null;
         self.additional_selection_count = 0;
@@ -3447,7 +3568,7 @@ pub const Studio = struct {
             return null;
         }
         if (input.promote_pressed) {
-            _ = self.emitSelectedCommand(items, input.allow_shared_edit, .promote_to_reusable);
+            _ = self.emitPromoteOrDetach(items, input.allow_shared_edit);
             return null;
         }
         if (input.foreground_color) |color| {
@@ -3610,6 +3731,79 @@ pub const Studio = struct {
     }
 
     const TargetCommandKind = enum { delete_item, edit_text, promote_to_reusable };
+
+    fn emitResetOverride(
+        self: *Studio,
+        items: []slides.SlideItem,
+        field: InlineField,
+    ) bool {
+        const item_index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() != 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        if (items[item_index].locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        const context = self.compositionContextForSelection(items) orelse {
+            self.notice = .override_reset_unsupported;
+            return true;
+        };
+        if (!context.local_overrides.contains(field) or
+            !context.resettable_overrides.contains(field) or
+            context.reset_target == null or
+            context.reset_target.?.item_identity != items[item_index].identity)
+        {
+            self.notice = .override_reset_unsupported;
+            return true;
+        }
+        self.notice = .none;
+        self.pending_semantic_command = .{ .reset_local_override = .{
+            .target = context.reset_target.?,
+            .field = field,
+        } };
+        return true;
+    }
+
+    fn emitPromoteOrDetach(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+    ) bool {
+        const item_index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() > 1) {
+            self.notice = .group_reusable_needs_source_support;
+            return true;
+        }
+        const item = items[item_index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (self.compositionContextForSelection(items)) |context| {
+            if (context.kind != .none) {
+                if (self.active_morph_state != null or context.detach_target == null or
+                    context.detach_target.?.item_identity != item.identity)
+                {
+                    self.notice = .detach_instance_unsupported;
+                    return true;
+                }
+                self.notice = .none;
+                self.pending_semantic_command = .{ .detach_reusable_instance = .{
+                    .target = context.detach_target.?,
+                    .kind = context.kind,
+                } };
+                return true;
+            }
+        } else if (item.source.scope == .component_instance or item.source.scope == .group_instance_member or
+            item.source.scope == .slide_template)
+        {
+            self.notice = .detach_instance_unsupported;
+            return true;
+        }
+        return self.emitSelectedCommand(items, allow_shared_edit, .promote_to_reusable);
+    }
 
     fn emitDuplicateItem(self: *Studio, items: []slides.SlideItem, allow_shared_edit: bool) bool {
         if (self.selectionCount() == 0) return false;
@@ -4264,6 +4458,7 @@ pub const Studio = struct {
             self.notice = .property_unavailable;
             return;
         }
+        self.composition_context = null;
         if (self.selected_identity == null) {
             self.setSingleSelection(item);
             return;
@@ -4711,6 +4906,10 @@ pub const Studio = struct {
             if (self.selected_identity == null) return true;
         }
         const inline_properties = viewport.chrome != null;
+        if (inline_properties) {
+            if (self.inlineOverrideFieldAtPoint(items, layout, pointer)) |field|
+                return self.emitResetOverride(items, field);
+        }
         if (pointInRectangle(pointer, layout.edit_text))
             return if (inline_properties)
                 self.beginInlineEdit(items, resolved_bounds, .text, allow_shared_edit)
@@ -4721,7 +4920,7 @@ pub const Studio = struct {
         if (pointInRectangle(pointer, layout.delete_item))
             return self.emitSelectedCommand(items, allow_shared_edit, .delete_item);
         if (pointInRectangle(pointer, layout.promote))
-            return self.emitSelectedCommand(items, allow_shared_edit, .promote_to_reusable);
+            return self.emitPromoteOrDetach(items, allow_shared_edit);
         for (layout.geometry_fields, 0..) |button, index| {
             if (pointInRectangle(pointer, button))
                 return if (inline_properties)
@@ -4818,6 +5017,7 @@ pub const Studio = struct {
     }
 
     fn setSingleSelection(self: *Studio, item: slides.SlideItem) void {
+        self.composition_context = null;
         self.selected_identity = item.identity;
         self.selected_source = sourceForSelection(item);
         self.additional_selection_count = 0;
@@ -4827,6 +5027,7 @@ pub const Studio = struct {
     }
 
     fn clearSelectionState(self: *Studio) void {
+        self.composition_context = null;
         self.interaction = .idle;
         self.marquee.active = false;
         self.selected_identity = null;
@@ -4856,6 +5057,7 @@ pub const Studio = struct {
             };
             self.selected_identity = member.identity;
             self.selected_source = member.source;
+            self.composition_context = null;
             self.last_objects_primary = null;
             return;
         }
@@ -4987,6 +5189,7 @@ pub const Studio = struct {
     }
 
     fn applySelectionMembers(self: *Studio, members: []const SelectionMember) void {
+        self.composition_context = null;
         self.selected_identity = members[0].identity;
         self.selected_source = members[0].source;
         self.additional_selection_count = members.len - 1;
@@ -6452,11 +6655,30 @@ pub const Studio = struct {
                 .none => "Unknown",
                 .direct => "Direct",
                 .component_instance => "Component",
+                .group_instance_member => "Group member",
                 .slide_template => "Shared",
                 .slide_instance_override => "Override",
                 .morph_item => "Morph",
             };
-            const local_badge: []const u8 = if (item.instance_source != null) " · Local" else "";
+            var ownership_badge_buffer: [96]u8 = undefined;
+            const local_badge: []const u8 = if (selected)
+                if (self.compositionContextForSelection(items)) |context|
+                    if (!context.local_overrides.empty()) blk: {
+                        var fields_buffer: [64]u8 = undefined;
+                        const fields = formatOverrideFields(&fields_buffer, context.local_overrides);
+                        break :blk std.fmt.bufPrint(&ownership_badge_buffer, " · Local {s}", .{fields}) catch " · Local";
+                    } else if (item.instance_source != null)
+                        " · Local"
+                    else
+                        ""
+                else if (item.instance_source != null)
+                    " · Local"
+                else
+                    ""
+            else if (item.instance_source != null)
+                " · Local"
+            else
+                "";
             const morph_badge: []const u8 = if (self.active_morph_state) |active_state|
                 if (item.creation_morph_state != null and item.creation_morph_state.? == active_state)
                     " · Born here"
@@ -6620,6 +6842,7 @@ pub const Studio = struct {
         value_y: f32,
         value_font: i32,
         multiline: bool,
+        reserved_right: f32,
     ) InlineDrawWindow {
         const before_cursor = self.inline_editor.buffer[0..self.inline_editor.cursor];
         const cursor_line_start = if (std.mem.lastIndexOfScalar(u8, before_cursor, '\n')) |index| index + 1 else 0;
@@ -6629,7 +6852,7 @@ pub const Studio = struct {
         cursor_buffer[cursor_line.len] = 0;
         const cursor_text: [:0]const u8 = cursor_buffer[0..cursor_line.len :0];
         const cursor_width = self.measureUiText(cursor_text, value_font);
-        const available_width = @max(0, rect.x + rect.width - value_x - 6);
+        const available_width = @max(0, rect.x + rect.width - reserved_right - value_x - 6);
         const horizontal_offset = @max(0, cursor_width - @max(0, available_width - 2));
 
         const line_height = @as(f32, @floatFromInt(value_font + 2));
@@ -6664,6 +6887,8 @@ pub const Studio = struct {
         active: bool,
         invalid: bool,
         multiline: bool,
+        local_override: bool,
+        resettable_override: bool,
         viewport: Viewport,
     ) void {
         if (rect.width <= 0 or rect.height <= 0) return;
@@ -6684,8 +6909,10 @@ pub const Studio = struct {
         const label_width = self.measureUiText(label, label_font);
         const value_x = if (multiline) rect.x + 7 else rect.x + 7 + label_width + 7;
         const value_y = inlineFieldValueY(rect, multiline, value_font);
+        const reset_rect = inlineResetRect(rect);
+        const reserved_right = if (local_override) reset_rect.width else 0;
         const draw_window: InlineDrawWindow = if (active)
-            self.inlineDrawWindow(rect, value_x, value_y, value_font, multiline)
+            self.inlineDrawWindow(rect, value_x, value_y, value_font, multiline, reserved_right)
         else
             .{
                 .display_start = 0,
@@ -6699,7 +6926,7 @@ pub const Studio = struct {
         rl.beginScissorMode(
             @intFromFloat(@floor(value_x)),
             @intFromFloat(@floor(value_y)),
-            @intFromFloat(@ceil(@max(0, rect.x + rect.width - value_x - 6))),
+            @intFromFloat(@ceil(@max(0, rect.x + rect.width - reserved_right - value_x - 6))),
             @intFromFloat(@ceil(@max(0, rect.y + rect.height - value_y - 4))),
         );
         var display_buffer: [max_inline_input_bytes + 1]u8 = undefined;
@@ -6726,6 +6953,28 @@ pub const Studio = struct {
             }, border);
         }
         rl.endScissorMode();
+        if (local_override) {
+            rl.drawRectangleRec(reset_rect, if (resettable_override)
+                .{ .r = 99, .g = 67, .b = 25, .a = 255 }
+            else
+                .{ .r = 50, .g = 45, .b = 39, .a = 255 });
+            rl.drawRectangleLinesEx(reset_rect, 1, if (resettable_override)
+                .{ .r = 247, .g = 164, .b = 29, .a = 255 }
+            else
+                .{ .r = 133, .g = 117, .b = 93, .a = 255 });
+            const marker: [:0]const u8 = if (resettable_override) "R" else "L";
+            const marker_font: i32 = 14;
+            const marker_width = self.measureUiText(marker, marker_font);
+            self.drawUiText(
+                marker,
+                .{
+                    .x = reset_rect.x + (reset_rect.width - marker_width) / 2,
+                    .y = reset_rect.y + (reset_rect.height - @as(f32, @floatFromInt(marker_font))) / 2,
+                },
+                marker_font,
+                if (resettable_override) .{ .r = 255, .g = 205, .b = 116, .a = 255 } else .{ .r = 181, .g = 168, .b = 145, .a = 255 },
+            );
+        }
     }
 
     fn inlineTextIsMultiline(layout: UiLayout) bool {
@@ -6739,6 +6988,79 @@ pub const Studio = struct {
             rect.y + (rect.height - @as(f32, @floatFromInt(value_font))) / 2;
     }
 
+    fn inlineResetRect(rect: rl.Rectangle) rl.Rectangle {
+        const width = @min(@as(f32, 32), rect.width);
+        return .{ .x = rect.x + rect.width - width, .y = rect.y, .width = width, .height = rect.height };
+    }
+
+    fn compositionKindLabel(kind: ReusableInstanceKind) []const u8 {
+        return switch (kind) {
+            .none => "Direct item",
+            .component => "Component instance",
+            .slide_template => "Template instance",
+        };
+    }
+
+    fn compositionBlockLabel(reason: CompositionBlockReason) []const u8 {
+        return switch (reason) {
+            .none => "available",
+            .not_instance => "not a reusable instance",
+            .generated_source => "generated source is read-only",
+            .morph_scene => "detach is base-scene only",
+            .ambiguous_instance => "instance boundary is ambiguous",
+            .dependent_structure => "dependent source structure must remain shared",
+            .integration_unavailable => "safe detach details are unavailable",
+        };
+    }
+
+    fn formatOverrideFields(buffer: []u8, overrides: PropertyOverrideSet) []const u8 {
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
+        const labels = [_][]const u8{ "Text", "X", "Y", "W", "H", "FG", "BG", "Font", "Opacity" };
+        var used: usize = 0;
+        for (fields, labels) |field, label| {
+            if (!overrides.contains(field)) continue;
+            const part = std.fmt.bufPrint(buffer[used..], "{s}{s}", .{ if (used == 0) "" else ", ", label }) catch break;
+            used += part.len;
+        }
+        return buffer[0..used];
+    }
+
+    fn compositionHelp(
+        self: Studio,
+        items: []const slides.SlideItem,
+        buffer: *[192]u8,
+    ) ?[:0]const u8 {
+        if (self.selectionCount() > 1)
+            return std.fmt.bufPrintZ(buffer, "Group reusable needs explicit source-format support", .{}) catch null;
+        const item_index = self.selectedIndex(items) orelse return null;
+        const item = items[item_index];
+        const context = self.compositionContextForSelection(items) orelse {
+            return switch (item.source.scope) {
+                .component_instance => std.fmt.bufPrintZ(buffer, "Component instance · waiting for safe detach details", .{}) catch null,
+                .group_instance_member => std.fmt.bufPrintZ(buffer, "Group instance member · composition details pending", .{}) catch null,
+                .slide_template => std.fmt.bufPrintZ(buffer, "Template instance · waiting for ownership details", .{}) catch null,
+                else => std.fmt.bufPrintZ(buffer, "Direct item · properties belong to this slide", .{}) catch null,
+            };
+        };
+        const kind = compositionKindLabel(context.kind);
+        if (!context.local_overrides.empty()) {
+            var fields_buffer: [96]u8 = undefined;
+            const fields = formatOverrideFields(&fields_buffer, context.local_overrides);
+            return std.fmt.bufPrintZ(
+                buffer,
+                "{s} · local {s} · {s}",
+                .{ kind, fields, if (context.reset_target != null) "R resets one" else "local source is read-only" },
+            ) catch null;
+        }
+        if (context.detach_target != null)
+            return std.fmt.bufPrintZ(buffer, "{s} · inherited · Detach makes local boxes", .{kind}) catch null;
+        return std.fmt.bufPrintZ(
+            buffer,
+            "{s} · inherited · {s}",
+            .{ kind, compositionBlockLabel(context.detach_block) },
+        ) catch null;
+    }
+
     fn drawInlineProperties(
         self: Studio,
         items: []const slides.SlideItem,
@@ -6749,11 +7071,31 @@ pub const Studio = struct {
         const layout = uiLayout(viewport);
         drawCompactButton(self, layout.duplicate_item, "Dup");
         drawCompactButton(self, layout.delete_item, "Del");
-        drawCompactButton(self, layout.promote, "Reuse");
+        if (self.selectionCount() > 1) {
+            drawDisabledBadge(self, layout.promote, "Group…");
+        } else if (self.compositionContextForSelection(items)) |context| {
+            if (context.kind != .none) {
+                if (context.detach_target != null)
+                    drawCompactButton(self, layout.promote, "Detach")
+                else
+                    drawDisabledBadge(self, layout.promote, "Inherited");
+            } else {
+                drawCompactButton(self, layout.promote, "Reuse");
+            }
+        } else if (self.selectedIndex(items)) |index| {
+            if (items[index].source.scope == .component_instance or items[index].source.scope == .group_instance_member or
+                items[index].source.scope == .slide_template)
+                drawDisabledBadge(self, layout.promote, "Instance")
+            else
+                drawCompactButton(self, layout.promote, "Reuse");
+        } else {
+            drawDisabledBadge(self, layout.promote, "Reuse");
+        }
         drawCompactButton(self, layout.lock_item, if (selected_locked) "Unlock" else "Lock");
 
         const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
         const labels = [_][:0]const u8{ "TEXT", "X", "Y", "W", "H", "FG", "BG", "FONT", "OPACITY" };
+        const composition = self.compositionContextForSelection(items);
         for (fields, labels) |field, label| {
             var scalar_buffer: [max_inline_input_bytes]u8 = undefined;
             var color_buffer: [9]u8 = undefined;
@@ -6762,6 +7104,11 @@ pub const Studio = struct {
                 self.inline_editor.text()
             else
                 self.inlineDisplayValue(items, resolved_bounds, field, &scalar_buffer, &color_buffer);
+            const local_override = if (composition) |context| context.local_overrides.contains(field) else false;
+            const resettable_override = if (composition) |context|
+                context.reset_target != null and context.resettable_overrides.contains(field)
+            else
+                false;
             self.drawInlineField(
                 inlineFieldRect(layout, field),
                 label,
@@ -6769,6 +7116,8 @@ pub const Studio = struct {
                 active,
                 active and self.inline_editor.error_value != null,
                 field == .text and inlineTextIsMultiline(layout),
+                local_override,
+                resettable_override,
                 viewport,
             );
         }
@@ -6781,6 +7130,7 @@ pub const Studio = struct {
         drawSwatches(layout.background_swatches, if (selected_item) |item| item.background_color else null);
 
         const error_font = @max(@as(i32, 14), scaledUiFont(layout.scale, UiTypography.compact));
+        var composition_buffer: [192]u8 = undefined;
         if (layout.inline_error.height >= @as(f32, @floatFromInt(error_font))) {
             const message: ?[:0]const u8 = if (self.inline_editor.active) inline_error: {
                 if (self.inline_editor.awaiting_commit) break :inline_error "Saving…";
@@ -6788,11 +7138,11 @@ pub const Studio = struct {
                 if (self.inline_editor.target.edit_scope == .shared_template) break :inline_error "Shared template · Enter commits · Esc cancels";
                 break :inline_error "Enter commits · Shift-Enter adds a text line · Tab moves";
             } else if (self.selectionCount() > 1)
-                "Mixed values shown; select one object to edit"
+                self.compositionHelp(items, &composition_buffer)
             else if (self.selectionCount() == 0)
                 "Select an object to edit its properties"
             else
-                null;
+                self.compositionHelp(items, &composition_buffer);
             if (message) |text_value| {
                 var fitted_buffer: [192]u8 = undefined;
                 const fitted = self.fitUiText(&fitted_buffer, text_value, error_font, layout.inline_error.width);
@@ -7007,6 +7357,9 @@ pub const Studio = struct {
             .library_entry_in_use => "Cannot delete: later source instances still use this reusable",
             .library_delete_unsupported => "Slide-template deletion is not source-safe yet",
             .slide_template_promotion_locked => "This slide cannot be promoted without changing its source semantics",
+            .group_reusable_needs_source_support => "Group reusable needs explicit component-group source-format support",
+            .override_reset_unsupported => "That local property cannot be reset safely; no source change was made",
+            .detach_instance_unsupported => "This reusable instance cannot be detached safely here",
         };
         if (notice_text) |message| {
             const notice_color: rl.Color = switch (self.notice) {
@@ -9452,7 +9805,7 @@ test "idless template semantic actions need IDs but Alt can delete shared" {
     }
 }
 
-test "promotion is offered only for direct base box items" {
+test "promotion is direct-only while instances require detach capability" {
     var items = [_]slides.SlideItem{testItem(88, .textbox, 100, 100, 300, 100)};
     const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
     var studio: Studio = .{ .enabled = true, .selected_identity = 88 };
@@ -9460,7 +9813,7 @@ test "promotion is offered only for direct base box items" {
     items[0].source.scope = .component_instance;
     _ = studio.update(&items, &.{}, viewport, .{ .promote_pressed = true });
     try std.testing.expect(studio.takeSemanticCommand() == null);
-    try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
+    try std.testing.expectEqual(Notice.detach_instance_unsupported, studio.notice);
 
     items[0].source.scope = .direct;
     items[0].kind = .crowd;
@@ -10555,6 +10908,10 @@ test "inline property layout stays legible and contained at compact minimum" {
     for (fields) |field| {
         try expectRectangleContained(layout.properties, field);
         try std.testing.expect(field.height >= 32);
+        const reset = Studio.inlineResetRect(field);
+        try expectRectangleContained(field, reset);
+        try std.testing.expectEqual(@as(f32, 32), reset.width);
+        try std.testing.expect(reset.height >= 32);
     }
     try std.testing.expect(layout.compact_properties);
     try std.testing.expect(!Studio.inlineTextIsMultiline(layout));
@@ -10581,6 +10938,9 @@ test "roomy inspector uses two-row geometry fields with representative values" {
     const samples = [_][:0]const u8{ "1920", "-1080", "123.456", "-987.654" };
     const studio: Studio = .{};
     for (layout.geometry_fields, labels, samples) |field, label, sample| {
+        const reset = Studio.inlineResetRect(field);
+        try expectRectangleContained(field, reset);
+        try std.testing.expectEqual(@as(f32, 32), reset.width);
         const value_x = field.x + 7 + studio.measureUiText(label, 14) + 7;
         const available = field.x + field.width - value_x - 6;
         try std.testing.expect(studio.measureUiText(sample, 16) <= available);
@@ -10600,11 +10960,12 @@ test "inline draw window keeps long ASCII caret inside compact scalar field" {
     const field = layout.geometry_fields[0];
     const value_x = field.x + 7 + studio.measureUiText("X", 14) + 7;
     const value_y = Studio.inlineFieldValueY(field, false, 16);
-    const window = studio.inlineDrawWindow(field, value_x, value_y, 16, false);
+    const reset = Studio.inlineResetRect(field);
+    const window = studio.inlineDrawWindow(field, value_x, value_y, 16, false, reset.width);
     try std.testing.expect(window.horizontal_offset > 0);
     try std.testing.expect(window.draw_x < value_x);
     try std.testing.expect(window.cursor_x >= value_x);
-    try std.testing.expect(window.cursor_x + 2 <= field.x + field.width - 6);
+    try std.testing.expect(window.cursor_x + 2 <= reset.x - 6);
     try std.testing.expect(window.cursor_y >= field.y);
     try std.testing.expect(window.cursor_y + window.line_height <= field.y + field.height - 4);
 }
@@ -10629,7 +10990,7 @@ test "inline draw window keeps multibyte tail and active multiline line visible"
     const field = layout.edit_text;
     const value_x = field.x + 7;
     const value_y = Studio.inlineFieldValueY(field, true, 16);
-    const window = studio.inlineDrawWindow(field, value_x, value_y, 16, true);
+    const window = studio.inlineDrawWindow(field, value_x, value_y, 16, true, 0);
     try std.testing.expect(window.display_start >= prefix.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(studio.inlineEditText()[window.display_start..]));
     try std.testing.expect(window.horizontal_offset > 0);
@@ -10743,6 +11104,171 @@ test "dirty inline field switch preserves the clicked shared scope after accept"
     try std.testing.expectEqual(@as(?InlineField, .y), studio.inlineEditField());
     try std.testing.expectEqual(EditScope.shared_template, studio.inline_editor.target.edit_scope);
     try std.testing.expectEqualStrings("30", studio.inlineEditText());
+}
+
+test "local override reset targets one exact property and explains ownership" {
+    var items = [_]slides.SlideItem{testItem(655, .textbox, 100, 120, 300, 80)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_offset = 10, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_offset = 40, .patchable = true };
+    items[0].shared_template_values = .{ .position = .{ .x = 20, .y = 30 }, .size = .{ .x = 200, .y = 60 } };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 655,
+    };
+    studio.setCompositionContext(.{
+        .item_identity = 655,
+        .selection_source = items[0].instance_source.?,
+        .kind = .slide_template,
+        .local_overrides = PropertyOverrideSet.fromFields(&.{ .x, .foreground }),
+        .resettable_overrides = PropertyOverrideSet.fromFields(&.{.x}),
+        .reset_target = .{
+            .item_identity = 655,
+            .source = items[0].instance_source.?,
+            .edit_scope = .local_instance,
+        },
+        .detach_block = .dependent_structure,
+    });
+    var help_buffer: [192]u8 = undefined;
+    const help = studio.compositionHelp(&items, &help_buffer).?;
+    try std.testing.expect(std.mem.indexOf(u8, help, "Template instance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "X, FG") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "R resets one") != null);
+
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 900, .height = 506 });
+    const layout = uiLayout(frame.viewport);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.inlineResetRect(layout.geometry_fields[0])),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .reset_local_override => |command| {
+            try std.testing.expectEqual(InlineField.x, command.field);
+            try std.testing.expectEqual(@as(usize, 655), command.target.item_identity);
+            try std.testing.expectEqual(@as(usize, 40), command.target.source.line_offset);
+            try std.testing.expectEqual(EditScope.local_instance, command.target.edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.inlineResetRect(layout.custom_foreground)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.override_reset_unsupported, studio.notice);
+
+    items[0].locked = true;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.inlineResetRect(layout.geometry_fields[0])),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.locked_item, studio.notice);
+}
+
+test "stale composition source cannot retarget an override reset" {
+    var items = [_]slides.SlideItem{testItem(656, .textbox, 100, 120, 300, 80)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_offset = 10, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_offset = 40, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 656,
+    };
+    const stale_source: slides.SourceRef = .{ .scope = .slide_instance_override, .line_offset = 999, .patchable = true };
+    studio.setCompositionContext(.{
+        .item_identity = 656,
+        .selection_source = stale_source,
+        .kind = .slide_template,
+        .local_overrides = PropertyOverrideSet.fromFields(&.{.x}),
+        .resettable_overrides = PropertyOverrideSet.fromFields(&.{.x}),
+        .reset_target = .{ .item_identity = 656, .source = stale_source, .edit_scope = .local_instance },
+    });
+    try std.testing.expect(studio.compositionContextForSelection(&items) == null);
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 900, .height = 506 });
+    const field = uiLayout(frame.viewport).geometry_fields[0];
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.inlineResetRect(field)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(@as(?InlineField, .x), studio.inlineEditField());
+}
+
+test "detach requires an identity-safe integration capability" {
+    var items = [_]slides.SlideItem{testItem(657, .textbox, 100, 120, 300, 80)};
+    items[0].source = .{ .scope = .component_instance, .line_offset = 70, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 657,
+    };
+    const target: CommandTarget = .{ .item_identity = 657, .source = items[0].source };
+    studio.setCompositionContext(.{
+        .item_identity = 657,
+        .selection_source = items[0].source,
+        .kind = .component,
+        .detach_target = target,
+        .detach_block = .none,
+    });
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 900, .height = 506 });
+    const promote = uiLayout(frame.viewport).promote;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(promote),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .detach_reusable_instance => |command| {
+            try std.testing.expectEqual(ReusableInstanceKind.component, command.kind);
+            try std.testing.expectEqual(@as(usize, 70), command.target.source.line_offset);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.setCompositionContext(.{
+        .item_identity = 657,
+        .selection_source = items[0].source,
+        .kind = .component,
+        .detach_block = .generated_source,
+    });
+    var help_buffer: [192]u8 = undefined;
+    const help = studio.compositionHelp(&items, &help_buffer).?;
+    try std.testing.expect(std.mem.indexOf(u8, help, "generated source is read-only") != null);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(promote),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.detach_instance_unsupported, studio.notice);
+}
+
+test "group reusable remains an honest disabled source-format boundary" {
+    var items = [_]slides.SlideItem{
+        testItem(658, .textbox, 100, 120, 300, 80),
+        testItem(659, .img, 500, 120, 240, 160),
+    };
+    for (&items, 0..) |*item, index|
+        item.source = .{ .scope = .direct, .line_offset = 10 + index * 10, .patchable = true };
+    var studio: Studio = .{ .enabled = true, .active_dock = .properties, .inspector_panel = .properties };
+    setTestSelection(&studio, &items, &.{ 658, 659 });
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 900, .height = 506 });
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(uiLayout(frame.viewport).promote),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.group_reusable_needs_source_support, studio.notice);
+    var help_buffer: [192]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Group reusable needs explicit source-format support",
+        studio.compositionHelp(&items, &help_buffer).?,
+    );
 }
 
 test "active inline editor consumes Studio toggle key and receives its text" {

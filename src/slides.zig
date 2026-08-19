@@ -178,6 +178,10 @@ pub const SourceScope = enum(u8) {
     none,
     direct,
     component_instance,
+    /// A member emitted by a literal `@popgroup` call. Its source points at
+    /// the structural call rather than pretending that every emitted member
+    /// is an independently patchable item directive.
+    group_instance_member,
     slide_template,
     slide_instance_override,
     morph_item,
@@ -222,6 +226,11 @@ pub const SlideItem = struct {
     id: ?[]const u8 = null,
     /// Location and authoring scope of the directive that created this item.
     source: SourceRef = .{},
+    /// Original literal `@box`/`@pop` line inside a reusable-group
+    /// definition. `source` remains the `@popgroup` structural owner for an
+    /// emitted instance, while this reference enables an editor to offer an
+    /// explicit shared-definition edit without conflating the two scopes.
+    group_member_source: ?SourceRef = null,
     /// Location of the most recent instance-local @set/@show/@hide directive
     /// applied to a slide-template item in the authored base scene. The
     /// creation source above deliberately remains the shared @pushslide item,

@@ -123,6 +123,82 @@ pub const VisibilitySourceEdit = union(enum) {
     },
 };
 
+/// One property whose scoped template-instance or morph-state mutations may
+/// be removed so the value inherited from the shared/base scene resurfaces.
+pub const InheritedProperty = enum {
+    x,
+    y,
+    w,
+    h,
+    text,
+    color,
+    bg,
+    fontsize,
+    opacity,
+    visible,
+    locked,
+};
+
+/// Exact mutation scene and parser-effective provenance captured by the UI.
+/// The effective offset is validated before reset planning so a stale command
+/// cannot remove similarly named mutations in another slide or state.
+pub const MutationOwner = union(enum) {
+    template_instance: struct {
+        slide_offset: usize,
+        effective_mutation_offset: usize,
+    },
+    morph_state: struct {
+        state_offset: usize,
+        effective_mutation_offset: usize,
+    },
+    component_instance: struct {
+        instance_offset: usize,
+        expected_definition_offset: usize,
+    },
+};
+
+/// Read-only Inspector capability summary. A set bit means this exact authored
+/// scope contributes the property and can therefore reset it to inheritance.
+pub const InheritedPropertyOverrides = packed struct(u16) {
+    x: bool = false,
+    y: bool = false,
+    w: bool = false,
+    h: bool = false,
+    text: bool = false,
+    color: bool = false,
+    bg: bool = false,
+    fontsize: bool = false,
+    opacity: bool = false,
+    visible: bool = false,
+    locked: bool = false,
+    _padding: u5 = 0,
+
+    pub fn contains(self: InheritedPropertyOverrides, property: InheritedProperty) bool {
+        return switch (property) {
+            .x => self.x,
+            .y => self.y,
+            .w => self.w,
+            .h => self.h,
+            .text => self.text,
+            .color => self.color,
+            .bg => self.bg,
+            .fontsize => self.fontsize,
+            .opacity => self.opacity,
+            .visible => self.visible,
+            .locked => self.locked,
+        };
+    }
+};
+
+/// Borrowed metadata for a literal component instance that can be detached.
+/// Main uses the definition offset as optimistic provenance when it later
+/// submits a fully materialized direct-box snippet.
+pub const ComponentDetachInfo = struct {
+    component_name: []const u8,
+    definition_offset: usize,
+    effective_id: []const u8,
+};
+
 /// The caller owns `source` and must free it with the allocator passed to the
 /// source-editing function that produced it.
 pub const PatchResult = struct {
@@ -153,6 +229,9 @@ pub const PatchError = error{
     InvalidSlideOffset,
     InvalidSnippet,
     ItemIdCollision,
+    ComponentDefinitionMismatch,
+    DetachedItemIdMismatch,
+    NoLocalPropertyOverride,
     NoAdjacentSlide,
     NoLayerChange,
     NotPromotableDirective,
@@ -161,6 +240,7 @@ pub const PatchError = error{
     SourceTooLarge,
     UnsupportedItemDuplication,
     UnsupportedClipboardItem,
+    UnsupportedComponentDetach,
     UnsupportedItemLayerMove,
     UnsupportedSlideTemplateOverride,
     UnsupportedSharedTemplateDeletion,
@@ -1094,6 +1174,134 @@ pub fn validateMorphMutationTarget(
     if (latest != mutation_offset) return error.InvalidMorphStateOffset;
 }
 
+/// Report whether the exact scoped mutation history contains a local override
+/// for `property`. This performs the same stale-provenance and literal-scope
+/// validation as resetInheritedProperty without allocating or changing source.
+pub fn inheritedPropertyOverrideExists(
+    source: []const u8,
+    owner: MutationOwner,
+    item_id: []const u8,
+    property: InheritedProperty,
+) PatchError!bool {
+    return (try inheritedPropertyOverrides(source, owner, item_id)).contains(property);
+}
+
+/// Return every locally authored property in the exact captured scope using
+/// the same provenance and contribution scan as resetInheritedProperty.
+pub fn inheritedPropertyOverrides(
+    source: []const u8,
+    owner: MutationOwner,
+    item_id: []const u8,
+) PatchError!InheritedPropertyOverrides {
+    if (owner == .component_instance) {
+        const component = owner.component_instance;
+        const info = try inspectComponentInstance(source, component.instance_offset);
+        if (info.definition_offset != component.expected_definition_offset) {
+            return error.ComponentDefinitionMismatch;
+        }
+        if (!std.mem.eql(u8, info.effective_id, item_id)) return error.DetachedItemIdMismatch;
+        const line = try directiveLine(source, component.instance_offset);
+        return propertyOverridesOnDirective(source, line, false);
+    }
+
+    const region = try validatedMutationRegion(source, owner, item_id);
+    var overrides: InheritedPropertyOverrides = .{};
+    var cursor = region.start;
+    while (cursor < region.end) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[line.start..line.content_end];
+        if (text.len > 0 and text[0] == '@' and isMorphMutationDirective(directiveName(text))) {
+            const target = validateSlideTemplateOverrideDirectiveLine(text) catch
+                return mutationOwnerError(owner);
+            if (std.mem.eql(u8, target, item_id)) {
+                mergePropertyOverrides(&overrides, try propertyOverridesOnDirective(
+                    source,
+                    line,
+                    std.mem.eql(u8, directiveName(text), "@show") or
+                        std.mem.eql(u8, directiveName(text), "@hide"),
+                ));
+            }
+        }
+        cursor = line.full_end;
+    }
+    return overrides;
+}
+
+/// Remove every contribution to one property from an item's exact local
+/// mutation scene. Removing the complete local history (rather than only the
+/// latest token) guarantees that the inherited shared/base value resurfaces.
+/// Unrelated mutation attributes, text, comments, whitespace, and line endings
+/// remain byte-identical. Visibility additionally canonicalizes @show/@hide to
+/// @set; a mutation that becomes semantically empty is removed.
+pub fn resetInheritedProperty(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    owner: MutationOwner,
+    item_id: []const u8,
+    property: InheritedProperty,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (owner == .component_instance) {
+        const component = owner.component_instance;
+        const info = try inspectComponentInstance(source, component.instance_offset);
+        if (info.definition_offset != component.expected_definition_offset) {
+            return error.ComponentDefinitionMismatch;
+        }
+        if (!std.mem.eql(u8, info.effective_id, item_id)) return error.DetachedItemIdMismatch;
+        const line = try directiveLine(source, component.instance_offset);
+        return resetComponentInstanceProperty(allocator, source, line, property);
+    }
+
+    const region = try validatedMutationRegion(source, owner, item_id);
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    var replacements = std.ArrayList([]u8).empty;
+    defer {
+        for (replacements.items) |replacement| allocator.free(replacement);
+        replacements.deinit(allocator);
+    }
+
+    var found = false;
+    var cursor = region.start;
+    while (cursor < region.end) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[line.start..line.content_end];
+        if (text.len > 0 and text[0] == '@' and isMorphMutationDirective(directiveName(text))) {
+            const target = validateSlideTemplateOverrideDirectiveLine(text) catch
+                return mutationOwnerError(owner);
+            if (std.mem.eql(u8, target, item_id)) {
+                const rewrite = try rewriteMutationWithoutProperty(allocator, source, line, property);
+                if (rewrite.changed) {
+                    found = true;
+                    if (rewrite.delete_directive) {
+                        try edits.append(allocator, .{
+                            .start = line.start,
+                            .end = line.full_end,
+                            .replacement = "",
+                        });
+                    } else if (rewrite.directive) |directive| {
+                        var replacement_owned = true;
+                        errdefer if (replacement_owned) allocator.free(directive);
+                        try replacements.append(allocator, directive);
+                        replacement_owned = false;
+                        try edits.append(allocator, .{
+                            .start = line.start,
+                            .end = line.content_end,
+                            .replacement = directive,
+                        });
+                    }
+                    if (rewrite.remove_body_text) {
+                        try appendBodyDeletionEdits(allocator, source, line.full_end, &edits);
+                    }
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (!found) return error.NoLocalPropertyOverride;
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
 /// Patch attributes on an already-authored instance-local override.
 ///
 /// `override_offset` must identify a literal `@set`/`@show`/`@hide` for
@@ -1572,6 +1780,118 @@ pub fn promoteItemToReusable(
         .end = item_end,
         .replacement = pop_line.items,
     });
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+/// Resolve one literal `@pop` instance and the exact parser-effective `@push`
+/// definition visible at its source position. Returned slices borrow `source`.
+/// Dynamic names/IDs, malformed attributes, and ambiguous definition prefixes
+/// are intentionally unavailable to Studio reset/detach capabilities.
+pub fn inspectComponentInstance(
+    source: []const u8,
+    instance_offset: usize,
+) PatchError!ComponentDetachInfo {
+    const line = directiveLine(source, instance_offset) catch
+        return error.UnsupportedComponentDetach;
+    const text = source[line.start..line.content_end];
+    const name = directiveName(text);
+    if (!std.mem.eql(u8, name, "@pop") or hasPotentialLetExpansion(text)) {
+        return error.UnsupportedComponentDetach;
+    }
+    const component_name = directiveContextName(text, name.len) orelse
+        return error.UnsupportedComponentDetach;
+    if (!isReusableName(component_name)) return error.UnsupportedComponentDetach;
+    const attributes_start = @intFromPtr(component_name.ptr) - @intFromPtr(text.ptr) + component_name.len;
+    validateClipboardDirectiveAttributes(text, attributes_start) catch
+        return error.UnsupportedComponentDetach;
+    const definition_offset = resolveLiteralComponentDefinitionBefore(
+        source,
+        line.start,
+        component_name,
+    ) catch return error.UnsupportedComponentDetach;
+    const effective_id = effectiveLiteralId(text, attributes_start) orelse component_name;
+    if (!isLiteralItemId(effective_id)) return error.UnsupportedComponentDetach;
+    return .{
+        .component_name = component_name,
+        .definition_offset = definition_offset,
+        .effective_id = effective_id,
+    };
+}
+
+/// Component provenance plus the forward-context proof required to detach.
+/// Resetting an attribute keeps the @pop and does not need this tail check;
+/// replacing @pop with @box does, because @pop persists its pushed context for
+/// following items until a slide/state boundary.
+pub fn inspectComponentInstanceForDetach(
+    source: []const u8,
+    instance_offset: usize,
+) PatchError!ComponentDetachInfo {
+    const info = try inspectComponentInstance(source, instance_offset);
+    const line = try directiveLine(source, instance_offset);
+    try validateComponentDetachTail(source, itemBodyEndOffset(source, line.full_end));
+    return info;
+}
+
+/// Replace one literal component instance with a caller-materialized direct
+/// `@box` while preserving the instance's pending @anim decorators, comments,
+/// blank layout, and physical line ending. `materialized_box_snippet` must
+/// encode the complete effective item semantics (including explicit ID and
+/// text/body); source_editor deliberately does not guess through nested parser
+/// contexts or presentation defaults. `expected_definition_offset` is the
+/// optimistic provenance returned by inspectComponentInstanceForDetach.
+///
+/// The source preflight also proves that no later item consumes the @pop's
+/// persistent item context before a clearing slide/state boundary. Otherwise
+/// detaching only this item could change a following @box and is refused.
+/// Unused @push definitions remain in place because their context-clearing
+/// side effect makes automatic orphan deletion unsafe.
+pub fn detachComponentInstance(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    instance_offset: usize,
+    expected_definition_offset: usize,
+    materialized_box_snippet: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const info = try inspectComponentInstanceForDetach(source, instance_offset);
+    if (info.definition_offset != expected_definition_offset) {
+        return error.ComponentDefinitionMismatch;
+    }
+
+    const materialized = try validateMaterializedBoxSnippet(materialized_box_snippet);
+    const materialized_id = effectiveLiteralId(materialized.directive, "@box".len) orelse
+        return error.DetachedItemIdMismatch;
+    if (!std.mem.eql(u8, materialized_id, info.effective_id)) {
+        return error.DetachedItemIdMismatch;
+    }
+
+    const line = try directiveLine(source, instance_offset);
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    try edits.append(allocator, .{
+        .start = line.start,
+        .end = line.content_end,
+        .replacement = materialized.directive,
+    });
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    if (materialized.body.len > 0) {
+        const newline = lineEndingNear(source, line.start);
+        if (line.full_end == line.content_end) try body.appendSlice(allocator, newline);
+        try appendNormalizedLines(allocator, &body, materialized.body, newline);
+        try body.appendSlice(allocator, newline);
+        try edits.append(allocator, .{
+            .start = line.full_end,
+            .end = line.full_end,
+            .replacement = body.items,
+        });
+    }
+    // Keep an insertion at the body anchor before deletions starting at that
+    // same byte. applyEdits deliberately supports this stable ordering: it
+    // emits the replacement, then advances over the old semantic body.
+    try appendBodyDeletionEdits(allocator, source, line.full_end, &edits);
+
     sortEditsByPosition(edits.items);
     return applyEdits(allocator, source, edits.items);
 }
@@ -3302,6 +3622,304 @@ fn itemBodyEndOffset(source: []const u8, body_start: usize) usize {
         cursor = line.full_end;
     }
     return source.len;
+}
+
+const MutationRegion = struct {
+    start: usize,
+    end: usize,
+};
+
+fn validatedMutationRegion(
+    source: []const u8,
+    owner: MutationOwner,
+    item_id: []const u8,
+) PatchError!MutationRegion {
+    return switch (owner) {
+        .template_instance => |instance| blk: {
+            try validateSlideTemplateOverrideTarget(
+                source,
+                instance.slide_offset,
+                instance.effective_mutation_offset,
+                item_id,
+            );
+            const region = try slideTemplateInstanceBaseRegion(source, instance.slide_offset);
+            break :blk .{ .start = region.anchor.full_end, .end = region.end };
+        },
+        .morph_state => |morph| blk: {
+            try validateMorphMutationTarget(
+                source,
+                morph.state_offset,
+                morph.effective_mutation_offset,
+                item_id,
+            );
+            const state = directiveLine(source, morph.state_offset) catch
+                return error.InvalidMorphStateOffset;
+            break :blk .{
+                .start = state.full_end,
+                .end = try morphStateEndOffset(source, morph.state_offset),
+            };
+        },
+        .component_instance => error.UnsupportedComponentDetach,
+    };
+}
+
+fn mutationOwnerError(owner: MutationOwner) PatchError {
+    return switch (owner) {
+        .template_instance => error.UnsupportedSlideTemplateOverride,
+        .morph_state => error.InvalidMorphStateOffset,
+        .component_instance => error.UnsupportedComponentDetach,
+    };
+}
+
+fn propertyKey(property: InheritedProperty) []const u8 {
+    return switch (property) {
+        .x => "x",
+        .y => "y",
+        .w => "w",
+        .h => "h",
+        .text => "text",
+        .color => "color",
+        .bg => "bg",
+        .fontsize => "fontsize",
+        .opacity => "opacity",
+        .visible => "visible",
+        .locked => "locked",
+    };
+}
+
+fn directiveAttributesStart(text: []const u8) PatchError!usize {
+    const name = directiveName(text);
+    var cursor = name.len;
+    while (cursor < text.len and isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
+    if (std.mem.eql(u8, name, "@set") or
+        std.mem.eql(u8, name, "@show") or
+        std.mem.eql(u8, name, "@hide") or
+        std.mem.eql(u8, name, "@pop"))
+    {
+        if (cursor == text.len) return error.InvalidLiteralValue;
+        while (cursor < text.len and !isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
+    }
+    return cursor;
+}
+
+fn mutationBodyHasText(source: []const u8, line: DirectiveLine) bool {
+    var cursor = line.full_end;
+    while (cursor < source.len) {
+        const body_line = physicalLineAt(source, cursor);
+        const content = source[body_line.start..body_line.content_end];
+        if (content.len > 0 and content[0] == '@') break;
+        if (content.len > 0 and content[0] != '#') return true;
+        cursor = body_line.full_end;
+    }
+    return false;
+}
+
+fn setPropertyOverride(overrides: *InheritedPropertyOverrides, property: InheritedProperty) void {
+    switch (property) {
+        .x => overrides.x = true,
+        .y => overrides.y = true,
+        .w => overrides.w = true,
+        .h => overrides.h = true,
+        .text => overrides.text = true,
+        .color => overrides.color = true,
+        .bg => overrides.bg = true,
+        .fontsize => overrides.fontsize = true,
+        .opacity => overrides.opacity = true,
+        .visible => overrides.visible = true,
+        .locked => overrides.locked = true,
+    }
+}
+
+fn propertyForKey(key: []const u8) ?InheritedProperty {
+    inline for (std.meta.fields(InheritedProperty)) |field| {
+        const property: InheritedProperty = @enumFromInt(field.value);
+        if (std.mem.eql(u8, key, propertyKey(property))) return property;
+    }
+    return null;
+}
+
+fn propertyOverridesOnDirective(
+    source: []const u8,
+    line: DirectiveLine,
+    verb_overrides_visibility: bool,
+) PatchError!InheritedPropertyOverrides {
+    const text = source[line.start..line.content_end];
+    var overrides: InheritedPropertyOverrides = .{};
+    if (verb_overrides_visibility) overrides.visible = true;
+    var cursor = try directiveAttributesStart(text);
+    while (cursor < text.len) {
+        while (cursor < text.len and isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
+        if (cursor == text.len) break;
+        const token_start = cursor;
+        while (cursor < text.len and !isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
+        const token = text[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse return error.InvalidLiteralValue;
+        const key = token[0..equals];
+        if (propertyForKey(key)) |property| setPropertyOverride(&overrides, property);
+        if (std.mem.eql(u8, key, "text")) break;
+    }
+    if (mutationBodyHasText(source, line)) overrides.text = true;
+    return overrides;
+}
+
+fn mergePropertyOverrides(target: *InheritedPropertyOverrides, source: InheritedPropertyOverrides) void {
+    inline for (std.meta.fields(InheritedProperty)) |field| {
+        const property: InheritedProperty = @enumFromInt(field.value);
+        if (source.contains(property)) setPropertyOverride(target, property);
+    }
+}
+
+const MutationPropertyRewrite = struct {
+    changed: bool = false,
+    delete_directive: bool = false,
+    directive: ?[]u8 = null,
+    remove_body_text: bool = false,
+};
+
+fn rewriteMutationWithoutProperty(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    line: DirectiveLine,
+    property: InheritedProperty,
+) (std.mem.Allocator.Error || PatchError)!MutationPropertyRewrite {
+    const text = source[line.start..line.content_end];
+    const name = directiveName(text);
+    const is_mutation = isMorphMutationDirective(name);
+    const rewrite_visibility_verb = is_mutation and property == .visible and
+        (std.mem.eql(u8, name, "@show") or std.mem.eql(u8, name, "@hide"));
+    const key_to_remove = propertyKey(property);
+    var removals = std.ArrayList(Span).empty;
+    defer removals.deinit(allocator);
+    var remaining_attributes: usize = 0;
+    var cursor = try directiveAttributesStart(text);
+    while (cursor < text.len) {
+        while (cursor < text.len and isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
+        if (cursor == text.len) break;
+        const token_start = cursor;
+        while (cursor < text.len and !isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
+        var token_end = cursor;
+        const token = text[token_start..token_end];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse return error.InvalidLiteralValue;
+        const key = token[0..equals];
+        if (std.mem.eql(u8, key, "text")) token_end = text.len;
+        if (std.mem.eql(u8, key, key_to_remove)) {
+            try removals.append(allocator, .{ .start = token_start, .end = token_end });
+        } else {
+            remaining_attributes += 1;
+        }
+        if (std.mem.eql(u8, key, "text")) break;
+    }
+
+    const body_has_text = mutationBodyHasText(source, line);
+    const remove_body_text = property == .text and body_has_text;
+    const changed = removals.items.len > 0 or rewrite_visibility_verb or remove_body_text;
+    if (!changed) return .{};
+    const remaining_body_text = body_has_text and !remove_body_text;
+    if (is_mutation and
+        (std.mem.eql(u8, name, "@set") or rewrite_visibility_verb) and
+        remaining_attributes == 0 and !remaining_body_text)
+    {
+        return .{
+            .changed = true,
+            .delete_directive = true,
+            .remove_body_text = remove_body_text,
+        };
+    }
+
+    if (removals.items.len == 0 and !rewrite_visibility_verb) {
+        return .{ .changed = true, .remove_body_text = remove_body_text };
+    }
+    var line_edits = std.ArrayList(Edit).empty;
+    defer line_edits.deinit(allocator);
+    if (rewrite_visibility_verb) {
+        try line_edits.append(allocator, .{ .start = 0, .end = name.len, .replacement = "@set" });
+    }
+    for (removals.items) |span| {
+        try line_edits.append(allocator, .{ .start = span.start, .end = span.end, .replacement = "" });
+    }
+    sortEditsByPosition(line_edits.items);
+    const rewritten = try applyEdits(allocator, text, line_edits.items);
+    return .{
+        .changed = true,
+        .directive = rewritten.source,
+        .remove_body_text = remove_body_text,
+    };
+}
+
+fn resetComponentInstanceProperty(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    line: DirectiveLine,
+    property: InheritedProperty,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const rewrite = try rewriteMutationWithoutProperty(allocator, source, line, property);
+    defer if (rewrite.directive) |directive| allocator.free(directive);
+    if (!rewrite.changed) return error.NoLocalPropertyOverride;
+    std.debug.assert(!rewrite.delete_directive);
+
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    if (rewrite.directive) |directive| {
+        try edits.append(allocator, .{
+            .start = line.start,
+            .end = line.content_end,
+            .replacement = directive,
+        });
+    }
+    if (rewrite.remove_body_text) {
+        try appendBodyDeletionEdits(allocator, source, line.full_end, &edits);
+    }
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+const MaterializedBoxSnippet = struct {
+    directive: []const u8,
+    body: []const u8,
+};
+
+fn validateMaterializedBoxSnippet(snippet: []const u8) PatchError!MaterializedBoxSnippet {
+    validateSnippet(snippet) catch return error.UnsupportedComponentDetach;
+    if (hasPotentialLetExpansion(snippet)) return error.UnsupportedComponentDetach;
+    const content = std.mem.trimEnd(u8, snippet, "\n");
+    const first_line_end = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
+    const directive = content[0..first_line_end];
+    if (!std.mem.eql(u8, directiveName(directive), "@box")) {
+        return error.UnsupportedComponentDetach;
+    }
+    validateClipboardDirectiveAttributes(directive, "@box".len) catch
+        return error.UnsupportedComponentDetach;
+    const body = if (first_line_end < content.len) content[first_line_end + 1 ..] else "";
+    validateBodyText(body) catch return error.UnsupportedComponentDetach;
+    return .{ .directive = directive, .body = body };
+}
+
+fn validateComponentDetachTail(source: []const u8, start: usize) PatchError!void {
+    var cursor = start;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[line.start..line.content_end];
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedComponentDetach;
+        if (text.len > 0 and text[0] == '@') {
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@slide") or
+                std.mem.eql(u8, name, "@popslide") or
+                isMorphStateDirective(name))
+            {
+                return;
+            }
+            if (std.mem.eql(u8, name, "@box") or
+                std.mem.eql(u8, name, "@pop") or
+                std.mem.eql(u8, name, "@popgroup") or
+                std.mem.eql(u8, name, "@bg") or
+                std.mem.eql(u8, name, "@crowd") or
+                std.mem.eql(u8, name, "@push"))
+            {
+                return error.UnsupportedComponentDetach;
+            }
+        }
+        cursor = line.full_end;
+    }
 }
 
 const ItemSceneKind = enum { base, template_base, morph };
@@ -7433,6 +8051,289 @@ test "inserted bullet snippet reparses as one box" {
     try std.testing.expectEqual(@as(usize, 2), deck.slides.items.len);
     const item = deck.slides.items[0].items.?.items[0];
     try std.testing.expectEqualStrings("- First item\n- Second item", item.text.?);
+}
+
+test "template property reset removes complete local history and preserves unrelated bytes" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@box id=hero x=10 y=20 w=300 h=80 fontsize=40 color=#112233ff text=Shared\r\n" ++
+        "@pushslide base\r\n" ++
+        "@popslide base\r\n" ++
+        "@set hero x=20 color=#aabbccff\r\n" ++
+        "# keep this note\r\n" ++
+        "@set hero x=30 bg=#01020304 locked=true text=Local\r\n";
+    const slide_offset = std.mem.indexOf(u8, source, "@popslide base").?;
+    const effective = std.mem.indexOf(u8, source, "@set hero x=30").?;
+    const owner: MutationOwner = .{ .template_instance = .{
+        .slide_offset = slide_offset,
+        .effective_mutation_offset = effective,
+    } };
+    const overrides = try inheritedPropertyOverrides(source, owner, "hero");
+    try std.testing.expect(overrides.x);
+    try std.testing.expect(overrides.color);
+    try std.testing.expect(overrides.bg);
+    try std.testing.expect(overrides.locked);
+    try std.testing.expect(overrides.text);
+    try std.testing.expect(!overrides.y);
+    try std.testing.expectError(
+        error.NoLocalPropertyOverride,
+        resetInheritedProperty(std.testing.allocator, source, owner, "hero", .y),
+    );
+
+    const result = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .x);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "x=20") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "x=30") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "# keep this note\r\n") != null);
+    try std.testing.expectEqual(
+        std.mem.count(u8, source, "\r\n"),
+        std.mem.count(u8, result.source, "\r\n"),
+    );
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = deck.slides.items[0].items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 10), item.position.x, 0.0001);
+    try std.testing.expectEqual(@as(u8, 170), item.color.?.r);
+    try std.testing.expectEqual(@as(u8, 4), item.background_color.?.a);
+    try std.testing.expect(item.locked);
+    try std.testing.expectEqualStrings("Local", item.text.?);
+}
+
+test "visibility and text reset preserve other mutation semantics" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@box id=hero x=10 visible=false text=Shared\n" ++
+        "@pushslide base\n" ++
+        "@popslide base\n" ++
+        "@show hero x=20\n" ++
+        "Local body\n" ++
+        "# body note stays\n" ++
+        "@hide hero opacity=0.5\n";
+    const owner: MutationOwner = .{ .template_instance = .{
+        .slide_offset = std.mem.indexOf(u8, source, "@popslide").?,
+        .effective_mutation_offset = std.mem.indexOf(u8, source, "@hide hero").?,
+    } };
+
+    const visibility = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .visible);
+    defer visibility.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, visibility.source, "@show") == null);
+    try std.testing.expect(std.mem.indexOf(u8, visibility.source, "@hide") == null);
+    try std.testing.expect(std.mem.indexOf(u8, visibility.source, "@set hero x=20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, visibility.source, "@set hero opacity=0.5") != null);
+
+    var visibility_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer visibility_arena.deinit();
+    const visibility_deck = try slides.SlideShow.new(visibility_arena.allocator());
+    const visibility_context = try parser.constructSlidesFromBuf(
+        visibility.source,
+        visibility_deck,
+        visibility_arena.allocator(),
+    );
+    defer visibility_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), visibility_context.parser_errors.items.len);
+    const visible_item = visibility_deck.slides.items[0].items.?.items[0];
+    try std.testing.expect(!visible_item.visible);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), visible_item.position.x, 0.0001);
+    try std.testing.expectEqualStrings("Local body", visible_item.text.?);
+
+    const text = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .text);
+    defer text.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, text.source, "Local body") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text.source, "# body note stays\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text.source, "@show hero x=20") != null);
+
+    var text_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer text_arena.deinit();
+    const text_deck = try slides.SlideShow.new(text_arena.allocator());
+    const text_context = try parser.constructSlidesFromBuf(text.source, text_deck, text_arena.allocator());
+    defer text_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), text_context.parser_errors.items.len);
+    try std.testing.expectEqualStrings("Shared", text_deck.slides.items[0].items.?.items[0].text.?);
+}
+
+test "morph property reset resurfaces the prior-state value" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box id=hero x=10 y=20 text=Base\n" ++
+        "@state(morph)\n" ++
+        "@set hero x=40 locked=true\n" ++
+        "@show hero x=80\n";
+    const owner: MutationOwner = .{ .morph_state = .{
+        .state_offset = std.mem.indexOf(u8, source, "@state(morph)").?,
+        .effective_mutation_offset = std.mem.indexOf(u8, source, "@show hero").?,
+    } };
+    const overrides = try inheritedPropertyOverrides(source, owner, "hero");
+    try std.testing.expect(overrides.x);
+    try std.testing.expect(overrides.locked);
+    try std.testing.expect(overrides.visible);
+    const result = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .x);
+    defer result.deinit(std.testing.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = deck.slides.items[0].morph_states.items[0].items.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 10), item.position.x, 0.0001);
+    try std.testing.expect(item.locked);
+    try std.testing.expect(item.visible);
+}
+
+test "component instance property reset keeps its persistent context semantics" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@push card x=10 y=20 w=300 h=80 color=#112233ff text=Shared\n" ++
+        "@slide\n" ++
+        "@pop card id=hero x=50 text=Local\n" ++
+        "@box id=following y=200 w=100 h=50 text=Following\n";
+    const instance_offset = std.mem.indexOf(u8, source, "@pop card").?;
+    const info = try inspectComponentInstance(source, instance_offset);
+    const owner: MutationOwner = .{ .component_instance = .{
+        .instance_offset = instance_offset,
+        .expected_definition_offset = info.definition_offset,
+    } };
+    const overrides = try inheritedPropertyOverrides(source, owner, "hero");
+    try std.testing.expect(overrides.x);
+    try std.testing.expect(overrides.text);
+    try std.testing.expect(!overrides.color);
+    const result = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .x);
+    defer result.deinit(std.testing.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 10), items[0].position.x, 0.0001);
+    try std.testing.expectEqualStrings("Local", items[0].text.?);
+    try std.testing.expectEqual(@as(u8, 17), items[1].color.?.r);
+}
+
+test "component detach roundtrip preserves the item and its owned source" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@push card x=10 y=20 w=300 h=80 fontsize=40 color=#112233ff bg=#01020304 opacity=0.75 visible=false locked=true text=Shared\r\n" ++
+        "@slide\r\n" ++
+        "@anim(fade) duration=0.2\r\n" ++
+        "@pop card id=hero x=120 text=Local\r\n" ++
+        "# instance note stays\r\n" ++
+        "@slide\r\n" ++
+        "@box text=Next\r\n";
+    const instance_offset = std.mem.indexOf(u8, source, "@pop card").?;
+    const info = try inspectComponentInstanceForDetach(source, instance_offset);
+    const result = try detachComponentInstance(
+        std.testing.allocator,
+        source,
+        instance_offset,
+        info.definition_offset,
+        "@box id=hero x=120 y=20 w=300 h=80 fontsize=40 color=#112233ff bg=#01020304 opacity=0.75 visible=false locked=true text=Local",
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@push card") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@pop card") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@anim(fade) duration=0.2\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "# instance note stays\r\n") != null);
+
+    var before_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer before_arena.deinit();
+    const before_deck = try slides.SlideShow.new(before_arena.allocator());
+    const before_context = try parser.constructSlidesFromBuf(source, before_deck, before_arena.allocator());
+    defer before_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before_context.parser_errors.items.len);
+
+    var after_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer after_arena.deinit();
+    const after_deck = try slides.SlideShow.new(after_arena.allocator());
+    const after_context = try parser.constructSlidesFromBuf(result.source, after_deck, after_arena.allocator());
+    defer after_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_context.parser_errors.items.len);
+
+    const before = before_deck.slides.items[0].items.?.items[0];
+    const after = after_deck.slides.items[0].items.?.items[0];
+    try std.testing.expectEqualStrings(before.id.?, after.id.?);
+    try std.testing.expectEqualStrings(before.text.?, after.text.?);
+    try std.testing.expectEqual(before.position, after.position);
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expectEqual(before.fontSize, after.fontSize);
+    try std.testing.expectEqual(before.color, after.color);
+    try std.testing.expectEqual(before.background_color, after.background_color);
+    try std.testing.expectApproxEqAbs(before.opacity, after.opacity, 0.0001);
+    try std.testing.expectEqual(before.visible, after.visible);
+    try std.testing.expectEqual(before.locked, after.locked);
+    try std.testing.expectEqual(before.animation, after.animation);
+    try std.testing.expectEqual(slides.SourceScope.direct, after.source.scope);
+}
+
+test "component detach replaces an existing semantic body atomically" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@push card x=10 y=20 w=300 h=80 text=Shared\n" ++
+        "@slide\n" ++
+        "@pop card id=hero\n" ++
+        "Old body\n" ++
+        "# keep the instance note\n" ++
+        "@slide\n";
+    const instance_offset = std.mem.indexOf(u8, source, "@pop card").?;
+    const info = try inspectComponentInstanceForDetach(source, instance_offset);
+    const result = try detachComponentInstance(
+        std.testing.allocator,
+        source,
+        instance_offset,
+        info.definition_offset,
+        "@box id=hero x=10 y=20 w=300 h=80\nNew body",
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "Old body") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "New body\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "# keep the instance note\n") != null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqualStrings("New body", deck.slides.items[0].items.?.items[0].text.?);
+}
+
+test "component detach refuses a following item that consumes persistent pop context" {
+    const source =
+        "@push t x=10 color=#112233ff\n" ++
+        "@slide\n" ++
+        "@pop t id=hero text=First\n" ++
+        "@box id=following y=200 text=Second\n";
+    const instance_offset = std.mem.indexOf(u8, source, "@pop t").?;
+    const provenance = try inspectComponentInstance(source, instance_offset);
+    try std.testing.expectError(
+        error.UnsupportedComponentDetach,
+        inspectComponentInstanceForDetach(source, instance_offset),
+    );
+    try std.testing.expectError(
+        error.UnsupportedComponentDetach,
+        detachComponentInstance(
+            std.testing.allocator,
+            source,
+            instance_offset,
+            provenance.definition_offset,
+            "@box id=hero x=10 color=#112233ff text=First",
+        ),
+    );
 }
 
 test "source editing APIs reject ambiguous unsafe input" {

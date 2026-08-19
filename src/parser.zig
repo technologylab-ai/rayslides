@@ -56,6 +56,29 @@ pub const ParserErrorContext = struct {
     }
 };
 
+const ReusableGroupDefinition = struct {
+    members: std.ArrayList(slides.SlideItem),
+    /// Ordinary `@pop` changes the parser's inherited item context for the
+    /// item after it. Preserve that observable tail only when the definition
+    /// actually contains a `@pop`; box-only groups leave the caller's context
+    /// untouched.
+    post_context: ?slides.ItemContext = null,
+};
+
+const ReusableGroupBuilder = struct {
+    name: []const u8,
+    start_line_number: usize,
+    start_line_offset: usize,
+    members: std.ArrayList(slides.SlideItem) = .empty,
+    parsing_item_context: slides.ItemContext = .{},
+    pending_animation: ?animation.ItemSpec = null,
+    pending_animation_source: slides.SourceRef = .{},
+    local_context: slides.ItemContext,
+    post_context: ?slides.ItemContext = null,
+    nested_depth: usize = 0,
+    valid: bool = true,
+};
+
 pub const ParserContext = struct {
     allocator: std.mem.Allocator,
     input: [:0]const u8 = undefined,
@@ -73,6 +96,8 @@ pub const ParserContext = struct {
     slideshow: *slides.SlideShow = undefined,
     push_contexts: std.StringHashMap(slides.ItemContext),
     push_slides: std.StringHashMap(*slides.Slide),
+    reusable_groups: std.StringHashMap(ReusableGroupDefinition),
+    active_group: ?ReusableGroupBuilder = null,
 
     current_context: slides.ItemContext = slides.ItemContext{},
     current_slide: *slides.Slide,
@@ -104,6 +129,7 @@ pub const ParserContext = struct {
             .let_substituted_lines = std.ArrayList([]const u8).empty,
             .push_contexts = std.StringHashMap(slides.ItemContext).init(a),
             .push_slides = std.StringHashMap(*slides.Slide).init(a),
+            .reusable_groups = std.StringHashMap(ReusableGroupDefinition).init(a),
             .current_slide = try slides.Slide.new(a),
             .parser_errors = std.ArrayList(ParserErrorContext).empty,
             .allErrorsCstrArray = null,
@@ -124,6 +150,10 @@ pub const ParserContext = struct {
         self.parser_errors.deinit(self.allocator);
         self.push_contexts.deinit();
         self.push_slides.deinit();
+        var group_it = self.reusable_groups.valueIterator();
+        while (group_it.next()) |group| group.members.deinit(self.allocator);
+        self.reusable_groups.deinit();
+        if (self.active_group) |*group| group.members.deinit(self.allocator);
         var it = self.let_substitutions.iterator();
         while (it.next()) |kv| {
             self.allocator.free(kv.key_ptr.*);
@@ -187,6 +217,258 @@ fn reportErrorInParsingContext(err: anyerror, pctx: *const slides.ItemContext, c
     };
 }
 
+fn isReusableName(name: []const u8) bool {
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) return false;
+    }
+    return true;
+}
+
+fn directiveWord(line: []const u8) []const u8 {
+    var words = std.mem.tokenizeAny(u8, line, " \t");
+    return words.next() orelse "";
+}
+
+fn beginReusableGroup(line: []const u8, context: *ParserContext) !void {
+    var words = std.mem.tokenizeAny(u8, line, " \t");
+    _ = words.next();
+    const name = words.next() orelse "";
+    var valid = true;
+    if (!isReusableName(name)) {
+        reportErrorInContext(ParserError.Syntax, context, "@pushgroup requires a literal reusable name");
+        valid = false;
+    }
+    if (words.next() != null) {
+        reportErrorInContext(ParserError.Syntax, context, "@pushgroup accepts only its literal name");
+        valid = false;
+    }
+    if (context.pending_animation != null) {
+        reportErrorInContext(ParserError.Syntax, context, "@anim must be followed by an item before @pushgroup");
+        context.pending_animation = null;
+    }
+    context.active_group = .{
+        .name = name,
+        .start_line_number = context.parsed_line_number,
+        .start_line_offset = context.parsed_line_offset,
+        .local_context = context.current_context,
+        .valid = valid,
+    };
+}
+
+fn appendReusableGroupBodyLine(item_context: *slides.ItemContext, line: []const u8, context: *ParserContext) !void {
+    var body_line = line;
+    if ((line.len == 1 and line[0] == '_') or line[0] == '`') body_line = " ";
+    item_context.text = if (item_context.text) |text|
+        try std.fmt.allocPrint(context.allocator, "{s}\n{s}", .{ text, body_line })
+    else
+        try std.fmt.allocPrint(context.allocator, "{s}", .{body_line});
+}
+
+fn reusableGroupHasMember(builder: *const ReusableGroupBuilder, id: []const u8) bool {
+    for (builder.members.items) |item| {
+        if (item.id) |member_id| if (std.mem.eql(u8, member_id, id)) return true;
+    }
+    return false;
+}
+
+fn buildReusableGroupMember(
+    item_context: *slides.ItemContext,
+    builder: *ReusableGroupBuilder,
+    context: *ParserContext,
+) !?slides.SlideItem {
+    const member_id = item_context.id orelse {
+        reportErrorInParsingContext(ParserError.Syntax, item_context, context, "every reusable-group member requires an explicit id=");
+        builder.valid = false;
+        return null;
+    };
+    if (!isReusableName(member_id)) {
+        reportErrorInParsingContext(ParserError.Syntax, item_context, context, "reusable-group member id= must be a literal reusable-name segment");
+        builder.valid = false;
+        return null;
+    }
+    if (reusableGroupHasMember(builder, member_id)) {
+        const message = try std.fmt.allocPrint(context.allocator, "duplicate reusable-group member id `{s}`", .{member_id});
+        reportErrorInParsingContext(ParserError.Syntax, item_context, context, message);
+        builder.valid = false;
+        return null;
+    }
+
+    if (builder.pending_animation) |pending| {
+        if (item_context.animation == null) item_context.animation = pending;
+        builder.pending_animation = null;
+    }
+
+    if (std.mem.eql(u8, item_context.directive, "@pop")) {
+        const component_name = item_context.context_name orelse {
+            builder.valid = false;
+            return null;
+        };
+        const component = context.push_contexts.get(component_name) orelse {
+            const message = try std.fmt.allocPrint(context.allocator, "cannot use @pop `{s}` in reusable group: was not pushed", .{component_name});
+            reportErrorInParsingContext(ParserError.Syntax, item_context, context, message);
+            builder.valid = false;
+            return null;
+        };
+        builder.local_context = component;
+        builder.local_context.text = null;
+        builder.local_context.img_path = null;
+        builder.post_context = builder.local_context;
+        item_context.applyOtherIfNull(component);
+    }
+
+    mergeParserAndItemContext(item_context, &builder.local_context);
+    var item = slides.SlideItem{};
+    item.applyContext(item_context.*);
+    item.source = .{
+        .scope = .direct,
+        .line_number = item_context.line_number,
+        .line_offset = item_context.line_offset,
+        .patchable = item_context.source_patchable,
+    };
+    item.applySlideDefaultsIfNecessary(context.current_slide);
+    item.applySlideShowDefaultsIfNecessary(context.slideshow);
+    item.kind = if (item.img_path != null) .img else .textbox;
+    item.sanityCheck() catch |err| {
+        reportErrorInParsingContext(err, item_context, context, "reusable-group member sanity check failed");
+        builder.valid = false;
+        return null;
+    };
+    return item;
+}
+
+fn commitReusableGroupParsingContext(builder: *ReusableGroupBuilder, context: *ParserContext) !void {
+    const item_context = &builder.parsing_item_context;
+    if (item_context.directive.len == 0) return;
+    defer builder.parsing_item_context = .{};
+
+    if (std.mem.eql(u8, item_context.directive, "@anim")) {
+        if (item_context.text != null) {
+            reportErrorInParsingContext(ParserError.Syntax, item_context, context, "@anim cannot own body text in a reusable group");
+            builder.valid = false;
+        }
+        if (builder.pending_animation != null) {
+            reportErrorInParsingContext(ParserError.Syntax, item_context, context, "@anim must be followed by one reusable-group member");
+            builder.valid = false;
+        }
+        builder.pending_animation = item_context.animation orelse animation.ItemSpec{};
+        builder.pending_animation_source = .{
+            .line_number = item_context.line_number,
+            .line_offset = item_context.line_offset,
+        };
+        return;
+    }
+
+    if (!std.mem.eql(u8, item_context.directive, "@box") and
+        !std.mem.eql(u8, item_context.directive, "@pop"))
+    {
+        builder.valid = false;
+        return;
+    }
+    if (try buildReusableGroupMember(item_context, builder, context)) |item| {
+        try builder.members.append(context.allocator, item);
+    }
+}
+
+fn installReusableGroup(context: *ParserContext, builder: *ReusableGroupBuilder) !void {
+    if (builder.pending_animation != null) {
+        const source = slides.ItemContext{
+            .line_number = builder.pending_animation_source.line_number,
+            .line_offset = builder.pending_animation_source.line_offset,
+        };
+        reportErrorInParsingContext(ParserError.Syntax, &source, context, "dangling @anim at end of reusable group");
+        builder.valid = false;
+    }
+    if (!builder.valid) {
+        builder.members.deinit(context.allocator);
+        return;
+    }
+    const definition = ReusableGroupDefinition{
+        .members = builder.members,
+        .post_context = builder.post_context,
+    };
+    if (context.reusable_groups.getPtr(builder.name)) |old| {
+        old.members.deinit(context.allocator);
+        old.* = definition;
+    } else {
+        try context.reusable_groups.put(builder.name, definition);
+    }
+}
+
+fn processReusableGroupLine(line: []const u8, context: *ParserContext) !void {
+    var builder = &context.active_group.?;
+    if (line.len == 0 or std.mem.startsWith(u8, line, "#")) return;
+    if (std.mem.indexOfScalar(u8, line, '$') != null) {
+        reportErrorInContext(ParserError.Syntax, context, "dynamic `$` expansion is forbidden in reusable-group definitions");
+        builder.valid = false;
+        return;
+    }
+
+    if (builder.nested_depth > 0) {
+        if (std.mem.startsWith(u8, line, "@")) {
+            const nested_directive = directiveWord(line);
+            if (std.mem.eql(u8, nested_directive, "@pushgroup")) {
+                builder.nested_depth += 1;
+            } else if (std.mem.eql(u8, nested_directive, "@endgroup")) {
+                builder.nested_depth -= 1;
+            }
+        }
+        return;
+    }
+
+    if (!std.mem.startsWith(u8, line, "@")) {
+        if (!std.mem.eql(u8, builder.parsing_item_context.directive, "@box") and
+            !std.mem.eql(u8, builder.parsing_item_context.directive, "@pop"))
+        {
+            reportErrorInContext(ParserError.Syntax, context, "reusable-group body text must belong to a literal @box or @pop member");
+            builder.valid = false;
+            return;
+        }
+        try appendReusableGroupBodyLine(&builder.parsing_item_context, line, context);
+        return;
+    }
+
+    const directive = directiveWord(line);
+    if (std.mem.eql(u8, directive, "@endgroup")) {
+        try commitReusableGroupParsingContext(builder, context);
+        if (std.mem.trim(u8, line[directive.len..], " \t").len != 0) {
+            reportErrorInContext(ParserError.Syntax, context, "@endgroup accepts no attributes");
+            builder.valid = false;
+        }
+        try installReusableGroup(context, builder);
+        context.active_group = null;
+        return;
+    }
+
+    try commitReusableGroupParsingContext(builder, context);
+    if (std.mem.eql(u8, directive, "@pushgroup")) {
+        reportErrorInContext(ParserError.Syntax, context, "reusable-group definitions cannot nest");
+        builder.valid = false;
+        builder.nested_depth = 1;
+        return;
+    }
+    if (!std.mem.eql(u8, directive, "@box") and
+        !std.mem.eql(u8, directive, "@pop") and
+        !std.mem.eql(u8, directive, "@anim") and
+        !(std.mem.startsWith(u8, directive, "@anim(") and std.mem.endsWith(u8, directive, ")")))
+    {
+        reportErrorInContext(ParserError.Syntax, context, "only literal @box/@pop members and their @anim are allowed in a reusable group");
+        builder.valid = false;
+        return;
+    }
+
+    const error_count = context.parser_errors.items.len;
+    builder.parsing_item_context = parseItemAttributes(line, context) catch |err| {
+        if (context.parser_errors.items.len == error_count) reportErrorInContext(err, context, null);
+        builder.valid = false;
+        return;
+    };
+    if (context.parser_errors.items.len != error_count) builder.valid = false;
+    builder.parsing_item_context.line_number = context.parsed_line_number;
+    builder.parsing_item_context.line_offset = context.parsed_line_offset;
+    builder.parsing_item_context.source_patchable = true;
+}
+
 pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, allocator: std.mem.Allocator) !*ParserContext {
     var context: *ParserContext = try ParserContext.new(allocator);
     context.slideshow = slideshow;
@@ -234,6 +516,32 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
                     },
                 );
                 return error.Overflow;
+            }
+
+            // Reusable-group definitions are parsed in a deliberately small,
+            // transactional sub-language before @let/global handling. This
+            // keeps forbidden directives and substitutions from mutating the
+            // live slide or inherited item context while a block is open.
+            if (context.active_group != null) {
+                processReusableGroupLine(line_unprocessed, context) catch |err| {
+                    reportErrorInContext(err, context, "could not parse reusable-group definition");
+                    if (context.active_group) |*group| group.valid = false;
+                };
+                continue;
+            }
+
+            const raw_directive = directiveWord(line_unprocessed);
+            if (std.mem.eql(u8, raw_directive, "@pushgroup")) {
+                commitParsingContext(&parsing_item_context, context) catch |err| {
+                    reportErrorInContext(err, context, null);
+                };
+                parsing_item_context = .{};
+                try beginReusableGroup(line_unprocessed, context);
+                continue;
+            }
+            if (std.mem.eql(u8, raw_directive, "@endgroup")) {
+                reportErrorInContext(ParserError.Syntax, context, "@endgroup without an open @pushgroup");
+                continue;
             }
 
             // try to handle let substitutions
@@ -383,6 +691,15 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
                 parsing_item_context.text = text;
             }
         }
+    }
+    if (context.active_group) |*group| {
+        const source = slides.ItemContext{
+            .line_number = group.start_line_number,
+            .line_offset = group.start_line_offset,
+        };
+        reportErrorInParsingContext(ParserError.Syntax, &source, context, "unclosed @pushgroup definition");
+        group.members.deinit(context.allocator);
+        context.active_group = null;
     }
     // commit last slide
     commitParsingContext(&parsing_item_context, context) catch |err| {
@@ -577,6 +894,7 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
         std.mem.eql(u8, item_context.directive, "@pop") or
         std.mem.eql(u8, item_context.directive, "@pushslide") or
         std.mem.eql(u8, item_context.directive, "@popslide") or
+        std.mem.eql(u8, item_context.directive, "@popgroup") or
         std.mem.eql(u8, item_context.directive, "@set") or
         std.mem.eql(u8, item_context.directive, "@show") or
         std.mem.eql(u8, item_context.directive, "@hide"))
@@ -611,9 +929,25 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
     var text_words = std.ArrayList([]const u8).empty;
     defer text_words.deinit(context.allocator);
     var after_text_directive = false;
+    var group_instance_id_seen = false;
 
     while (word_it.next()) |word| {
         if (!after_text_directive) {
+            if (std.mem.eql(u8, item_context.directive, "@popgroup")) {
+                const equals_index = std.mem.indexOfScalar(u8, word, '=') orelse {
+                    reportErrorInContext(ParserError.Syntax, context, "@popgroup accepts only id=INSTANCE");
+                    return ParserError.Syntax;
+                };
+                if (!std.mem.eql(u8, word[0..equals_index], "id") or
+                    equals_index + 1 == word.len or
+                    std.mem.indexOfScalar(u8, word[equals_index + 1 ..], '=') != null or
+                    group_instance_id_seen)
+                {
+                    reportErrorInContext(ParserError.Syntax, context, "@popgroup requires exactly one id=INSTANCE attribute");
+                    return ParserError.Syntax;
+                }
+                group_instance_id_seen = true;
+            }
             // `text=` owns the complete remainder of the directive. Split at
             // only its first equals sign so inline examples such as
             // `id=hero_image` are preserved instead of being truncated to
@@ -1193,6 +1527,84 @@ fn commitSlideInstanceMutation(parsing_item_context: *slides.ItemContext, contex
     };
 }
 
+fn currentSlideHasExactId(context: *ParserContext, id: []const u8) bool {
+    for (context.current_slide.currentItems(context.active_morph_state).items) |item| {
+        if (item.id) |existing_id| {
+            if (std.mem.eql(u8, existing_id, id)) return true;
+        }
+    }
+    return false;
+}
+
+fn commitReusableGroupInstance(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
+    if (context.pending_animation != null) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@anim cannot target @popgroup; animations belong to its literal members");
+        context.pending_animation = null;
+        return;
+    }
+    if (context.active_morph_state != null) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup must be instantiated before the first @state(morph)");
+        return;
+    }
+
+    const group_name = parsing_item_context.context_name orelse return;
+    if (!isReusableName(group_name)) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup name must be a literal reusable-name segment");
+        return;
+    }
+    const instance_id = parsing_item_context.id orelse {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup requires id=INSTANCE");
+        return;
+    };
+    if (!isReusableName(instance_id)) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup id= must be a literal reusable-name segment");
+        return;
+    }
+    if (parsing_item_context.text != null) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup cannot own body text");
+        return;
+    }
+
+    const definition = context.reusable_groups.get(group_name) orelse {
+        const message = try std.fmt.allocPrint(context.allocator, "cannot @popgroup `{s}`: definition is missing or not complete", .{group_name});
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, message);
+        return;
+    };
+
+    var clones = std.ArrayList(slides.SlideItem).empty;
+    defer clones.deinit(context.allocator);
+    try clones.ensureTotalCapacity(context.allocator, definition.members.items.len);
+    for (definition.members.items) |prototype| {
+        const member_id = prototype.id.?;
+        const effective_id = try std.fmt.allocPrint(context.allocator, "{s}.{s}", .{ instance_id, member_id });
+        if (currentSlideHasExactId(context, effective_id)) {
+            const message = try std.fmt.allocPrint(context.allocator, "reusable-group instance id `{s}` collides with an item on the current slide", .{effective_id});
+            reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, message);
+            return;
+        }
+
+        var clone = prototype;
+        clone.id = effective_id;
+        clone.identity = context.current_slide.next_item_identity + clones.items.len;
+        clone.creation_morph_state = null;
+        clone.source = .{
+            .scope = .group_instance_member,
+            .line_number = parsing_item_context.line_number,
+            .line_offset = parsing_item_context.line_offset,
+            .patchable = parsing_item_context.source_patchable,
+        };
+        clone.group_member_source = prototype.source;
+        clone.instance_source = null;
+        clone.state_source = null;
+        clone.state_source_state = null;
+        clones.appendAssumeCapacity(clone);
+    }
+
+    try context.current_slide.items.?.appendSlice(context.allocator, clones.items);
+    context.current_slide.next_item_identity += clones.items.len;
+    if (definition.post_context) |post_context| context.current_context = post_context;
+}
+
 fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
     // .
     if (parsing_item_context.directive.len == 0) return;
@@ -1243,6 +1655,11 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         } else {
             reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@set/@show/@hide require a @popslide base scene or a preceding @state(morph)");
         }
+        return;
+    }
+
+    if (std.mem.eql(u8, parsing_item_context.directive, "@popgroup")) {
+        try commitReusableGroupInstance(parsing_item_context, context);
         return;
     }
 
@@ -2593,4 +3010,168 @@ test "invalid editor lock values are rejected" {
     defer context.deinit();
     try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
     try std.testing.expect(!slideshow.slides.items[0].items.?.items[0].locked);
+}
+
+test "reusable groups emit ordered fresh members and remain morph targets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push badge x=700 y=80 w=220 h=70 color=#ffeeaaff
+        \\@slide
+        \\@pushgroup feature-card
+        \\@anim fade duration=0.4
+        \\@box id=title x=120 y=140 w=500 h=100 fontsize=48 text=Reusable title
+        \\@pop badge id=tag text=New
+        \\@endgroup
+        \\@popgroup feature-card id=primary
+        \\@box id=after text=Inherited after group
+        \\@popgroup feature-card id=secondary
+        \\@state(morph) duration=0.7
+        \\@set primary.title x=300 text=Moved title
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const slide = slideshow.slides.items[0];
+    const items = slide.items.?.items;
+    try std.testing.expectEqual(@as(usize, 5), items.len);
+    try std.testing.expectEqualStrings("primary.title", items[0].id.?);
+    try std.testing.expectEqualStrings("primary.tag", items[1].id.?);
+    try std.testing.expectEqualStrings("after", items[2].id.?);
+    try std.testing.expectEqualStrings("secondary.title", items[3].id.?);
+    try std.testing.expectEqualStrings("secondary.tag", items[4].id.?);
+    try std.testing.expectEqualStrings("Reusable title", items[0].text.?);
+    try std.testing.expectEqualStrings("New", items[1].text.?);
+    try std.testing.expectEqual(animation.Effect.fade, items[0].animation.?.effect);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), items[0].animation.?.duration, 0.0001);
+    try std.testing.expectEqual(slides.SourceScope.group_instance_member, items[0].source.scope);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@popgroup feature-card").?, items[0].source.line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box id=title").?, items[0].group_member_source.?.line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@pop badge id=tag").?, items[1].group_member_source.?.line_offset);
+    try std.testing.expect(items[0].identity != items[1].identity);
+    try std.testing.expect(items[0].identity != items[3].identity);
+    try std.testing.expect(items[1].identity != items[4].identity);
+    // The definition's final @pop context is reproduced by the call, just as
+    // the literal promoted sequence would affect the item that follows it.
+    try std.testing.expectApproxEqAbs(@as(f32, 700), items[2].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 80), items[2].position.y, 0.0001);
+
+    const morphed = slide.morph_states.items[0].items.items;
+    try std.testing.expectEqualStrings("primary.title", morphed[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), morphed[0].position.x, 0.0001);
+    try std.testing.expectEqualStrings("Moved title", morphed[0].text.?);
+    try std.testing.expectEqual(slides.SourceScope.morph_item, morphed[0].state_source.?.scope);
+}
+
+test "reusable groups require complete prior definitions and later definitions shadow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@popgroup card id=too-early
+        \\@pushgroup card
+        \\@box id=body x=1 y=2 w=3 h=4 text=First
+        \\@endgroup
+        \\@popgroup card id=one
+        \\@pushgroup card
+        \\@box id=body x=10 y=20 w=30 h=40 text=Second
+        \\@endgroup
+        \\@popgroup card id=two
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("one.body", items[0].id.?);
+    try std.testing.expectEqualStrings("First", items[0].text.?);
+    try std.testing.expectEqualStrings("two.body", items[1].id.?);
+    try std.testing.expectEqualStrings("Second", items[1].text.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), items[1].position.x, 0.0001);
+}
+
+test "reusable group id collisions reject an entire instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@pushgroup pair
+        \\@box id=left x=10 y=20 w=30 h=40 text=Left
+        \\@box id=right x=50 y=20 w=30 h=40 text=Right
+        \\@endgroup
+        \\@box id=dupe.right x=0 y=0 w=1 h=1 text=Existing
+        \\@popgroup pair id=dupe
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("dupe.right", items[0].id.?);
+}
+
+test "malformed reusable groups emit nothing and do not poison slide context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push inherited x=900 y=800 w=70 h=60
+        \\@slide
+        \\@pushgroup broken
+        \\@pop inherited id=inside text=Would leak context
+        \\@pushgroup nested
+        \\@box id=nested-item x=1 y=2 w=3 h=4 text=Nested
+        \\@endgroup
+        \\@box id=still-inside x=not-a-number y=2 w=3 h=4 text=Still inside outer block
+        \\@bg color=#101010ff
+        \\@endgroup
+        \\@popgroup broken id=nope
+        \\@box id=healthy x=11 y=22 w=33 h=44 text=Healthy
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expect(context.parser_errors.items.len >= 2);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("healthy", items[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 11), items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 22), items[0].position.y, 0.0001);
+}
+
+test "reusable group syntax rejects dynamic names missing ids dangling anim and unclosed blocks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@pushgroup bad$name
+        \\@anim fade
+        \\@box x=1 y=2 w=3 h=4 text=Missing id
+        \\@pushgroup nested
+        \\@box id=member x=1 y=2 w=3 h=4 text=Nested
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expect(context.parser_errors.items.len >= 3);
+    try std.testing.expectEqual(@as(usize, 0), slideshow.slides.items[0].items.?.items.len);
+    try std.testing.expectEqual(@as(usize, 0), context.reusable_groups.count());
 }

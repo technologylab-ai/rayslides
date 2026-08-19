@@ -1100,6 +1100,16 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .library = studio_library_entries.items,
             };
         }
+        studio_mode.setCompositionContext(if (studio_mode.capturesInput() and current_slide != null)
+            studioCompositionContext(
+                G.editor_memory[0..G.source_len],
+                current_slide.?,
+                studio_mode.active_morph_state,
+                studio_items,
+                studio_mode,
+            )
+        else
+            null);
 
         var semantic_to_apply: ?studio.SemanticCommand = null;
         var semantic_text: ?[]const u8 = null;
@@ -1607,6 +1617,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                         error.LockedLayerBarrier,
                         error.StudioItemLocked,
                         => .locked_item,
+                        error.NoLocalPropertyOverride => .override_reset_unsupported,
+                        error.UnsupportedComponentDetach,
+                        error.ComponentDefinitionMismatch,
+                        error.DetachedItemIdMismatch,
+                        => .detach_instance_unsupported,
                         error.NameCollision => .library_name_conflict,
                         error.SlideTemplateNameCollision => .library_name_conflict,
                         error.LiveUses => .library_entry_in_use,
@@ -2265,6 +2280,241 @@ fn replaceEditorSource(source: []const u8) !void {
 fn studioItemByIdentity(items: []const slides.SlideItem, identity: usize) ?*const slides.SlideItem {
     for (items) |*item| if (item.identity == identity) return item;
     return null;
+}
+
+fn inheritedPropertyForInlineField(field: studio.InlineField) source_editor.InheritedProperty {
+    return switch (field) {
+        .text => .text,
+        .x => .x,
+        .y => .y,
+        .width => .w,
+        .height => .h,
+        .foreground => .color,
+        .background => .bg,
+        .font_size => .fontsize,
+        .opacity => .opacity,
+    };
+}
+
+fn studioPropertyOverrides(
+    source_overrides: source_editor.InheritedPropertyOverrides,
+) studio.PropertyOverrideSet {
+    var result: studio.PropertyOverrideSet = .{};
+    const fields = [_]studio.InlineField{
+        .text,
+        .x,
+        .y,
+        .width,
+        .height,
+        .foreground,
+        .background,
+        .font_size,
+        .opacity,
+    };
+    for (fields) |field| {
+        if (source_overrides.contains(inheritedPropertyForInlineField(field))) result.set(field);
+    }
+    return result;
+}
+
+fn studioResetOwner(
+    source: []const u8,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    item: *const slides.SlideItem,
+) !source_editor.MutationOwner {
+    const id = item.id orelse return error.NoLocalPropertyOverride;
+    if (morph_state) |state_index| {
+        if (state_index >= slide.morph_states.items.len or
+            itemBornInMorphState(slide, state_index, item) or
+            item.state_source == null or item.state_source_state == null or
+            item.state_source_state.? != state_index)
+        {
+            return error.NoLocalPropertyOverride;
+        }
+        return .{ .morph_state = .{
+            .state_offset = slide.morph_states.items[state_index].source.line_offset,
+            .effective_mutation_offset = item.state_source.?.line_offset,
+        } };
+    }
+
+    return switch (item.source.scope) {
+        .slide_template => if (item.instance_source) |instance_source|
+            .{ .template_instance = .{
+                .slide_offset = slide.pos_in_editor,
+                .effective_mutation_offset = instance_source.line_offset,
+            } }
+        else
+            error.NoLocalPropertyOverride,
+        .component_instance => blk: {
+            const info = try source_editor.inspectComponentInstance(source, item.source.line_offset);
+            if (!std.mem.eql(u8, info.effective_id, id)) return error.DetachedItemIdMismatch;
+            break :blk .{ .component_instance = .{
+                .instance_offset = item.source.line_offset,
+                .expected_definition_offset = info.definition_offset,
+            } };
+        },
+        else => error.NoLocalPropertyOverride,
+    };
+}
+
+fn studioReusableKind(item: *const slides.SlideItem) studio.ReusableInstanceKind {
+    return switch (item.source.scope) {
+        .component_instance => .component,
+        .slide_template => .slide_template,
+        else => .none,
+    };
+}
+
+/// Build a fresh, source-validated capability snapshot for the selected
+/// object. Studio never guesses reset/detach ownership from rendered values;
+/// every affordance comes from this exact slide/state/source scan.
+fn studioCompositionContext(
+    source: []const u8,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+    studio_state: studio.Studio,
+) ?studio.CompositionContext {
+    if (studio_state.selectionCount() != 1) return null;
+    const identity = studio_state.selectedIdentityAt(0) orelse return null;
+    const item = studioItemByIdentity(items, identity) orelse return null;
+    const kind = studioReusableKind(item);
+    var context: studio.CompositionContext = .{
+        .item_identity = identity,
+        .selection_source = item.effectiveSource(),
+        .kind = kind,
+        .detach_block = if (kind == .none) .not_instance else .dependent_structure,
+    };
+
+    if (item.id != null) {
+        if (studioResetOwner(source, slide, morph_state, item)) |owner| {
+            if (source_editor.inheritedPropertyOverrides(source, owner, item.id.?)) |overrides| {
+                context.local_overrides = studioPropertyOverrides(overrides);
+                if (!context.local_overrides.empty() and item.effectiveSource().patchable) {
+                    context.resettable_overrides = context.local_overrides;
+                    context.reset_target = .{
+                        .item_identity = identity,
+                        .source = item.effectiveSource(),
+                        .edit_scope = if (morph_state != null)
+                            .direct
+                        else if (item.source.scope == .slide_template)
+                            .local_instance
+                        else
+                            .direct,
+                    };
+                }
+            } else |_| {}
+        } else |_| {}
+    }
+
+    if (kind == .component) {
+        if (morph_state != null) {
+            context.detach_block = .morph_scene;
+        } else if (!item.source.patchable) {
+            context.detach_block = .generated_source;
+        } else if (source_editor.inspectComponentInstanceForDetach(source, item.source.line_offset)) |info| {
+            if (item.id != null and std.mem.eql(u8, item.id.?, info.effective_id)) {
+                context.detach_target = .{
+                    .item_identity = identity,
+                    .source = item.source,
+                    .edit_scope = .direct,
+                };
+                context.detach_block = .none;
+            } else {
+                context.detach_block = .ambiguous_instance;
+            }
+        } else |_| {
+            context.detach_block = .dependent_structure;
+        }
+    } else if (kind == .slide_template and morph_state != null) {
+        context.detach_block = .morph_scene;
+    }
+    return context;
+}
+
+test "Studio composition capabilities expose exact component overrides and safe detach" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@push card x=10 y=20 w=300 h=80 fontsize=40 color=#112233ff text=Shared\n" ++
+        "@slide\n" ++
+        "@pop card id=hero x=120 text=Local\n" ++
+        "@slide\n";
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const parser_context = try parser.constructSlidesFromBuf(source, deck, arena.allocator());
+    defer parser_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parser_context.parser_errors.items.len);
+
+    const slide = deck.slides.items[0];
+    const items = slide.items.?.items;
+    var studio_state: studio.Studio = .{
+        .enabled = true,
+        .selected_identity = items[0].identity,
+        .selected_source = items[0].source,
+    };
+    const context = studioCompositionContext(source, slide, null, items, studio_state).?;
+    try std.testing.expectEqual(studio.ReusableInstanceKind.component, context.kind);
+    try std.testing.expect(context.local_overrides.contains(.x));
+    try std.testing.expect(context.local_overrides.contains(.text));
+    try std.testing.expect(!context.local_overrides.contains(.foreground));
+    try std.testing.expect(context.resettable_overrides.contains(.x));
+    try std.testing.expect(context.reset_target != null);
+    try std.testing.expect(context.detach_target != null);
+    try std.testing.expectEqual(studio.CompositionBlockReason.none, context.detach_block);
+
+    studio_state.additional_selection_count = 1;
+    try std.testing.expect(studioCompositionContext(source, slide, null, items, studio_state) == null);
+}
+
+test "Studio component materialization preserves effective box semantics" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@push card x=10 y=20 w=300 h=80 fontsize=40 color=#112233ff bg=#01020304 " ++
+        "line_height=1.2 underline_width=2 bullet_color=#aabbccff bullet_symbol=• " ++
+        "shadow=#101112ff shadow_x=3 shadow_y=4 opacity=0.75 visible=false locked=true text=Shared\n" ++
+        "@slide\n" ++
+        "@anim(fade) duration=0.2\n" ++
+        "@pop card id=hero x=120 text=Local\n" ++
+        "@slide\n";
+    var before_arena = std.heap.ArenaAllocator.init(allocator);
+    defer before_arena.deinit();
+    const before_deck = try slides.SlideShow.new(before_arena.allocator());
+    const before_context = try parser.constructSlidesFromBuf(source, before_deck, before_arena.allocator());
+    defer before_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before_context.parser_errors.items.len);
+    const before = before_deck.slides.items[0].items.?.items[0];
+
+    const snippet = try materializeStudioItem(allocator, &before);
+    defer allocator.free(snippet);
+    const direct_source = try std.fmt.allocPrint(allocator, "@slide\n{s}\n", .{snippet});
+    defer allocator.free(direct_source);
+    var after_arena = std.heap.ArenaAllocator.init(allocator);
+    defer after_arena.deinit();
+    const after_deck = try slides.SlideShow.new(after_arena.allocator());
+    const after_context = try parser.constructSlidesFromBuf(direct_source, after_deck, after_arena.allocator());
+    defer after_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_context.parser_errors.items.len);
+    const after = after_deck.slides.items[0].items.?.items[0];
+
+    try std.testing.expectEqual(slides.SourceScope.direct, after.source.scope);
+    try std.testing.expectEqualStrings(before.id.?, after.id.?);
+    try std.testing.expectEqualStrings(before.text.?, after.text.?);
+    try std.testing.expectEqual(before.position, after.position);
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expectEqual(before.fontSize, after.fontSize);
+    try std.testing.expectEqual(before.color, after.color);
+    try std.testing.expectEqual(before.background_color, after.background_color);
+    try std.testing.expectEqual(before.line_height_factor, after.line_height_factor);
+    try std.testing.expectEqual(before.underline_width, after.underline_width);
+    try std.testing.expectEqual(before.bullet_color, after.bullet_color);
+    try std.testing.expectEqualStrings(before.bullet_symbol.?, after.bullet_symbol.?);
+    try std.testing.expectEqual(before.text_shadow, after.text_shadow);
+    try std.testing.expectApproxEqAbs(before.opacity, after.opacity, 0.0001);
+    try std.testing.expectEqual(before.visible, after.visible);
+    try std.testing.expectEqual(before.locked, after.locked);
+    try std.testing.expectEqual(before.animation, after.animation);
 }
 
 fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticCommand, items: []const slides.SlideItem) bool {
@@ -3384,6 +3634,133 @@ fn itemTextSnippet(
     return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ directive_without_text, text_value });
 }
 
+fn appendStudioToken(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    var buffer: [160]u8 = undefined;
+    const token = try std.fmt.bufPrint(&buffer, format, args);
+    try output.appendSlice(allocator, token);
+}
+
+fn animationEffectLiteral(effect: animation.Effect) []const u8 {
+    return switch (effect) {
+        .none => "none",
+        .appear => "appear",
+        .fade => "fade",
+        .slide_left => "slide-left",
+        .slide_right => "slide-right",
+        .slide_up => "slide-up",
+        .slide_down => "slide-down",
+    };
+}
+
+fn animationGroupingLiteral(grouping: animation.Grouping) []const u8 {
+    return switch (grouping) {
+        .item => "item",
+        .line => "line",
+        .bullet => "bullet",
+    };
+}
+
+fn studioLiteralToken(value: []const u8) ![]const u8 {
+    if (value.len == 0 or !std.unicode.utf8ValidateSlice(value) or
+        std.mem.indexOfAny(u8, value, " \t\r\n=$") != null)
+    {
+        return error.UnsupportedComponentDetach;
+    }
+    return value;
+}
+
+/// Materialize the complete effective renderer-facing item into a direct
+/// literal @box. Detach is an explicit customization boundary, so values that
+/// were previously inherited are intentionally made concrete. Auto-sized
+/// images retain zero W/H plus their scale/ratio controls.
+fn materializeStudioItem(allocator: std.mem.Allocator, item: *const slides.SlideItem) ![]u8 {
+    if (item.kind != .textbox and item.kind != .img) return error.UnsupportedComponentDetach;
+    const id = try studioLiteralToken(item.id orelse return error.DetachedItemIdMismatch);
+
+    var directive = std.ArrayList(u8).empty;
+    defer directive.deinit(allocator);
+    try directive.appendSlice(allocator, "@box id=");
+    try directive.appendSlice(allocator, id);
+    try appendStudioToken(&directive, allocator, " x={d} y={d} w={d} h={d}", .{
+        item.position.x,
+        item.position.y,
+        item.size.x,
+        item.size.y,
+    });
+
+    if (item.img_path) |path| {
+        try directive.appendSlice(allocator, " img=");
+        try directive.appendSlice(allocator, try studioLiteralToken(path));
+    }
+    if (item.fontSize) |font_size|
+        try appendStudioToken(&directive, allocator, " fontsize={d}", .{font_size});
+    if (item.color) |color| {
+        var color_buffer: [9]u8 = undefined;
+        try directive.appendSlice(allocator, " color=");
+        try directive.appendSlice(allocator, colorLiteral(&color_buffer, color));
+    }
+    try directive.appendSlice(allocator, " bg=");
+    if (item.background_color) |background| {
+        var background_buffer: [9]u8 = undefined;
+        try directive.appendSlice(allocator, colorLiteral(&background_buffer, background));
+    } else {
+        try directive.appendSlice(allocator, "none");
+    }
+    if (item.line_height_factor) |line_height|
+        try appendStudioToken(&directive, allocator, " line_height={d}", .{line_height});
+    if (item.underline_width) |underline_width|
+        try appendStudioToken(&directive, allocator, " underline_width={d}", .{underline_width});
+    if (item.bullet_color) |bullet_color| {
+        var bullet_color_buffer: [9]u8 = undefined;
+        try directive.appendSlice(allocator, " bullet_color=");
+        try directive.appendSlice(allocator, colorLiteral(&bullet_color_buffer, bullet_color));
+    }
+    if (item.bullet_symbol) |bullet_symbol| {
+        try directive.appendSlice(allocator, " bullet_symbol=");
+        try directive.appendSlice(allocator, try studioLiteralToken(bullet_symbol));
+    }
+    if (item.scale) |scale| try appendStudioToken(&directive, allocator, " scale={d}", .{scale});
+    if (item.ratio) |ratio| try appendStudioToken(&directive, allocator, " ratio={d}", .{ratio});
+    try appendStudioToken(&directive, allocator, " opacity={d} visible={s} locked={s}", .{
+        item.opacity,
+        if (item.visible) "true" else "false",
+        if (item.locked) "true" else "false",
+    });
+    if (item.text_shadow) |shadow| {
+        try directive.appendSlice(allocator, " shadow=");
+        if (shadow.enabled) {
+            var shadow_buffer: [9]u8 = undefined;
+            try directive.appendSlice(allocator, colorLiteral(&shadow_buffer, shadow.color));
+        } else {
+            try directive.appendSlice(allocator, "none");
+        }
+        try appendStudioToken(&directive, allocator, " shadow_x={d} shadow_y={d}", .{
+            shadow.offset.x,
+            shadow.offset.y,
+        });
+    } else {
+        try directive.appendSlice(allocator, " shadow=none");
+    }
+    if (item.animation) |spec| {
+        try directive.appendSlice(allocator, " anim=");
+        try directive.appendSlice(allocator, animationEffectLiteral(spec.effect));
+        try directive.appendSlice(allocator, " by=");
+        try directive.appendSlice(allocator, animationGroupingLiteral(spec.by));
+        if (spec.after) |after| try appendStudioToken(&directive, allocator, " after={d}", .{after});
+        try appendStudioToken(&directive, allocator, " duration={d}", .{spec.duration});
+    }
+
+    if (item.text) |text_value| {
+        return itemTextSnippet(allocator, directive.items, text_value);
+    }
+    return directive.toOwnedSlice(allocator);
+}
+
 fn studioItemInsertionOffset(slide: *const slides.Slide, morph_state: ?usize) !usize {
     if (morph_state) |state_index| {
         if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
@@ -4426,6 +4803,65 @@ fn applyStudioSemanticEdit(
             }
             if (!all_have_ids) selection_ids.clear();
             try applyStudioLockEdit(history, lock, slide, morph_state, items);
+        },
+        .reset_local_override => |reset| {
+            const item = studioItemByIdentity(items, reset.target.item_identity) orelse
+                return error.StudioItemMissing;
+            if (item.locked) return error.StudioItemLocked;
+            const id = item.id orelse return error.NoLocalPropertyOverride;
+            const owner = try studioResetOwner(
+                G.editor_memory[0..G.source_len],
+                slide,
+                morph_state,
+                item,
+            );
+            const property = inheritedPropertyForInlineField(reset.field);
+            if (!try source_editor.inheritedPropertyOverrideExists(
+                G.editor_memory[0..G.source_len],
+                owner,
+                id,
+                property,
+            )) return error.NoLocalPropertyOverride;
+            try recordStudioPatch(history, try source_editor.resetInheritedProperty(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                owner,
+                id,
+                property,
+            ));
+            return .{ .preserve_selection = true };
+        },
+        .detach_reusable_instance => |detach| {
+            if (detach.kind != .component or morph_state != null) {
+                return error.UnsupportedComponentDetach;
+            }
+            const item = studioItemByIdentity(items, detach.target.item_identity) orelse
+                return error.StudioItemMissing;
+            if (item.locked) return error.StudioItemLocked;
+            if (item.source.scope != .component_instance or
+                item.source.line_offset != detach.target.source.line_offset)
+            {
+                return error.UnsupportedComponentDetach;
+            }
+            const info = try source_editor.inspectComponentInstanceForDetach(
+                G.editor_memory[0..G.source_len],
+                item.source.line_offset,
+            );
+            if (item.id == null or !std.mem.eql(u8, item.id.?, info.effective_id)) {
+                return error.DetachedItemIdMismatch;
+            }
+            const materialized = try materializeStudioItem(G.allocator, item);
+            defer G.allocator.free(materialized);
+            // Detach is structural; allocate the stable rebind key before the
+            // source/history transaction so an OOM cannot leave stale UI state.
+            try selection_ids.appendCopy(info.effective_id);
+            try recordStudioPatch(history, try source_editor.detachComponentInstance(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                item.source.line_offset,
+                info.definition_offset,
+                materialized,
+            ));
         },
         .promote_to_reusable => |target| {
             if (morph_state != null) return error.MorphPromotionUnsupported;
