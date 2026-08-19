@@ -1061,6 +1061,7 @@ pub const PropertyOverrideSet = struct {
 pub const ReusableInstanceKind = enum {
     none,
     component,
+    group,
     slide_template,
 };
 
@@ -1134,6 +1135,7 @@ pub const SlideSummary = struct {
 
 pub const LibraryEntryKind = enum {
     element,
+    group,
     slide_template,
 };
 
@@ -1187,6 +1189,7 @@ pub const SemanticCommand = union(enum) {
     reset_local_override: ResetOverrideCommand,
     detach_reusable_instance: DetachInstanceCommand,
     promote_to_reusable: CommandTarget,
+    promote_items_to_group: ItemBatchCommand,
     select_morph_scene: MorphSceneCommand,
     new_slide: void,
     select_slide: usize,
@@ -1198,6 +1201,8 @@ pub const SemanticCommand = union(enum) {
     promote_slide_to_template: usize,
     /// Creates a new slide using the indexed `slide_template` library entry.
     new_slide_from_template: usize,
+    /// Inserts an absolute-position @popgroup instance for this Library row.
+    add_reusable_group: usize,
     /// Renames the indexed source definition. The integration layer prompts
     /// for and validates the new name before applying the source edit.
     rename_library_entry: usize,
@@ -3773,7 +3778,34 @@ pub const Studio = struct {
     ) bool {
         const item_index = self.selectedIndex(items) orelse return false;
         if (self.selectionCount() > 1) {
-            self.notice = .group_reusable_needs_source_support;
+            if (self.active_morph_state != null) {
+                self.notice = .group_reusable_needs_source_support;
+                return true;
+            }
+            var command = ItemBatchCommand{};
+            for (items, 0..) |candidate, candidate_index| {
+                if (!self.isIdentitySelected(candidate.identity)) continue;
+                if (candidate.locked) {
+                    self.notice = .locked_item;
+                    return true;
+                }
+                const target = self.structuralTarget(items, candidate_index, true) orelse {
+                    self.notice = .group_reusable_needs_source_support;
+                    return true;
+                };
+                if (batchHasNonLocalSource(command.slice(), target)) {
+                    self.notice = .group_reusable_needs_source_support;
+                    return true;
+                }
+                command.targets[command.count] = target;
+                command.count += 1;
+            }
+            if (command.count != self.selectionCount()) {
+                self.notice = .group_reusable_needs_source_support;
+                return true;
+            }
+            self.notice = .none;
+            self.pending_semantic_command = .{ .promote_items_to_group = command };
             return true;
         }
         const item = items[item_index];
@@ -4749,6 +4781,11 @@ pub const Studio = struct {
         switch (action) {
             .use => switch (entry.kind) {
                 .element => self.tool = .add_reusable,
+                .group => {
+                    self.tool = .select;
+                    self.active_morph_state = null;
+                    self.pending_semantic_command = .{ .add_reusable_group = entry_index };
+                },
                 .slide_template => {
                     self.tool = .select;
                     self.active_morph_state = null;
@@ -6518,13 +6555,22 @@ pub const Studio = struct {
             else
                 .{ .r = 103, .g = 117, .b = 140, .a = 210 };
             rl.drawRectangleLinesEx(row, if (selected) 2 else 1, border);
-            const badge: [:0]const u8 = if (entry.kind == .element) "ITEM" else "SLIDE";
+            const badge: [:0]const u8 = switch (entry.kind) {
+                .element => "ITEM",
+                .group => "GROUP",
+                .slide_template => "SLIDE",
+            };
             const badge_rect: rl.Rectangle = .{ .x = row.x + 7, .y = row.y + 9, .width = 48, .height = 28 };
-            rl.drawRectangleRec(badge_rect, if (entry.kind == .element)
-                .{ .r = 43, .g = 123, .b = 151, .a = if (entry.available) 255 else 100 }
-            else
-                .{ .r = 116, .g = 83, .b = 160, .a = if (entry.available) 255 else 100 });
-            self.drawUiText(badge, .{ .x = badge_rect.x + 6, .y = badge_rect.y + (badge_rect.height - @as(f32, @floatFromInt(compact_font))) / 2 }, compact_font, .white);
+            rl.drawRectangleRec(badge_rect, switch (entry.kind) {
+                .element => .{ .r = 43, .g = 123, .b = 151, .a = if (entry.available) 255 else 100 },
+                .group => .{ .r = 170, .g = 91, .b = 126, .a = if (entry.available) 255 else 100 },
+                .slide_template => .{ .r = 116, .g = 83, .b = 160, .a = if (entry.available) 255 else 100 },
+            });
+            const badge_width = self.measureUiText(badge, compact_font);
+            self.drawUiText(badge, .{
+                .x = badge_rect.x + (badge_rect.width - badge_width) / 2,
+                .y = badge_rect.y + (badge_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
+            }, compact_font, .white);
             const text_x = row.x + 64;
             const text_width = @max(0, row.x + row.width - text_x - 7);
             if (text_width <= 0) continue;
@@ -6997,6 +7043,7 @@ pub const Studio = struct {
         return switch (kind) {
             .none => "Direct item",
             .component => "Component instance",
+            .group => "Group instance",
             .slide_template => "Template instance",
         };
     }
@@ -7031,7 +7078,7 @@ pub const Studio = struct {
         buffer: *[192]u8,
     ) ?[:0]const u8 {
         if (self.selectionCount() > 1)
-            return std.fmt.bufPrintZ(buffer, "Group reusable needs explicit source-format support", .{}) catch null;
+            return std.fmt.bufPrintZ(buffer, "Selected group · Reuse creates one source-native component", .{}) catch null;
         const item_index = self.selectedIndex(items) orelse return null;
         const item = items[item_index];
         const context = self.compositionContextForSelection(items) orelse {
@@ -7072,7 +7119,7 @@ pub const Studio = struct {
         drawCompactButton(self, layout.duplicate_item, "Dup");
         drawCompactButton(self, layout.delete_item, "Del");
         if (self.selectionCount() > 1) {
-            drawDisabledBadge(self, layout.promote, "Group…");
+            drawCompactButton(self, layout.promote, "Reuse");
         } else if (self.compositionContextForSelection(items)) |context| {
             if (context.kind != .none) {
                 if (context.detach_target != null)
@@ -10091,6 +10138,7 @@ test "library selection persists while Use places elements or creates template s
     const summaries = [_]SlideSummary{.{ .index = 0 }};
     const entries = [_]LibraryEntry{
         .{ .kind = .element, .name = "page_number" },
+        .{ .kind = .group, .name = "hero_pair" },
         .{ .kind = .slide_template, .name = "chapter" },
     };
     const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0, .library = &entries };
@@ -10138,7 +10186,23 @@ test "library selection persists while Use places elements or creates template s
         .pointer_pressed = true,
     });
     switch (studio.takeSemanticCommand().?) {
-        .new_slide_from_template => |entry_index| try std.testing.expectEqual(@as(usize, 1), entry_index),
+        .add_reusable_group => |entry_index| try std.testing.expectEqual(@as(usize, 1), entry_index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 2).?),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 2), studio.selected_library_index);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.library_use),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .new_slide_from_template => |entry_index| try std.testing.expectEqual(@as(usize, 2), entry_index),
         else => return error.UnexpectedSemanticCommand,
     }
 }
@@ -11248,7 +11312,7 @@ test "detach requires an identity-safe integration capability" {
     try std.testing.expectEqual(Notice.detach_instance_unsupported, studio.notice);
 }
 
-test "group reusable remains an honest disabled source-format boundary" {
+test "group reusable emits one atomic source-native promotion" {
     var items = [_]slides.SlideItem{
         testItem(658, .textbox, 100, 120, 300, 80),
         testItem(659, .img, 500, 120, 240, 160),
@@ -11262,11 +11326,18 @@ test "group reusable remains an honest disabled source-format boundary" {
         .pointer_screen = rectangleCenter(uiLayout(frame.viewport).promote),
         .pointer_pressed = true,
     });
-    try std.testing.expect(studio.takeSemanticCommand() == null);
-    try std.testing.expectEqual(Notice.group_reusable_needs_source_support, studio.notice);
+    switch (studio.takeSemanticCommand().?) {
+        .promote_items_to_group => |command| {
+            try std.testing.expectEqual(@as(usize, 2), command.count);
+            try std.testing.expectEqual(@as(usize, 10), command.targets[0].source.line_offset);
+            try std.testing.expectEqual(@as(usize, 20), command.targets[1].source.line_offset);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(Notice.none, studio.notice);
     var help_buffer: [192]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "Group reusable needs explicit source-format support",
+        "Selected group · Reuse creates one source-native component",
         studio.compositionHelp(&items, &help_buffer).?,
     );
 }

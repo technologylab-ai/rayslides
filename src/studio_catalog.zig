@@ -1,4 +1,4 @@
-//! Source-backed catalog of reusable element and slide templates.
+//! Source-backed catalog of reusable elements, groups, and slide templates.
 //!
 //! Entries borrow their names from the source buffer, while the catalog owns
 //! only the entry array. Rebuild the catalog after every source edit; indices
@@ -9,10 +9,11 @@ const std = @import("std");
 
 pub const Kind = enum {
     element,
+    group,
     slide,
 };
 
-/// One physical `@push` or `@pushslide` definition.
+/// One physical `@push`, `@pushgroup`, or `@pushslide` definition.
 pub const Entry = struct {
     kind: Kind,
     /// Borrowed from the source passed to `discover`.
@@ -115,6 +116,7 @@ pub const EditError = error{
     DynamicContextName,
     NameCollision,
     LiveUses,
+    UnsafeGroupDelete,
     UnsafeSlideTemplateDelete,
     SourceTooLarge,
 };
@@ -298,6 +300,30 @@ pub fn deleteDefinition(
         cursor = line.full_end;
     }
 
+    if (entry.kind == .group) {
+        var block_cursor = definition.line.full_end;
+        while (block_cursor < source.len) {
+            const line = physicalLineAt(source, block_cursor);
+            const text = source[line.start..line.trimmed_end];
+            if (std.mem.indexOfScalar(u8, text, '$') != null) return error.UnsafeGroupDelete;
+            const token = firstToken(text);
+            if (std.mem.eql(u8, token, "@endgroup")) {
+                if (std.mem.trim(u8, text["@endgroup".len..], " \t").len != 0) {
+                    return error.UnsafeGroupDelete;
+                }
+                return removeSpans(allocator, source, &.{.{
+                    .start = definition.line.start,
+                    .end = line.full_end,
+                }});
+            }
+            if (token.len > 0 and token[0] == '@' and !isSafeGroupBodyDirective(token)) {
+                return error.UnsafeGroupDelete;
+            }
+            block_cursor = line.full_end;
+        }
+        return error.UnsafeGroupDelete;
+    }
+
     var removals = std.ArrayList(Span).empty;
     defer removals.deinit(allocator);
     try removals.append(allocator, .{ .start = definition.line.start, .end = definition.line.full_end });
@@ -382,6 +408,10 @@ fn parseContextDirective(source: []const u8, line: Line) ?Directive {
             .{ .element, .definition }
         else if (std.mem.eql(u8, token, "@pop"))
             .{ .element, .use }
+        else if (std.mem.eql(u8, token, "@pushgroup"))
+            .{ .group, .definition }
+        else if (std.mem.eql(u8, token, "@popgroup"))
+            .{ .group, .use }
         else if (std.mem.eql(u8, token, "@pushslide"))
             .{ .slide, .definition }
         else if (std.mem.eql(u8, token, "@popslide"))
@@ -402,6 +432,19 @@ fn parseContextDirective(source: []const u8, line: Line) ?Directive {
         .name_offset = name_start,
         .name_end = name_end,
     };
+}
+
+fn firstToken(text: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < text.len and !isHorizontalWhitespace(text[end])) : (end += 1) {}
+    return text[0..end];
+}
+
+fn isSafeGroupBodyDirective(token: []const u8) bool {
+    return std.mem.eql(u8, token, "@box") or
+        std.mem.eql(u8, token, "@pop") or
+        std.mem.eql(u8, token, "@anim") or
+        (std.mem.startsWith(u8, token, "@anim(") and std.mem.endsWith(u8, token, ")"));
 }
 
 fn physicalLineAt(source: []const u8, start: usize) Line {
@@ -592,6 +635,93 @@ test "slide template rename updates only its scoped popslide uses" {
             "@pushslide content\n" ++
             "@popslide content\n",
         renamed.source,
+    );
+}
+
+test "group catalog discovers scopes renames uses and deletes an unused block" {
+    const source =
+        "\xEF\xBB\xBF@pushgroup feature\r\n" ++
+        "@box id=title x=10 text=Feature\r\n" ++
+        "# owned group note\r\n" ++
+        "@endgroup\r\n" ++
+        "@slide\r\n" ++
+        "@popgroup feature id=one\r\n" ++
+        "@pushgroup unused\r\n" ++
+        "@box id=badge text=Unused\r\n" ++
+        "@endgroup\r\n";
+    var catalog = try discover(std.testing.allocator, source);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 2), catalog.entries.len);
+    try std.testing.expectEqual(Kind.group, catalog.entries[0].kind);
+    try std.testing.expectEqualStrings("feature", catalog.entries[0].name);
+    try std.testing.expectEqual(@as(usize, 1), catalog.entries[0].use_count);
+    try std.testing.expectEqual(@as(?usize, 0), catalog.findVisible(
+        .group,
+        "feature",
+        std.mem.indexOf(u8, source, "@popgroup feature").?,
+    ));
+
+    const renamed = try renameDefinition(std.testing.allocator, source, catalog.entries[0], "hero");
+    defer renamed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, renamed.source, "@pushgroup hero\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renamed.source, "@popgroup hero id=one\r\n") != null);
+
+    var renamed_catalog = try discover(std.testing.allocator, renamed.source);
+    defer renamed_catalog.deinit();
+    const deleted = try deleteDefinition(
+        std.testing.allocator,
+        renamed.source,
+        renamed_catalog.entries[1],
+    );
+    defer deleted.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "@pushgroup unused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "id=badge") == null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "@pushgroup hero") != null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(deleted.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqualStrings("one.title", deck.slides.items[0].items.?.items[0].id.?);
+}
+
+test "group catalog refuses live and malformed block deletion" {
+    const live =
+        "@pushgroup card\n" ++
+        "@box id=title text=Card\n" ++
+        "@endgroup\n" ++
+        "@slide\n" ++
+        "@popgroup card id=one\n";
+    var live_catalog = try discover(std.testing.allocator, live);
+    defer live_catalog.deinit();
+    try std.testing.expectError(
+        error.LiveUses,
+        deleteDefinition(std.testing.allocator, live, live_catalog.entries[0]),
+    );
+
+    const malformed = "@pushgroup broken\n@box id=title text=Broken\n";
+    var malformed_catalog = try discover(std.testing.allocator, malformed);
+    defer malformed_catalog.deinit();
+    try std.testing.expectError(
+        error.UnsafeGroupDelete,
+        deleteDefinition(std.testing.allocator, malformed, malformed_catalog.entries[0]),
+    );
+
+    const forbidden =
+        "@pushgroup broken\n" ++
+        "@box id=title text=Broken\n" ++
+        "@slide\n" ++
+        "@box id=outside text=Must survive\n" ++
+        "@endgroup\n";
+    var forbidden_catalog = try discover(std.testing.allocator, forbidden);
+    defer forbidden_catalog.deinit();
+    try std.testing.expectError(
+        error.UnsafeGroupDelete,
+        deleteDefinition(std.testing.allocator, forbidden, forbidden_catalog.entries[0]),
     );
 }
 

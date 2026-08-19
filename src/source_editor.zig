@@ -72,6 +72,22 @@ pub const CapturedPasteItem = struct {
     placement: DuplicateItemPlacement,
 };
 
+/// One physically authored item promoted into a reusable-group definition.
+/// `member_id` becomes the definition-local ID; instance IDs are qualified by
+/// the parser as `INSTANCE.MEMBER`.
+pub const GroupPromotionTarget = struct {
+    directive_offset: usize,
+    member_id: []const u8,
+};
+
+/// Borrowed, source-order-resolved metadata for one literal @popgroup call.
+pub const ReusableGroupInstanceInfo = struct {
+    group_name: []const u8,
+    instance_id: []const u8,
+    definition_offset: usize,
+    member_count: usize,
+};
+
 /// One source operation in an atomic geometry rewrite. Every offset refers to
 /// the original, unmodified source buffer. Insertions at the same offset are
 /// emitted in caller order. Snippet bytes are borrowed only for the duration
@@ -231,6 +247,7 @@ pub const PatchError = error{
     ItemIdCollision,
     ComponentDefinitionMismatch,
     DetachedItemIdMismatch,
+    GroupNameCollision,
     NoLocalPropertyOverride,
     NoAdjacentSlide,
     NoLayerChange,
@@ -241,6 +258,9 @@ pub const PatchError = error{
     UnsupportedItemDuplication,
     UnsupportedClipboardItem,
     UnsupportedComponentDetach,
+    UnsupportedGroupDetach,
+    UnsupportedGroupInstance,
+    UnsupportedGroupPromotion,
     UnsupportedItemLayerMove,
     UnsupportedSlideTemplateOverride,
     UnsupportedSharedTemplateDeletion,
@@ -1962,6 +1982,482 @@ pub fn duplicateItem(
     }
     try insertion.appendSlice(allocator, cloned.source);
     return replaceRange(allocator, source, item_end, item_end, insertion.items);
+}
+
+/// Promote one contiguous paint-order segment of literal base-scene items to
+/// an explicit reusable group without moving it in source order. The selected
+/// units are wrapped in `@pushgroup`/`@endgroup` and immediately replaced by
+/// `@popgroup`, so visual order, animations, body text, comments, and component
+/// definition resolution remain stable. Existing morph mutations targeting a
+/// selected item are atomically rewritten to its qualified instance ID.
+pub fn promoteItemsToReusableGroup(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    targets: []const GroupPromotionTarget,
+    group_name: []const u8,
+    instance_id: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (!isReusableName(group_name) or !isReusableName(instance_id)) {
+        return error.InvalidReusableName;
+    }
+    if (targets.len < 2) return error.UnsupportedGroupPromotion;
+    try rejectReusableGroupNameCollision(source, group_name);
+
+    const range = resolveItemScene(source, scene) catch return error.UnsupportedGroupPromotion;
+    if (range.kind != .base) return error.UnsupportedGroupPromotion;
+    var units = std.ArrayList(ItemSourceUnit).empty;
+    defer units.deinit(allocator);
+    collectSceneItemUnits(allocator, source, range, &units) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnsupportedGroupPromotion,
+    };
+
+    var target_unit_indices = try allocator.alloc(usize, targets.len);
+    defer allocator.free(target_unit_indices);
+    var original_ids = try allocator.alloc(?[]const u8, targets.len);
+    defer allocator.free(original_ids);
+    var qualified_ids = std.ArrayList([]u8).empty;
+    defer {
+        for (qualified_ids.items) |id| allocator.free(id);
+        qualified_ids.deinit(allocator);
+    }
+
+    for (targets, 0..) |target, target_index| {
+        if (!isReusableName(target.member_id)) return error.InvalidReusableName;
+        for (targets[0..target_index]) |previous| {
+            if (previous.directive_offset == target.directive_offset or
+                std.mem.eql(u8, previous.member_id, target.member_id))
+            {
+                return error.UnsupportedGroupPromotion;
+            }
+        }
+
+        var found: ?usize = null;
+        for (units.items, 0..) |unit, unit_index| {
+            if (unit.directive_offset == target.directive_offset) {
+                found = unit_index;
+                break;
+            }
+        }
+        const unit_index = found orelse return error.UnsupportedGroupPromotion;
+        const line = directiveLine(source, target.directive_offset) catch
+            return error.UnsupportedGroupPromotion;
+        const text = source[line.start..line.content_end];
+        const name = directiveName(text);
+        if (!(std.mem.eql(u8, name, "@box") or std.mem.eql(u8, name, "@pop")) or
+            std.mem.indexOfScalar(u8, source[units.items[unit_index].start..units.items[unit_index].end], '$') != null or
+            directiveHasDynamicIdentity(text, name))
+        {
+            return error.UnsupportedGroupPromotion;
+        }
+        if (std.mem.eql(u8, name, "@pop")) {
+            const component = directiveContextName(text, name.len) orelse
+                return error.UnsupportedGroupPromotion;
+            if (!isReusableName(component)) return error.UnsupportedGroupPromotion;
+            _ = resolveLiteralComponentDefinitionBefore(source, target.directive_offset, component) catch
+                return error.UnsupportedGroupPromotion;
+        }
+        target_unit_indices[target_index] = unit_index;
+        original_ids[target_index] = literalEmittedItemId(text, name);
+        const qualified = try std.fmt.allocPrint(
+            allocator,
+            "{s}.{s}",
+            .{ instance_id, target.member_id },
+        );
+        errdefer allocator.free(qualified);
+        try qualified_ids.append(allocator, qualified);
+    }
+
+    // Targets must be supplied in paint/source order and cover one physically
+    // adjacent segment. A gap means an unselected item or semantic barrier
+    // would change relative order when wrapped.
+    const first_index = target_unit_indices[0];
+    for (target_unit_indices, 0..) |unit_index, index| {
+        if (unit_index != first_index + index) return error.UnsupportedGroupPromotion;
+        if (index > 0 and units.items[unit_index - 1].end != units.items[unit_index].start) {
+            return error.UnsupportedGroupPromotion;
+        }
+    }
+
+    // Existing IDs must uniquely identify their selected authored item within
+    // this scene before later morph targets can be rewritten safely. Qualified
+    // IDs must not collide with any unselected authored item.
+    for (units.items, 0..) |unit, unit_index| {
+        const line = directiveLine(source, unit.directive_offset) catch
+            return error.UnsupportedGroupPromotion;
+        const text = source[line.start..line.content_end];
+        const name = directiveName(text);
+        const candidate_id = literalEmittedItemId(text, name);
+        for (targets, 0..) |_, target_index| {
+            if (candidate_id) |candidate| {
+                if (original_ids[target_index]) |old_id| {
+                    if (std.mem.eql(u8, candidate, old_id) and
+                        unit_index != target_unit_indices[target_index])
+                    {
+                        return error.UnsupportedGroupPromotion;
+                    }
+                }
+                if (std.mem.eql(u8, candidate, qualified_ids.items[target_index])) {
+                    return error.ItemIdCollision;
+                }
+            }
+        }
+    }
+
+    const segment_start = units.items[first_index].start;
+    const segment_end = units.items[first_index + targets.len - 1].end;
+    const newline = lineEndingNear(source, segment_start);
+    var replacement = std.ArrayList(u8).empty;
+    defer replacement.deinit(allocator);
+    try replacement.appendSlice(allocator, "@pushgroup ");
+    try replacement.appendSlice(allocator, group_name);
+    try replacement.appendSlice(allocator, newline);
+    for (targets, 0..) |target, index| {
+        const unit = units.items[target_unit_indices[index]];
+        const snippet = source[unit.start..unit.end];
+        const patches = [_]LiteralAttributePatch{.{ .key = "id", .value = target.member_id }};
+        const patched = patchLiteralAttributes(
+            allocator,
+            snippet,
+            unit.directive_offset - unit.start,
+            &patches,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedGroupPromotion,
+        };
+        defer patched.deinit(allocator);
+        try replacement.appendSlice(allocator, patched.source);
+        if (replacement.items.len == 0 or replacement.items[replacement.items.len - 1] != '\n') {
+            try replacement.appendSlice(allocator, newline);
+        }
+    }
+    try replacement.appendSlice(allocator, "@endgroup");
+    try replacement.appendSlice(allocator, newline);
+    try replacement.appendSlice(allocator, "@popgroup ");
+    try replacement.appendSlice(allocator, group_name);
+    try replacement.appendSlice(allocator, " id=");
+    try replacement.appendSlice(allocator, instance_id);
+    try replacement.appendSlice(allocator, newline);
+
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    try edits.append(allocator, .{
+        .start = segment_start,
+        .end = segment_end,
+        .replacement = replacement.items,
+    });
+
+    const slide_end = batchDeleteLogicalSlideEnd(source, range) catch
+        return error.UnsupportedGroupPromotion;
+    var cursor = range.end;
+    while (cursor < slide_end) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > slide_end) return error.UnsupportedGroupPromotion;
+        const text = source[cursor..line.content_end];
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedGroupPromotion;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (isMorphMutationDirective(name)) {
+                const target_name = directiveContextName(text, name.len) orelse
+                    return error.UnsupportedGroupPromotion;
+                for (original_ids, 0..) |old_id, target_index| {
+                    if (old_id != null and std.mem.eql(u8, old_id.?, target_name)) {
+                        const target_start = @intFromPtr(target_name.ptr) - @intFromPtr(source.ptr);
+                        try edits.append(allocator, .{
+                            .start = target_start,
+                            .end = target_start + target_name.len,
+                            .replacement = qualified_ids.items[target_index],
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+
+    sortEditsByPosition(edits.items);
+    try validateNonOverlappingEdits(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+fn rejectReusableGroupNameCollision(source: []const u8, group_name: []const u8) PatchError!void {
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[cursor..line.content_end];
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedGroupPromotion;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@pushgroup")) {
+                const candidate = directiveContextName(text, name.len) orelse
+                    return error.UnsupportedGroupPromotion;
+                if (!isReusableName(candidate)) return error.UnsupportedGroupPromotion;
+                if (std.mem.eql(u8, candidate, group_name)) return error.GroupNameCollision;
+            }
+        }
+        cursor = line.full_end;
+    }
+}
+
+const ReusableGroupDefinitionView = struct {
+    start: usize,
+    end: usize,
+    name: []const u8,
+    member_ids: [][]const u8,
+
+    fn deinit(self: ReusableGroupDefinitionView, allocator: std.mem.Allocator) void {
+        allocator.free(self.member_ids);
+    }
+};
+
+fn reusableGroupDefinitionAt(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    definition_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!ReusableGroupDefinitionView {
+    const opening = directiveLine(source, definition_offset) catch
+        return error.UnsupportedGroupInstance;
+    const opening_text = source[opening.start..opening.content_end];
+    if (!std.mem.eql(u8, directiveName(opening_text), "@pushgroup") or
+        std.mem.indexOfScalar(u8, opening_text, '$') != null)
+    {
+        return error.UnsupportedGroupInstance;
+    }
+    var opening_words = std.mem.tokenizeAny(u8, opening_text, " \t");
+    _ = opening_words.next();
+    const group_name = opening_words.next() orelse return error.UnsupportedGroupInstance;
+    if (!isReusableName(group_name) or opening_words.next() != null) {
+        return error.UnsupportedGroupInstance;
+    }
+
+    var member_ids = std.ArrayList([]const u8).empty;
+    errdefer member_ids.deinit(allocator);
+    var cursor = opening.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[cursor..line.content_end];
+        if (std.mem.indexOfScalar(u8, text, '$') != null) return error.UnsupportedGroupInstance;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@endgroup")) {
+                if (std.mem.trim(u8, text[name.len..], " \t").len != 0 or
+                    member_ids.items.len == 0)
+                {
+                    return error.UnsupportedGroupInstance;
+                }
+                return .{
+                    .start = opening.start,
+                    .end = line.full_end,
+                    .name = group_name,
+                    .member_ids = try member_ids.toOwnedSlice(allocator),
+                };
+            }
+            if (std.mem.eql(u8, name, "@pushgroup") or
+                !(std.mem.eql(u8, name, "@box") or
+                    std.mem.eql(u8, name, "@pop") or
+                    isAnimationDirective(name)))
+            {
+                return error.UnsupportedGroupInstance;
+            }
+            if (std.mem.eql(u8, name, "@box") or std.mem.eql(u8, name, "@pop")) {
+                if (directiveHasDynamicIdentity(text, name)) return error.UnsupportedGroupInstance;
+                const member_id = effectiveLiteralId(text, name.len) orelse
+                    return error.UnsupportedGroupInstance;
+                if (!isReusableName(member_id)) return error.UnsupportedGroupInstance;
+                for (member_ids.items) |existing| {
+                    if (std.mem.eql(u8, existing, member_id)) return error.UnsupportedGroupInstance;
+                }
+                try member_ids.append(allocator, member_id);
+            }
+        }
+        cursor = line.full_end;
+    }
+    return error.UnsupportedGroupInstance;
+}
+
+fn resolveReusableGroupDefinitionBefore(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    before_offset: usize,
+    group_name: []const u8,
+) (std.mem.Allocator.Error || PatchError)!ReusableGroupDefinitionView {
+    if (!isReusableName(group_name) or before_offset > source.len or
+        !isPhysicalLineBoundary(source, before_offset))
+    {
+        return error.UnsupportedGroupInstance;
+    }
+    var latest_offset: ?usize = null;
+    var cursor = sourceStart(source);
+    while (cursor < before_offset) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > before_offset) return error.UnsupportedGroupInstance;
+        const text = source[cursor..line.content_end];
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedGroupInstance;
+        if (cursor < line.content_end and source[cursor] == '@' and
+            std.mem.eql(u8, directiveName(text), "@pushgroup"))
+        {
+            const view = try reusableGroupDefinitionAt(allocator, source, cursor);
+            if (view.end > before_offset) {
+                view.deinit(allocator);
+                return error.UnsupportedGroupInstance;
+            }
+            if (std.mem.eql(u8, view.name, group_name)) latest_offset = view.start;
+            const next = view.end;
+            view.deinit(allocator);
+            cursor = next;
+            continue;
+        }
+        cursor = line.full_end;
+    }
+    if (cursor != before_offset) return error.UnsupportedGroupInstance;
+    return reusableGroupDefinitionAt(
+        allocator,
+        source,
+        latest_offset orelse return error.UnsupportedGroupInstance,
+    );
+}
+
+/// Validate and resolve one literal @popgroup call to the exact latest complete
+/// definition visible at its source position.
+pub fn inspectReusableGroupInstance(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    instance_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!ReusableGroupInstanceInfo {
+    const line = directiveLine(source, instance_offset) catch
+        return error.UnsupportedGroupInstance;
+    const text = source[line.start..line.content_end];
+    if (!std.mem.eql(u8, directiveName(text), "@popgroup") or
+        std.mem.indexOfScalar(u8, text, '$') != null)
+    {
+        return error.UnsupportedGroupInstance;
+    }
+    var words = std.mem.tokenizeAny(u8, text, " \t");
+    _ = words.next();
+    const group_name = words.next() orelse return error.UnsupportedGroupInstance;
+    const id_token = words.next() orelse return error.UnsupportedGroupInstance;
+    if (words.next() != null or !std.mem.startsWith(u8, id_token, "id=")) {
+        return error.UnsupportedGroupInstance;
+    }
+    const instance_id = id_token["id=".len..];
+    if (!isReusableName(group_name) or !isReusableName(instance_id)) {
+        return error.UnsupportedGroupInstance;
+    }
+    const definition = try resolveReusableGroupDefinitionBefore(
+        allocator,
+        source,
+        line.start,
+        group_name,
+    );
+    defer definition.deinit(allocator);
+    return .{
+        .group_name = group_name,
+        .instance_id = instance_id,
+        .definition_offset = definition.start,
+        .member_count = definition.member_ids.len,
+    };
+}
+
+/// Insert one absolute-position reusable-group instance at the end of a base
+/// scene. Exact definition provenance prevents a stale Library row from
+/// binding to a later shadowing group.
+pub fn insertReusableGroupInstance(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    expected_definition_offset: usize,
+    group_name: []const u8,
+    instance_id: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (!isReusableName(group_name) or !isReusableName(instance_id)) {
+        return error.InvalidReusableName;
+    }
+    const range = resolveItemScene(source, scene) catch return error.UnsupportedGroupInstance;
+    if (range.kind == .morph) return error.UnsupportedGroupInstance;
+    const definition = try resolveReusableGroupDefinitionBefore(
+        allocator,
+        source,
+        range.end,
+        group_name,
+    );
+    defer definition.deinit(allocator);
+    if (definition.start != expected_definition_offset) return error.UnsupportedGroupInstance;
+    if (hasLiteralItemId(source, instance_id)) return error.ItemIdCollision;
+    for (definition.member_ids) |member_id| {
+        const qualified = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ instance_id, member_id });
+        defer allocator.free(qualified);
+        if (hasLiteralItemId(source, qualified)) return error.ItemIdCollision;
+    }
+    const directive = try std.fmt.allocPrint(
+        allocator,
+        "@popgroup {s} id={s}",
+        .{ group_name, instance_id },
+    );
+    defer allocator.free(directive);
+    return insertDirectiveAt(allocator, source, range.end, directive);
+}
+
+/// Detach one group instance into caller-materialized direct boxes. Each
+/// snippet must preserve the parser-qualified member ID in definition order.
+/// Following items that consume the group's post-context make the operation
+/// unsafe and are refused atomically.
+pub fn detachReusableGroupInstance(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    instance_offset: usize,
+    expected_definition_offset: usize,
+    materialized_box_snippets: []const []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const info = try inspectReusableGroupInstance(allocator, source, instance_offset);
+    if (info.definition_offset != expected_definition_offset) return error.UnsupportedGroupDetach;
+    const definition = try reusableGroupDefinitionAt(allocator, source, info.definition_offset);
+    defer definition.deinit(allocator);
+    if (materialized_box_snippets.len != definition.member_ids.len) {
+        return error.UnsupportedGroupDetach;
+    }
+
+    const instance_line = directiveLine(source, instance_offset) catch
+        return error.UnsupportedGroupDetach;
+    if ((itemOwnedAnimationStart(source, instance_line.start) catch
+        return error.UnsupportedGroupDetach) != instance_line.start)
+    {
+        return error.UnsupportedGroupDetach;
+    }
+    validateComponentDetachTail(source, itemBodyEndOffset(source, instance_line.full_end)) catch
+        return error.UnsupportedGroupDetach;
+
+    const newline = lineEndingNear(source, instance_line.start);
+    var replacement = std.ArrayList(u8).empty;
+    defer replacement.deinit(allocator);
+    for (materialized_box_snippets, 0..) |snippet, index| {
+        const materialized = validateMaterializedBoxSnippet(snippet) catch
+            return error.UnsupportedGroupDetach;
+        const actual_id = effectiveLiteralId(materialized.directive, "@box".len) orelse
+            return error.UnsupportedGroupDetach;
+        const expected_id = try std.fmt.allocPrint(
+            allocator,
+            "{s}.{s}",
+            .{ info.instance_id, definition.member_ids[index] },
+        );
+        defer allocator.free(expected_id);
+        if (!std.mem.eql(u8, actual_id, expected_id)) return error.UnsupportedGroupDetach;
+        if (index > 0) try replacement.appendSlice(allocator, newline);
+        try appendNormalizedLines(
+            allocator,
+            &replacement,
+            std.mem.trimEnd(u8, snippet, "\n"),
+            newline,
+        );
+    }
+    return replaceRange(
+        allocator,
+        source,
+        instance_line.start,
+        instance_line.content_end,
+        replacement.items,
+    );
 }
 
 /// Reorder one or more complete authored items inside one exact direct base or
@@ -8334,6 +8830,250 @@ test "component detach refuses a following item that consumes persistent pop con
             "@box id=hero x=10 color=#112233ff text=First",
         ),
     );
+}
+
+test "group promotion preserves paint semantics and retargets morph dependencies" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@anim(fade) duration=0.2\r\n" ++
+        "@box id=title x=100 y=120 w=500 h=90 fontsize=48 text=Feature\r\n" ++
+        "# title stays with its unit\r\n" ++
+        "@box id=art img=assets/art.png x=900 y=140 w=400 h=300\r\n" ++
+        "@state(morph) duration=0.6\r\n" ++
+        "@set title y=420\r\n" ++
+        "@set art x=1100\r\n";
+    const targets = [_]GroupPromotionTarget{
+        .{ .directive_offset = std.mem.indexOf(u8, source, "@box id=title").?, .member_id = "title" },
+        .{ .directive_offset = std.mem.indexOf(u8, source, "@box id=art").?, .member_id = "art" },
+    };
+    const result = try promoteItemsToReusableGroup(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = std.mem.indexOf(u8, source, "@slide").? },
+        &targets,
+        "feature",
+        "hero",
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@pushgroup feature\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@endgroup\r\n@popgroup feature id=hero\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@set hero.title y=420\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@set hero.art x=1100\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "# title stays with its unit\r\n") != null);
+
+    var before_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer before_arena.deinit();
+    const before_deck = try slides.SlideShow.new(before_arena.allocator());
+    const before_context = try parser.constructSlidesFromBuf(source, before_deck, before_arena.allocator());
+    defer before_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before_context.parser_errors.items.len);
+
+    var after_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer after_arena.deinit();
+    const after_deck = try slides.SlideShow.new(after_arena.allocator());
+    const after_context = try parser.constructSlidesFromBuf(result.source, after_deck, after_arena.allocator());
+    defer after_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_context.parser_errors.items.len);
+    const before_base = before_deck.slides.items[0].items.?.items;
+    const after_base = after_deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), after_base.len);
+    try std.testing.expectEqualStrings("hero.title", after_base[0].id.?);
+    try std.testing.expectEqualStrings("hero.art", after_base[1].id.?);
+    try std.testing.expectEqual(before_base[0].position, after_base[0].position);
+    try std.testing.expectEqual(before_base[0].size, after_base[0].size);
+    try std.testing.expectEqualStrings(before_base[0].text.?, after_base[0].text.?);
+    try std.testing.expectEqual(before_base[0].animation, after_base[0].animation);
+    try std.testing.expectEqual(before_base[1].position, after_base[1].position);
+    try std.testing.expectEqualStrings(before_base[1].img_path.?, after_base[1].img_path.?);
+    const before_morph = before_deck.slides.items[0].morph_states.items[0].items.items;
+    const after_morph = after_deck.slides.items[0].morph_states.items[0].items.items;
+    try std.testing.expectEqual(before_morph[0].position, after_morph[0].position);
+    try std.testing.expectEqual(before_morph[1].position, after_morph[1].position);
+}
+
+test "group promotion rejects gaps collisions and unsupported scenes atomically" {
+    const source =
+        "@slide\n" ++
+        "@box id=one text=One\n" ++
+        "@box id=middle text=Middle\n" ++
+        "@box id=two text=Two\n" ++
+        "@state(morph)\n" ++
+        "@set one x=20\n";
+    const one = std.mem.indexOf(u8, source, "@box id=one").?;
+    const two = std.mem.indexOf(u8, source, "@box id=two").?;
+    const gap = [_]GroupPromotionTarget{
+        .{ .directive_offset = one, .member_id = "one" },
+        .{ .directive_offset = two, .member_id = "two" },
+    };
+    try std.testing.expectError(error.UnsupportedGroupPromotion, promoteItemsToReusableGroup(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = 0 },
+        &gap,
+        "pair",
+        "instance",
+    ));
+
+    const collision =
+        "@pushgroup pair\n@endgroup\n" ++ source;
+    const collision_one = std.mem.indexOf(u8, collision, "@box id=one").?;
+    const collision_middle = std.mem.indexOf(u8, collision, "@box id=middle").?;
+    const adjacent = [_]GroupPromotionTarget{
+        .{ .directive_offset = collision_one, .member_id = "one" },
+        .{ .directive_offset = collision_middle, .member_id = "middle" },
+    };
+    try std.testing.expectError(error.GroupNameCollision, promoteItemsToReusableGroup(
+        std.testing.allocator,
+        collision,
+        .{ .base_slide = std.mem.indexOf(u8, collision, "@slide").? },
+        &adjacent,
+        "pair",
+        "instance",
+    ));
+    try std.testing.expectError(error.UnsupportedGroupPromotion, promoteItemsToReusableGroup(
+        std.testing.allocator,
+        source,
+        .{ .morph_state = std.mem.indexOf(u8, source, "@state(morph)").? },
+        &gap,
+        "other",
+        "instance",
+    ));
+
+    const literal_dollar =
+        "@slide\n" ++
+        "@box id=price text=$5\n" ++
+        "@box id=note text=Literal\n";
+    const dollar_targets = [_]GroupPromotionTarget{
+        .{
+            .directive_offset = std.mem.indexOf(u8, literal_dollar, "@box id=price").?,
+            .member_id = "price",
+        },
+        .{
+            .directive_offset = std.mem.indexOf(u8, literal_dollar, "@box id=note").?,
+            .member_id = "note",
+        },
+    };
+    try std.testing.expectError(error.UnsupportedGroupPromotion, promoteItemsToReusableGroup(
+        std.testing.allocator,
+        literal_dollar,
+        .{ .base_slide = 0 },
+        &dollar_targets,
+        "prices",
+        "instance",
+    ));
+}
+
+test "group instance insertion requires exact visible definition provenance" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@pushgroup feature\n" ++
+        "@box id=title x=100 y=120 w=500 h=90 text=Feature\n" ++
+        "@box id=art img=assets/art.png x=900 y=140 w=400 h=300\n" ++
+        "@endgroup\n" ++
+        "@slide\n" ++
+        "@box id=local text=Local\n" ++
+        "@state(morph)\n" ++
+        "@set local x=40\n";
+    const definition_offset = std.mem.indexOf(u8, source, "@pushgroup feature").?;
+    const result = try insertReusableGroupInstance(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = std.mem.indexOf(u8, source, "@slide").? },
+        definition_offset,
+        "feature",
+        "second",
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "@popgroup feature id=second\n@state(morph)",
+    ) != null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const base = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), base.len);
+    try std.testing.expectEqualStrings("second.title", base[1].id.?);
+    try std.testing.expectEqualStrings("second.art", base[2].id.?);
+
+    const shadowed =
+        "@pushgroup feature\n@box id=old text=Old\n@endgroup\n" ++
+        "@pushgroup feature\n@box id=new text=New\n@endgroup\n" ++
+        "@slide\n";
+    try std.testing.expectError(error.UnsupportedGroupInstance, insertReusableGroupInstance(
+        std.testing.allocator,
+        shadowed,
+        .{ .base_slide = std.mem.indexOf(u8, shadowed, "@slide").? },
+        0,
+        "feature",
+        "instance",
+    ));
+}
+
+test "group detach expands qualified members and preserves effective semantics" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@pushgroup feature\r\n" ++
+        "@anim(fade) duration=0.2\r\n" ++
+        "@box id=title x=100 y=120 w=500 h=90 fontsize=48 color=#112233ff text=Feature\r\n" ++
+        "@box id=art img=assets/art.png x=900 y=140 w=0 h=0 scale=0.5\r\n" ++
+        "@endgroup\r\n" ++
+        "@slide\r\n" ++
+        "@popgroup feature id=hero\r\n" ++
+        "# instance note stays\r\n" ++
+        "@state(morph)\r\n" ++
+        "@set hero.title y=420\r\n";
+    const instance_offset = std.mem.indexOf(u8, source, "@popgroup feature").?;
+    const info = try inspectReusableGroupInstance(std.testing.allocator, source, instance_offset);
+    try std.testing.expectEqual(@as(usize, 2), info.member_count);
+    const snippets = [_][]const u8{
+        "@box id=hero.title x=100 y=120 w=500 h=90 fontsize=48 color=#112233ff bg=none opacity=1 visible=true locked=false shadow=none anim=fade by=item duration=0.2 text=Feature",
+        "@box id=hero.art img=assets/art.png x=900 y=140 w=0 h=0 bg=none scale=0.5 opacity=1 visible=true locked=false shadow=none",
+    };
+    const result = try detachReusableGroupInstance(
+        std.testing.allocator,
+        source,
+        instance_offset,
+        info.definition_offset,
+        &snippets,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@popgroup feature") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "# instance note stays\r\n") != null);
+
+    var before_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer before_arena.deinit();
+    const before_deck = try slides.SlideShow.new(before_arena.allocator());
+    const before_context = try parser.constructSlidesFromBuf(source, before_deck, before_arena.allocator());
+    defer before_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before_context.parser_errors.items.len);
+
+    var after_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer after_arena.deinit();
+    const after_deck = try slides.SlideShow.new(after_arena.allocator());
+    const after_context = try parser.constructSlidesFromBuf(result.source, after_deck, after_arena.allocator());
+    defer after_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_context.parser_errors.items.len);
+    const before_base = before_deck.slides.items[0].items.?.items;
+    const after_base = after_deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), after_base.len);
+    for (before_base, after_base) |before, after| {
+        try std.testing.expectEqualStrings(before.id.?, after.id.?);
+        try std.testing.expectEqual(before.position, after.position);
+        try std.testing.expectEqual(before.size, after.size);
+        try std.testing.expectEqual(before.animation, after.animation);
+    }
+    const after_morph = after_deck.slides.items[0].morph_states.items[0].items.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 420), after_morph[0].position.y, 0.0001);
 }
 
 test "source editing APIs reject ambiguous unsafe input" {

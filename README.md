@@ -456,8 +456,14 @@ ones in normal source order. The initial format deliberately keeps absolute
 member coordinates and refuses nested, generated, background, Crowdplay, or
 malformed group bodies rather than guessing at ownership.
 
-Studio group promotion and Library placement build on this syntax and are
-tracked in [the Studio roadmap](STUDIO_ROADMAP.md).
+In Studio, select two or more contiguous authored objects and choose **Reuse**
+to promote them in one undoable source transaction. The Library labels the
+result as **GROUP** and can place additional absolute-position instances;
+Properties identifies inherited group members and **Detach** expands the whole
+instance into ordinary local boxes. Group rename, unused deletion, placement,
+promotion, and detach all retain exact source-order definition provenance and
+refuse ambiguous structures atomically. The remaining dependency-cleanup work
+is tracked in [the Studio roadmap](STUDIO_ROADMAP.md).
 
 ## Slide-template instance overrides
 

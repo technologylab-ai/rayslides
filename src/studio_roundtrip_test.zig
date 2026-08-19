@@ -10,6 +10,7 @@ const parser = @import("parser.zig");
 const slides = @import("slides.zig");
 const source_editor = @import("source_editor.zig");
 const studio_api = @import("studio.zig");
+const studio_catalog = @import("studio_catalog.zig");
 
 fn adoptPatch(allocator: std.mem.Allocator, source: *[]u8, patch: source_editor.PatchResult) void {
     allocator.free(source.*);
@@ -996,4 +997,93 @@ test "Studio morph batch deletion removes a current-state birth and all later de
         try std.testing.expectEqualStrings("base", state.items.items[0].id.?);
         try std.testing.expect(!state.items.items[0].visible);
     }
+}
+
+test "Studio reusable group promotion Library placement and detach round trip atomically" {
+    const allocator = std.testing.allocator;
+    const original =
+        "@slide\n" ++
+        "@box id=title x=120 y=120 w=760 h=100 fontsize=64 text=Fast by design\n" ++
+        "@box id=art img=assets/feature.png x=1040 y=120 w=680 h=680\n" ++
+        "@state(morph)\n" ++
+        "@set title y=480\n";
+    const promotion_targets = [_]source_editor.GroupPromotionTarget{
+        .{
+            .directive_offset = std.mem.indexOf(u8, original, "@box id=title").?,
+            .member_id = "title",
+        },
+        .{
+            .directive_offset = std.mem.indexOf(u8, original, "@box id=art").?,
+            .member_id = "art",
+        },
+    };
+    const promoted = try source_editor.promoteItemsToReusableGroup(
+        allocator,
+        original,
+        .{ .base_slide = 0 },
+        &promotion_targets,
+        "feature",
+        "hero",
+    );
+    defer promoted.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, promoted.source, "@pushgroup feature\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promoted.source, "@popgroup feature id=hero\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promoted.source, "@set hero.title y=480\n") != null);
+
+    const catalog = try studio_catalog.discover(allocator, promoted.source);
+    defer catalog.deinit();
+    const group_index = catalog.findVisible(.group, "feature", promoted.source.len).?;
+    const group_entry = catalog.entries[group_index];
+    try std.testing.expectEqual(@as(usize, 1), group_entry.use_count);
+
+    const placed = try source_editor.insertReusableGroupInstance(
+        allocator,
+        promoted.source,
+        .{ .base_slide = 0 },
+        group_entry.directive_offset,
+        group_entry.name,
+        "copy",
+    );
+    defer placed.deinit(allocator);
+    const copy_offset = std.mem.indexOf(u8, placed.source, "@popgroup feature id=copy").?;
+    const copy_info = try source_editor.inspectReusableGroupInstance(allocator, placed.source, copy_offset);
+    try std.testing.expectEqual(group_entry.directive_offset, copy_info.definition_offset);
+    try std.testing.expectEqual(@as(usize, 2), copy_info.member_count);
+
+    const materialized = [_][]const u8{
+        "@box id=copy.title x=120 y=120 w=760 h=100 fontsize=64 text=Fast by design",
+        "@box id=copy.art img=assets/feature.png x=1040 y=120 w=680 h=680",
+    };
+    const detached = try source_editor.detachReusableGroupInstance(
+        allocator,
+        placed.source,
+        copy_offset,
+        copy_info.definition_offset,
+        &materialized,
+    );
+    defer detached.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, detached.source, "@popgroup feature id=copy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detached.source, "@box id=copy.title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached.source, "@box id=copy.art") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(detached.source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 4), slideshow.slides.items[0].items.?.items.len);
+    const base_items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqualStrings("hero.title", base_items[0].id.?);
+    try std.testing.expectEqualStrings("hero.art", base_items[1].id.?);
+    try std.testing.expectEqualStrings("copy.title", base_items[2].id.?);
+    try std.testing.expectEqualStrings("copy.art", base_items[3].id.?);
+    try std.testing.expectEqual(slides.SourceScope.group_instance_member, base_items[0].source.scope);
+    try std.testing.expectEqual(slides.SourceScope.direct, base_items[2].source.scope);
+    try std.testing.expectEqual(@as(f32, 120), base_items[0].position.y);
+    try std.testing.expectEqual(@as(f32, 120), base_items[2].position.y);
+
+    const morph_items = slideshow.slides.items[0].morph_states.items[0].items.items;
+    try std.testing.expectEqual(@as(f32, 480), morph_items[0].position.y);
+    try std.testing.expectEqual(@as(f32, 120), morph_items[2].position.y);
 }

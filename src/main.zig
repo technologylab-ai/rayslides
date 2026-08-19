@@ -1102,6 +1102,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
         studio_mode.setCompositionContext(if (studio_mode.capturesInput() and current_slide != null)
             studioCompositionContext(
+                gpa,
                 G.editor_memory[0..G.source_len],
                 current_slide.?,
                 studio_mode.active_morph_state,
@@ -1263,6 +1264,16 @@ pub fn main(init: std.process.Init) anyerror!void {
                         pending_semantic_command = command;
                         property_prompt.begin(.reusable_name, name);
                     },
+                    .promote_items_to_group => {
+                        var suggested_name: [96]u8 = undefined;
+                        const name = std.fmt.bufPrint(
+                            &suggested_name,
+                            "studio_group_{d}",
+                            .{@as(usize, @intCast(@max(G.current_slide, 0))) + 1},
+                        ) catch "studio_group";
+                        pending_semantic_command = command;
+                        property_prompt.begin(.reusable_name, name);
+                    },
                     .promote_slide_to_template => |slide_index| {
                         var suggested_name: [96]u8 = undefined;
                         const name = std.fmt.bufPrint(&suggested_name, "slide_template_{d}", .{slide_index + 1}) catch "slide_template";
@@ -1313,6 +1324,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                             studio_mode.setNotice(.edit_failed);
                         }
                     },
+                    .add_reusable_group => semantic_to_apply = command,
                     .copy_items => |copy| {
                         if (current_slide) |slide| {
                             if (captureStudioClipboard(
@@ -1580,6 +1592,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                             error.UnsupportedItemLayerMove,
                             error.UnsupportedClipboardItem,
                             error.UnsupportedBatchDeletion,
+                            error.UnsupportedGroupPromotion,
+                            error.UnsupportedGroupInstance,
+                            error.UnsupportedGroupDetach,
                             => .structural_source_locked,
                             error.StudioClipboardEmpty => .clipboard_empty,
                             error.LockedLayerBarrier,
@@ -1612,6 +1627,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                         error.UnsupportedItemLayerMove,
                         error.UnsupportedClipboardItem,
                         error.UnsupportedBatchDeletion,
+                        error.UnsupportedGroupPromotion,
+                        error.UnsupportedGroupInstance,
                         => .structural_source_locked,
                         error.StudioClipboardEmpty => .clipboard_empty,
                         error.LockedLayerBarrier,
@@ -1619,13 +1636,16 @@ pub fn main(init: std.process.Init) anyerror!void {
                         => .locked_item,
                         error.NoLocalPropertyOverride => .override_reset_unsupported,
                         error.UnsupportedComponentDetach,
+                        error.UnsupportedGroupDetach,
                         error.ComponentDefinitionMismatch,
                         error.DetachedItemIdMismatch,
                         => .detach_instance_unsupported,
                         error.NameCollision => .library_name_conflict,
+                        error.GroupNameCollision => .library_name_conflict,
                         error.SlideTemplateNameCollision => .library_name_conflict,
                         error.LiveUses => .library_entry_in_use,
                         error.UnsafeSlideTemplateDelete => .library_delete_unsupported,
+                        error.UnsafeGroupDelete => .library_delete_unsupported,
                         error.DynamicContextName => .structural_source_locked,
                         error.UnsupportedSlidePromotion => .slide_template_promotion_locked,
                         else => .edit_failed,
@@ -2361,6 +2381,7 @@ fn studioResetOwner(
 fn studioReusableKind(item: *const slides.SlideItem) studio.ReusableInstanceKind {
     return switch (item.source.scope) {
         .component_instance => .component,
+        .group_instance_member => .group,
         .slide_template => .slide_template,
         else => .none,
     };
@@ -2370,6 +2391,7 @@ fn studioReusableKind(item: *const slides.SlideItem) studio.ReusableInstanceKind
 /// object. Studio never guesses reset/detach ownership from rendered values;
 /// every affordance comes from this exact slide/state/source scan.
 fn studioCompositionContext(
+    allocator: std.mem.Allocator,
     source: []const u8,
     slide: *const slides.Slide,
     morph_state: ?usize,
@@ -2427,6 +2449,29 @@ fn studioCompositionContext(
         } else |_| {
             context.detach_block = .dependent_structure;
         }
+    } else if (kind == .group) {
+        if (morph_state != null) {
+            context.detach_block = .morph_scene;
+        } else if (!item.source.patchable) {
+            context.detach_block = .generated_source;
+        } else if (source_editor.inspectReusableGroupInstance(
+            allocator,
+            source,
+            item.source.line_offset,
+        )) |info| {
+            if (info.member_count > 0 and info.member_count <= studio.max_selection_items) {
+                context.detach_target = .{
+                    .item_identity = identity,
+                    .source = item.source,
+                    .edit_scope = .direct,
+                };
+                context.detach_block = .none;
+            } else {
+                context.detach_block = .ambiguous_instance;
+            }
+        } else |_| {
+            context.detach_block = .dependent_structure;
+        }
     } else if (kind == .slide_template and morph_state != null) {
         context.detach_block = .morph_scene;
     }
@@ -2454,7 +2499,7 @@ test "Studio composition capabilities expose exact component overrides and safe 
         .selected_identity = items[0].identity,
         .selected_source = items[0].source,
     };
-    const context = studioCompositionContext(source, slide, null, items, studio_state).?;
+    const context = studioCompositionContext(allocator, source, slide, null, items, studio_state).?;
     try std.testing.expectEqual(studio.ReusableInstanceKind.component, context.kind);
     try std.testing.expect(context.local_overrides.contains(.x));
     try std.testing.expect(context.local_overrides.contains(.text));
@@ -2465,7 +2510,39 @@ test "Studio composition capabilities expose exact component overrides and safe 
     try std.testing.expectEqual(studio.CompositionBlockReason.none, context.detach_block);
 
     studio_state.additional_selection_count = 1;
-    try std.testing.expect(studioCompositionContext(source, slide, null, items, studio_state) == null);
+    try std.testing.expect(studioCompositionContext(allocator, source, slide, null, items, studio_state) == null);
+}
+
+test "Studio composition capabilities authorize an exact reusable group detach" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@pushgroup feature\n" ++
+        "@box id=title x=100 y=100 text=Title\n" ++
+        "@box id=art x=900 y=100 w=400 h=300 color=#223344ff\n" ++
+        "@endgroup\n" ++
+        "@slide\n" ++
+        "@popgroup feature id=hero\n";
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const parser_context = try parser.constructSlidesFromBuf(source, deck, arena.allocator());
+    defer parser_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parser_context.parser_errors.items.len);
+
+    const slide = deck.slides.items[0];
+    const items = slide.items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    const studio_state: studio.Studio = .{
+        .enabled = true,
+        .selected_identity = items[1].identity,
+        .selected_source = items[1].source,
+    };
+    const context = studioCompositionContext(allocator, source, slide, null, items, studio_state).?;
+    try std.testing.expectEqual(studio.ReusableInstanceKind.group, context.kind);
+    try std.testing.expectEqual(studio.CompositionBlockReason.none, context.detach_block);
+    try std.testing.expect(context.detach_target != null);
+    try std.testing.expectEqual(items[1].source.line_offset, context.detach_target.?.source.line_offset);
+    try std.testing.expectEqual(@as(u16, 0), context.local_overrides.bits);
 }
 
 test "Studio component materialization preserves effective box semantics" {
@@ -3527,18 +3604,20 @@ fn collectStudioLibraryEntries(
     for (catalog.entries, 0..) |entry, catalog_index| {
         const insertion_offset = switch (entry.kind) {
             .element => item_insertion_offset,
+            .group => item_insertion_offset,
             .slide => slide_insertion_offset,
         };
         if (!catalog.isVisibleAt(catalog_index, insertion_offset)) continue;
         try output.append(allocator, .{
             .kind = switch (entry.kind) {
                 .element => .element,
+                .group => .group,
                 .slide => .slide_template,
             },
             .name = entry.name,
             .available = entry.placeable,
             .use_count = entry.use_count,
-            .deletable = entry.kind == .element and entry.use_count == 0,
+            .deletable = entry.kind != .slide and entry.use_count == 0,
         });
         errdefer _ = output.pop();
         try catalog_indices.append(allocator, catalog_index);
@@ -4832,35 +4911,147 @@ fn applyStudioSemanticEdit(
             return .{ .preserve_selection = true };
         },
         .detach_reusable_instance => |detach| {
-            if (detach.kind != .component or morph_state != null) {
-                return error.UnsupportedComponentDetach;
-            }
+            if (morph_state != null) return error.UnsupportedComponentDetach;
             const item = studioItemByIdentity(items, detach.target.item_identity) orelse
                 return error.StudioItemMissing;
             if (item.locked) return error.StudioItemLocked;
-            if (item.source.scope != .component_instance or
-                item.source.line_offset != detach.target.source.line_offset)
-            {
-                return error.UnsupportedComponentDetach;
+            switch (detach.kind) {
+                .component => {
+                    if (item.source.scope != .component_instance or
+                        item.source.line_offset != detach.target.source.line_offset)
+                    {
+                        return error.UnsupportedComponentDetach;
+                    }
+                    const info = try source_editor.inspectComponentInstanceForDetach(
+                        G.editor_memory[0..G.source_len],
+                        item.source.line_offset,
+                    );
+                    if (item.id == null or !std.mem.eql(u8, item.id.?, info.effective_id)) {
+                        return error.DetachedItemIdMismatch;
+                    }
+                    const materialized = try materializeStudioItem(G.allocator, item);
+                    defer G.allocator.free(materialized);
+                    // Detach is structural; allocate the stable rebind key before the
+                    // source/history transaction so an OOM cannot leave stale UI state.
+                    try selection_ids.appendCopy(info.effective_id);
+                    try recordStudioPatch(history, try source_editor.detachComponentInstance(
+                        G.allocator,
+                        G.editor_memory[0..G.source_len],
+                        item.source.line_offset,
+                        info.definition_offset,
+                        materialized,
+                    ));
+                },
+                .group => {
+                    if (item.source.scope != .group_instance_member or
+                        item.source.line_offset != detach.target.source.line_offset)
+                    {
+                        return error.UnsupportedGroupDetach;
+                    }
+                    const info = try source_editor.inspectReusableGroupInstance(
+                        G.allocator,
+                        G.editor_memory[0..G.source_len],
+                        item.source.line_offset,
+                    );
+                    var snippets: [studio.max_selection_items][]u8 = undefined;
+                    var snippet_count: usize = 0;
+                    defer for (snippets[0..snippet_count]) |snippet| G.allocator.free(snippet);
+                    for (items) |*member| {
+                        if (member.source.scope != .group_instance_member or
+                            member.source.line_offset != item.source.line_offset) continue;
+                        if (snippet_count >= snippets.len) return error.UnsupportedGroupDetach;
+                        const member_id = member.id orelse return error.UnsupportedGroupDetach;
+                        try selection_ids.appendCopy(member_id);
+                        snippets[snippet_count] = try materializeStudioItem(G.allocator, member);
+                        snippet_count += 1;
+                    }
+                    if (snippet_count != info.member_count) return error.UnsupportedGroupDetach;
+                    var snippet_views: [studio.max_selection_items][]const u8 = undefined;
+                    for (snippets[0..snippet_count], 0..) |snippet, index| snippet_views[index] = snippet;
+                    try recordStudioPatch(history, try source_editor.detachReusableGroupInstance(
+                        G.allocator,
+                        G.editor_memory[0..G.source_len],
+                        item.source.line_offset,
+                        info.definition_offset,
+                        snippet_views[0..snippet_count],
+                    ));
+                },
+                .none, .slide_template => return error.UnsupportedComponentDetach,
             }
-            const info = try source_editor.inspectComponentInstanceForDetach(
-                G.editor_memory[0..G.source_len],
-                item.source.line_offset,
-            );
-            if (item.id == null or !std.mem.eql(u8, item.id.?, info.effective_id)) {
-                return error.DetachedItemIdMismatch;
+        },
+        .promote_items_to_group => |batch| {
+            if (morph_state != null or batch.count < 2 or batch.count > studio.max_selection_items) {
+                return error.UnsupportedGroupPromotion;
             }
-            const materialized = try materializeStudioItem(G.allocator, item);
-            defer G.allocator.free(materialized);
-            // Detach is structural; allocate the stable rebind key before the
-            // source/history transaction so an OOM cannot leave stale UI state.
-            try selection_ids.appendCopy(info.effective_id);
-            try recordStudioPatch(history, try source_editor.detachComponentInstance(
+            const group_name = prompted_text orelse return error.StudioPromptMissing;
+            if (!validReusableName(group_name)) return error.InvalidReusableName;
+            var instance_buffer: [64]u8 = undefined;
+            const instance_id = try nextStudioItemId(&instance_buffer);
+            var member_buffers: [studio.max_selection_items][64]u8 = undefined;
+            var member_ids: [studio.max_selection_items][]const u8 = undefined;
+            var promotion_targets: [studio.max_selection_items]source_editor.GroupPromotionTarget = undefined;
+
+            for (batch.slice(), 0..) |target, index| {
+                const selected = studioItemByIdentity(items, target.item_identity) orelse
+                    return error.StudioItemMissing;
+                if (selected.locked or !target.source.patchable or
+                    (target.source.scope != .direct and target.source.scope != .component_instance))
+                {
+                    return error.UnsupportedGroupPromotion;
+                }
+                const proposed = if (selected.id) |id|
+                    if (validReusableName(id)) id else null
+                else
+                    null;
+                var unique = proposed != null;
+                if (proposed) |candidate| {
+                    for (batch.slice(), 0..) |other_target, other_index| {
+                        if (other_index == index) continue;
+                        const other = studioItemByIdentity(items, other_target.item_identity) orelse
+                            return error.StudioItemMissing;
+                        if (other.id != null and std.mem.eql(u8, other.id.?, candidate)) {
+                            unique = false;
+                            break;
+                        }
+                    }
+                }
+                member_ids[index] = if (unique)
+                    proposed.?
+                else
+                    try std.fmt.bufPrint(&member_buffers[index], "item_{d}", .{index + 1});
+                for (member_ids[0..index]) |previous| {
+                    if (std.mem.eql(u8, previous, member_ids[index])) {
+                        member_ids[index] = try std.fmt.bufPrint(
+                            &member_buffers[index],
+                            "member_{d}",
+                            .{index + 1},
+                        );
+                        break;
+                    }
+                }
+                promotion_targets[index] = .{
+                    .directive_offset = target.source.line_offset,
+                    .member_id = member_ids[index],
+                };
+            }
+            // Preallocate all stable qualified selection keys before the
+            // structural source/history transaction.
+            for (member_ids[0..batch.count]) |member_id| {
+                const qualified = try std.fmt.allocPrint(
+                    G.allocator,
+                    "{s}.{s}",
+                    .{ instance_id, member_id },
+                );
+                defer G.allocator.free(qualified);
+                try selection_ids.appendCopy(qualified);
+            }
+            try recordStudioPatch(history, try source_editor.promoteItemsToReusableGroup(
                 G.allocator,
                 G.editor_memory[0..G.source_len],
-                item.source.line_offset,
-                info.definition_offset,
-                materialized,
+                try studioItemSceneAnchor(slide, morph_state),
+                promotion_targets[0..batch.count],
+                group_name,
+                instance_id,
             ));
         },
         .promote_to_reusable => |target| {
@@ -4936,6 +5127,22 @@ fn applyStudioSemanticEdit(
                 G.editor_memory[0..G.source_len],
                 insertion_offset,
                 directive,
+            ));
+        },
+        .add_reusable_group => |workspace_index| {
+            if (morph_state != null) return error.UnsupportedGroupInstance;
+            const entry = studioLibraryEntry(catalog_opt, catalog_indices, workspace_index) orelse
+                return error.StudioLibraryEntryMissing;
+            if (entry.kind != .group) return error.StudioLibraryEntryMissing;
+            var instance_buffer: [64]u8 = undefined;
+            const instance_id = try nextStudioItemId(&instance_buffer);
+            try recordStudioPatch(history, try source_editor.insertReusableGroupInstance(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                try studioItemSceneAnchor(slide, null),
+                entry.directive_offset,
+                entry.name,
+                instance_id,
             ));
         },
         .new_slide => {

@@ -61,9 +61,9 @@ sessions.
 - [x] Add the explicit reusable-group grammar and parser model:
   `@pushgroup NAME` … `@endgroup`, used by `@popgroup NAME id=INSTANCE`, with
   member IDs namespaced as `INSTANCE.MEMBER`.
-- [ ] Promote a contiguous selected group into one group definition and one
+- [x] Promote a contiguous selected group into one group definition and one
   group instance without changing paint/reveal order.
-- [ ] Discover, place, rename, and safely detach reusable groups through the
+- [x] Discover, place, rename, and safely detach reusable groups through the
   Library and Properties UI.
 - [ ] Improve dependency-aware rename, delete, and fixed-point cleanup across
   element, group, and slide-template definitions.
@@ -73,6 +73,14 @@ exactly one item, so Studio will not pretend that several unrelated component
 definitions form one reusable object. The first group release uses absolute
 member coordinates and requires literal, stable member and instance IDs;
 translation/scaling overrides can build on that source contract later.
+
+Studio now exposes reusable groups honestly throughout the authoring loop:
+multi-select contiguous authored items and choose **Reuse** to create one
+definition/instance transaction; Library rows carry an explicit **GROUP**
+badge and place source-order-resolved instances; Properties identifies group
+members and detaches the complete instance into ordinary local boxes. Rename,
+unused deletion, placement, promotion, and detach all preserve exact definition
+provenance and fail atomically when source ownership is ambiguous.
 
 ## Planned tranches
 
