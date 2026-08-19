@@ -569,7 +569,12 @@ fn notesForSlide(slideshow: *const SlideShow, slide_number: i32) []const u8 {
     return slideshow.slides.items[@intCast(slide_number)].speaker_notes orelse "";
 }
 
-fn publishPresenterState(runtime: *presenter.Runtime, controls_enabled: bool, pointer_enabled: bool) void {
+fn publishPresenterState(
+    runtime: *presenter.Runtime,
+    controls_enabled: bool,
+    pointer_enabled: bool,
+    drawing_enabled: bool,
+) void {
     if (!runtime.isRunning()) return;
     const slide_count = G.slideshow.slides.items.len;
     const valid_slide = G.current_slide >= 0 and G.current_slide < slide_count;
@@ -590,6 +595,7 @@ fn publishPresenterState(runtime: *presenter.Runtime, controls_enabled: bool, po
         .can_previous = controls_enabled and has_previous and !reversing,
         .can_next = controls_enabled and has_next and !advancing,
         .pointer_enabled = pointer_enabled,
+        .drawing_enabled = drawing_enabled,
     }) catch |err| log.err("Presenter state update failed: {any}", .{err});
 }
 
@@ -876,6 +882,103 @@ const LaserPointer = struct {
     }
 };
 
+const max_remote_drawing_vertices: usize = 32 * 1024;
+
+const RemoteDrawing = struct {
+    allocator: std.mem.Allocator,
+    vertices: std.ArrayList(?rl.Vector2),
+    active: bool = false,
+    cursor: ?rl.Vector2 = null,
+
+    fn init(allocator: std.mem.Allocator) !RemoteDrawing {
+        return .{
+            .allocator = allocator,
+            .vertices = try std.ArrayList(?rl.Vector2).initCapacity(allocator, max_remote_drawing_vertices),
+        };
+    }
+
+    fn deinit(self: *RemoteDrawing) void {
+        self.vertices.deinit(self.allocator);
+    }
+
+    fn clear(self: *RemoteDrawing) void {
+        self.vertices.shrinkRetainingCapacity(0);
+        self.active = false;
+        self.cursor = null;
+    }
+
+    fn finishStroke(self: *RemoteDrawing) void {
+        if (self.active and self.vertices.items.len < max_remote_drawing_vertices) {
+            self.vertices.appendAssumeCapacity(null);
+        }
+        self.active = false;
+        self.cursor = null;
+    }
+
+    fn appendPoint(self: *RemoteDrawing, point: rl.Vector2) !void {
+        if (self.vertices.items.len > 0) {
+            if (self.vertices.items[self.vertices.items.len - 1]) |previous| {
+                if (previous.x == point.x and previous.y == point.y) return;
+            }
+        }
+        if (self.vertices.items.len >= max_remote_drawing_vertices) return error.DrawingCapacity;
+        self.vertices.appendAssumeCapacity(point);
+    }
+
+    fn apply(self: *RemoteDrawing, event: presenter.DrawingEvent) !void {
+        const point: rl.Vector2 = .{ .x = event.x, .y = event.y };
+        switch (event.phase) {
+            .begin => {
+                self.finishStroke();
+                try self.appendPoint(point);
+                self.active = true;
+                self.cursor = point;
+            },
+            .move => {
+                try self.appendPoint(point);
+                self.active = true;
+                self.cursor = point;
+            },
+            .end => {
+                if (self.active) try self.appendPoint(point);
+                self.finishStroke();
+            },
+        }
+    }
+
+    fn draw(self: *const RemoteDrawing, slide_top_left: rl.Vector2, slide_size: rl.Vector2, color: rl.Color) void {
+        var previous: ?rl.Vector2 = null;
+        const thickness = @max(@as(f32, 3), slide_size.y * 0.006);
+        for (self.vertices.items) |entry| {
+            const normalized = entry orelse {
+                previous = null;
+                continue;
+            };
+            const point = presenterPointerPosition(
+                .{ .x = normalized.x, .y = normalized.y },
+                slide_top_left,
+                slide_size,
+            );
+            if (previous) |prior| {
+                const mapped_prior = presenterPointerPosition(
+                    .{ .x = prior.x, .y = prior.y },
+                    slide_top_left,
+                    slide_size,
+                );
+                rl.drawLineEx(mapped_prior, point, thickness, color);
+            }
+            previous = normalized;
+        }
+        if (self.cursor) |cursor| {
+            rl.drawCircleV(
+                presenterPointerPosition(.{ .x = cursor.x, .y = cursor.y }, slide_top_left, slide_size),
+                @max(@as(f32, 8), thickness * 1.8),
+                color,
+            );
+        }
+    }
+};
+
 const PresenterPreviewKey = struct {
     slide_number: i32,
     visible_step: usize,
@@ -1053,6 +1156,27 @@ test "presenter pointer maps normalized phone coordinates into the fitted slide"
     );
     try std.testing.expectApproxEqAbs(@as(f32, 300), position.x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 387.5), position.y, 0.001);
+}
+
+test "remote drawing preserves normalized stroke boundaries" {
+    var drawing = try RemoteDrawing.init(std.testing.allocator);
+    defer drawing.deinit();
+
+    try drawing.apply(.{ .phase = .begin, .x = 0.1, .y = 0.2, .sequence = 1 });
+    try drawing.apply(.{ .phase = .move, .x = 0.3, .y = 0.4, .sequence = 2 });
+    try drawing.apply(.{ .phase = .move, .x = 0.3, .y = 0.4, .sequence = 3 });
+    try drawing.apply(.{ .phase = .end, .x = 0.5, .y = 0.6, .sequence = 4 });
+
+    try std.testing.expectEqual(@as(usize, 4), drawing.vertices.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), drawing.vertices.items[0].?.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), drawing.vertices.items[1].?.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), drawing.vertices.items[2].?.x, 0.0001);
+    try std.testing.expect(drawing.vertices.items[3] == null);
+    try std.testing.expect(!drawing.active);
+    try std.testing.expect(drawing.cursor == null);
+
+    drawing.clear();
+    try std.testing.expectEqual(@as(usize, 0), drawing.vertices.items.len);
 }
 
 const Banner = struct {
@@ -1872,6 +1996,9 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer export_controller.deinit();
     var laser_pointer: LaserPointer = try .init(gpa);
     defer laser_pointer.deinit();
+    var remote_drawing: RemoteDrawing = try .init(gpa);
+    defer remote_drawing.deinit();
+    var remote_drawing_slide = G.current_slide;
     var banner: Banner = try .init(screenWidth, screenHeight);
     if (suppress_startup_banner) banner.show = false;
     defer banner.deinit();
@@ -2144,6 +2271,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         const presenter_controls_enabled = !export_controller.running and
             !studio_mode.capturesInput() and !presenter_overlay_captures_input;
         const presenter_pointer_enabled = presenter_controls_enabled and !laser_pointer.show;
+        const presenter_drawing_enabled = presenter_controls_enabled and !laser_pointer.show;
         var presenter_commands_consumed: usize = 0;
         while (presenter_commands_consumed < 8) : (presenter_commands_consumed += 1) {
             const queued = presenter_runtime.takeCommand() orelse break;
@@ -2151,7 +2279,18 @@ pub fn main(init: std.process.Init) anyerror!void {
             switch (queued.command) {
                 .previous => reversePresentation(now),
                 .next => advancePresentation(now),
+                .clear_drawing => {
+                    presenter_runtime.clearDrawingInput();
+                    remote_drawing.clear();
+                    laser_pointer.clearDrawing();
+                },
             }
+        }
+        if (remote_drawing_slide != G.current_slide) {
+            presenter_runtime.clearDrawingInput();
+            remote_drawing.clear();
+            laser_pointer.clearDrawing();
+            remote_drawing_slide = G.current_slide;
         }
         const remote_pointer: ?presenter.PointerSample = if (presenter_runtime.isRunning()) remote: {
             if (!presenter_pointer_enabled) {
@@ -2160,7 +2299,22 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
             break :remote presenter_runtime.activePointer();
         } else null;
-        publishPresenterState(&presenter_runtime, presenter_controls_enabled, presenter_pointer_enabled);
+        if (presenter_runtime.isRunning() and presenter_drawing_enabled) {
+            var drawing_events_consumed: usize = 0;
+            while (drawing_events_consumed < 64) : (drawing_events_consumed += 1) {
+                const event = presenter_runtime.takeDrawing() orelse break;
+                remote_drawing.apply(event) catch |err| log.err("Presenter drawing update failed: {any}", .{err});
+            }
+        } else {
+            presenter_runtime.clearDrawingInput();
+            remote_drawing.finishStroke();
+        }
+        publishPresenterState(
+            &presenter_runtime,
+            presenter_controls_enabled,
+            presenter_pointer_enabled,
+            presenter_drawing_enabled,
+        );
 
         // render slide
         // G.slide_render_width = G.internal_render_size.x - ed_anim.current_size.x;
@@ -2799,6 +2953,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                     export_controller.final_messagebox_message = null;
                 }
             }
+            if (!export_controller.running and !studio_mode.capturesInput()) {
+                remote_drawing.draw(slide_tl, slide_size_in_window, laser_pointer.color);
+            }
             if (remote_pointer) |sample| {
                 rl.drawCircleV(presenterPointerPosition(sample, slide_tl, slide_size_in_window), laser_pointer.size, laser_pointer.color);
             }
@@ -3210,6 +3367,8 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         if (!presenter_overlay_captures_input and !studio_mode.capturesInput() and rl.isKeyPressed(.c)) {
             laser_pointer.clearDrawing();
+            presenter_runtime.clearDrawingInput();
+            remote_drawing.clear();
         }
 
         // An external file change must never silently replace an unsaved

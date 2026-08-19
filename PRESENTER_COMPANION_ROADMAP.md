@@ -85,14 +85,22 @@ The phone UI has three intentionally distinct surfaces:
 - Local mouse/keyboard laser controls continue to work and take predictable
   precedence over remote pointer state.
 
-### Draw — later tranche
+### Draw
 
-- Remote drawing follows Pointer only after pointer latency and disconnect
-  safety are proven.
-- Drawing must be explicitly armed and visually unmistakable.
-- Stroke begin/move/end, clear, and an undo story must be designed before this
-  mode ships; accidental marks while scrolling notes are unacceptable.
-- Existing laptop-side drawing remains unchanged throughout earlier tranches.
+- A third, explicit mode keeps drawing visually unmistakable and prevents
+  accidental marks while scrolling notes or using the software pointer.
+- The phone draws into a local canvas immediately, then mirrors normalized
+  begin/move/end events to a bounded main-thread queue.
+- A deliberate Clear button removes both phone and projected strokes. The
+  initial mode favors one obvious recovery action over a hidden undo history.
+- Drawings persist through reveals, clear on logical slide changes, and time
+  out an abandoned stroke if the browser loses its touch-end event.
+- Existing laptop-side drawing remains available and local `C` clears both
+  annotation layers.
+
+Pointer and Draw both retain a compact, scrollable copy of the current speaker
+notes below their control surface. This keeps the active stage tool usable while
+still providing a glanceable prompt without switching back to Notes mode.
 
 ## Source format and authoring
 
@@ -150,15 +158,16 @@ The boundaries are:
   by local input instead of setting slide indices directly.
 - Commands carry sequence IDs and are retry-safe, so a reconnect or repeated
   request cannot advance twice.
-- Revision polling remains the state transport. Pointer motion currently uses
+- Revision polling remains the state transport. Pointer and drawing motion use
   sequenced HTTP updates capped by the client at roughly 30 Hz, with a single
-  in-flight request and only the newest pending value retained. A later
-  persistent transport is justified only by physical-device measurement and
-  must preserve the same bounded, disconnect-safe handoff.
-- The main renderer produces a 640x360 authenticated JPEG when slide semantics,
-  reveal state, source, or Crowdplay state changes. Active transitions refresh
-  at up to 5 fps; stable slides cause no continuing GPU readback or image
-  encoding.
+  in-flight request and only the newest pending move retained. Drawing lifecycle
+  events enter a separate bounded queue so begin/end cannot be replayed as
+  pointer state. A later persistent transport is justified only by physical-
+  device measurement and must preserve the same bounded, disconnect-safe handoff.
+- The main renderer produces a 640x360 authenticated PNG when settled slide
+  semantics, reveal state, source, or Crowdplay state changes. Active animation
+  frames perform no GPU readback or image encoding; the first settled frame is
+  published immediately afterward.
 
 The initial presenter snapshot should contain at least:
 
@@ -168,8 +177,8 @@ The initial presenter snapshot should contain at least:
 - current notes and next-slide notes;
 - timer state and server time;
 - preview readiness and a monotonic rendered-preview revision;
-- companion capabilities, allowing Pointer or later features to be hidden when
-  unavailable.
+- companion capabilities, allowing Pointer and Draw to be disabled when local
+  presentation state makes them unavailable.
 
 ## Pairing and privacy
 
@@ -247,8 +256,11 @@ LAN latency is under 150 ms at the 95th percentile.
 
 ### 5. Remote drawing and optional desktop reuse
 
-- [ ] Design and implement explicitly armed remote drawing only after Pointer is
-  proven reliable.
+- [x] Add an explicitly armed Draw surface with immediate phone-side feedback.
+- [x] Mirror normalized begin/move/end events through a bounded authenticated
+  queue and render them without triggering preview captures.
+- [x] Add clear, slide-change cleanup, lost-touch timeout, and local-control
+  arbitration.
 - [ ] Let the same responsive companion run in a laptop browser for presenters
   who intentionally use extended displays.
 - [ ] Consider projector selection/identification for the single rayslides
@@ -272,7 +284,7 @@ The feature is complete when:
 - repeated or delayed commands cannot advance twice;
 - losing the phone or local server leaves rayslides fully controllable;
 - unauthorized audience requests cannot retrieve notes or issue commands;
-- remote pointer release is fail-safe; and
+- remote pointer release and drawing termination are fail-safe;
 - no external account, app installation, Internet connection, or second
   rayslides process is required.
 

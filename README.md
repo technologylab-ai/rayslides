@@ -50,9 +50,9 @@ recovery locations.
 
 Rayslides now includes a phone-first Presenter Companion: source-native private
 speaker notes, explicit QR pairing, synchronized current and next-slide notes,
-animation-aware Previous/Next controls, and a software pointer over a live
-preview of the rendered slide. The accepted workflow and remaining guardrails
-are recorded in the
+animation-aware Previous/Next controls, a software pointer, and remote drawing
+over a live preview of the rendered slide. The accepted workflow and remaining
+guardrails are recorded in the
 [Presenter Companion roadmap](PRESENTER_COMPANION_ROADMAP.md).
 
 Missing but maybe coming soon:
@@ -562,10 +562,13 @@ To present with a phone:
 4. Press <kbd>P</kbd> again to hide setup, enable display mirroring, and put
    rayslides fullscreen. The phone shows current/next notes, talk time,
    connection status, and large Previous/Next controls.
-5. Switch between **Notes** and **Pointer** on the phone. Pointer shows a compact
-   preview of the current rendered slide; touch and hold anywhere on it, drag
-   the software laser, and lift to hide it. Rotate the phone to landscape when
-   you want a larger pointing surface.
+5. Switch between **Notes**, **Pointer**, and **Draw** on the phone. Pointer and
+   Draw keep a compact copy of the current speaker notes below their controls, so
+   you can glance at the script without leaving the active tool. Pointer shows
+   a compact preview of the current rendered slide; touch and hold anywhere on
+   it, drag the software laser, and lift to hide it. Draw mirrors normalized
+   strokes onto the projected slide and provides a deliberate **Clear drawing**
+   button. Rotate the phone to landscape for a larger control surface.
 6. Press <kbd>Shift-P</kbd> to invalidate the pairing capability and stop the
    Presenter server. Simply hiding setup leaves the paired phone connected.
 
@@ -577,14 +580,18 @@ than the window, coalesced to the newest value, and expires after 900 ms without
 a heartbeat. Leaving Pointer, backgrounding the browser, or lifting the finger
 also sends an immediate release. The laptop's local laser/drawing tool takes
 precedence and temporarily pauses the phone pointer without disabling phone
-navigation.
+navigation. Draw strokes appear immediately in a phone-side canvas without
+requesting new slide images, use a bounded authenticated event queue on the
+laptop, and time out safely if touch-end is lost. They persist through reveals
+on the current slide and clear automatically when the logical slide changes;
+the phone button or local <kbd>C</kbd> clears both local and remote annotations.
 
 Presenter Companion and Crowdplay intentionally run as two independent local
 servers. Crowdplay retains port `7331` and its audience-only API; Presenter is
 started only by explicit pairing on port `7332`, with a random capability kept
-in the QR URL fragment. Notes, rendered previews, navigation, and pointer
-updates exist only on the authenticated Presenter server and are absent from
-Crowdplay. Use `--presenter-host=HOST` to advertise a specific LAN
+in the QR URL fragment. Notes, rendered previews, navigation, pointer updates,
+and drawing events exist only on the authenticated Presenter server and are
+absent from Crowdplay. Use `--presenter-host=HOST` to advertise a specific LAN
 address and `--presenter-port=PORT` to change its port. Windows requires an
 explicit LAN IP via `--presenter-host`; after changing networks, unpair and pair
 again. Local HTTP and an unguessable capability prevent accidental audience

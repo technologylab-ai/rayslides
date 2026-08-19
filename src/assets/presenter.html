@@ -18,7 +18,7 @@
     #slideCount { color: #9db0c4; font-variant-numeric: tabular-nums; }
     #timer { min-width: 4.7ch; font-size: 24px; font-weight: 750; font-variant-numeric: tabular-nums; text-align: right; }
     main { width: min(780px, 100%); margin: 0 auto; padding: 16px 18px 140px; }
-    .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin: 0 0 22px; padding: 4px; border: 1px solid #213a56; border-radius: 15px; background: #0b1422; }
+    .modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin: 0 0 22px; padding: 4px; border: 1px solid #213a56; border-radius: 15px; background: #0b1422; }
     .modes button { min-height: 43px; border: 0; border-radius: 11px; background: transparent; color: #8fa7bd; font-size: 15px; font-weight: 800; }
     .modes button[aria-selected="true"] { background: #1b344e; color: #f7fbff; box-shadow: 0 3px 14px #0007; }
     .eyebrow { margin: 0 0 8px; color: #ffb547; font-size: 12px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
@@ -29,11 +29,20 @@
     #nextNotes { margin: 0; color: #adc0d3; font-size: 17px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
     .pointer-copy { margin: 0 0 12px; color: #a8bbce; font-size: 14px; line-height: 1.4; }
     .pointer-surface { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border: 2px solid #2d536f; border-radius: 18px; background: #02050b; box-shadow: 0 18px 45px #0008; touch-action: none; user-select: none; -webkit-user-select: none; }
+    .pointer-surface.drawing { border-color: #ffb547; }
     .pointer-surface.disabled { border-color: #503342; opacity: .72; }
     #slidePreview { display: block; width: 100%; height: 100%; object-fit: cover; pointer-events: none; -webkit-user-drag: none; }
+    #drawingCanvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; pointer-events: none; }
     #pointerDot { position: absolute; left: 50%; top: 50%; width: 28px; height: 28px; transform: translate(-50%, -50%); border: 3px solid #fff; border-radius: 50%; background: #f3314d; box-shadow: 0 0 0 5px #f3314d55, 0 3px 14px #000c; pointer-events: none; }
     #previewStatus { position: absolute; inset: auto 12px 12px; padding: 8px 10px; border-radius: 10px; background: #07101ddd; color: #c3d2e0; font-size: 12px; text-align: center; pointer-events: none; }
     .pointer-footnote { margin: 13px 2px 0; color: #7890a6; font-size: 12px; line-height: 1.4; text-align: center; }
+    .drawing-actions { display: grid; grid-template-columns: 1fr; margin-top: 14px; }
+    .drawing-actions button { min-height: 52px; border: 1px solid #8a3a4a; border-radius: 14px; background: #351620; color: #ffafbd; font-size: 17px; font-weight: 800; }
+    .drawing-actions button:disabled { opacity: .42; }
+    .compact-notes { margin-top: 16px; padding: 14px 16px; border: 1px solid #213a56; border-radius: 16px; background: #0d1828; }
+    .compact-notes .eyebrow { margin-bottom: 6px; color: #7892a8; }
+    #compactNotes { max-height: min(23vh, 220px); margin: 0; overflow-y: auto; color: #d6e2ed; font-size: clamp(15px, 4vw, 19px); line-height: 1.4; font-weight: 570; white-space: pre-wrap; overflow-wrap: anywhere; overscroll-behavior: contain; }
+    #compactNotes.empty { color: #71869c; font-weight: 520; }
     .network { position: fixed; left: 18px; right: 18px; bottom: calc(92px + env(safe-area-inset-bottom)); z-index: 3; display: flex; justify-content: center; pointer-events: none; }
     #status { padding: 7px 11px; border-radius: 999px; background: #14243a; color: #a9bdd0; font-size: 12px; box-shadow: 0 8px 30px #0008; }
     #status.live { background: #113323; color: #82e6ae; }
@@ -65,7 +74,8 @@
     <main>
       <div class="modes" role="tablist" aria-label="Presenter view">
         <button id="notesTab" type="button" role="tab" aria-selected="true" aria-controls="notesMode">Notes</button>
-        <button id="pointerTab" type="button" role="tab" aria-selected="false" aria-controls="pointerMode">Pointer</button>
+        <button id="pointerTab" type="button" role="tab" aria-selected="false" aria-controls="controlMode">Pointer</button>
+        <button id="drawTab" type="button" role="tab" aria-selected="false" aria-controls="controlMode">Draw</button>
       </div>
       <section id="notesMode" role="tabpanel" aria-labelledby="notesTab">
         <p class="eyebrow">Current notes</p>
@@ -75,15 +85,23 @@
           <p id="nextNotes">No upcoming notes.</p>
         </section>
       </section>
-      <section id="pointerMode" role="tabpanel" aria-labelledby="pointerTab" hidden>
-        <p class="eyebrow">Software pointer</p>
-        <p class="pointer-copy">Touch and hold the slide, then drag. Lift your finger to hide the laser.</p>
+      <section id="controlMode" role="tabpanel" aria-labelledby="pointerTab" hidden>
+        <p class="eyebrow" id="toolEyebrow">Software pointer</p>
+        <p class="pointer-copy" id="toolInstructions">Touch and hold the slide, then drag. Lift your finger to hide the laser.</p>
         <div id="pointerSurface" class="pointer-surface disabled" aria-label="Current slide pointer surface">
           <img id="slidePreview" alt="Current projected slide" draggable="false">
+          <canvas id="drawingCanvas" hidden></canvas>
           <span id="pointerDot" hidden></span>
           <span id="previewStatus">Preparing current slide…</span>
         </div>
-        <p class="pointer-footnote">For more precision, rotate the phone to landscape. Local mouse and drawing controls remain available.</p>
+        <div id="drawingActions" class="drawing-actions" hidden>
+          <button id="clearDrawing" type="button">Clear drawing</button>
+        </div>
+        <section class="compact-notes" aria-labelledby="compactNotesLabel">
+          <p class="eyebrow" id="compactNotesLabel">Current notes</p>
+          <p id="compactNotes" class="empty">No notes for this slide.</p>
+        </section>
+        <p class="pointer-footnote" id="toolFootnote">For more precision, rotate the phone to landscape. Local mouse and drawing controls remain available.</p>
       </section>
     </main>
     <div class="network"><span id="status">Connecting…</span></div>
@@ -128,7 +146,8 @@
       let wakeLock = null;
       let elapsedBaseMs = 0;
       let elapsedBaseAt = Date.now();
-      let mode = sessionStorage.getItem(tokenKey + ":mode") === "pointer" ? "pointer" : "notes";
+      const rememberedMode = sessionStorage.getItem(tokenKey + ":mode");
+      let mode = rememberedMode === "pointer" || rememberedMode === "draw" ? rememberedMode : "notes";
       let loadedPreviewRevision = 0;
       let pointerSeq = Number(sessionStorage.getItem(tokenKey + ":pointer-seq")) || 0;
       let pointerId = null;
@@ -139,6 +158,17 @@
       let pointerMoveTimer = 0;
       let pointerMovePending = null;
       let lastPointerMoveAt = 0;
+      let drawingSeq = Number(sessionStorage.getItem(tokenKey + ":drawing-seq")) || 0;
+      let drawingPointerId = null;
+      let drawingActive = false;
+      let drawingPosition = { x: .5, y: .5 };
+      let pendingDrawing = null;
+      let drawingRequestInFlight = false;
+      let drawingMoveTimer = 0;
+      let drawingMovePending = null;
+      let lastDrawingMoveAt = 0;
+      let drawingStrokes = [];
+      let currentDrawingStroke = null;
 
       const apiUrl = (path) => path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token);
 
@@ -175,29 +205,52 @@
       function expirePairing() {
         sessionStorage.removeItem(tokenKey);
         pointerActive = false;
+        drawingActive = false;
         $("pointerDot").hidden = true;
         showPairError("Pairing expired", "This private presenter session has ended. Show the pairing QR in rayslides and scan it again.");
       }
 
       function setMode(next) {
-        if (next !== "notes" && next !== "pointer") return;
+        if (next !== "notes" && next !== "pointer" && next !== "draw") return;
         if (mode === "pointer" && next !== "pointer") releasePointer(false);
+        if (mode === "draw" && next !== "draw") releaseDrawing(false);
         mode = next;
         sessionStorage.setItem(tokenKey + ":mode", mode);
         const notes = mode === "notes";
+        const pointer = mode === "pointer";
+        const drawing = mode === "draw";
         $("notesTab").setAttribute("aria-selected", String(notes));
-        $("pointerTab").setAttribute("aria-selected", String(!notes));
+        $("pointerTab").setAttribute("aria-selected", String(pointer));
+        $("drawTab").setAttribute("aria-selected", String(drawing));
         $("notesMode").hidden = !notes;
-        $("pointerMode").hidden = notes;
+        $("controlMode").hidden = notes;
+        $("controlMode").setAttribute("aria-labelledby", drawing ? "drawTab" : "pointerTab");
+        $("pointerSurface").classList.toggle("drawing", drawing);
+        $("pointerSurface").setAttribute("aria-label", drawing ? "Current slide drawing surface" : "Current slide pointer surface");
+        $("drawingCanvas").hidden = !drawing;
+        $("drawingActions").hidden = !drawing;
+        $("pointerDot").hidden = !pointer || !pointerActive;
+        $("toolEyebrow").textContent = drawing ? "Slide drawing" : "Software pointer";
+        $("toolInstructions").textContent = drawing
+          ? "Draw directly on the slide. Your stroke appears here immediately and on the projector."
+          : "Touch and hold the slide, then drag. Lift your finger to hide the laser.";
+        $("toolFootnote").textContent = drawing
+          ? "Drawings remain through reveals and clear automatically when the slide changes."
+          : "For more precision, rotate the phone to landscape. Local mouse and drawing controls remain available.";
+        if (drawing) resizeDrawingCanvas();
+        if (state) updatePreview(state);
       }
 
       function updatePreview(next) {
-        const enabled = Boolean(next.pointer_enabled);
+        const drawing = mode === "draw";
+        const enabled = drawing ? Boolean(next.drawing_enabled) : Boolean(next.pointer_enabled);
         $("pointerSurface").classList.toggle("disabled", !enabled);
+        $("clearDrawing").disabled = !Boolean(next.drawing_enabled) || commandInFlight;
         if (!enabled) {
           $("previewStatus").hidden = false;
-          $("previewStatus").textContent = "Hide pairing setup and return to presentation to use Pointer.";
+          $("previewStatus").textContent = "Hide pairing setup and return to presentation to use " + (drawing ? "Draw" : "Pointer") + ".";
           if (pointerActive) releasePointer(false);
+          if (drawingActive) releaseDrawing(false);
         } else if (!next.preview_ready) {
           $("previewStatus").hidden = false;
           $("previewStatus").textContent = "Preparing current slide…";
@@ -219,11 +272,17 @@
           elapsedBaseMs = Math.max(0, Number(next.elapsed_ms) || 0);
           elapsedBaseAt = Date.now();
         }
+        if (state && next.current_slide !== state.current_slide) {
+          if (drawingActive) releaseDrawing(false);
+          clearLocalDrawing();
+        }
         state = next;
         $("slideCount").textContent = next.slide_count > 0 ? "Slide " + (next.current_slide + 1) + " / " + next.slide_count : "No slides";
         const notes = typeof next.notes === "string" ? next.notes : "";
         $("notes").textContent = notes || "No notes for this slide.";
         $("notes").classList.toggle("empty", !notes);
+        $("compactNotes").textContent = notes || "No notes for this slide.";
+        $("compactNotes").classList.toggle("empty", !notes);
         $("nextNotes").textContent = next.next_notes || "No upcoming notes.";
         $("previous").disabled = !next.can_previous || commandInFlight;
         $("next").disabled = !next.can_next || commandInFlight;
@@ -256,6 +315,8 @@
       async function sendCommand(command) {
         if (commandInFlight) return;
         if (pointerActive) releasePointer(false);
+        if (drawingActive) releaseDrawing(false);
+        if (command === "clear_drawing") clearLocalDrawing();
         commandInFlight = true;
         if (state) applyState(state);
         await requestWakeLock();
@@ -362,47 +423,235 @@
         }
       }
 
+      function drawingContext() {
+        const context = $("drawingCanvas").getContext("2d");
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        context.strokeStyle = "#f3314d";
+        context.fillStyle = "#f3314d";
+        context.lineWidth = 5;
+        return context;
+      }
+
+      function drawLocalSegment(from, to) {
+        const canvas = $("drawingCanvas");
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        if (!width || !height) return;
+        const context = drawingContext();
+        context.beginPath();
+        context.moveTo(from.x * width, from.y * height);
+        context.lineTo(to.x * width, to.y * height);
+        context.stroke();
+      }
+
+      function redrawLocalDrawing() {
+        const canvas = $("drawingCanvas");
+        const context = drawingContext();
+        context.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+        for (const stroke of drawingStrokes) {
+          if (!stroke.length) continue;
+          if (stroke.length === 1) {
+            context.beginPath();
+            context.arc(stroke[0].x * canvas.clientWidth, stroke[0].y * canvas.clientHeight, 2.5, 0, Math.PI * 2);
+            context.fill();
+            continue;
+          }
+          context.beginPath();
+          context.moveTo(stroke[0].x * canvas.clientWidth, stroke[0].y * canvas.clientHeight);
+          for (let index = 1; index < stroke.length; index += 1) {
+            context.lineTo(stroke[index].x * canvas.clientWidth, stroke[index].y * canvas.clientHeight);
+          }
+          context.stroke();
+        }
+      }
+
+      function resizeDrawingCanvas() {
+        const canvas = $("drawingCanvas");
+        const rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        const scale = Math.min(2, window.devicePixelRatio || 1);
+        const width = Math.max(1, Math.round(rect.width * scale));
+        const height = Math.max(1, Math.round(rect.height * scale));
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        drawingContext().setTransform(scale, 0, 0, scale, 0, 0);
+        redrawLocalDrawing();
+      }
+
+      function clearLocalDrawing() {
+        drawingStrokes = [];
+        currentDrawingStroke = null;
+        const canvas = $("drawingCanvas");
+        drawingContext().clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      }
+
+      function appendLocalDrawingPoint(point, begin) {
+        if (begin || !currentDrawingStroke) {
+          currentDrawingStroke = [point];
+          drawingStrokes.push(currentDrawingStroke);
+          drawLocalSegment(point, point);
+          return;
+        }
+        const previous = currentDrawingStroke[currentDrawingStroke.length - 1];
+        if (previous.x === point.x && previous.y === point.y) return;
+        currentDrawingStroke.push(point);
+        drawLocalSegment(previous, point);
+      }
+
+      function nextDrawingSequence() {
+        drawingSeq += 1;
+        sessionStorage.setItem(tokenKey + ":drawing-seq", String(drawingSeq));
+        return drawingSeq;
+      }
+
+      function queueDrawing(phase, x, y) {
+        pendingDrawing = { phase, x, y, seq: nextDrawingSequence() };
+        flushDrawing();
+      }
+
+      async function flushDrawing() {
+        if (drawingRequestInFlight || !pendingDrawing) return;
+        const update = pendingDrawing;
+        pendingDrawing = null;
+        drawingRequestInFlight = true;
+        try {
+          await api("/api/v1/presenter/drawing", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(update)
+          });
+        } catch (error) {
+          if (error && error.status === 401) expirePairing();
+          else setStatus("error", "Drawing connection interrupted");
+        } finally {
+          drawingRequestInFlight = false;
+          if (pendingDrawing) flushDrawing();
+        }
+      }
+
+      function sendDrawingMove(x, y) {
+        drawingPosition = { x, y };
+        appendLocalDrawingPoint(drawingPosition, false);
+        const now = performance.now();
+        const remaining = 32 - (now - lastDrawingMoveAt);
+        if (remaining <= 0) {
+          clearTimeout(drawingMoveTimer);
+          drawingMoveTimer = 0;
+          drawingMovePending = null;
+          lastDrawingMoveAt = now;
+          queueDrawing("move", x, y);
+          return;
+        }
+        drawingMovePending = { x, y };
+        if (!drawingMoveTimer) drawingMoveTimer = setTimeout(() => {
+          drawingMoveTimer = 0;
+          const latest = drawingMovePending;
+          drawingMovePending = null;
+          if (!latest || !drawingActive) return;
+          lastDrawingMoveAt = performance.now();
+          queueDrawing("move", latest.x, latest.y);
+        }, remaining);
+      }
+
+      function beginDrawing(point, eventPointerId) {
+        drawingPointerId = eventPointerId;
+        drawingActive = true;
+        drawingPosition = point;
+        appendLocalDrawingPoint(point, true);
+        queueDrawing("begin", point.x, point.y);
+      }
+
+      function releaseDrawing(useBeacon) {
+        if (!drawingActive && !(pendingDrawing && pendingDrawing.phase !== "end")) return;
+        clearTimeout(drawingMoveTimer);
+        drawingMoveTimer = 0;
+        drawingMovePending = null;
+        drawingActive = false;
+        drawingPointerId = null;
+        currentDrawingStroke = null;
+        const update = { phase: "end", x: drawingPosition.x, y: drawingPosition.y, seq: nextDrawingSequence() };
+        if (useBeacon && navigator.sendBeacon) {
+          const body = new Blob([JSON.stringify(update)], { type: "application/json" });
+          navigator.sendBeacon(apiUrl("/api/v1/presenter/drawing"), body);
+        } else {
+          pendingDrawing = update;
+          flushDrawing();
+        }
+      }
+
       $("previous").addEventListener("click", () => sendCommand("previous"));
       $("next").addEventListener("click", () => sendCommand("next"));
       $("notesTab").addEventListener("click", () => setMode("notes"));
       $("pointerTab").addEventListener("click", () => setMode("pointer"));
+      $("drawTab").addEventListener("click", () => setMode("draw"));
+      $("clearDrawing").addEventListener("click", () => sendCommand("clear_drawing"));
       $("slidePreview").addEventListener("load", () => {
-        if (state && state.pointer_enabled) $("previewStatus").hidden = true;
+        const enabled = state && (mode === "draw" ? state.drawing_enabled : state.pointer_enabled);
+        if (enabled) $("previewStatus").hidden = true;
       });
       $("slidePreview").addEventListener("error", () => {
         $("previewStatus").hidden = false;
         $("previewStatus").textContent = "Current slide preview unavailable; reconnecting…";
       });
       $("pointerSurface").addEventListener("pointerdown", (event) => {
-        if (!state || !state.pointer_enabled || pointerId !== null) return;
+        const drawing = mode === "draw";
+        const enabled = state && (drawing ? state.drawing_enabled : state.pointer_enabled);
+        if (!enabled || pointerId !== null || drawingPointerId !== null) return;
         event.preventDefault();
-        pointerId = event.pointerId;
-        pointerActive = true;
         $("pointerSurface").setPointerCapture(event.pointerId);
         const point = pointerCoordinates(event);
-        sendPointerMove(point.x, point.y);
+        if (drawing) {
+          beginDrawing(point, event.pointerId);
+        } else {
+          pointerId = event.pointerId;
+          pointerActive = true;
+          sendPointerMove(point.x, point.y);
+        }
         if (navigator.vibrate) navigator.vibrate(10);
       });
       $("pointerSurface").addEventListener("pointermove", (event) => {
-        if (!pointerActive || event.pointerId !== pointerId) return;
-        event.preventDefault();
-        const point = pointerCoordinates(event);
-        sendPointerMove(point.x, point.y);
+        if (pointerActive && event.pointerId === pointerId) {
+          event.preventDefault();
+          const point = pointerCoordinates(event);
+          sendPointerMove(point.x, point.y);
+        } else if (drawingActive && event.pointerId === drawingPointerId) {
+          event.preventDefault();
+          const point = pointerCoordinates(event);
+          sendDrawingMove(point.x, point.y);
+        }
       });
       for (const eventName of ["pointerup", "pointercancel", "lostpointercapture"]) {
         $("pointerSurface").addEventListener(eventName, (event) => {
-          if (!pointerActive || event.pointerId !== pointerId) return;
-          event.preventDefault();
-          releasePointer(false);
+          if (pointerActive && event.pointerId === pointerId) {
+            event.preventDefault();
+            releasePointer(false);
+          } else if (drawingActive && event.pointerId === drawingPointerId) {
+            event.preventDefault();
+            const point = pointerCoordinates(event);
+            drawingPosition = point;
+            appendLocalDrawingPoint(point, false);
+            releaseDrawing(false);
+          }
         });
       }
       document.addEventListener("visibilitychange", () => {
-        if (document.hidden) releasePointer(true);
+        if (document.hidden) {
+          releasePointer(true);
+          releaseDrawing(true);
+        }
         else { requestWakeLock(); refresh(); }
       });
-      window.addEventListener("pagehide", () => releasePointer(true));
+      window.addEventListener("pagehide", () => {
+        releasePointer(true);
+        releaseDrawing(true);
+      });
+      window.addEventListener("resize", resizeDrawingCanvas);
       setInterval(() => {
         if (pointerActive) queuePointer(true, pointerPosition.x, pointerPosition.y);
+        if (drawingActive) queueDrawing("move", drawingPosition.x, drawingPosition.y);
       }, 300);
       setInterval(() => {
         if (!state) return;

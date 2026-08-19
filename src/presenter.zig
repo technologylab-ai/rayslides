@@ -4,8 +4,10 @@ const slides = @import("slides.zig");
 pub const default_port: u16 = 7332;
 pub const max_connections: u16 = 16;
 pub const max_commands: usize = 32;
+pub const max_drawing_events: usize = 256;
 pub const connected_window_ms: i64 = 12_000;
 pub const pointer_timeout_ms: i64 = 900;
+pub const drawing_timeout_ms: i64 = 900;
 pub const preview_file_type = ".png";
 pub const preview_content_type = "image/png";
 pub const max_preview_bytes: usize = 1024 * 1024;
@@ -37,6 +39,7 @@ pub fn FixedText(comptime capacity: usize) type {
 pub const Command = enum {
     previous,
     next,
+    clear_drawing,
 };
 
 pub const QueuedCommand = struct {
@@ -54,10 +57,24 @@ pub const PublishInput = struct {
     can_previous: bool,
     can_next: bool,
     pointer_enabled: bool,
+    drawing_enabled: bool,
 };
 
 pub const PointerSample = struct {
     active: bool = false,
+    x: f32 = 0,
+    y: f32 = 0,
+    sequence: u64 = 0,
+};
+
+pub const DrawingPhase = enum {
+    begin,
+    move,
+    end,
+};
+
+pub const DrawingEvent = struct {
+    phase: DrawingPhase = .end,
     x: f32 = 0,
     y: f32 = 0,
     sequence: u64 = 0,
@@ -75,6 +92,7 @@ pub const Snapshot = struct {
     can_previous: bool = false,
     can_next: bool = false,
     pointer_enabled: bool = false,
+    drawing_enabled: bool = false,
     preview_ready: bool = false,
     preview_revision: u64 = 0,
 };
@@ -93,6 +111,13 @@ const Store = struct {
     pointer: PointerSample = .{},
     pointer_last_seen_ms: i64 = 0,
     last_pointer_sequence: u64 = 0,
+    drawing_events: [max_drawing_events]DrawingEvent = @splat(.{}),
+    drawing_head: usize = 0,
+    drawing_count: usize = 0,
+    drawing_open: bool = false,
+    drawing_last_seen_ms: i64 = 0,
+    drawing_position: struct { x: f32 = 0, y: f32 = 0 } = .{},
+    last_drawing_sequence: u64 = 0,
 
     fn resetSession(self: *Store, random: [40]u8, now_ms: i64) void {
         const preview_storage = self.preview_storage;
@@ -123,6 +148,7 @@ const Store = struct {
             self.snapshot.can_previous != input.can_previous or
             self.snapshot.can_next != input.can_next or
             self.snapshot.pointer_enabled != input.pointer_enabled or
+            self.snapshot.drawing_enabled != input.drawing_enabled or
             !self.snapshot.notes.eql(input.notes) or
             !self.snapshot.next_notes.eql(input.next_notes);
         if (!changed) return false;
@@ -134,6 +160,7 @@ const Store = struct {
         self.snapshot.can_previous = input.can_previous;
         self.snapshot.can_next = input.can_next;
         self.snapshot.pointer_enabled = input.pointer_enabled;
+        self.snapshot.drawing_enabled = input.drawing_enabled;
         try self.snapshot.notes.set(input.notes);
         try self.snapshot.next_notes.set(input.next_notes);
         self.bump();
@@ -170,6 +197,57 @@ const Store = struct {
             return null;
         }
         return self.pointer;
+    }
+
+    fn enqueueDrawing(self: *Store, event: DrawingEvent, now_ms: i64) error{ InvalidDrawing, Capacity }!bool {
+        if (event.sequence == 0 or event.sequence <= self.last_drawing_sequence) return false;
+        if (!std.math.isFinite(event.x) or !std.math.isFinite(event.y) or
+            event.x < 0 or event.x > 1 or event.y < 0 or event.y > 1)
+        {
+            return error.InvalidDrawing;
+        }
+        if (self.drawing_count >= self.drawing_events.len) {
+            if (event.phase != .move or self.drawing_count == 0) return error.Capacity;
+            const tail = (self.drawing_head + self.drawing_count - 1) % self.drawing_events.len;
+            if (self.drawing_events[tail].phase != .move) return error.Capacity;
+            self.drawing_events[tail] = event;
+        } else {
+            const tail = (self.drawing_head + self.drawing_count) % self.drawing_events.len;
+            self.drawing_events[tail] = event;
+            self.drawing_count += 1;
+        }
+        self.drawing_open = event.phase != .end;
+        self.drawing_last_seen_ms = now_ms;
+        self.drawing_position = .{ .x = event.x, .y = event.y };
+        self.last_drawing_sequence = event.sequence;
+        return true;
+    }
+
+    fn takeDrawing(self: *Store, now_ms: i64) ?DrawingEvent {
+        if (self.drawing_count > 0) {
+            const event = self.drawing_events[self.drawing_head];
+            self.drawing_head = (self.drawing_head + 1) % self.drawing_events.len;
+            self.drawing_count -= 1;
+            return event;
+        }
+        if (!self.drawing_open or self.drawing_last_seen_ms == 0 or
+            now_ms - self.drawing_last_seen_ms <= drawing_timeout_ms)
+        {
+            return null;
+        }
+        self.drawing_open = false;
+        return .{
+            .phase = .end,
+            .x = self.drawing_position.x,
+            .y = self.drawing_position.y,
+            .sequence = self.last_drawing_sequence,
+        };
+    }
+
+    fn clearDrawingInput(self: *Store) void {
+        self.drawing_head = 0;
+        self.drawing_count = 0;
+        self.drawing_open = false;
     }
 
     fn enqueue(self: *Store, command: Command, sequence: u64) error{Capacity}!bool {
@@ -309,6 +387,18 @@ pub const Runtime = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.store.pointer.active = false;
+    }
+
+    pub fn takeDrawing(self: *Runtime) ?DrawingEvent {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.store.takeDrawing(self.nowMs());
+    }
+
+    pub fn clearDrawingInput(self: *Runtime) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.store.clearDrawingInput();
     }
 
     fn nowMs(self: *const Runtime) i64 {
@@ -465,6 +555,46 @@ pub const Runtime = struct {
             return respondPointer(&request, parsed.value.seq, accepted);
         }
 
+        if (request.head.method == .POST and std.mem.eql(u8, path, "/api/v1/presenter/drawing")) {
+            const token = queryValue(target, "token") orelse "";
+            self.mutex.lockUncancelable(self.io);
+            const authorized = self.store.authorized(token);
+            self.mutex.unlock(self.io);
+            if (!authorized) return respondError(&request, .unauthorized, "presenter pairing required");
+            if (!hasJsonContentType(&request)) return respondError(&request, .unsupported_media_type, "Content-Type must be application/json");
+            const body = self.readBody(&request) catch |err| switch (err) {
+                error.BodyTooLarge, error.StreamTooLong => return respondError(&request, .payload_too_large, "request body too large"),
+                else => return err,
+            };
+            defer self.allocator.free(body);
+            const parsed = std.json.parseFromSlice(DrawingRequest, self.allocator, body, .{}) catch {
+                return respondError(&request, .bad_request, "invalid drawing update");
+            };
+            defer parsed.deinit();
+            const phase = std.meta.stringToEnum(DrawingPhase, parsed.value.phase) orelse
+                return respondError(&request, .bad_request, "unknown drawing phase");
+            const event = DrawingEvent{
+                .phase = phase,
+                .x = parsed.value.x,
+                .y = parsed.value.y,
+                .sequence = parsed.value.seq,
+            };
+            self.mutex.lockUncancelable(self.io);
+            self.store.last_seen_ms = self.nowMs();
+            const queued = self.store.enqueueDrawing(event, self.store.last_seen_ms) catch |err| switch (err) {
+                error.InvalidDrawing => {
+                    self.mutex.unlock(self.io);
+                    return respondError(&request, .bad_request, "drawing coordinates must be normalized");
+                },
+                error.Capacity => {
+                    self.mutex.unlock(self.io);
+                    return respondError(&request, .too_many_requests, "drawing queue is full");
+                },
+            };
+            self.mutex.unlock(self.io);
+            return respondDrawing(&request, parsed.value.seq, queued);
+        }
+
         if (request.head.method == .GET and std.mem.eql(u8, path, "/health/presenter")) {
             return request.respond("ok\n", .{ .keep_alive = false, .extra_headers = text_headers });
         }
@@ -488,6 +618,13 @@ const CommandRequest = struct {
 
 const PointerRequest = struct {
     active: bool,
+    x: f32,
+    y: f32,
+    seq: u64,
+};
+
+const DrawingRequest = struct {
+    phase: []const u8,
     x: f32,
     y: f32,
     seq: u64,
@@ -559,6 +696,13 @@ fn respondPointer(request: *std.http.Server.Request, sequence: u64, accepted: bo
     try request.respond(writer.buffered(), .{ .keep_alive = false, .extra_headers = api_headers });
 }
 
+fn respondDrawing(request: *std.http.Server.Request, sequence: u64, queued: bool) !void {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try std.json.Stringify.value(.{ .sequence = sequence, .queued = queued }, .{}, &writer);
+    try request.respond(writer.buffered(), .{ .keep_alive = false, .extra_headers = api_headers });
+}
+
 fn respondState(request: *std.http.Server.Request, snapshot: Snapshot, now_ms: i64, started_at_ms: i64) !void {
     const WireState = struct {
         session_id: []const u8,
@@ -572,6 +716,7 @@ fn respondState(request: *std.http.Server.Request, snapshot: Snapshot, now_ms: i
         can_previous: bool,
         can_next: bool,
         pointer_enabled: bool,
+        drawing_enabled: bool,
         preview_ready: bool,
         preview_revision: u64,
         elapsed_ms: i64,
@@ -591,6 +736,7 @@ fn respondState(request: *std.http.Server.Request, snapshot: Snapshot, now_ms: i
         .can_previous = snapshot.can_previous,
         .can_next = snapshot.can_next,
         .pointer_enabled = snapshot.pointer_enabled,
+        .drawing_enabled = snapshot.drawing_enabled,
         .preview_ready = snapshot.preview_ready,
         .preview_revision = snapshot.preview_revision,
         .elapsed_ms = @max(@as(i64, 0), now_ms - started_at_ms),
@@ -613,6 +759,7 @@ test "presentation state revisions and command sequences are stable" {
         .can_previous = true,
         .can_next = true,
         .pointer_enabled = true,
+        .drawing_enabled = true,
     };
     try std.testing.expect(try store.publish(input));
     const revision = store.snapshot.revision;
@@ -630,6 +777,23 @@ test "presentation state revisions and command sequences are stable" {
     try std.testing.expect(!try store.updatePointer(.{ .active = false, .x = 0, .y = 0, .sequence = 7 }, 201));
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), store.activePointer(300).?.x, 0.0001);
     try std.testing.expect(store.activePointer(200 + pointer_timeout_ms + 1) == null);
+
+    try std.testing.expect(try store.enqueueDrawing(.{ .phase = .begin, .x = 0.1, .y = 0.2, .sequence = 1 }, 300));
+    try std.testing.expect(try store.enqueueDrawing(.{ .phase = .move, .x = 0.3, .y = 0.4, .sequence = 2 }, 301));
+    try std.testing.expect(try store.enqueueDrawing(.{ .phase = .end, .x = 0.5, .y = 0.6, .sequence = 3 }, 302));
+    try std.testing.expect(!try store.enqueueDrawing(.{ .phase = .move, .x = 0.7, .y = 0.8, .sequence = 2 }, 303));
+    try std.testing.expectEqual(DrawingPhase.begin, store.takeDrawing(304).?.phase);
+    try std.testing.expectEqual(DrawingPhase.move, store.takeDrawing(304).?.phase);
+    try std.testing.expectEqual(DrawingPhase.end, store.takeDrawing(304).?.phase);
+    try std.testing.expect(store.takeDrawing(304) == null);
+    try std.testing.expectError(
+        error.InvalidDrawing,
+        store.enqueueDrawing(.{ .phase = .begin, .x = 1.1, .y = 0, .sequence = 4 }, 305),
+    );
+    try std.testing.expect(try store.enqueueDrawing(.{ .phase = .begin, .x = 0.7, .y = 0.8, .sequence = 5 }, 400));
+    try std.testing.expectEqual(DrawingPhase.begin, store.takeDrawing(400).?.phase);
+    try std.testing.expect(store.takeDrawing(400 + drawing_timeout_ms) == null);
+    try std.testing.expectEqual(DrawingPhase.end, store.takeDrawing(400 + drawing_timeout_ms + 1).?.phase);
 }
 
 fn rawHttp(allocator: std.mem.Allocator, io: std.Io, port: u16, request: []const u8) ![]u8 {
@@ -661,6 +825,7 @@ test "presenter HTTP is private and queues authenticated commands" {
         .can_previous = false,
         .can_next = true,
         .pointer_enabled = true,
+        .drawing_enabled = true,
     });
     try runtime.publishPreview("fake-png-preview");
 
@@ -676,6 +841,9 @@ test "presenter HTTP is private and queues authenticated commands" {
     const denied_preview = try rawHttp(allocator, io, port, "GET /api/v1/presenter/preview HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     defer allocator.free(denied_preview);
     try std.testing.expect(std.mem.indexOf(u8, denied_preview, "401 Unauthorized") != null);
+    const denied_drawing = try rawHttp(allocator, io, port, "POST /api/v1/presenter/drawing HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+    defer allocator.free(denied_drawing);
+    try std.testing.expect(std.mem.indexOf(u8, denied_drawing, "401 Unauthorized") != null);
 
     const state_request = try std.fmt.allocPrint(
         allocator,
@@ -687,6 +855,7 @@ test "presenter HTTP is private and queues authenticated commands" {
     defer allocator.free(state_response);
     try std.testing.expect(std.mem.indexOf(u8, state_response, "\"notes\":\"Private cue\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state_response, "\"preview_ready\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_response, "\"drawing_enabled\":true") != null);
 
     const preview_request = try std.fmt.allocPrint(
         allocator,
@@ -726,6 +895,33 @@ test "presenter HTTP is private and queues authenticated commands" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), pointer.y, 0.0001);
     runtime.clearPointer();
     try std.testing.expect(runtime.activePointer() == null);
+
+    const drawing_body = "{\"phase\":\"begin\",\"x\":0.15,\"y\":0.85,\"seq\":1}";
+    const drawing_request = try std.fmt.allocPrint(
+        allocator,
+        "POST /api/v1/presenter/drawing?token={s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ runtime.store.capability.slice(), drawing_body.len, drawing_body },
+    );
+    defer allocator.free(drawing_request);
+    const drawing_response = try rawHttp(allocator, io, port, drawing_request);
+    defer allocator.free(drawing_response);
+    try std.testing.expect(std.mem.indexOf(u8, drawing_response, "\"queued\":true") != null);
+    const drawing = runtime.takeDrawing().?;
+    try std.testing.expectEqual(DrawingPhase.begin, drawing.phase);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.15), drawing.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.85), drawing.y, 0.0001);
+
+    const clear_body = "{\"command\":\"clear_drawing\",\"seq\":2}";
+    const clear_request = try std.fmt.allocPrint(
+        allocator,
+        "POST /api/v1/presenter/command?token={s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ runtime.store.capability.slice(), clear_body.len, clear_body },
+    );
+    defer allocator.free(clear_request);
+    const clear_response = try rawHttp(allocator, io, port, clear_request);
+    defer allocator.free(clear_response);
+    try std.testing.expect(std.mem.indexOf(u8, clear_response, "\"queued\":true") != null);
+    try std.testing.expectEqual(Command.clear_drawing, runtime.takeCommand().?.command);
 }
 
 test "Presenter Companion and Crowdplay remain independent servers" {
@@ -751,6 +947,7 @@ test "Presenter Companion and Crowdplay remain independent servers" {
         .can_previous = false,
         .can_next = false,
         .pointer_enabled = true,
+        .drawing_enabled = true,
     });
 
     const audience_health = try rawHttp(allocator, io, audience_port, "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -770,6 +967,9 @@ test "Presenter Companion and Crowdplay remain independent servers" {
     const preview_route_on_audience = try rawHttp(allocator, io, audience_port, "GET /api/v1/presenter/preview HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     defer allocator.free(preview_route_on_audience);
     try std.testing.expect(std.mem.indexOf(u8, preview_route_on_audience, "404 Not Found") != null);
+    const drawing_route_on_audience = try rawHttp(allocator, io, audience_port, "POST /api/v1/presenter/drawing HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    defer allocator.free(drawing_route_on_audience);
+    try std.testing.expect(std.mem.indexOf(u8, drawing_route_on_audience, "404 Not Found") != null);
 
     presenter_runtime.stop();
     const audience_after_presenter_stop = try rawHttp(allocator, io, audience_port, "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
