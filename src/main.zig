@@ -738,6 +738,32 @@ test "inline completion releases a deferred native close request" {
     try std.testing.expect(close_seen);
 }
 
+test "frame diagnostics distinguishes full partial and unchanged rebuilds" {
+    var diagnostics = FrameDiagnostics{};
+    diagnostics.recordPreRender(0.010, 1024, .{
+        .mode = .full,
+        .rebuilt_slide_count = 12,
+        .total_slide_count = 12,
+    });
+    diagnostics.recordPreRender(0.002, 2048, .{
+        .mode = .partial,
+        .rebuilt_slide_count = 1,
+        .total_slide_count = 12,
+    });
+    diagnostics.recordPreRender(0.0001, 2048, .{
+        .mode = .unchanged,
+        .rebuilt_slide_count = 0,
+        .total_slide_count = 12,
+    });
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.pre_render_count);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.full_rebuild_count);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.partial_rebuild_count);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.unchanged_rebuild_count);
+    try std.testing.expectEqual(renderer.SlideshowRenderer.RebuildMode.unchanged, diagnostics.last_rebuild_mode);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.last_rebuilt_slide_count);
+    try std.testing.expectEqual(@as(usize, 12), diagnostics.last_rebuild_total_slide_count);
+}
+
 const FrameDiagnostics = struct {
     enabled: bool = false,
     last_frame_at: f64 = 0,
@@ -750,6 +776,12 @@ const FrameDiagnostics = struct {
     last_pre_render_ms: f64 = 0,
     slideshow_arena_bytes: usize = 0,
     pre_render_count: usize = 0,
+    last_rebuild_mode: renderer.SlideshowRenderer.RebuildMode = .full,
+    last_rebuilt_slide_count: usize = 0,
+    last_rebuild_total_slide_count: usize = 0,
+    full_rebuild_count: usize = 0,
+    partial_rebuild_count: usize = 0,
+    unchanged_rebuild_count: usize = 0,
     last_studio_prepare_ms: f64 = 0,
     studio_document_cache_builds: usize = 0,
     studio_scene_cache_builds: usize = 0,
@@ -781,13 +813,33 @@ const FrameDiagnostics = struct {
         }
     }
 
-    fn recordPreRender(self: *FrameDiagnostics, elapsed_seconds: f64, arena_bytes: usize) void {
+    fn recordPreRender(
+        self: *FrameDiagnostics,
+        elapsed_seconds: f64,
+        arena_bytes: usize,
+        result: renderer.SlideshowRenderer.RebuildResult,
+    ) void {
         self.last_pre_render_ms = elapsed_seconds * 1000;
         self.slideshow_arena_bytes = arena_bytes;
         self.pre_render_count += 1;
+        self.last_rebuild_mode = result.mode;
+        self.last_rebuilt_slide_count = result.rebuilt_slide_count;
+        self.last_rebuild_total_slide_count = result.total_slide_count;
+        switch (result.mode) {
+            .full => self.full_rebuild_count += 1,
+            .partial => self.partial_rebuild_count += 1,
+            .unchanged => self.unchanged_rebuild_count += 1,
+        }
         log.debug(
-            "render graph rebuild #{d}: {d:.1} ms, slideshow arena {d:.1} KiB",
-            .{ self.pre_render_count, self.last_pre_render_ms, @as(f64, @floatFromInt(arena_bytes)) / 1024.0 },
+            "render graph rebuild #{d}: {s} {d}/{d} slides, {d:.1} ms, slideshow arena {d:.1} KiB",
+            .{
+                self.pre_render_count,
+                @tagName(result.mode),
+                result.rebuilt_slide_count,
+                result.total_slide_count,
+                self.last_pre_render_ms,
+                @as(f64, @floatFromInt(arena_bytes)) / 1024.0,
+            },
         );
     }
 
@@ -824,8 +876,17 @@ const FrameDiagnostics = struct {
         ) catch return;
         const graph_text = std.fmt.bufPrintZ(
             &graph_buffer,
-            "REBUILD {d:.1} ms   ARENA {d:.1} KiB   BUILDS {d}",
-            .{ self.last_pre_render_ms, @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0, self.pre_render_count },
+            "REBUILD {d:.1} ms   {s} {d}/{d}   F/P/N {d}/{d}/{d}   ARENA {d:.1} KiB",
+            .{
+                self.last_pre_render_ms,
+                @tagName(self.last_rebuild_mode),
+                self.last_rebuilt_slide_count,
+                self.last_rebuild_total_slide_count,
+                self.full_rebuild_count,
+                self.partial_rebuild_count,
+                self.unchanged_rebuild_count,
+                @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0,
+            },
         ) catch return;
         const mouse = rl.getMousePosition();
         const input_text = std.fmt.bufPrintZ(
@@ -880,9 +941,12 @@ const FrameDiagnostics = struct {
                 const compact_graph = if (roomy)
                     std.fmt.bufPrintZ(
                         &compact_graph_buffer,
-                        "BUILD {d:.1} ms   PREP {d:.2} ms   CACHE {d}/{d}/{d}{s}   DECK {d}   ITEMS {d}/{d}",
+                        "BUILD {d:.1} ms {s} {d}/{d}   PREP {d:.2} ms   CACHE {d}/{d}/{d}{s}   DECK {d}   ITEMS {d}/{d}",
                         .{
                             self.last_pre_render_ms,
+                            @tagName(self.last_rebuild_mode),
+                            self.last_rebuilt_slide_count,
+                            self.last_rebuild_total_slide_count,
                             self.last_studio_prepare_ms,
                             self.studio_document_cache_builds,
                             self.studio_scene_cache_builds,
@@ -896,8 +960,15 @@ const FrameDiagnostics = struct {
                 else
                     std.fmt.bufPrintZ(
                         &compact_graph_buffer,
-                        "BUILD {d:.0} ms   {d:.0} KiB   #{d}   {s}",
-                        .{ self.last_pre_render_ms, @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0, self.pre_render_count, if (beast_mode) "UNCAPPED" else "VSYNC" },
+                        "{s} {d}/{d}   {d:.0} ms   #{d}   {s}",
+                        .{
+                            @tagName(self.last_rebuild_mode),
+                            self.last_rebuilt_slide_count,
+                            self.last_rebuild_total_slide_count,
+                            self.last_pre_render_ms,
+                            self.pre_render_count,
+                            if (beast_mode) "UNCAPPED" else "VSYNC",
+                        },
                     ) catch return;
                 rl.drawRectangleRec(panel, .{ .r = 5, .g = 11, .b = 22, .a = 235 });
                 rl.drawRectangleLinesEx(panel, @max(@as(f32, 1), scale), .{ .r = 119, .g = 226, .b = 255, .a = 185 });
@@ -983,6 +1054,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_command_tooltip = false;
     var diagnostics_precision_view = false;
     var diagnostics_large_deck_count: ?usize = null;
+    var diagnostics_incremental_edit_slide: ?usize = null;
     var diagnostics_window_size: ?WindowDimensions = null;
     var diagnostics_select_buffer: [128]u8 = undefined;
     var diagnostics_select_id: ?[]const u8 = null;
@@ -1026,6 +1098,13 @@ pub fn main(init: std.process.Init) anyerror!void {
                 diagnostics_enabled = true;
                 diagnostics_large_deck_count = count;
                 launch_studio = true;
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-incremental-edit=")) {
+                const value = arg["--diagnostics-incremental-edit=".len..];
+                const one_based_slide = std.fmt.parseInt(usize, value, 10) catch return error.InvalidDiagnosticSlideIndex;
+                if (one_based_slide == 0) return error.InvalidDiagnosticSlideIndex;
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_incremental_edit_slide = one_based_slide - 1;
             } else if (std.mem.startsWith(u8, arg, "--diagnostics-window=")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
@@ -1110,6 +1189,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_command_palette_pending = diagnostics_command_palette;
     var diagnostics_precision_view_pending = diagnostics_precision_view;
     var diagnostics_find_slide_pending = diagnostics_find_slide_query;
+    var diagnostics_incremental_edit_pending = diagnostics_incremental_edit_slide;
 
     // Main game loop
     var is_pre_rendered: bool = false;
@@ -1262,44 +1342,58 @@ pub fn main(init: std.process.Init) anyerror!void {
                 log.info("LOADED!!!", .{});
                 log.debug("I AM GOING TO PRE-RENDER!", .{});
                 const pre_render_started_at = rl.getTime();
-                G.slide_renderer.preRender(G.slideshow, slideshow_filp) catch |err| {
+                const rebuild_result: ?renderer.SlideshowRenderer.RebuildResult = G.slide_renderer.preRenderChanged(
+                    G.slideshow,
+                    slideshow_filp,
+                ) catch |err| failed: {
+                    // Keep the old graph live and retry next frame. Selective
+                    // rebuilds are transactional, so a failed image/text/morph
+                    // build cannot leave a half-updated deck on screen.
                     log.err("Pre-rendering failed: {any}", .{err});
+                    break :failed null;
                 };
-                frame_diagnostics.recordPreRender(
-                    rl.getTime() - pre_render_started_at,
-                    G.slideshow_arena.queryCapacity(),
-                );
-                const deck_has_crowd = slideshowHasCrowd(G.slideshow);
-                const host_is_usable = builtin.os.tag != .windows or crowd_options.host_explicit;
-                if (crowd_options.enabled and deck_has_crowd and !host_is_usable) {
-                    log.err("Crowdplay on Windows requires --crowd-host=<LAN-IP>; server disabled", .{});
-                }
-                const wants_crowd = crowd_options.enabled and deck_has_crowd and host_is_usable;
-                var crowd_configured = false;
-                if (wants_crowd) {
-                    if (crowd_runtime.configure(G.slideshow)) |_| {
-                        crowd_configured = true;
-                    } else |err| {
-                        log.err("Crowdplay configuration failed; server disabled: {any}", .{err});
+                if (rebuild_result) |result| {
+                    frame_diagnostics.recordPreRender(
+                        rl.getTime() - pre_render_started_at,
+                        G.slideshow_arena.queryCapacity(),
+                        result,
+                    );
+                    const deck_has_crowd = slideshowHasCrowd(G.slideshow);
+                    const host_is_usable = builtin.os.tag != .windows or crowd_options.host_explicit;
+                    if (crowd_options.enabled and deck_has_crowd and !host_is_usable) {
+                        log.err("Crowdplay on Windows requires --crowd-host=<LAN-IP>; server disabled", .{});
+                    }
+                    const wants_crowd = crowd_options.enabled and deck_has_crowd and host_is_usable;
+                    var crowd_configured = false;
+                    if (wants_crowd) {
+                        if (crowd_runtime.configure(G.slideshow)) |_| {
+                            crowd_configured = true;
+                        } else |err| {
+                            log.err("Crowdplay configuration failed; server disabled: {any}", .{err});
+                            crowd_runtime.stop();
+                        }
+                    } else {
                         crowd_runtime.stop();
                     }
-                } else {
-                    crowd_runtime.stop();
-                }
-                if (crowd_configured and !crowd_runtime.isRunning()) {
-                    if (crowd_runtime.start(crowd_options.port, crowd_options.host)) |port| {
-                        log.info("Crowdplay listening on port {d}; audience URL: {s}", .{ port, crowd_runtime.public_url.slice() });
-                    } else |err| {
-                        log.err("Crowdplay could not start: {any}", .{err});
+                    if (crowd_configured and !crowd_runtime.isRunning()) {
+                        if (crowd_runtime.start(crowd_options.port, crowd_options.host)) |port| {
+                            log.info("Crowdplay listening on port {d}; audience URL: {s}", .{ port, crowd_runtime.public_url.slice() });
+                        } else |err| {
+                            log.err("Crowdplay could not start: {any}", .{err});
+                        }
                     }
+                    if (G.slideshow.slides.items.len > 0) {
+                        if (G.current_slide < 0 or G.current_slide >= G.slideshow.slides.items.len) G.current_slide = 0;
+                        const now = rl.getTime();
+                        G.playback.enterSlide(null, 0, 0, G.slide_renderer.transitionForSlide(G.current_slide), 1, now);
+                    }
+                    log.info("PRE-RENDERED {s} {d}/{d} slides", .{
+                        @tagName(result.mode),
+                        result.rebuilt_slide_count,
+                        result.total_slide_count,
+                    });
+                    is_pre_rendered = true;
                 }
-                if (G.slideshow.slides.items.len > 0) {
-                    if (G.current_slide < 0 or G.current_slide >= G.slideshow.slides.items.len) G.current_slide = 0;
-                    const now = rl.getTime();
-                    G.playback.enterSlide(null, 0, 0, G.slide_renderer.transitionForSlide(G.current_slide), 1, now);
-                }
-                log.info("PRE-RENDERED!!!!", .{});
-                is_pre_rendered = true;
             }
         }
 
@@ -2115,6 +2209,21 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
+        if (diagnostics_incremental_edit_pending) |slide_index| {
+            if (is_pre_rendered and frame_diagnostics.pre_render_count > 0 and !source_graph_reparsed_this_frame) {
+                diagnostics_incremental_edit_pending = null;
+                if (applyDiagnosticIncrementalEdit(&studio_history, slide_index)) |_| {
+                    studio_mode.markSourceChanged();
+                    studio_mode.dirty = editorSourceDirty();
+                    is_pre_rendered = false;
+                    source_graph_reparsed_this_frame = true;
+                    log.info("diagnostics applied incremental source edit to slide {d}", .{slide_index + 1});
+                } else |err| {
+                    log.err("diagnostics incremental edit failed for slide {d}: {any}", .{ slide_index + 1, err });
+                }
+            }
+        }
+
         releaseDeferredInlineCloseLatch(
             &window_close_seen,
             inline_edit_active_at_frame_start,
@@ -2418,7 +2527,11 @@ const AppData = struct {
         errdefer rl.unloadFont(self.studio_ui_font);
         rl.setTextureFilter(self.studio_ui_font.texture, .bilinear);
         self.slideshow = try SlideShow.new(self.slideshow_allocator);
-        self.slide_renderer = try renderer.SlideshowRenderer.new(self.slideshow_allocator, &self.fonts);
+        // The parser graph is arena-backed and replaced after every Studio
+        // source edit. The renderer deliberately lives on the long-lived GPA
+        // so unchanged rendered slides and cached textures can survive those
+        // reparses and be replaced selectively.
+        self.slide_renderer = try renderer.SlideshowRenderer.new(self.allocator, &self.fonts);
         self.playback.reset(rl.getTime());
 
         self.editor_memory = try self.allocator.alloc(u8, 128 * 1024);
@@ -2444,12 +2557,10 @@ const AppData = struct {
     fn resetSlideshowGraph(self: *AppData) !void {
         if (self.parser_context) |context| context.deinit();
         self.parser_context = null;
-        self.slide_renderer.deinit();
         self.slideshow_arena.deinit();
         self.slideshow_arena = std.heap.ArenaAllocator.init(self.allocator);
         self.slideshow_allocator = self.slideshow_arena.allocator();
         self.slideshow = try SlideShow.new(self.slideshow_allocator);
-        self.slide_renderer = try renderer.SlideshowRenderer.new(self.slideshow_allocator, &self.fonts);
     }
 
     fn noteSourceMutation(self: *AppData) void {
@@ -4956,6 +5067,30 @@ fn applyStudioLiteralAttribute(
         source_ref.line_offset,
         &patches,
     ));
+}
+
+/// One-shot real source edit for repeatable incremental-render QA. It uses the
+/// same patch/history/reparse boundary as the Properties inspector, then lets
+/// the following frame report which render-graph region was rebuilt.
+fn applyDiagnosticIncrementalEdit(history: *StudioHistory, slide_index: usize) !void {
+    if (slide_index >= G.slideshow.slides.items.len) return error.InvalidDiagnosticSlideIndex;
+    const slide = G.slideshow.slides.items[slide_index];
+    const items = if (slide.items) |*list| list else return error.InvalidDiagnosticSlideIndex;
+    for (items.items) |*item| {
+        if (item.kind != .textbox or item.color == null or
+            item.source.scope != .direct or !item.source.patchable)
+            continue;
+        return applyStudioLiteralAttribute(
+            history,
+            slide,
+            null,
+            item,
+            .direct,
+            "color",
+            "#ff5ca8ff",
+        );
+    }
+    return error.InvalidDiagnosticSlideIndex;
 }
 
 fn applyStudioText(

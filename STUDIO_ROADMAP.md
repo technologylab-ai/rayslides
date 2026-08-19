@@ -205,17 +205,40 @@ monitor-aware default size and an exact 900×600 client area on macOS workspace
 12. The active query, result focus, thumbnail, pager, Library, toolbar, and
 morph strip remain legible and non-overlapping in both configurations.
 
+## Completed tranche: Incremental render-graph rebuilding
+
+- [x] Keep the renderer and image texture cache alive across parser-arena
+  replacement while giving every rendered string and Crowd choice array
+  explicit renderer ownership.
+- [x] Fingerprint the complete parsed renderer input for each slide, excluding
+  source offsets and authoring provenance that cannot change pixels.
+- [x] Rebuild only semantically changed slide positions when deck structure is
+  stable; changes to shared definitions naturally rebuild every parsed
+  dependent slide and no unrelated one.
+- [x] Retain a transactional full-deck fallback for slide-count changes and
+  build every partial replacement beside the live graph before swapping any
+  pointer.
+- [x] Leave the complete previous graph intact on allocation/render failure,
+  and retry rather than marking a failed build as current.
+- [x] Report full/partial/unchanged mode, affected/total slides, and cumulative
+  counters in the diagnostics HUD and log.
+- [x] Add `--diagnostics-incremental-edit=N` for a deterministic real
+  source/history/reparse edit after the first rendered frame.
+
+ReleaseSafe live QA on the 160-slide stress deck measured a 6.5 ms initial
+full build followed by a 0.3 ms `partial 1/160` rebuild. The edited title
+appeared in the same frame sequence while the other 159 rendered-slide
+pointers and the Studio shell remained stable. Headless coverage includes
+local and morph edits, exact shared-definition dependency fan-out, structural
+fallback, Crowd lifetime across arena replacement, unchanged pointer identity,
+and induced allocation failure after one replacement has already been built.
+
 ## Planned tranches
-
-### Edit-time scaling
-
-- Rebuild only provably affected render-graph regions after edits; retain the
-  current atomic full-deck fallback whenever dependencies are ambiguous.
-- Add automated performance and screenshot baselines for compact, default,
-  large, and synthetic-deck Studio configurations.
 
 ### Release and resilience confidence
 
+- Add automated performance and screenshot baselines for compact, default,
+  large, and synthetic-deck Studio configurations.
 - Extend application-boundary tests around document reload, Save As, recovery,
   and source-edit failure injection, including allocation-failure history paths.
 - Add a repeatable macOS release QA checklist covering input focus, multiple

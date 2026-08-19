@@ -237,7 +237,8 @@ source.
 ### Rendering diagnostics
 
 Press <kbd>F3</kbd>, or launch with `--diagnostics`, to show frame time, the
-one-second peak and slow-frame count, render-graph rebuild time, slideshow
+one-second peak and slow-frame count, render-graph rebuild time and mode, the
+number of slides rebuilt, full/partial/unchanged rebuild counters, slideshow
 arena capacity, Studio preparation time, cache rebuild counts, deck size,
 active item/render-fragment counts, mouse coordinates, and window size. A `*`
 beside the cache counters marks a rebuild in the current frame. Slow frames
@@ -261,6 +262,10 @@ and a 110% canvas view for deterministic precision-surface QA; pair it with
 stress deck with reusable elements and morph states. `COUNT` accepts 1–200;
 the deck is intentionally untitled and does not touch a file unless you
 explicitly save it.
+`--diagnostics-incremental-edit=N` performs one real, undoable Properties-style
+source edit on the one-based slide `N` after the first complete frame. Pair it
+with the large-deck flag to verify that the next HUD event is a selective
+`partial 1/COUNT` rebuild without synthesizing keyboard or pointer input.
 `--diagnostics-find-slide=QUERY` opens the real slide-picker Find field with a
 deterministic query, and `--diagnostics-window=WIDTHxHEIGHT` requests an exact
 Studio client size (minimum 900×506). Together they make compact/default/large
