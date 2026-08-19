@@ -1331,6 +1331,8 @@ pub const SemanticCommand = union(enum) {
     save_document_copy: void,
     undo: void,
     redo: void,
+    edit_speaker_notes: void,
+    pair_presenter_phone: void,
     /// Replaces the pristine untitled placeholder with an ordinary starter
     /// `.sld` source in one undoable edit.
     create_starter_deck: NewDeckPreset,
@@ -2439,6 +2441,8 @@ pub const CommandId = enum {
     show_slides,
     show_objects,
     show_properties,
+    edit_speaker_notes,
+    pair_presenter_phone,
     find_slides,
     find_library,
     find_objects,
@@ -2491,6 +2495,8 @@ const command_specs = [_]CommandSpec{
     .{ .id = .show_slides, .category = "VIEW", .title = "Show Slides and Library", .description = "Open the deck organizer dock", .keywords = "left dock organizer reusable" },
     .{ .id = .show_objects, .category = "VIEW", .title = "Show Objects", .description = "Open the source-aware object stack", .keywords = "layers inspector right dock" },
     .{ .id = .show_properties, .category = "VIEW", .title = "Show Properties", .description = "Open precise inline object properties", .keywords = "inspector right dock values" },
+    .{ .id = .edit_speaker_notes, .category = "PRESENT", .title = "Edit speaker notes", .description = "Edit private notes for the current slide", .keywords = "presenter companion phone notes cue" },
+    .{ .id = .pair_presenter_phone, .category = "PRESENT", .title = "Pair presenter phone", .description = "Show the private Presenter Companion QR", .keywords = "mobile remote companion qr connect" },
     .{ .id = .find_slides, .category = "FIND", .title = "Find a slide", .description = "Filter the slide picker and jump to a result", .keywords = "search deck title number navigate", .shortcut = "Cmd/Ctrl F" },
     .{ .id = .find_library, .category = "FIND", .title = "Find a library entry", .description = "Filter reusable elements, groups, and slide templates", .keywords = "search reuse component group template" },
     .{ .id = .find_objects, .category = "FIND", .title = "Find an object", .description = "Filter the source-aware object stack", .keywords = "search layers id text image hidden locked" },
@@ -3612,6 +3618,12 @@ pub const Studio = struct {
             .show_objects,
             .show_properties,
             => .{ .enabled = true },
+            .edit_speaker_notes,
+            .pair_presenter_phone,
+            => if (workspace.slides.len > 0)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "The deck has no slides" },
             .find_slides => if (workspace.slides.len > 0)
                 .{ .enabled = true }
             else
@@ -4032,6 +4044,8 @@ pub const Studio = struct {
                 self.active_dock = .properties;
                 self.inspector_panel = .properties;
             },
+            .edit_speaker_notes => self.pending_semantic_command = .{ .edit_speaker_notes = {} },
+            .pair_presenter_phone => self.pending_semantic_command = .{ .pair_presenter_phone = {} },
             .find_slides => self.activatePanelSearch(.slides),
             .find_library => self.activatePanelSearch(.library),
             .find_objects => self.activatePanelSearch(.objects),

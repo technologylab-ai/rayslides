@@ -231,6 +231,7 @@ pub const PatchError = error{
     AmbiguousSlideTemplateDependency,
     AmbiguousItemLayer,
     CannotDeleteOnlySlide,
+    DuplicateSpeakerNotes,
     DuplicateAttribute,
     InvalidAttribute,
     InvalidColorLiteral,
@@ -244,6 +245,7 @@ pub const PatchError = error{
     InvalidReusableName,
     InvalidSlideOffset,
     InvalidSnippet,
+    InvalidSpeakerNotes,
     ItemIdCollision,
     ComponentDefinitionMismatch,
     DetachedItemIdMismatch,
@@ -268,6 +270,7 @@ pub const PatchError = error{
     UnsupportedSlidePromotion,
     UnsafeSlideGlobalDirective,
     UnsupportedBatchDeletion,
+    UnterminatedSpeakerNotes,
 };
 
 /// Exact physical bytes owned by one rendered slide.
@@ -1437,6 +1440,57 @@ pub fn slideItemInsertionOffset(source: []const u8, slide_offset: usize) PatchEr
 /// the selected one instead of appending it to the whole file.
 pub fn slideEndOffset(source: []const u8, slide_offset: usize) PatchError!usize {
     return findSlideBoundary(source, slide_offset, false);
+}
+
+/// Replace, insert, or remove the private speaker-notes block belonging to one
+/// rendered slide. The block is source-native but not renderer input.
+pub fn setSpeakerNotes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    value: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (value.len > 8192 or !std.unicode.utf8ValidateSlice(value) or
+        std.mem.indexOfScalar(u8, value, '\r') != null)
+    {
+        return error.InvalidSpeakerNotes;
+    }
+    var note_lines = std.mem.splitScalar(u8, value, '\n');
+    while (note_lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, line, " \t"), "@endnotes")) return error.InvalidSpeakerNotes;
+    }
+
+    const range = try logicalSlideRange(source, slide_offset);
+    const existing = try findSpeakerNotesBlock(source, range);
+    if (value.len == 0) {
+        if (existing) |block| return replaceRange(allocator, source, block.start, block.end, "");
+        return .{ .source = try allocator.dupe(u8, source), .byte_delta = 0 };
+    }
+
+    const near = if (existing) |block| block.start else range.end;
+    const newline = lineEndingNear(source, near);
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    try block.appendSlice(allocator, "@notes");
+    try block.appendSlice(allocator, newline);
+    try appendNormalizedLines(allocator, &block, value, newline);
+    try block.appendSlice(allocator, newline);
+    try block.appendSlice(allocator, "@endnotes");
+
+    if (existing) |old| {
+        if (old.end > old.start and source[old.end - 1] == '\n') try block.appendSlice(allocator, newline);
+        return replaceRange(allocator, source, old.start, old.end, block.items);
+    }
+
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.ensureTotalCapacity(allocator, source.len + block.items.len + newline.len * 2);
+    try output.appendSlice(allocator, source[0..range.end]);
+    if (range.end > sourceStart(source) and source[range.end - 1] != '\n') try output.appendSlice(allocator, newline);
+    try output.appendSlice(allocator, block.items);
+    try output.appendSlice(allocator, newline);
+    try output.appendSlice(allocator, source[range.end..]);
+    return finishResult(allocator, &output, source.len);
 }
 
 /// Insert a blank rendered slide immediately after the selected slide.
@@ -5214,6 +5268,38 @@ fn validateBodyText(value: []const u8) PatchError!void {
     while (lines.next()) |line| {
         if (line.len > 0 and (line[0] == '@' or line[0] == '#')) return error.InvalidLiteralValue;
     }
+}
+
+fn findSpeakerNotesBlock(source: []const u8, range: LogicalSlideRange) PatchError!?Span {
+    var opening: ?DirectiveLine = null;
+    var found: ?Span = null;
+    var cursor = range.start;
+    while (cursor < range.end) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > range.end) return error.InvalidSpeakerNotes;
+        if (cursor < line.content_end) {
+            const text = source[cursor..line.content_end];
+            const trimmed = std.mem.trimEnd(u8, text, " \t\r");
+            if (opening) |start| {
+                if (std.mem.eql(u8, trimmed, "@endnotes")) {
+                    found = .{ .start = start.start, .end = line.full_end };
+                    opening = null;
+                }
+            } else if (source[cursor] == '@') {
+                const name = directiveName(trimmed);
+                if (std.mem.eql(u8, name, "@notes")) {
+                    if (found != null) return error.DuplicateSpeakerNotes;
+                    if (!std.mem.eql(u8, trimmed, "@notes")) return error.InvalidSpeakerNotes;
+                    opening = line;
+                } else if (std.mem.eql(u8, name, "@endnotes")) {
+                    return error.InvalidSpeakerNotes;
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (opening != null) return error.UnterminatedSpeakerNotes;
+    return found;
 }
 
 fn validateSnippet(snippet: []const u8) PatchError!void {
@@ -9474,5 +9560,61 @@ test "source editing APIs reject ambiguous unsafe input" {
     try std.testing.expectError(
         error.InvalidLiteralValue,
         patchItemText(std.testing.allocator, source, source.len - "@box text=Safe\n".len, "@slide\nOops"),
+    );
+}
+
+test "speaker notes insert replace and remove within one logical slide" {
+    const source =
+        "@slide\r\n" ++
+        "@box text=First\r\n" ++
+        "@slide\r\n" ++
+        "@box text=Second\r\n";
+    const first = std.mem.indexOf(u8, source, "@slide").?;
+    const second = std.mem.indexOfPos(u8, source, first + 1, "@slide").?;
+
+    const inserted = try setSpeakerNotes(
+        std.testing.allocator,
+        source,
+        first,
+        "Opening cue\n\nPause here.",
+    );
+    defer inserted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@slide\r\n" ++
+            "@box text=First\r\n" ++
+            "@notes\r\n" ++
+            "Opening cue\r\n" ++
+            "\r\n" ++
+            "Pause here.\r\n" ++
+            "@endnotes\r\n" ++
+            "@slide\r\n" ++
+            "@box text=Second\r\n",
+        inserted.source,
+    );
+
+    const replaced = try setSpeakerNotes(std.testing.allocator, inserted.source, first, "Replacement");
+    defer replaced.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, replaced.source, "Opening cue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, replaced.source, "@notes\r\nReplacement\r\n@endnotes") != null);
+
+    const removed = try setSpeakerNotes(std.testing.allocator, replaced.source, first, "");
+    defer removed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, removed.source, "@notes") == null);
+    try std.testing.expect(std.mem.indexOfPos(u8, removed.source, second, "@box text=Second") != null);
+}
+
+test "speaker notes preserve directive-looking prose and reject a literal terminator" {
+    const source = "@slide\n@box text=Visible\n";
+    const prose = try setSpeakerNotes(std.testing.allocator, source, 0, "Mention @renerocksai\n@slide is code here");
+    defer prose.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, prose.source, "@slide is code here") != null);
+    try std.testing.expectError(
+        error.InvalidSpeakerNotes,
+        setSpeakerNotes(std.testing.allocator, source, 0, "@endnotes"),
+    );
+    const malformed = "@slide\n@notes\nUnclosed\n";
+    try std.testing.expectError(
+        error.UnterminatedSpeakerNotes,
+        setSpeakerNotes(std.testing.allocator, malformed, 0, "Replacement"),
     );
 }

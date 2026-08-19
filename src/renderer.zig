@@ -273,6 +273,16 @@ fn renderInputFingerprint(slide: *const slides.Slide, slideshow_filp: []const u8
     return hash.value;
 }
 
+test "speaker notes are excluded from renderer fingerprints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const slide = try slides.Slide.new(arena.allocator());
+    const before = renderInputFingerprint(slide, "deck.sld");
+    slide.speaker_notes = "This must never change projected or exported pixels.";
+    slide.speaker_notes_source = .{ .line_number = 42, .line_offset = 900, .patchable = true };
+    try std.testing.expectEqual(before, renderInputFingerprint(slide, "deck.sld"));
+}
+
 pub const RevealState = struct {
     visible_through: usize = 0,
     active_step: ?usize = null,

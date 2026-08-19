@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#070b18">
+  <title>Rayslides Presenter</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; margin: 0; background: #070b18; color: #f7fbff; }
+    body { min-height: 100dvh; overscroll-behavior: none; }
+    button { color: inherit; font: inherit; touch-action: manipulation; }
+    .shell { min-height: 100dvh; display: grid; grid-template-rows: auto 1fr auto; }
+    header { position: sticky; top: 0; z-index: 2; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; padding: max(14px, env(safe-area-inset-top)) 18px 12px; background: rgba(7,11,24,.94); border-bottom: 1px solid #1b2d45; backdrop-filter: blur(14px); }
+    .brand { color: #61dafb; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .meta { display: flex; align-items: baseline; gap: 12px; }
+    #slideCount { color: #9db0c4; font-variant-numeric: tabular-nums; }
+    #timer { min-width: 4.7ch; font-size: 24px; font-weight: 750; font-variant-numeric: tabular-nums; text-align: right; }
+    main { width: min(780px, 100%); margin: 0 auto; padding: 16px 18px 140px; }
+    .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin: 0 0 22px; padding: 4px; border: 1px solid #213a56; border-radius: 15px; background: #0b1422; }
+    .modes button { min-height: 43px; border: 0; border-radius: 11px; background: transparent; color: #8fa7bd; font-size: 15px; font-weight: 800; }
+    .modes button[aria-selected="true"] { background: #1b344e; color: #f7fbff; box-shadow: 0 3px 14px #0007; }
+    .eyebrow { margin: 0 0 8px; color: #ffb547; font-size: 12px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    #notes { min-height: 32vh; margin: 0; font-size: clamp(22px, 6vw, 34px); line-height: 1.36; font-weight: 620; white-space: pre-wrap; overflow-wrap: anywhere; }
+    #notes.empty { color: #71869c; font-weight: 520; }
+    .next { margin-top: 34px; padding: 18px; border: 1px solid #213a56; border-radius: 18px; background: #0d1828; }
+    .next .eyebrow { color: #7892a8; }
+    #nextNotes { margin: 0; color: #adc0d3; font-size: 17px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .pointer-copy { margin: 0 0 12px; color: #a8bbce; font-size: 14px; line-height: 1.4; }
+    .pointer-surface { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border: 2px solid #2d536f; border-radius: 18px; background: #02050b; box-shadow: 0 18px 45px #0008; touch-action: none; user-select: none; -webkit-user-select: none; }
+    .pointer-surface.disabled { border-color: #503342; opacity: .72; }
+    #slidePreview { display: block; width: 100%; height: 100%; object-fit: cover; pointer-events: none; -webkit-user-drag: none; }
+    #pointerDot { position: absolute; left: 50%; top: 50%; width: 28px; height: 28px; transform: translate(-50%, -50%); border: 3px solid #fff; border-radius: 50%; background: #f3314d; box-shadow: 0 0 0 5px #f3314d55, 0 3px 14px #000c; pointer-events: none; }
+    #previewStatus { position: absolute; inset: auto 12px 12px; padding: 8px 10px; border-radius: 10px; background: #07101ddd; color: #c3d2e0; font-size: 12px; text-align: center; pointer-events: none; }
+    .pointer-footnote { margin: 13px 2px 0; color: #7890a6; font-size: 12px; line-height: 1.4; text-align: center; }
+    .network { position: fixed; left: 18px; right: 18px; bottom: calc(92px + env(safe-area-inset-bottom)); z-index: 3; display: flex; justify-content: center; pointer-events: none; }
+    #status { padding: 7px 11px; border-radius: 999px; background: #14243a; color: #a9bdd0; font-size: 12px; box-shadow: 0 8px 30px #0008; }
+    #status.live { background: #113323; color: #82e6ae; }
+    #status.error { background: #441d26; color: #ff9bae; }
+    nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 2; display: grid; grid-template-columns: 1fr 1.35fr; gap: 10px; padding: 10px 14px max(10px, env(safe-area-inset-bottom)); background: rgba(7,11,24,.96); border-top: 1px solid #1b2d45; backdrop-filter: blur(14px); }
+    nav button { min-height: 62px; border: 1px solid #2a4665; border-radius: 16px; background: #122238; font-size: 20px; font-weight: 800; }
+    nav button.primary { border-color: #61dafb; background: #61dafb; color: #07111f; }
+    nav button:active { transform: translateY(1px); filter: brightness(.9); }
+    nav button:disabled { opacity: .42; }
+    .pair-error { max-width: 520px; margin: 16vh auto; padding: 24px; border: 1px solid #653142; border-radius: 18px; background: #1b1018; }
+    .pair-error h1 { margin-top: 0; }
+    @media (max-width: 480px) {
+      main { padding-left: 12px; padding-right: 12px; }
+      .modes { margin-bottom: 16px; }
+      .pointer-surface { border-radius: 14px; }
+    }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="shell" id="app" hidden>
+    <header>
+      <div>
+        <div class="brand">Rayslides Presenter</div>
+        <div id="slideCount">Slide — / —</div>
+      </div>
+      <div class="meta"><span id="timer">00:00</span></div>
+    </header>
+    <main>
+      <div class="modes" role="tablist" aria-label="Presenter view">
+        <button id="notesTab" type="button" role="tab" aria-selected="true" aria-controls="notesMode">Notes</button>
+        <button id="pointerTab" type="button" role="tab" aria-selected="false" aria-controls="pointerMode">Pointer</button>
+      </div>
+      <section id="notesMode" role="tabpanel" aria-labelledby="notesTab">
+        <p class="eyebrow">Current notes</p>
+        <p id="notes" class="empty">No notes for this slide.</p>
+        <section class="next">
+          <p class="eyebrow">Next slide</p>
+          <p id="nextNotes">No upcoming notes.</p>
+        </section>
+      </section>
+      <section id="pointerMode" role="tabpanel" aria-labelledby="pointerTab" hidden>
+        <p class="eyebrow">Software pointer</p>
+        <p class="pointer-copy">Touch and hold the slide, then drag. Lift your finger to hide the laser.</p>
+        <div id="pointerSurface" class="pointer-surface disabled" aria-label="Current slide pointer surface">
+          <img id="slidePreview" alt="Current projected slide" draggable="false">
+          <span id="pointerDot" hidden></span>
+          <span id="previewStatus">Preparing current slide…</span>
+        </div>
+        <p class="pointer-footnote">For more precision, rotate the phone to landscape. Local mouse and drawing controls remain available.</p>
+      </section>
+    </main>
+    <div class="network"><span id="status">Connecting…</span></div>
+    <nav aria-label="Presentation controls">
+      <button id="previous" type="button" aria-label="Previous presentation step">← Previous</button>
+      <button id="next" class="primary" type="button" aria-label="Next presentation step">Next →</button>
+    </nav>
+  </div>
+  <section class="pair-error" id="pairError" hidden>
+    <h1 id="pairErrorTitle">Pairing link required</h1>
+    <p id="pairErrorMessage">Open the private QR code in rayslides and scan it again. No presenter information has been exposed.</p>
+  </section>
+  <script>
+    (() => {
+      "use strict";
+      const $ = (id) => document.getElementById(id);
+      const tokenKey = "rayslides:presenter-token:" + location.host;
+      const fragment = location.hash.length > 1 ? location.hash.slice(1) : "";
+      const remembered = sessionStorage.getItem(tokenKey) || "";
+      const token = /^[a-f0-9]{64}$/.test(fragment) ? fragment : remembered;
+
+      function showPairError(title, message) {
+        $("app").hidden = true;
+        $("pairErrorTitle").textContent = title;
+        $("pairErrorMessage").textContent = message;
+        $("pairError").hidden = false;
+      }
+
+      if (!/^[a-f0-9]{64}$/.test(token)) {
+        showPairError("Pairing link required", "Open the private QR code in rayslides and scan it again. No presenter information has been exposed.");
+        return;
+      }
+      sessionStorage.setItem(tokenKey, token);
+      if (fragment) history.replaceState(null, "", location.pathname);
+      $("app").hidden = false;
+
+      let state = null;
+      let pollTimer = 0;
+      let failures = 0;
+      let commandInFlight = false;
+      let commandSeq = Number(sessionStorage.getItem(tokenKey + ":seq")) || 0;
+      let wakeLock = null;
+      let elapsedBaseMs = 0;
+      let elapsedBaseAt = Date.now();
+      let mode = sessionStorage.getItem(tokenKey + ":mode") === "pointer" ? "pointer" : "notes";
+      let loadedPreviewRevision = 0;
+      let pointerSeq = Number(sessionStorage.getItem(tokenKey + ":pointer-seq")) || 0;
+      let pointerId = null;
+      let pointerActive = false;
+      let pointerPosition = { x: .5, y: .5 };
+      let pendingPointer = null;
+      let pointerRequestInFlight = false;
+      let pointerMoveTimer = 0;
+      let pointerMovePending = null;
+      let lastPointerMoveAt = 0;
+
+      const apiUrl = (path) => path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token);
+
+      async function api(path, options = {}) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        try {
+          const response = await fetch(apiUrl(path), {
+            cache: "no-store",
+            credentials: "same-origin",
+            ...options,
+            headers: { "Accept": "application/json", ...(options.headers || {}) },
+            signal: controller.signal
+          });
+          const text = await response.text();
+          let body = null;
+          if (text) body = JSON.parse(text);
+          if (!response.ok) {
+            const error = new Error(body && body.error ? body.error : "Request failed");
+            error.status = response.status;
+            throw error;
+          }
+          return body;
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      function setStatus(kind, message) {
+        $("status").className = kind;
+        $("status").textContent = message;
+      }
+
+      function expirePairing() {
+        sessionStorage.removeItem(tokenKey);
+        pointerActive = false;
+        $("pointerDot").hidden = true;
+        showPairError("Pairing expired", "This private presenter session has ended. Show the pairing QR in rayslides and scan it again.");
+      }
+
+      function setMode(next) {
+        if (next !== "notes" && next !== "pointer") return;
+        if (mode === "pointer" && next !== "pointer") releasePointer(false);
+        mode = next;
+        sessionStorage.setItem(tokenKey + ":mode", mode);
+        const notes = mode === "notes";
+        $("notesTab").setAttribute("aria-selected", String(notes));
+        $("pointerTab").setAttribute("aria-selected", String(!notes));
+        $("notesMode").hidden = !notes;
+        $("pointerMode").hidden = notes;
+      }
+
+      function updatePreview(next) {
+        const enabled = Boolean(next.pointer_enabled);
+        $("pointerSurface").classList.toggle("disabled", !enabled);
+        if (!enabled) {
+          $("previewStatus").hidden = false;
+          $("previewStatus").textContent = "Hide pairing setup and return to presentation to use Pointer.";
+          if (pointerActive) releasePointer(false);
+        } else if (!next.preview_ready) {
+          $("previewStatus").hidden = false;
+          $("previewStatus").textContent = "Preparing current slide…";
+        } else if (next.preview_revision !== loadedPreviewRevision) {
+          loadedPreviewRevision = next.preview_revision;
+          $("previewStatus").hidden = false;
+          $("previewStatus").textContent = "Updating current slide…";
+          $("slidePreview").src = apiUrl("/api/v1/presenter/preview") + "&revision=" + encodeURIComponent(next.preview_revision);
+        } else if ($("slidePreview").complete && $("slidePreview").naturalWidth > 0) {
+          $("previewStatus").hidden = true;
+        }
+      }
+
+      function applyState(next) {
+        if (!next || !Number.isSafeInteger(next.revision) || !Number.isSafeInteger(next.current_slide)) {
+          throw new Error("Incompatible presenter state");
+        }
+        if (!state || next.server_now_ms !== state.server_now_ms) {
+          elapsedBaseMs = Math.max(0, Number(next.elapsed_ms) || 0);
+          elapsedBaseAt = Date.now();
+        }
+        state = next;
+        $("slideCount").textContent = next.slide_count > 0 ? "Slide " + (next.current_slide + 1) + " / " + next.slide_count : "No slides";
+        const notes = typeof next.notes === "string" ? next.notes : "";
+        $("notes").textContent = notes || "No notes for this slide.";
+        $("notes").classList.toggle("empty", !notes);
+        $("nextNotes").textContent = next.next_notes || "No upcoming notes.";
+        $("previous").disabled = !next.can_previous || commandInFlight;
+        $("next").disabled = !next.can_next || commandInFlight;
+        updatePreview(next);
+        failures = 0;
+        setStatus("live", "Connected");
+      }
+
+      async function refresh() {
+        clearTimeout(pollTimer);
+        try {
+          applyState(await api("/api/v1/presenter/state"));
+        } catch (error) {
+          if (error && error.status === 401) {
+            expirePairing();
+            return;
+          }
+          failures += 1;
+          setStatus(failures > 2 ? "error" : "", failures > 2 ? "Reconnecting…" : "Connection interrupted");
+        }
+        pollTimer = setTimeout(refresh, document.hidden ? 1800 : 500);
+      }
+
+      async function requestWakeLock() {
+        if (!("wakeLock" in navigator) || wakeLock) return;
+        try { wakeLock = await navigator.wakeLock.request("screen"); }
+        catch (_) {}
+      }
+
+      async function sendCommand(command) {
+        if (commandInFlight) return;
+        if (pointerActive) releasePointer(false);
+        commandInFlight = true;
+        if (state) applyState(state);
+        await requestWakeLock();
+        commandSeq += 1;
+        sessionStorage.setItem(tokenKey + ":seq", String(commandSeq));
+        try {
+          await api("/api/v1/presenter/command", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command, seq: commandSeq })
+          });
+          if (navigator.vibrate) navigator.vibrate(18);
+          setStatus("live", "Command sent");
+          setTimeout(refresh, 30);
+        } catch (error) {
+          if (error && error.status === 401) expirePairing();
+          else setStatus("error", "Command not delivered");
+        } finally {
+          commandInFlight = false;
+          if (state) applyState(state);
+        }
+      }
+
+      function nextPointerSequence() {
+        pointerSeq += 1;
+        sessionStorage.setItem(tokenKey + ":pointer-seq", String(pointerSeq));
+        return pointerSeq;
+      }
+
+      function queuePointer(active, x, y) {
+        pendingPointer = { active, x, y, seq: nextPointerSequence() };
+        flushPointer();
+      }
+
+      async function flushPointer() {
+        if (pointerRequestInFlight || !pendingPointer) return;
+        const update = pendingPointer;
+        pendingPointer = null;
+        pointerRequestInFlight = true;
+        try {
+          await api("/api/v1/presenter/pointer", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(update)
+          });
+        } catch (error) {
+          if (error && error.status === 401) expirePairing();
+          else setStatus("error", "Pointer connection interrupted");
+        } finally {
+          pointerRequestInFlight = false;
+          if (pendingPointer) flushPointer();
+        }
+      }
+
+      function sendPointerMove(x, y) {
+        pointerPosition = { x, y };
+        $("pointerDot").style.left = (x * 100) + "%";
+        $("pointerDot").style.top = (y * 100) + "%";
+        $("pointerDot").hidden = false;
+        const now = performance.now();
+        const remaining = 32 - (now - lastPointerMoveAt);
+        if (remaining <= 0) {
+          clearTimeout(pointerMoveTimer);
+          pointerMoveTimer = 0;
+          pointerMovePending = null;
+          lastPointerMoveAt = now;
+          queuePointer(true, x, y);
+          return;
+        }
+        pointerMovePending = { x, y };
+        if (!pointerMoveTimer) pointerMoveTimer = setTimeout(() => {
+          pointerMoveTimer = 0;
+          const latest = pointerMovePending;
+          pointerMovePending = null;
+          if (!latest || !pointerActive) return;
+          lastPointerMoveAt = performance.now();
+          queuePointer(true, latest.x, latest.y);
+        }, remaining);
+      }
+
+      function pointerCoordinates(event) {
+        const rect = $("pointerSurface").getBoundingClientRect();
+        return {
+          x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+          y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
+        };
+      }
+
+      function releasePointer(useBeacon) {
+        if (!pointerActive && !(pendingPointer && pendingPointer.active)) return;
+        clearTimeout(pointerMoveTimer);
+        pointerMoveTimer = 0;
+        pointerMovePending = null;
+        pointerActive = false;
+        pointerId = null;
+        $("pointerDot").hidden = true;
+        const update = { active: false, x: pointerPosition.x, y: pointerPosition.y, seq: nextPointerSequence() };
+        if (useBeacon && navigator.sendBeacon) {
+          const body = new Blob([JSON.stringify(update)], { type: "application/json" });
+          navigator.sendBeacon(apiUrl("/api/v1/presenter/pointer"), body);
+        } else {
+          pendingPointer = update;
+          flushPointer();
+        }
+      }
+
+      $("previous").addEventListener("click", () => sendCommand("previous"));
+      $("next").addEventListener("click", () => sendCommand("next"));
+      $("notesTab").addEventListener("click", () => setMode("notes"));
+      $("pointerTab").addEventListener("click", () => setMode("pointer"));
+      $("slidePreview").addEventListener("load", () => {
+        if (state && state.pointer_enabled) $("previewStatus").hidden = true;
+      });
+      $("slidePreview").addEventListener("error", () => {
+        $("previewStatus").hidden = false;
+        $("previewStatus").textContent = "Current slide preview unavailable; reconnecting…";
+      });
+      $("pointerSurface").addEventListener("pointerdown", (event) => {
+        if (!state || !state.pointer_enabled || pointerId !== null) return;
+        event.preventDefault();
+        pointerId = event.pointerId;
+        pointerActive = true;
+        $("pointerSurface").setPointerCapture(event.pointerId);
+        const point = pointerCoordinates(event);
+        sendPointerMove(point.x, point.y);
+        if (navigator.vibrate) navigator.vibrate(10);
+      });
+      $("pointerSurface").addEventListener("pointermove", (event) => {
+        if (!pointerActive || event.pointerId !== pointerId) return;
+        event.preventDefault();
+        const point = pointerCoordinates(event);
+        sendPointerMove(point.x, point.y);
+      });
+      for (const eventName of ["pointerup", "pointercancel", "lostpointercapture"]) {
+        $("pointerSurface").addEventListener(eventName, (event) => {
+          if (!pointerActive || event.pointerId !== pointerId) return;
+          event.preventDefault();
+          releasePointer(false);
+        });
+      }
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) releasePointer(true);
+        else { requestWakeLock(); refresh(); }
+      });
+      window.addEventListener("pagehide", () => releasePointer(true));
+      setInterval(() => {
+        if (pointerActive) queuePointer(true, pointerPosition.x, pointerPosition.y);
+      }, 300);
+      setInterval(() => {
+        if (!state) return;
+        const elapsed = elapsedBaseMs + Math.max(0, Date.now() - elapsedBaseAt);
+        const seconds = Math.floor(elapsed / 1000);
+        $("timer").textContent = String(Math.floor(seconds / 60)).padStart(2, "0") + ":" + String(seconds % 60).padStart(2, "0");
+      }, 250);
+      requestWakeLock();
+      setMode(mode);
+      refresh();
+    })();
+  </script>
+</body>
+</html>

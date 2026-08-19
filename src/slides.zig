@@ -38,6 +38,10 @@ pub const Slide = struct {
     allocator: std.mem.Allocator,
     pos_in_editor: usize = 0,
     line_in_editor: usize = 0,
+    /// Private presenter text attached to this logical slide. Notes are never
+    /// renderer input and therefore cannot affect presentation/export pixels.
+    speaker_notes: ?[]const u8 = null,
+    speaker_notes_source: ?SourceRef = null,
     items: ?std.ArrayList(SlideItem) = null,
     fontsize: i32 = 16,
     text_color: rl.Color = .ray_white,
@@ -80,6 +84,9 @@ pub const Slide = struct {
 
     pub fn fromSlide(orig: *Slide, a: std.mem.Allocator) !*Slide {
         var n = try new(a);
+        // Speaker notes are deliberately instance-local. A @pushslide may
+        // reuse visual structure, but its notes must not silently leak into
+        // every @popslide instance.
         n.fontsize = orig.fontsize;
         n.text_color = orig.text_color;
         n.bullet_color = orig.bullet_color;
@@ -112,6 +119,8 @@ pub const Slide = struct {
         return self.morph_states.items.len - 1;
     }
 };
+
+pub const max_speaker_notes_bytes: usize = 8192;
 
 pub const SlideItemKind = enum {
     background,

@@ -79,6 +79,25 @@ const ReusableGroupBuilder = struct {
     valid: bool = true,
 };
 
+const SpeakerNotesBuilder = struct {
+    text: std.ArrayList(u8) = .empty,
+    source: slides.SourceRef,
+    line_count: usize = 0,
+    duplicate: bool = false,
+    invalid: bool = false,
+
+    fn appendLine(self: *SpeakerNotesBuilder, allocator: std.mem.Allocator, line: []const u8) !void {
+        const separator: usize = if (self.line_count > 0) 1 else 0;
+        if (line.len + separator > slides.max_speaker_notes_bytes -| self.text.items.len) {
+            self.invalid = true;
+            return error.SpeakerNotesTooLong;
+        }
+        if (separator != 0) try self.text.append(allocator, '\n');
+        try self.text.appendSlice(allocator, line);
+        self.line_count += 1;
+    }
+};
+
 pub const ParserContext = struct {
     allocator: std.mem.Allocator,
     input: [:0]const u8 = undefined,
@@ -487,6 +506,7 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
     var it = std.mem.splitScalar(u8, context.input[start..], '\n');
 
     var parsing_item_context = slides.ItemContext{};
+    var speaker_notes_builder: ?SpeakerNotesBuilder = null;
 
     while (it.next()) |line_untrimmed| {
         {
@@ -494,6 +514,27 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
             log.info("the line {d} is : len={d} {s}", .{ context.parsed_line_number, line_unprocessed.len, line_unprocessed });
             context.parsed_line_number += 1;
             defer context.parsed_line_offset += line_untrimmed.len + 1;
+
+            // Notes are an explicit block, so directive-looking prose remains
+            // private text instead of mutating the slide. Empty lines remain
+            // meaningful; only an exact, unindented @endnotes line closes it.
+            if (speaker_notes_builder) |*builder| {
+                if (std.mem.eql(u8, line_unprocessed, "@endnotes")) {
+                    if (!builder.invalid and !builder.duplicate) {
+                        context.current_slide.speaker_notes = try builder.text.toOwnedSlice(context.allocator);
+                        context.current_slide.speaker_notes_source = builder.source;
+                    } else {
+                        builder.text.deinit(context.allocator);
+                    }
+                    speaker_notes_builder = null;
+                    continue;
+                }
+                if (builder.invalid or builder.duplicate) continue;
+                builder.appendLine(context.allocator, line_unprocessed) catch |err| {
+                    reportErrorInContext(err, context, "speaker notes exceed the 8192-byte limit");
+                };
+                continue;
+            }
 
             if (line_unprocessed.len == 0) {
                 log.debug("line {d} len == 0!", .{context.parsed_line_number});
@@ -534,6 +575,35 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
             }
 
             const raw_directive = directiveWord(line_unprocessed);
+            if (std.mem.eql(u8, raw_directive, "@notes")) {
+                commitParsingContext(&parsing_item_context, context) catch |err| {
+                    reportErrorInContext(err, context, null);
+                };
+                parsing_item_context = .{};
+                const has_attributes = std.mem.trim(u8, line_unprocessed[raw_directive.len..], " \t").len != 0;
+                if (has_attributes) {
+                    reportErrorInContext(ParserError.Syntax, context, "@notes accepts no attributes");
+                }
+                const duplicate = context.current_slide.speaker_notes != null;
+                if (duplicate) {
+                    reportErrorInContext(ParserError.Syntax, context, "a slide can contain only one @notes block");
+                }
+                speaker_notes_builder = .{
+                    .source = .{
+                        .scope = .direct,
+                        .line_number = context.parsed_line_number,
+                        .line_offset = context.parsed_line_offset,
+                        .patchable = true,
+                    },
+                    .duplicate = duplicate,
+                    .invalid = has_attributes,
+                };
+                continue;
+            }
+            if (std.mem.eql(u8, raw_directive, "@endnotes")) {
+                reportErrorInContext(ParserError.Syntax, context, "@endnotes without an open @notes block");
+                continue;
+            }
             if (std.mem.eql(u8, raw_directive, "@pushgroup")) {
                 commitParsingContext(&parsing_item_context, context) catch |err| {
                     reportErrorInContext(err, context, null);
@@ -703,6 +773,15 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
         reportErrorInParsingContext(ParserError.Syntax, &source, context, "unclosed @pushgroup definition");
         group.members.deinit(context.allocator);
         context.active_group = null;
+    }
+    if (speaker_notes_builder) |*builder| {
+        const source = slides.ItemContext{
+            .line_number = builder.source.line_number,
+            .line_offset = builder.source.line_offset,
+        };
+        reportErrorInParsingContext(ParserError.Syntax, &source, context, "unclosed @notes block");
+        builder.text.deinit(context.allocator);
+        speaker_notes_builder = null;
     }
     // commit last slide
     commitParsingContext(&parsing_item_context, context) catch |err| {
@@ -1720,6 +1799,9 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
 
     if (std.mem.eql(u8, parsing_item_context.directive, "@pushslide")) {
         context.template_instance_base_open = false;
+        if (context.current_slide.speaker_notes != null) {
+            reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@notes is slide-instance content and cannot be captured by @pushslide");
+        }
         context.current_slide.applyContext(parsing_item_context);
         if (context.current_slide.morph_states.items.len > 0) {
             try validateCurrentMorphIds(context, parsing_item_context);
@@ -1982,6 +2064,56 @@ fn finalizeCrowdSpec(item_context: *slides.ItemContext, parser_context: *ParserC
     }
     crowd.choices = try choices.toOwnedSlice(parser_context.allocator);
     item_context.crowd = crowd;
+}
+
+test "speaker notes are private slide-level multiline content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        "@slide\n" ++
+        "@box text=Visible\n" ++
+        "@notes\n" ++
+        "Open with the customer story.\n" ++
+        "\n" ++
+        "# This is a note, not a source comment.\n" ++
+        "@slide is source to mention, not a directive here.\n" ++
+        "@endnotes\n" ++
+        "@slide\n" ++
+        "@box text=Second\n";
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+    try std.testing.expectEqualStrings(
+        "Open with the customer story.\n\n# This is a note, not a source comment.\n@slide is source to mention, not a directive here.",
+        slideshow.slides.items[0].speaker_notes.?,
+    );
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@notes").?, slideshow.slides.items[0].speaker_notes_source.?.line_offset);
+    try std.testing.expect(slideshow.slides.items[1].speaker_notes == null);
+    try std.testing.expectEqual(@as(usize, 1), slideshow.slides.items[0].items.?.items.len);
+}
+
+test "malformed and duplicate speaker-note blocks report parser errors" {
+    const cases = [_][]const u8{
+        "@slide\n@endnotes\n",
+        "@slide\n@notes extra\nText\n@endnotes\n",
+        "@slide\n@notes\nUnclosed\n",
+        "@slide\n@notes\nOne\n@endnotes\n@notes\nTwo\n@endnotes\n",
+        "@slide\n@notes\nTemplate note\n@endnotes\n@pushslide template\n",
+    };
+    for (cases) |input| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const slideshow = try slides.SlideShow.new(allocator);
+        const context = try constructSlidesFromBuf(input, slideshow, allocator);
+        defer context.deinit();
+        try std.testing.expect(context.parser_errors.items.len > 0);
+    }
 }
 
 test "animation annotations and slide transitions are parsed" {

@@ -819,12 +819,14 @@ test "expired participant slots are recycled without retaining votes" {
         _ = try store.join(id, "", 0);
     }
     _ = try store.vote("browser-0000", "recycle", 0, 1, 1);
-    _ = try store.join("browser-newcomer", "", active_window_ms + 1);
+    // The vote heartbeat happened at t=1, so advance beyond that participant's
+    // inclusive active window before asserting that its slot is recyclable.
+    _ = try store.join("browser-newcomer", "", active_window_ms + 2);
 
     try std.testing.expectEqual(@as(u16, max_participants), store.participant_count);
     try std.testing.expect(store.findParticipant("browser-0000") == null);
     try std.testing.expect(store.findParticipant("browser-newcomer") != null);
-    try std.testing.expectEqual(@as(u32, 0), store.snapshot(active_window_ms + 1).poll.?.total);
+    try std.testing.expectEqual(@as(u32, 0), store.snapshot(active_window_ms + 2).poll.?.total);
 }
 
 test "reconfigure preserves unchanged poll votes and rejects duplicate ids" {

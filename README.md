@@ -48,6 +48,13 @@ may require one right-click **Open** before ordinary double-click launches are
 allowed. See the [macOS app notes](docs/MACOS_APP.md) for file opening and
 recovery locations.
 
+Rayslides now includes a phone-first Presenter Companion: source-native private
+speaker notes, explicit QR pairing, synchronized current and next-slide notes,
+animation-aware Previous/Next controls, and a software pointer over a live
+preview of the rendered slide. The accepted workflow and remaining guardrails
+are recorded in the
+[Presenter Companion roadmap](PRESENTER_COMPANION_ROADMAP.md).
+
 Missing but maybe coming soon:
 
 - SDF-based font scaling
@@ -87,6 +94,8 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>O</kbd> | Open or lock the active Crowdplay poll |
 | <kbd>V</kbd> | Reveal or hide Crowdplay results |
 | <kbd>R</kbd> | Reset votes in the active Crowdplay poll |
+| <kbd>P</kbd> | Show or hide private Presenter Companion pairing |
+| <kbd>Shift-P</kbd> | Unpair the phone and stop the Presenter server |
 | <kbd>E</kbd> | Enter or leave Studio visual editing mode |
 | <kbd>F3</kbd> | Toggle frame/rebuild diagnostics |
 
@@ -522,6 +531,64 @@ The shadow uses the same font, wrapping, markdown spans, reveal state, opacity,
 and motion as its text. It is deliberately a crisp duplicate-text shadow, not
 a blurred raster effect. As with other box attributes, place shadow attributes
 before `text=` on an inline `@box` or `@pop` directive.
+
+## Presenter Companion: private notes and phone control
+
+Speaker notes are ordinary per-slide `.sld` source. They do not become slide
+items and are deliberately excluded from renderer fingerprints, screenshots,
+PDF export, and Crowdplay state:
+
+```text
+@slide
+@box text=The projected slide remains public
+@notes
+Open with the customer story.
+Pause here, then ask the room a question.
+@endnotes
+```
+
+Only an unindented `@endnotes` line terminates the block (trailing whitespace
+is ignored), so notes may contain `@handles`, example directives, Markdown, and
+code. In Studio, open **Commands**, then choose **Edit speaker notes** for the
+current slide. The multiline edit is transactional and participates normally
+in save, copy, undo, redo, reload, and recovery.
+
+To present with a phone:
+
+1. If desired, enable the phone's hotspot and join it from the laptop first.
+2. Press <kbd>P</kbd>, or choose **Pair presenter phone** in Studio.
+3. Scan the private QR code. The embedded companion needs no installation,
+   account, Internet access, or externally hosted assets.
+4. Press <kbd>P</kbd> again to hide setup, enable display mirroring, and put
+   rayslides fullscreen. The phone shows current/next notes, talk time,
+   connection status, and large Previous/Next controls.
+5. Switch between **Notes** and **Pointer** on the phone. Pointer shows a compact
+   preview of the current rendered slide; touch and hold anywhere on it, drag
+   the software laser, and lift to hide it. Rotate the phone to landscape when
+   you want a larger pointing surface.
+6. Press <kbd>Shift-P</kbd> to invalidate the pairing capability and stop the
+   Presenter server. Simply hiding setup leaves the paired phone connected.
+
+Phone navigation enters the same main-thread playback functions as keyboard,
+mouse, and clicker input, preserving reveal animations, reversal, transitions,
+and auto-reveal behavior. A lost phone or failed network never prevents local
+presentation control. Pointer motion is normalized to the fitted slide rather
+than the window, coalesced to the newest value, and expires after 900 ms without
+a heartbeat. Leaving Pointer, backgrounding the browser, or lifting the finger
+also sends an immediate release. The laptop's local laser/drawing tool takes
+precedence and temporarily pauses the phone pointer without disabling phone
+navigation.
+
+Presenter Companion and Crowdplay intentionally run as two independent local
+servers. Crowdplay retains port `7331` and its audience-only API; Presenter is
+started only by explicit pairing on port `7332`, with a random capability kept
+in the QR URL fragment. Notes, rendered previews, navigation, and pointer
+updates exist only on the authenticated Presenter server and are absent from
+Crowdplay. Use `--presenter-host=HOST` to advertise a specific LAN
+address and `--presenter-port=PORT` to change its port. Windows requires an
+explicit LAN IP via `--presenter-host`; after changing networks, unpair and pair
+again. Local HTTP and an unguessable capability prevent accidental audience
+access but do not defend against a malicious observer on an untrusted network.
 
 ## Crowdplay: live audience participation
 

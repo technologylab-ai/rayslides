@@ -7,6 +7,7 @@ pub const Kind = enum {
     text,
     shared_text,
     bullets,
+    speaker_notes,
     image_path,
     reusable_name,
     coordinate,
@@ -132,7 +133,8 @@ pub const Prompt = struct {
 
         if (rl.isKeyPressed(.backspace) or rl.isKeyPressedRepeat(.backspace)) self.removeLastCodepoint();
 
-        const multiline = self.kind == .text or self.kind == .shared_text or self.kind == .bullets;
+        const multiline = self.kind == .text or self.kind == .shared_text or
+            self.kind == .bullets or self.kind == .speaker_notes;
         if (rl.isKeyPressed(.enter)) {
             const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
             if (multiline and shift) {
@@ -271,6 +273,7 @@ fn promptTitle(kind: Kind) [:0]const u8 {
         .text => "Edit text",
         .shared_text => "Edit shared template text",
         .bullets => "Edit bullet list",
+        .speaker_notes => "Edit speaker notes",
         .image_path => "Choose image",
         .reusable_name => "Name reusable or template",
         .coordinate => "Set coordinate",
@@ -287,6 +290,7 @@ fn promptHint(kind: Kind) [:0]const u8 {
         .text => "Enter commits · Shift-Enter adds a line · Cmd/Ctrl-V pastes · Esc cancels",
         .shared_text => "This changes every uncustomized instance · Enter commits · Esc cancels",
         .bullets => "One item per line; '-' is added when needed · Shift-Enter adds a line",
+        .speaker_notes => "Private companion text · Enter commits · Shift-Enter adds a line · Esc cancels",
         .image_path => "Path relative to the slide file · Enter commits · Esc cancels",
         .reusable_name => "Use letters, numbers, '_' or '-' · Enter commits · Esc cancels",
         .coordinate => "Logical slide pixels · decimals and negative values are allowed · Enter commits",

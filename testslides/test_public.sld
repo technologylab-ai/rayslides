@@ -80,6 +80,10 @@
 
 # -------------------------------------------------------------
 @popslide intro
+@notes
+Welcome everyone. This deck exercises transitions, staged reveals, and semantic morphs.
+Use the phone to advance, then switch to Pointer to call out the Rayslides logo.
+@endnotes
 @pop intro_title text=!Slideshows in <$ZIGCOLOR$>ZIG</>!
 @pop intro_subtitle text=_**Easy, text-based slideshows for Hackers, now with**_
 @pop intro_authors text=_@renerocksai_
@@ -92,6 +96,10 @@
 
 # -------------------------------------------------------------
 @popslide content
+@notes
+Set the premise: source-native slides, live editing, and presenter tools in one executable.
+Advance slowly—the overview bullets are revealed one at a time.
+@endnotes
 @pop slide_title text=~~**Overview**~~
 @anim(fade) by=bullet duration=0.25
 @pop bigbox bullet_symbol=- color=#202020FF
@@ -115,6 +123,10 @@ _
 
 # -------------------------------------------------------------
 @popslide content
+@notes
+Demonstrate Markdown formatting and nested bullets.
+The right column animates automatically after each reveal; watch the phone preview keep up.
+@endnotes
 @pop slide_title text=~~**Formatting Text**~~
 
 @pop  sources_info
@@ -156,6 +168,10 @@ _
 
 # -------------------------------------------------------------
 @popslide content
+@notes
+This image enters with a slide-up animation.
+Use Pointer mode to indicate details in the editor screenshot.
+@endnotes
 @pop slide_title text=**Easier than Bullets**
 
 @anim(slide-up) duration=0.4
@@ -177,6 +193,10 @@ _
 
 # -------------------------------------------------------------
 @popslide content
+@notes
+Explain how text, images, and translucent color boxes compose freely.
+This is also a useful high-contrast pointer and preview test.
+@endnotes
 @pop slide_title text=~~**Easier than Bullets**~~
 
 @box x=1398 y=148 w=404 h=204 color=#606060FF
@@ -207,6 +227,10 @@ _
 # -------------------------------------------------------------
 # The three animation layers, shown with the syntax that enables each one.
 @popslide content transition=slide-left duration=0.45
+@notes
+Three animation layers: reveal content, transition whole slides, then morph named objects.
+Advance through each bullet before moving on.
+@endnotes
 
 @pop slide_title text=~~**Animation without choreography**~~
 @box x=145 y=145 w=1550 h=70 fontsize=35 color=#606060ff text=Choose what advances. Rayslides handles frames, timing, and reverse playback.
@@ -237,6 +261,10 @@ _
 # -------------------------------------------------------------
 # Semantic morphing: first teach the tiny mental model.
 @popslide content transition=fade duration=0.4
+@notes
+Introduce the morph mental model: identify an object once, then describe its destination.
+The lines on the right reveal automatically.
+@endnotes
 
 @pop slide_title text=~~**Semantic morphs: the entire idea**~~
 
@@ -268,6 +296,10 @@ _
 # Now let the audience watch that model operate: one logical slide, four
 # reversible states. One click starts it; the later states schedule themselves.
 @popslide content transition=fade duration=0.4
+@notes
+Now let the semantic morph sequence play. The phone preview should track every animated state.
+Try moving the phone laser across the changing objects while the animation runs.
+@endnotes
 
 # These flowchart elements start hidden, but already have stable identities
 # and sit behind the labels they will receive later.
@@ -365,6 +397,10 @@ _
 
 # -------------------------------------------------------------
 @popslide thankyou
+@notes
+Close on the source-native workflow and invite questions.
+This final cue also verifies that private notes never appear on the projected slide.
+@endnotes
 @pop thankyou_title color=#7A7A7AFF text=!Slideshows in ZIG!
 @pop thankyou_subtitle color=#202020FF text=_Slideshows for Hackers_
 @pop thankyou_authors text=_@renerocksai_

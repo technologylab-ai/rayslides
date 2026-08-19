@@ -14,6 +14,8 @@ const slides = @import("slides.zig");
 const animation = @import("animation.zig");
 const playback = @import("playback.zig");
 const crowdplay = @import("crowdplay.zig");
+const presenter = @import("presenter.zig");
+const qrcode = @import("qrcode.zig");
 const source_editor = @import("source_editor.zig");
 const studio = @import("studio.zig");
 const studio_catalog = @import("studio_catalog.zig");
@@ -37,6 +39,8 @@ const cli_help =
     \\  --no-crowd                       Disable the Crowdplay server
     \\  --crowd-host=HOST                Bind Crowdplay to HOST
     \\  --crowd-port=PORT                Bind Crowdplay to PORT (default 7331)
+    \\  --presenter-host=HOST            Address advertised by Presenter Companion
+    \\  --presenter-port=PORT            Bind Presenter Companion to PORT (default 7332)
     \\  -h, --help                       Show this help and exit
     \\  -v, --version                    Show the version and exit
     \\
@@ -104,6 +108,7 @@ const log = std.log.scoped(.main);
 
 test {
     std.testing.refAllDecls(parser);
+    std.testing.refAllDecls(presenter);
     std.testing.refAllDecls(renderer);
     std.testing.refAllDecls(slides);
     std.testing.refAllDecls(source_editor);
@@ -119,6 +124,12 @@ const CrowdOptions = struct {
     host: []const u8 = "localhost",
     host_explicit: bool = false,
     port: u16 = 7331,
+};
+
+const PresenterOptions = struct {
+    host: []const u8 = "localhost",
+    host_explicit: bool = false,
+    port: u16 = presenter.default_port,
 };
 
 const WindowDimensions = struct {
@@ -536,6 +547,119 @@ fn crowdSpecForSlide(slideshow: *const SlideShow, slide_number: i32) ?slides.Cro
     return null;
 }
 
+fn ensurePresenterCompanionRunning(runtime: *presenter.Runtime, options: PresenterOptions) bool {
+    if (runtime.isRunning()) return true;
+    if (comptime builtin.os.tag == .windows) {
+        if (!options.host_explicit) {
+            log.err("Presenter Companion on Windows requires --presenter-host=<LAN-IP>", .{});
+            return false;
+        }
+    }
+    const port = runtime.start(options.port, options.host) catch |err| {
+        log.err("Presenter Companion could not start: {any}", .{err});
+        return false;
+    };
+    // Never log pairing_url: its fragment is the private presenter capability.
+    log.info("Presenter Companion listening on port {d}; setup address: {s}", .{ port, runtime.base_url.slice() });
+    return true;
+}
+
+fn notesForSlide(slideshow: *const SlideShow, slide_number: i32) []const u8 {
+    if (slide_number < 0 or slide_number >= slideshow.slides.items.len) return "";
+    return slideshow.slides.items[@intCast(slide_number)].speaker_notes orelse "";
+}
+
+fn publishPresenterState(runtime: *presenter.Runtime, controls_enabled: bool, pointer_enabled: bool) void {
+    if (!runtime.isRunning()) return;
+    const slide_count = G.slideshow.slides.items.len;
+    const valid_slide = G.current_slide >= 0 and G.current_slide < slide_count;
+    const current_slide: usize = if (valid_slide) @intCast(G.current_slide) else 0;
+    const step_count = if (valid_slide) G.slide_renderer.stepCount(G.current_slide) else 0;
+    const has_previous = valid_slide and (G.playback.visible_step > 0 or G.current_slide > 0);
+    const has_next = valid_slide and
+        (G.playback.visible_step < step_count or current_slide + 1 < slide_count);
+    const reversing = G.playback.active_step != null and G.playback.active_reverse;
+    const advancing = G.playback.active_step != null and !G.playback.active_reverse;
+    _ = runtime.publish(.{
+        .current_slide = @intCast(@min(current_slide, std.math.maxInt(u32))),
+        .slide_count = @intCast(@min(slide_count, std.math.maxInt(u32))),
+        .visible_step = @intCast(@min(G.playback.visible_step, std.math.maxInt(u32))),
+        .step_count = @intCast(@min(step_count, std.math.maxInt(u32))),
+        .notes = notesForSlide(G.slideshow, G.current_slide),
+        .next_notes = notesForSlide(G.slideshow, G.current_slide + 1),
+        .can_previous = controls_enabled and has_previous and !reversing,
+        .can_next = controls_enabled and has_next and !advancing,
+        .pointer_enabled = pointer_enabled,
+    }) catch |err| log.err("Presenter state update failed: {any}", .{err});
+}
+
+fn drawCenteredPresenterText(text: [:0]const u8, y: i32, font_size: i32, color: rl.Color, width: i32) void {
+    const text_width = rl.measureText(text, font_size);
+    rl.drawText(text, @divFloor(width - text_width, 2), y, font_size, color);
+}
+
+fn drawPresenterPairingOverlay(
+    code: *qrcode.Code,
+    runtime: *presenter.Runtime,
+    connected: bool,
+    screen_width: i32,
+    screen_height: i32,
+) void {
+    rl.drawRectangleRec(.{
+        .x = 0,
+        .y = 0,
+        .width = @floatFromInt(screen_width),
+        .height = @floatFromInt(screen_height),
+    }, .{ .r = 7, .g = 11, .b = 24, .a = 255 });
+    drawCenteredPresenterText("PAIR PRESENTER PHONE", 24, 28, .{ .r = 97, .g = 218, .b = 251, .a = 255 }, screen_width);
+    drawCenteredPresenterText("Scan this private code before enabling screen mirroring", 60, 18, .{ .r = 185, .g = 202, .b = 220, .a = 255 }, screen_width);
+
+    const qr_target = @max(@as(i32, 120), @min(@as(i32, 340), @min(screen_width - 80, screen_height - 190)));
+    if (code.ensure(runtime.pairing_url.slice())) {
+        const matrix_size = code.size();
+        const quiet_modules: i32 = 4;
+        const cell = @max(@as(i32, 1), @divFloor(qr_target, matrix_size + quiet_modules * 2));
+        const rendered_side = (matrix_size + quiet_modules * 2) * cell;
+        const left = @divFloor(screen_width - rendered_side, 2);
+        const top: i32 = 88;
+        rl.drawRectangleRec(.{
+            .x = @floatFromInt(left),
+            .y = @floatFromInt(top),
+            .width = @floatFromInt(rendered_side),
+            .height = @floatFromInt(rendered_side),
+        }, .white);
+        var y: i32 = 0;
+        while (y < matrix_size) : (y += 1) {
+            var x: i32 = 0;
+            while (x < matrix_size) : (x += 1) {
+                if (!code.module(x, y)) continue;
+                rl.drawRectangleRec(.{
+                    .x = @floatFromInt(left + (x + quiet_modules) * cell),
+                    .y = @floatFromInt(top + (y + quiet_modules) * cell),
+                    .width = @floatFromInt(cell),
+                    .height = @floatFromInt(cell),
+                }, .{ .r = 5, .g = 9, .b = 18, .a = 255 });
+            }
+        }
+
+        var address_buffer: [320:0]u8 = @splat(0);
+        const address = std.fmt.bufPrintZ(&address_buffer, "Local address: {s}", .{runtime.base_url.slice()}) catch "Local address is too long";
+        const address_y = @min(screen_height - 74, top + rendered_side + 12);
+        drawCenteredPresenterText(address, address_y, 18, .{ .r = 223, .g = 233, .b = 244, .a = 255 }, screen_width);
+    } else {
+        drawCenteredPresenterText("The pairing address is too long to encode as a QR code.", 160, 20, .{ .r = 255, .g = 155, .b = 174, .a = 255 }, screen_width);
+    }
+
+    drawCenteredPresenterText(
+        if (connected) "PHONE CONNECTED" else "WAITING FOR PHONE",
+        screen_height - 48,
+        18,
+        if (connected) .{ .r = 130, .g = 230, .b = 174, .a = 255 } else .{ .r = 255, .g = 181, .b = 71, .a = 255 },
+        screen_width,
+    );
+    drawCenteredPresenterText("P: hide setup   •   Shift-P: unpair and stop", screen_height - 25, 15, .{ .r = 139, .g = 158, .b = 179, .a = 255 }, screen_width);
+}
+
 const ExportController = struct {
     gpa: std.mem.Allocator,
     running: bool,
@@ -751,6 +875,185 @@ const LaserPointer = struct {
         self.size = self.sizes[self.size_index];
     }
 };
+
+const PresenterPreviewKey = struct {
+    slide_number: i32,
+    visible_step: usize,
+    active_step: ?usize,
+    previous_slide: ?i32,
+    source_revision: usize,
+    crowd_revision: u64,
+    previous_crowd_revision: u64,
+};
+
+const presenter_preview_width: i32 = 640;
+const presenter_preview_height: i32 = 360;
+const presenter_preview_retry_interval_seconds: f64 = 1.0;
+
+fn presenterPreviewCaptureDue(
+    last_key: ?PresenterPreviewKey,
+    last_capture_at: f64,
+    published: bool,
+    key: PresenterPreviewKey,
+    animating: bool,
+    now: f64,
+) bool {
+    // Capturing performs a synchronous GPU readback and PNG encode. Waiting
+    // for the settled frame keeps that work entirely outside animations.
+    if (animating) return false;
+    const previous = last_key orelse return true;
+    if (!std.meta.eql(previous, key)) return true;
+    if (published) return false;
+    return now - last_capture_at >= presenter_preview_retry_interval_seconds;
+}
+
+fn presenterCrowdRevision(snapshot: ?crowdplay.Snapshot) u64 {
+    return if (snapshot) |value| value.revision else 0;
+}
+
+const PresenterPreviewController = struct {
+    target: rl.RenderTexture,
+    last_key: ?PresenterPreviewKey = null,
+    last_capture_at: f64 = -std.math.inf(f64),
+    published: bool = false,
+
+    fn init() !PresenterPreviewController {
+        return .{ .target = try rl.RenderTexture.init(presenter_preview_width, presenter_preview_height) };
+    }
+
+    fn deinit(self: *PresenterPreviewController) void {
+        self.target.unload();
+    }
+
+    fn invalidate(self: *PresenterPreviewController) void {
+        self.last_key = null;
+        self.last_capture_at = -std.math.inf(f64);
+        self.published = false;
+    }
+
+    fn capture(
+        self: *PresenterPreviewController,
+        runtime: *presenter.Runtime,
+        slide_renderer: *renderer.SlideshowRenderer,
+        slide_number: i32,
+        reveal_state: renderer.RevealState,
+        transition_state: renderer.TransitionState,
+        internal_render_size: rl.Vector2,
+        crowd_snapshot: ?crowdplay.Snapshot,
+        previous_crowd_snapshot: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
+        source_revision: usize,
+        now: f64,
+    ) !void {
+        if (!runtime.isRunning()) {
+            self.invalidate();
+            return;
+        }
+
+        const key: PresenterPreviewKey = .{
+            .slide_number = slide_number,
+            .visible_step = reveal_state.visible_through,
+            .active_step = reveal_state.active_step,
+            .previous_slide = transition_state.previous_slide,
+            .source_revision = source_revision,
+            .crowd_revision = presenterCrowdRevision(crowd_snapshot),
+            .previous_crowd_revision = presenterCrowdRevision(previous_crowd_snapshot),
+        };
+        const animating = reveal_state.active_step != null or transition_state.previous_slide != null;
+        if (!presenterPreviewCaptureDue(self.last_key, self.last_capture_at, self.published, key, animating, now)) return;
+
+        self.last_key = key;
+        self.last_capture_at = now;
+        self.published = false;
+
+        {
+            self.target.begin();
+            defer self.target.end();
+            rl.clearBackground(.black);
+            try slide_renderer.render(
+                slide_number,
+                reveal_state,
+                transition_state,
+                .zero(),
+                .{ .x = @floatFromInt(presenter_preview_width), .y = @floatFromInt(presenter_preview_height) },
+                internal_render_size,
+                crowd_snapshot,
+                previous_crowd_snapshot,
+                crowd_url,
+            );
+        }
+
+        var image = try rl.loadImageFromTexture(self.target.texture);
+        defer image.unload();
+        image.flipVertical();
+        image.setFormat(.uncompressed_r8g8b8);
+        // raylib's in-memory exporter only implements PNG even when its
+        // file-based JPEG codec is enabled in the build.
+        const encoded = try rl.exportImageToMemory(image, presenter.preview_file_type);
+        defer rl.memFree(@ptrCast(encoded.ptr));
+        if (encoded.len > presenter.max_preview_bytes) return error.PresenterPreviewTooLarge;
+        try runtime.publishPreview(encoded);
+        self.published = true;
+    }
+};
+
+fn presenterPointerPosition(sample: presenter.PointerSample, slide_top_left: rl.Vector2, slide_size: rl.Vector2) rl.Vector2 {
+    return .{
+        .x = slide_top_left.x + std.math.clamp(sample.x, 0, 1) * slide_size.x,
+        .y = slide_top_left.y + std.math.clamp(sample.y, 0, 1) * slide_size.y,
+    };
+}
+
+test "presenter preview schedule waits for settled frames and retries failures" {
+    const first: PresenterPreviewKey = .{
+        .slide_number = 2,
+        .visible_step = 1,
+        .active_step = null,
+        .previous_slide = null,
+        .source_revision = 4,
+        .crowd_revision = 0,
+        .previous_crowd_revision = 0,
+    };
+    try std.testing.expect(presenterPreviewCaptureDue(null, 0, false, first, false, 10));
+    try std.testing.expect(!presenterPreviewCaptureDue(first, 10, true, first, false, 20));
+
+    var changed = first;
+    changed.visible_step = 2;
+    changed.active_step = 2;
+    try std.testing.expect(!presenterPreviewCaptureDue(first, 10, true, changed, true, 10.01));
+    try std.testing.expect(!presenterPreviewCaptureDue(null, 0, false, changed, true, 10.22));
+
+    changed.active_step = null;
+    try std.testing.expect(presenterPreviewCaptureDue(first, 10, true, changed, false, 11));
+    try std.testing.expect(!presenterPreviewCaptureDue(changed, 11, true, changed, false, 20));
+    try std.testing.expect(!presenterPreviewCaptureDue(changed, 11, false, changed, false, 11.9));
+    try std.testing.expect(presenterPreviewCaptureDue(changed, 11, false, changed, false, 12.01));
+
+    var transitioning = changed;
+    transitioning.previous_slide = 1;
+    try std.testing.expect(!presenterPreviewCaptureDue(changed, 12.01, true, transitioning, true, 13));
+}
+
+test "presenter preview format supports raylib in-memory export" {
+    var image = rl.genImageColor(8, 8, .black);
+    defer image.unload();
+    const encoded = try rl.exportImageToMemory(image, presenter.preview_file_type);
+    defer rl.memFree(@ptrCast(encoded.ptr));
+
+    const png_signature = [_]u8{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    try std.testing.expect(encoded.len > png_signature.len);
+    try std.testing.expectEqualSlices(u8, &png_signature, encoded[0..png_signature.len]);
+}
+
+test "presenter pointer maps normalized phone coordinates into the fitted slide" {
+    const position = presenterPointerPosition(
+        .{ .active = true, .x = 0.25, .y = 0.75, .sequence = 3 },
+        .{ .x = 100, .y = 50 },
+        .{ .x = 800, .y = 450 },
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 300), position.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 387.5), position.y, 0.001);
+}
 
 const Banner = struct {
     logo_texture: ?rl.Texture = null,
@@ -1329,6 +1632,9 @@ pub fn main(init: std.process.Init) anyerror!void {
     var crowd_options = CrowdOptions{};
     var crowd_host_buffer: [256]u8 = undefined;
     crowd_options.host = defaultCrowdHost(&crowd_host_buffer);
+    var presenter_options = PresenterOptions{};
+    var presenter_host_buffer: [256]u8 = undefined;
+    presenter_options.host = defaultCrowdHost(&presenter_host_buffer);
     var launch_studio = false;
     var suppress_startup_banner = false;
     var diagnostics_enabled = false;
@@ -1381,6 +1687,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                 crowd_options.port = std.fmt.parseInt(u16, arg["--crowd-port=".len..], 10) catch std.process.fatal("Invalid --crowd-port value", .{});
             } else if (!positional_only and std.mem.eql(u8, arg, "--no-crowd")) {
                 crowd_options.enabled = false;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--presenter-host=")) {
+                presenter_options.host = try std.fmt.bufPrint(&presenter_host_buffer, "{s}", .{arg["--presenter-host=".len..]});
+                presenter_options.host_explicit = true;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--presenter-port=")) {
+                presenter_options.port = std.fmt.parseInt(u16, arg["--presenter-port=".len..], 10) catch std.process.fatal("Invalid --presenter-port value", .{});
             } else if (!positional_only and std.mem.eql(u8, arg, "--studio")) {
                 launch_studio = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--no-startup-banner")) {
@@ -1537,6 +1848,12 @@ pub fn main(init: std.process.Init) anyerror!void {
     }
     var crowd_runtime = try crowdplay.Runtime.init(gpa, io);
     defer crowd_runtime.stop();
+    var presenter_runtime = try presenter.Runtime.init(gpa, io);
+    defer presenter_runtime.deinit();
+    var presenter_preview = try PresenterPreviewController.init();
+    defer presenter_preview.deinit();
+    var presenter_qr: qrcode.Code = .{};
+    var presenter_pairing_visible = false;
 
     rl.setTargetFPS(60);
     var beast_mode: bool = false;
@@ -1605,6 +1922,27 @@ pub fn main(init: std.process.Init) anyerror!void {
         const inline_edit_active_at_frame_start = studio_mode.inlineEditActive();
         const command_palette_active_at_frame_start = studio_mode.commandPaletteActive();
         const text_input_active_at_frame_start = property_prompt.active or studio_mode.textEntryActive();
+        const presenter_pairing_visible_at_frame_start = presenter_pairing_visible;
+        var presenter_overlay_consumed_input = false;
+        if (!text_input_active_at_frame_start and rl.isKeyPressed(.p)) {
+            presenter_overlay_consumed_input = true;
+            if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
+                presenter_runtime.stop();
+                presenter_pairing_visible = false;
+                log.info("Presenter Companion stopped and pairing invalidated", .{});
+            } else if (presenter_pairing_visible) {
+                presenter_pairing_visible = false;
+            } else if (ensurePresenterCompanionRunning(&presenter_runtime, presenter_options)) {
+                presenter_pairing_visible = true;
+            }
+        }
+        if (presenter_pairing_visible_at_frame_start and rl.isKeyPressed(.escape)) {
+            presenter_pairing_visible = false;
+            presenter_overlay_consumed_input = true;
+            window_close_seen = false;
+        }
+        const presenter_overlay_captures_input = presenter_pairing_visible_at_frame_start or
+            presenter_pairing_visible or presenter_overlay_consumed_input;
         // A modal or inline property draft is not part of the persisted source
         // yet. Do not let the OS close button silently throw it away; after
         // submitting or cancelling, Q/Escape (or a fresh close request)
@@ -1803,6 +2141,26 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (!export_controller.running and !studio_mode.capturesInput()) updateAutomaticReveal(now);
         const current_crowd_spec = crowdSpecForSlide(G.slideshow, G.current_slide);
         if (crowd_runtime.isRunning() and !export_controller.running) crowd_runtime.activate(current_crowd_spec);
+        const presenter_controls_enabled = !export_controller.running and
+            !studio_mode.capturesInput() and !presenter_overlay_captures_input;
+        const presenter_pointer_enabled = presenter_controls_enabled and !laser_pointer.show;
+        var presenter_commands_consumed: usize = 0;
+        while (presenter_commands_consumed < 8) : (presenter_commands_consumed += 1) {
+            const queued = presenter_runtime.takeCommand() orelse break;
+            if (!presenter_controls_enabled) continue;
+            switch (queued.command) {
+                .previous => reversePresentation(now),
+                .next => advancePresentation(now),
+            }
+        }
+        const remote_pointer: ?presenter.PointerSample = if (presenter_runtime.isRunning()) remote: {
+            if (!presenter_pointer_enabled) {
+                presenter_runtime.clearPointer();
+                break :remote null;
+            }
+            break :remote presenter_runtime.activePointer();
+        } else null;
+        publishPresenterState(&presenter_runtime, presenter_controls_enabled, presenter_pointer_enabled);
 
         // render slide
         // G.slide_render_width = G.internal_render_size.x - ed_anim.current_size.x;
@@ -1991,7 +2349,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        const studio_command: ?studio.GeometryCommand = if (!export_controller.running and !prompt_was_active)
+        const studio_command: ?studio.GeometryCommand = if (!export_controller.running and !prompt_was_active and !presenter_overlay_captures_input)
             studio_mode.updateWithWorkspaceFromRaylib(studio_items, studio_bounds.items, studio_viewport, studio_workspace)
         else
             null;
@@ -2033,6 +2391,21 @@ pub fn main(init: std.process.Init) anyerror!void {
                     },
                     .undo => history_command_requested = false,
                     .redo => history_command_requested = true,
+                    .edit_speaker_notes => {
+                        pending_semantic_command = command;
+                        property_prompt.begin(
+                            .speaker_notes,
+                            if (current_slide) |slide| slide.speaker_notes orelse "" else "",
+                        );
+                    },
+                    .pair_presenter_phone => {
+                        if (ensurePresenterCompanionRunning(&presenter_runtime, presenter_options)) {
+                            presenter_pairing_visible = true;
+                            studio_mode.setNotice(.none);
+                        } else {
+                            studio_mode.setNotice(.edit_failed);
+                        }
+                    },
                     .add_item => |add| switch (add.kind) {
                         .text => {
                             pending_semantic_command = command;
@@ -2347,6 +2720,24 @@ pub fn main(init: std.process.Init) anyerror!void {
             break :blk crowd_runtime.snapshotFor(crowdSpecForSlide(G.slideshow, previous_slide));
         } else null;
 
+        if (is_pre_rendered) {
+            presenter_preview.capture(
+                &presenter_runtime,
+                G.slide_renderer,
+                G.current_slide,
+                reveal_state,
+                transition_state,
+                internal_render_size,
+                crowd_snapshot,
+                previous_crowd_snapshot,
+                crowd_runtime.public_url.slice(),
+                G.source_revision,
+                now,
+            ) catch |err| log.err("Presenter slide preview capture failed: {any}", .{err});
+        } else if (!presenter_runtime.isRunning()) {
+            presenter_preview.invalidate();
+        }
+
         // Keep parsing, pre-rendering, workspace collection, and input updates
         // outside the acquired draw frame. Inspector commits can rebuild the
         // complete render graph; beginning the frame only when pixels are
@@ -2408,6 +2799,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                     export_controller.final_messagebox_message = null;
                 }
             }
+            if (remote_pointer) |sample| {
+                rl.drawCircleV(presenterPointerPosition(sample, slide_tl, slide_size_in_window), laser_pointer.size, laser_pointer.color);
+            }
             if (laser_pointer.show and !studio_mode.capturesInput()) try laser_pointer.draw();
             if (banner.show) banner.render();
 
@@ -2418,6 +2812,15 @@ pub fn main(init: std.process.Init) anyerror!void {
                 // hover help must remain legible above diagnostics and every
                 // persistent Studio surface.
                 studio_mode.drawDiscoveryOverlay(studio_items, studio_viewport, studio_workspace);
+            }
+            if (presenter_pairing_visible and presenter_runtime.isRunning()) {
+                drawPresenterPairingOverlay(
+                    &presenter_qr,
+                    &presenter_runtime,
+                    presenter_runtime.phoneConnected(),
+                    screenWidth,
+                    screenHeight,
+                );
             }
         }
 
@@ -2672,7 +3075,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             window_close_seen = false;
         }
 
-        const keyboard_history_requested = !property_prompt.active and !studio_mode.textEntryActive() and
+        const keyboard_history_requested = !presenter_overlay_captures_input and !property_prompt.active and !studio_mode.textEntryActive() and
             shortcutModifierDown() and rl.isKeyPressed(.z);
         if (!source_graph_reparsed_this_frame and studio_mode.capturesInput() and
             (keyboard_history_requested or history_command_requested != null))
@@ -2704,25 +3107,25 @@ pub fn main(init: std.process.Init) anyerror!void {
         //
         // hanlde keys
         //
-        if (!export_controller.running and !studio_mode.capturesInput() and (rl.isKeyPressed(.space) or rl.isKeyPressed(.right) or rl.isKeyPressed(.page_down) or (!laser_pointer.show and rl.isMouseButtonPressed(.left)))) {
+        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and (rl.isKeyPressed(.space) or rl.isKeyPressed(.right) or rl.isKeyPressed(.page_down) or (!laser_pointer.show and rl.isMouseButtonPressed(.left)))) {
             advancePresentation(rl.getTime());
         }
 
-        if (!export_controller.running and !studio_mode.capturesInput() and (rl.isKeyPressed(.backspace) or rl.isKeyPressed(.left) or rl.isKeyPressed(.page_up))) {
+        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and (rl.isKeyPressed(.backspace) or rl.isKeyPressed(.left) or rl.isKeyPressed(.page_up))) {
             reversePresentation(rl.getTime());
         }
 
-        if (crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.o)) {
+        if (!presenter_overlay_captures_input and crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.o)) {
             _ = crowd_runtime.toggleOpen();
         }
-        if (crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.v)) {
+        if (!presenter_overlay_captures_input and crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.v)) {
             _ = crowd_runtime.toggleReveal();
         }
-        if (crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.r)) {
+        if (!presenter_overlay_captures_input and crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.r)) {
             _ = crowd_runtime.resetActive();
         }
 
-        if (!property_prompt.active and !studio_mode.textEntryActive() and rl.isKeyPressed(.f)) {
+        if (!presenter_overlay_captures_input and !property_prompt.active and !studio_mode.textEntryActive() and rl.isKeyPressed(.f)) {
             if (!manual_fullscreen) {
                 windowed_width = screenWidth;
                 windowed_height = screenHeight;
@@ -2753,21 +3156,21 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!property_prompt.active and !studio_mode.textEntryActive() and (rl.isKeyPressed(.q) or
-            (rl.isKeyPressed(.escape) and !studio_active_at_frame_start)))
+        if (!presenter_overlay_captures_input and !property_prompt.active and !studio_mode.textEntryActive() and (rl.isKeyPressed(.q) or
+            (rl.isKeyPressed(.escape) and !studio_active_at_frame_start and !presenter_pairing_visible_at_frame_start)))
         {
             if (readyToQuitPreservingEdits(&studio_mode)) break;
         }
 
-        if (!export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.one)) {
+        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.one)) {
             jumpToSlide(0, rl.getTime());
         }
 
-        if (!export_controller.running and !studio_mode.capturesInput() and G.slideshow.slides.items.len > 0 and rl.isKeyPressed(.zero)) {
+        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and G.slideshow.slides.items.len > 0 and rl.isKeyPressed(.zero)) {
             jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime());
         }
 
-        if (!export_controller.running and !studio_mode.capturesInput() and G.slideshow.slides.items.len > 0 and rl.isKeyPressed(.g)) {
+        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and G.slideshow.slides.items.len > 0 and rl.isKeyPressed(.g)) {
             if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                 jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime());
             } else {
@@ -2775,7 +3178,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!studio_mode.capturesInput() and !property_prompt.active and rl.isKeyPressed(.b)) {
+        if (!presenter_overlay_captures_input and !studio_mode.capturesInput() and !property_prompt.active and rl.isKeyPressed(.b)) {
             if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                 banner.reset();
             } else {
@@ -2790,7 +3193,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!studio_mode.capturesInput() and rl.isKeyPressed(.l)) {
+        if (!presenter_overlay_captures_input and !studio_mode.capturesInput() and rl.isKeyPressed(.l)) {
             if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                 if (laser_pointer.show) {
                     laser_pointer.changeSize();
@@ -2805,7 +3208,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!studio_mode.capturesInput() and rl.isKeyPressed(.c)) {
+        if (!presenter_overlay_captures_input and !studio_mode.capturesInput() and rl.isKeyPressed(.c)) {
             laser_pointer.clearDrawing();
         }
 
@@ -6258,7 +6661,18 @@ fn applyStudioSemanticEdit(
 ) !StudioSemanticEditResult {
     const slide = slide_opt orelse return error.NoStudioSlide;
     switch (command) {
-        .save_document, .save_document_copy, .undo, .redo => return error.NonSourceStudioCommand,
+        .save_document, .save_document_copy, .undo, .redo, .pair_presenter_phone => return error.NonSourceStudioCommand,
+        .edit_speaker_notes => {
+            const notes = prompted_text orelse return error.StudioPromptMissing;
+            if (std.mem.eql(u8, notes, slide.speaker_notes orelse "")) return .{ .source_changed = false };
+            try recordStudioPatch(history, try source_editor.setSpeakerNotes(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+                notes,
+            ));
+            return .{ .preserve_selection = true };
+        },
         .create_starter_deck => |preset| {
             if (!pristineUntitledDeck()) return error.StarterDeckUnavailable;
             try recordStudioPatch(history, try starterDeckPatch(
