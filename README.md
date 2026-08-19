@@ -53,6 +53,9 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 
 ## Studio visual editing
 
+The current direction and upcoming implementation tranches are tracked in the
+[Studio roadmap](STUDIO_ROADMAP.md).
+
 Run rayslides without a slide file to begin with a blank, untitled slide in
 Studio, pass `--studio` with a slide file to open that deck directly in Studio,
 or press <kbd>E</kbd> while presenting an existing deck. Studio is a visual
@@ -67,6 +70,16 @@ together; narrower windows reserve one dock at a time through the toolbar
 toggles. Press <kbd>Tab</kbd> for **Focus Canvas**, which hides all chrome while
 leaving selection, guides, and direct manipulation active. Studio uses an
 embedded, compact UI typeface independently of any fonts chosen by the deck.
+
+The right inspector opens on **Objects**, a front-to-back paint-order list for
+the active base or morph scene. It includes hidden, fully transparent, and
+locked objects so they remain recoverable when canvas hit-testing cannot reach
+them. Click a row to select it, Shift-click for an ordered multi-selection,
+use **Vis/Hid** and **L/U** for visibility and locking, and use the layer
+buttons for atomic paint-order changes. Full-slide background rows remain
+visible as read-only paint barriers. Switch to **Properties** in the same dock
+for exact values and styling. Opacity accepts the inclusive range `0`–`1` or
+`0%`–`100%`; visibility remains a separate source property.
 
 The top toolbar contains these one-shot canvas tools:
 
@@ -91,9 +104,9 @@ font size, opacity, foreground and item-background colors, duplicates or
 deletes the object, promotes it for reuse, and aligns it to any slide edge or
 center. Numeric width and height fields change only the chosen dimension, so
 the other dimension of an auto-sized image remains automatic. Custom colors
-accept `#RRGGBB` or `#RRGGBBAA`; opacity accepts `0.01`–`1` or `1%`–`100%`.
-Zero opacity is intentionally refused until transparent objects can be
-reselected through a layers view. Shift-click toggles objects into an ordered
+accept `#RRGGBB` or `#RRGGBBAA`; opacity accepts `0`–`1` or `0%`–`100%`.
+Fully transparent objects remain recoverable through the Objects inspector.
+Shift-click toggles objects into an ordered
 multi-selection, and <kbd>Cmd/Ctrl-A</kbd> selects every editable object in the
 current scene. Drag an empty part of the canvas to marquee-select everything
 the rectangle overlaps; hold <kbd>Shift</kbd> to toggle the marquee hits against

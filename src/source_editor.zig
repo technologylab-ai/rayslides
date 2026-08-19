@@ -101,6 +101,28 @@ pub const LiteralSourceEdit = union(enum) {
     },
 };
 
+/// One visibility operation in an atomic source rewrite. Creation directives
+/// own visibility as a literal `visible=` attribute. Existing template-local
+/// and morph mutations instead retain their complete target/attribute/body
+/// text while their verb becomes canonical `@show` or `@hide`. A missing
+/// local mutation is inserted at an already-scoped scene boundary.
+pub const VisibilitySourceEdit = union(enum) {
+    patch_item: struct {
+        directive_offset: usize,
+        visible: bool,
+    },
+    rewrite_mutation: struct {
+        directive_offset: usize,
+        item_id: []const u8,
+        visible: bool,
+    },
+    insert_mutation: struct {
+        insertion_offset: usize,
+        item_id: []const u8,
+        visible: bool,
+    },
+};
+
 /// The caller owns `source` and must free it with the allocator passed to the
 /// source-editing function that produced it.
 pub const PatchResult = struct {
@@ -351,6 +373,168 @@ pub fn applyLiteralEdits(
         .source = working.?,
         .byte_delta = try signedLengthDelta(working.?.len, source.len),
     };
+}
+
+/// Apply direct-item attributes and scene-local visibility mutations as one
+/// source transaction. All offsets are interpreted against `source` and the
+/// complete batch is validated before any owned result is produced. Existing
+/// mutation lines are never collapsed: changing `@set hero x=20 text=Hello`
+/// to hidden yields `@hide hero x=20 text=Hello`, preserving its body too.
+pub fn applyVisibilityEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: []const VisibilitySourceEdit,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateVisibilitySourceEdits(source, edits);
+
+    const order = try allocator.alloc(usize, edits.len);
+    defer allocator.free(order);
+    for (order, 0..) |*entry, index| entry.* = index;
+    sortVisibilitySourceEditOrder(edits, order);
+
+    var working: ?[]u8 = try allocator.dupe(u8, source);
+    errdefer if (working) |owned| allocator.free(owned);
+
+    for (order) |edit_index| {
+        const next = switch (edits[edit_index]) {
+            .patch_item => |patch| blk: {
+                const value = if (patch.visible) "true" else "false";
+                const attributes = [_]LiteralAttributePatch{.{ .key = "visible", .value = value }};
+                break :blk try patchLiteralAttributes(
+                    allocator,
+                    working.?,
+                    patch.directive_offset,
+                    &attributes,
+                );
+            },
+            .rewrite_mutation => |rewrite| blk: {
+                const line = try directiveLine(working.?, rewrite.directive_offset);
+                const name = directiveName(working.?[line.start..line.content_end]);
+                break :blk try replaceRange(
+                    allocator,
+                    working.?,
+                    line.start,
+                    line.start + name.len,
+                    if (rewrite.visible) "@show" else "@hide",
+                );
+            },
+            .insert_mutation => |insert| blk: {
+                const directive = if (insert.visible)
+                    try std.fmt.allocPrint(allocator, "@show {s}", .{insert.item_id})
+                else
+                    try std.fmt.allocPrint(allocator, "@hide {s}", .{insert.item_id});
+                defer allocator.free(directive);
+                break :blk try insertDirectiveAt(
+                    allocator,
+                    working.?,
+                    insert.insertion_offset,
+                    directive,
+                );
+            },
+        };
+        allocator.free(working.?);
+        working = next.source;
+    }
+
+    return .{
+        .source = working.?,
+        .byte_delta = try signedLengthDelta(working.?.len, source.len),
+    };
+}
+
+fn validateVisibilitySourceEdits(source: []const u8, edits: []const VisibilitySourceEdit) PatchError!void {
+    for (edits, 0..) |edit, index| {
+        const offset = visibilitySourceEditOffset(edit);
+        switch (edit) {
+            .patch_item => |patch| {
+                const line = try directiveLine(source, patch.directive_offset);
+                const text = source[line.start..line.content_end];
+                if (!directiveEmitsSlideItem(directiveName(text)) or hasPotentialLetExpansion(text)) {
+                    return error.InvalidDirectiveOffset;
+                }
+            },
+            .rewrite_mutation => |rewrite| {
+                if (!isLiteralItemId(rewrite.item_id)) return error.InvalidLiteralValue;
+                const line = try directiveLine(source, rewrite.directive_offset);
+                const text = source[line.start..line.content_end];
+                if (!isMorphMutationDirective(directiveName(text)) or hasPotentialLetExpansion(text)) {
+                    return error.InvalidDirectiveOffset;
+                }
+                const target = try validateSlideTemplateOverrideDirectiveLine(text);
+                if (!std.mem.eql(u8, target, rewrite.item_id)) return error.InvalidDirectiveOffset;
+            },
+            .insert_mutation => |insert| {
+                if (!isLiteralItemId(insert.item_id)) return error.InvalidLiteralValue;
+                if (!isPhysicalLineBoundary(source, insert.insertion_offset)) {
+                    return error.InvalidInsertionOffset;
+                }
+            },
+        }
+
+        for (edits[0..index]) |previous| {
+            const previous_offset = visibilitySourceEditOffset(previous);
+            const both_insertions = edit == .insert_mutation and previous == .insert_mutation;
+            if (offset == previous_offset and !both_insertions) return error.OverlappingSourceEdits;
+            if (both_insertions) {
+                const current_insert = edit.insert_mutation;
+                const previous_insert = previous.insert_mutation;
+                if (offset == previous_offset and std.mem.eql(u8, current_insert.item_id, previous_insert.item_id)) {
+                    return error.OverlappingSourceEdits;
+                }
+                continue;
+            }
+
+            const current_line = visibilitySourceEditLine(source, edit);
+            const previous_line = visibilitySourceEditLine(source, previous);
+            if (current_line) |current| {
+                if (previous == .insert_mutation and
+                    previous_offset > current.start and previous_offset < current.full_end)
+                {
+                    return error.OverlappingSourceEdits;
+                }
+            }
+            if (previous_line) |prior| {
+                if (edit == .insert_mutation and offset > prior.start and offset < prior.full_end) {
+                    return error.OverlappingSourceEdits;
+                }
+            }
+        }
+    }
+}
+
+fn visibilitySourceEditLine(source: []const u8, edit: VisibilitySourceEdit) ?DirectiveLine {
+    return switch (edit) {
+        .patch_item => |patch| directiveLine(source, patch.directive_offset) catch null,
+        .rewrite_mutation => |rewrite| directiveLine(source, rewrite.directive_offset) catch null,
+        .insert_mutation => null,
+    };
+}
+
+fn visibilitySourceEditOffset(edit: VisibilitySourceEdit) usize {
+    return switch (edit) {
+        .patch_item => |patch| patch.directive_offset,
+        .rewrite_mutation => |rewrite| rewrite.directive_offset,
+        .insert_mutation => |insert| insert.insertion_offset,
+    };
+}
+
+fn sortVisibilitySourceEditOrder(edits: []const VisibilitySourceEdit, order: []usize) void {
+    var index: usize = 1;
+    while (index < order.len) : (index += 1) {
+        var moving = index;
+        while (moving > 0) : (moving -= 1) {
+            const left_index = order[moving];
+            const right_index = order[moving - 1];
+            const left_offset = visibilitySourceEditOffset(edits[left_index]);
+            const right_offset = visibilitySourceEditOffset(edits[right_index]);
+            const comes_first = if (left_offset != right_offset)
+                left_offset > right_offset
+            else
+                left_index > right_index;
+            if (!comes_first) break;
+            std.mem.swap(usize, &order[moving], &order[moving - 1]);
+        }
+    }
 }
 
 fn validateLiteralSourceEdits(source: []const u8, edits: []const LiteralSourceEdit) PatchError!void {
@@ -816,6 +1000,19 @@ pub fn slideTemplateOverrideInsertionOffset(
 ) PatchError!usize {
     _ = try slideTemplateInstanceBaseRegion(source, slide_offset);
     try validateSlideTemplateOverrideSnippet(snippet);
+    return slideItemInsertionOffset(source, slide_offset);
+}
+
+/// Resolve the insertion point for a canonical instance-local visibility
+/// mutation without first formatting its potentially long literal item ID
+/// into a caller-owned scratch buffer.
+pub fn slideTemplateVisibilityInsertionOffset(
+    source: []const u8,
+    slide_offset: usize,
+    item_id: []const u8,
+) PatchError!usize {
+    _ = try slideTemplateInstanceBaseRegion(source, slide_offset);
+    if (!isLiteralItemId(item_id)) return error.InvalidLiteralValue;
     return slideItemInsertionOffset(source, slide_offset);
 }
 
@@ -6409,6 +6606,104 @@ test "atomic literal edits patch and insert in original-offset caller order" {
     try std.testing.expectEqualStrings("c", items[1].id.?);
     try std.testing.expectEqualStrings("d", items[2].id.?);
     try std.testing.expect(!items[3].locked);
+}
+
+test "atomic visibility edits preserve mutation payloads and caller insertion order" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=hero x=10 y=20 text=Base\r\n" ++
+        "@box id=direct text=Direct\r\n" ++
+        "@state(morph)\r\n" ++
+        "@set hero x=300 color=#010203ff text=Changed\r\n" ++
+        "continued body\r\n" ++
+        "@state(morph)\r\n";
+    const direct = std.mem.indexOf(u8, source, "@box id=direct").?;
+    const set_hero = std.mem.indexOf(u8, source, "@set hero").?;
+    const final_state = std.mem.lastIndexOf(u8, source, "@state(morph)").?;
+    const edits = [_]VisibilitySourceEdit{
+        .{ .patch_item = .{ .directive_offset = direct, .visible = false } },
+        .{ .rewrite_mutation = .{ .directive_offset = set_hero, .item_id = "hero", .visible = false } },
+        .{ .insert_mutation = .{ .insertion_offset = final_state, .item_id = "hero", .visible = true } },
+        .{ .insert_mutation = .{ .insertion_offset = final_state, .item_id = "direct", .visible = false } },
+    };
+    const hidden = try applyVisibilityEdits(std.testing.allocator, source, &edits);
+    defer hidden.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "\xEF\xBB\xBF@slide\r\n" ++
+            "@box id=hero x=10 y=20 text=Base\r\n" ++
+            "@box id=direct visible=false text=Direct\r\n" ++
+            "@state(morph)\r\n" ++
+            "@hide hero x=300 color=#010203ff text=Changed\r\n" ++
+            "continued body\r\n" ++
+            "@show hero\r\n" ++
+            "@hide direct\r\n" ++
+            "@state(morph)\r\n",
+        hidden.source,
+    );
+
+    // Toggling the existing mutation back changes only its verb. Geometry,
+    // color, inline text, body text, and CRLF formatting remain byte-exact.
+    const hidden_mutation = std.mem.indexOf(u8, hidden.source, "@hide hero x=300").?;
+    const show_edit = [_]VisibilitySourceEdit{.{ .rewrite_mutation = .{
+        .directive_offset = hidden_mutation,
+        .item_id = "hero",
+        .visible = true,
+    } }};
+    const shown = try applyVisibilityEdits(std.testing.allocator, hidden.source, &show_edit);
+    defer shown.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        shown.source,
+        "@show hero x=300 color=#010203ff text=Changed\r\ncontinued body\r\n",
+    ) != null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(shown.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expect(deck.slides.items[0].morph_states.items[0].items.items[0].visible);
+    try std.testing.expect(!deck.slides.items[0].morph_states.items[0].items.items[1].visible);
+}
+
+test "visibility edit preflight rejects stale targets and duplicate insertions" {
+    const source =
+        "@slide\n" ++
+        "@box id=hero text=Hero\n" ++
+        "@state(morph)\n" ++
+        "@set hero x=200\n";
+    const state = std.mem.indexOf(u8, source, "@state").?;
+    const mutation = std.mem.indexOf(u8, source, "@set").?;
+    const wrong_target = [_]VisibilitySourceEdit{.{ .rewrite_mutation = .{
+        .directive_offset = mutation,
+        .item_id = "other",
+        .visible = false,
+    } }};
+    try std.testing.expectError(
+        error.InvalidDirectiveOffset,
+        applyVisibilityEdits(std.testing.allocator, source, &wrong_target),
+    );
+
+    const wrong_item = [_]VisibilitySourceEdit{.{ .patch_item = .{
+        .directive_offset = state,
+        .visible = false,
+    } }};
+    try std.testing.expectError(
+        error.InvalidDirectiveOffset,
+        applyVisibilityEdits(std.testing.allocator, source, &wrong_item),
+    );
+
+    const duplicate = [_]VisibilitySourceEdit{
+        .{ .insert_mutation = .{ .insertion_offset = mutation, .item_id = "hero", .visible = false } },
+        .{ .insert_mutation = .{ .insertion_offset = mutation, .item_id = "hero", .visible = true } },
+    };
+    try std.testing.expectError(
+        error.OverlappingSourceEdits,
+        applyVisibilityEdits(std.testing.allocator, source, &duplicate),
+    );
 }
 
 test "deletes only the exact selected physical directive" {

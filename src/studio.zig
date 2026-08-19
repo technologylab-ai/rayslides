@@ -171,6 +171,15 @@ pub const FrameMode = enum {
 pub const DockPanel = enum {
     none,
     slides,
+    objects,
+    properties,
+};
+
+/// Content displayed in the right-hand Studio dock. Keeping this independent
+/// from DockPanel lets wide windows retain the slide organizer while authors
+/// switch between the object stack and precise properties.
+pub const InspectorPanel = enum {
+    objects,
     properties,
 };
 
@@ -313,7 +322,8 @@ pub fn frameLayout(
     };
 
     const left_visible = mode == .wide or (mode != .wide and active_dock == .slides);
-    const right_visible = mode == .wide or (mode != .wide and active_dock == .properties);
+    const right_visible = mode == .wide or (mode != .wide and
+        (active_dock == .objects or active_dock == .properties));
     const left_width: f32 = if (mode == .wide)
         std.math.clamp(safe_content.width * 0.16, 248, 304)
     else
@@ -788,6 +798,15 @@ fn sourceScopeLabel(scope: slides.SourceScope) []const u8 {
     };
 }
 
+fn firstNonEmptyTextLine(value: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, value, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len > 0) return line;
+    }
+    return null;
+}
+
 pub const Interaction = enum {
     idle,
     moving,
@@ -935,6 +954,19 @@ pub const SetLockedCommand = struct {
     }
 };
 
+/// Applies one authored visibility value to an atomic selection. This is
+/// distinct from opacity: hidden items stay present in paint order and can be
+/// recovered from the Objects dock.
+pub const SetVisibleCommand = struct {
+    targets: [max_selection_items]CommandTarget = undefined,
+    count: usize = 0,
+    visible: bool,
+
+    pub fn slice(self: *const SetVisibleCommand) []const CommandTarget {
+        return self.targets[0..self.count];
+    }
+};
+
 pub const AddItemCommand = struct {
     kind: NewItemKind,
     position: rl.Vector2,
@@ -1049,6 +1081,7 @@ pub const SemanticCommand = union(enum) {
     copy_items: CopyItemsCommand,
     paste_items: PasteItemsCommand,
     set_locked: SetLockedCommand,
+    set_visible: SetVisibleCommand,
     promote_to_reusable: CommandTarget,
     select_morph_scene: MorphSceneCommand,
     new_slide: void,
@@ -1343,6 +1376,134 @@ pub fn libraryRowRect(layout: WorkspaceLayout, visible_slot: usize) ?rl.Rectangl
         .width = layout.library_rows_clip.width,
         .height = library_row_height,
     };
+}
+
+pub const object_row_height: f32 = 54;
+pub const object_row_gap: f32 = 5;
+
+/// Stable geometry for the tabbed Objects/Properties inspector. Rows are
+/// intentionally derived separately so large scenes remain allocation-free.
+pub const ObjectsLayout = struct {
+    panel: rl.Rectangle,
+    objects_tab: rl.Rectangle,
+    properties_tab: rl.Rectangle,
+    layer_actions: [4]rl.Rectangle,
+    rows_clip: rl.Rectangle,
+    page_previous: rl.Rectangle,
+    page_next: rl.Rectangle,
+};
+
+fn emptyObjectsLayout() ObjectsLayout {
+    return .{
+        .panel = empty_frame_rectangle,
+        .objects_tab = empty_frame_rectangle,
+        .properties_tab = empty_frame_rectangle,
+        .layer_actions = [_]rl.Rectangle{empty_frame_rectangle} ** 4,
+        .rows_clip = empty_frame_rectangle,
+        .page_previous = empty_frame_rectangle,
+        .page_next = empty_frame_rectangle,
+    };
+}
+
+pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
+    const chrome = viewport.chrome orelse return emptyObjectsLayout();
+    if (!chrome.visible or !chrome.right_visible or chrome.right_dock.width <= 0 or chrome.right_dock.height <= 0)
+        return emptyObjectsLayout();
+    const panel = chrome.right_dock;
+    const inset: f32 = 10;
+    const gap: f32 = 5;
+    const tab_width = (panel.width - inset * 2 - gap) / 2;
+    const objects_tab: rl.Rectangle = .{
+        .x = panel.x + inset,
+        .y = panel.y + 7,
+        .width = tab_width,
+        .height = 28,
+    };
+    const properties_tab: rl.Rectangle = .{
+        .x = objects_tab.x + objects_tab.width + gap,
+        .y = objects_tab.y,
+        .width = tab_width,
+        .height = objects_tab.height,
+    };
+    const action_gap: f32 = 5;
+    const action_width = (panel.width - inset * 2 - action_gap * 3) / 4;
+    var layer_actions: [4]rl.Rectangle = undefined;
+    for (&layer_actions, 0..) |*button, index| button.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (action_width + action_gap),
+        .y = panel.y + 43,
+        .width = action_width,
+        .height = 29,
+    };
+    const pager_width: f32 = 58;
+    const pager_y = panel.y + panel.height - 29;
+    const page_next: rl.Rectangle = .{
+        .x = panel.x + panel.width - inset - pager_width,
+        .y = pager_y,
+        .width = pager_width,
+        .height = 22,
+    };
+    const page_previous: rl.Rectangle = .{
+        .x = page_next.x - gap - pager_width,
+        .y = pager_y,
+        .width = pager_width,
+        .height = page_next.height,
+    };
+    return .{
+        .panel = panel,
+        .objects_tab = objects_tab,
+        .properties_tab = properties_tab,
+        .layer_actions = layer_actions,
+        .rows_clip = .{
+            .x = panel.x + 7,
+            .y = panel.y + 80,
+            .width = panel.width - 14,
+            .height = @max(0, pager_y - 6 - (panel.y + 80)),
+        },
+        .page_previous = page_previous,
+        .page_next = page_next,
+    };
+}
+
+pub fn objectRowCapacity(layout: ObjectsLayout) usize {
+    return rowsThatFit(layout.rows_clip.height, object_row_height, object_row_gap);
+}
+
+pub fn objectRowRect(layout: ObjectsLayout, visible_slot: usize) ?rl.Rectangle {
+    if (visible_slot >= objectRowCapacity(layout)) return null;
+    return .{
+        .x = layout.rows_clip.x,
+        .y = layout.rows_clip.y + @as(f32, @floatFromInt(visible_slot)) * (object_row_height + object_row_gap),
+        .width = layout.rows_clip.width,
+        .height = object_row_height,
+    };
+}
+
+pub fn objectVisibilityRect(row: rl.Rectangle) rl.Rectangle {
+    return .{ .x = row.x + 5, .y = row.y + 8, .width = 36, .height = row.height - 16 };
+}
+
+pub fn objectLockRect(row: rl.Rectangle) rl.Rectangle {
+    return .{ .x = row.x + row.width - 41, .y = row.y + 8, .width = 36, .height = row.height - 16 };
+}
+
+pub fn objectItemCount(items: []const slides.SlideItem) usize {
+    return items.len;
+}
+
+/// Maps a front-to-back Objects-row offset to the slide's ordinary paint-
+/// order item index. Background barriers are included as read-only rows so
+/// the list never misrepresents the renderer's actual paint order.
+pub fn objectIndexAtPaintOffset(items: []const slides.SlideItem, paint_offset: usize) ?usize {
+    if (paint_offset >= items.len) return null;
+    return items.len - paint_offset - 1;
+}
+
+fn objectPaintOffsetByIdentity(items: []const slides.SlideItem, identity: usize) ?usize {
+    var offset: usize = 0;
+    while (objectIndexAtPaintOffset(items, offset)) |index| : (offset += 1) {
+        if (items[index].identity == identity) return offset;
+    }
+    return null;
 }
 
 fn rowsThatFit(height: f32, row_height: f32, gap: f32) usize {
@@ -1823,6 +1984,9 @@ pub const Studio = struct {
     focus_canvas: bool = false,
     /// Below the wide breakpoint only this dock is reserved beside the slide.
     active_dock: DockPanel = .slides,
+    /// Wide windows always reserve the right dock; this chooses its content.
+    /// Compact windows remember the tab even while the inspector is closed.
+    inspector_panel: InspectorPanel = .objects,
     /// A dedicated, narrow UI face supplied by the integration layer. A null
     /// font retains raylib's built-in text path for lightweight embedders and
     /// unit tests.
@@ -1861,6 +2025,8 @@ pub const Studio = struct {
     group_bounds_after: Geometry = .{ .position = .zero(), .size = .zero() },
     organizer_first_visible: usize = 0,
     library_first_visible: usize = 0,
+    objects_first_visible: usize = 0,
+    last_objects_primary: ?usize = null,
     selected_library_index: ?usize = null,
     last_workspace_slide: ?usize = null,
 
@@ -2309,6 +2475,8 @@ pub const Studio = struct {
         }
 
         self.validateSelection(items, resolved_bounds);
+        self.normalizeObjects(items, viewport);
+        self.handleObjectsScroll(items, viewport, input);
 
         // A marquee owns the pointer until release. Keeping this path ahead
         // of shortcuts prevents an unrelated command from observing a
@@ -2428,7 +2596,14 @@ pub const Studio = struct {
 
         if (input.pointer_pressed and workspace.visible and
             self.handleWorkspaceClick(items, viewport, workspace, input.pointer_screen)) return null;
-        if (input.pointer_pressed and self.handleUiClick(items, resolved_bounds, viewport, input.pointer_screen, input.allow_shared_edit)) {
+        if (input.pointer_pressed and self.handleUiClick(
+            items,
+            resolved_bounds,
+            viewport,
+            input.pointer_screen,
+            input.toggle_selection,
+            input.allow_shared_edit,
+        )) {
             const command = self.pending_geometry_command;
             self.pending_geometry_command = null;
             return command;
@@ -2928,15 +3103,11 @@ pub const Studio = struct {
         if (self.selectionCount() == 0) return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
         var all_locked = true;
-        for (0..self.selectionCount()) |selection_index| {
-            const identity = self.selectedIdentityAt(selection_index) orelse return true;
-            const item_index = itemIndexByIdentity(items, identity) orelse return true;
-            if (!items[item_index].locked) all_locked = false;
-        }
-        var command = SetLockedCommand{ .locked = !all_locked };
+        var command = SetLockedCommand{ .locked = false };
         for (items, 0..) |item, item_index| {
             if (!self.isIdentitySelected(item.identity)) continue;
             const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return true;
+            if (!lockedValueForScope(item, edit_scope)) all_locked = false;
             command.targets[command.count] = .{
                 .item_identity = item.identity,
                 .source = self.commandSource(item, edit_scope),
@@ -2945,6 +3116,111 @@ pub const Studio = struct {
             command.count += 1;
         }
         if (command.count != self.selectionCount()) return true;
+        command.locked = !all_locked;
+        self.pending_semantic_command = .{ .set_locked = command };
+        return true;
+    }
+
+    fn emitSelectedVisibilityCommand(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+    ) bool {
+        if (self.selectionCount() == 0) return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        var all_hidden = true;
+        var command = SetVisibleCommand{ .visible = false };
+        for (items, 0..) |item, item_index| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            if (item.kind == .background) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            if (item.locked) {
+                self.notice = .locked_item;
+                return true;
+            }
+            const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return true;
+            if (visibleValueForScope(item, edit_scope)) all_hidden = false;
+            command.targets[command.count] = .{
+                .item_identity = item.identity,
+                .source = self.commandSource(item, edit_scope),
+                .edit_scope = edit_scope,
+            };
+            command.count += 1;
+        }
+        if (command.count != self.selectionCount()) return true;
+        command.visible = all_hidden;
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_visible = command };
+        return true;
+    }
+
+    fn visibleValueForScope(item: slides.SlideItem, edit_scope: EditScope) bool {
+        if (edit_scope == .shared_template) {
+            if (item.sharedTemplateValues()) |shared| return shared.visible;
+        }
+        return item.visible;
+    }
+
+    fn lockedValueForScope(item: slides.SlideItem, edit_scope: EditScope) bool {
+        if (edit_scope == .shared_template) {
+            if (item.sharedTemplateValues()) |shared| return shared.locked;
+        }
+        return item.locked;
+    }
+
+    /// Row affordances always affect exactly their row. Batch visibility and
+    /// lock remain available through selection-level keyboard/properties
+    /// commands, but a small eye/lock icon must never surprise-hide siblings.
+    fn emitItemVisibilityCommand(
+        self: *Studio,
+        items: []slides.SlideItem,
+        item_index: usize,
+        allow_shared_edit: bool,
+    ) bool {
+        if (item_index >= items.len or items[item_index].kind == .background) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const item = items[item_index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return true;
+        var command = SetVisibleCommand{ .visible = !visibleValueForScope(item, edit_scope) };
+        command.targets[0] = .{
+            .item_identity = item.identity,
+            .source = self.commandSource(item, edit_scope),
+            .edit_scope = edit_scope,
+        };
+        command.count = 1;
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_visible = command };
+        return true;
+    }
+
+    fn emitItemLockCommand(
+        self: *Studio,
+        items: []slides.SlideItem,
+        item_index: usize,
+        allow_shared_edit: bool,
+    ) bool {
+        if (item_index >= items.len or items[item_index].kind == .background) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const item = items[item_index];
+        const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return true;
+        var command = SetLockedCommand{ .locked = !lockedValueForScope(item, edit_scope) };
+        command.targets[0] = .{
+            .item_identity = item.identity,
+            .source = self.commandSource(item, edit_scope),
+            .edit_scope = edit_scope,
+        };
+        command.count = 1;
+        self.notice = .none;
         self.pending_semantic_command = .{ .set_locked = command };
         return true;
     }
@@ -3089,6 +3365,86 @@ pub const Studio = struct {
                 self.selected_library_index = null;
             }
         }
+    }
+
+    fn normalizeObjects(self: *Studio, items: []const slides.SlideItem, viewport: Viewport) void {
+        const layout = objectsLayout(viewport);
+        const capacity = objectRowCapacity(layout);
+        self.objects_first_visible = clampFirstVisible(
+            self.objects_first_visible,
+            objectItemCount(items),
+            capacity,
+        );
+        const primary = self.selected_identity;
+        if (primary == self.last_objects_primary) return;
+        self.last_objects_primary = primary;
+        if (primary) |identity| {
+            if (objectPaintOffsetByIdentity(items, identity)) |offset| {
+                self.objects_first_visible = revealIndex(
+                    self.objects_first_visible,
+                    offset,
+                    objectItemCount(items),
+                    capacity,
+                );
+            }
+        }
+    }
+
+    fn toggleObjectSelection(self: *Studio, item: slides.SlideItem) void {
+        if (item.kind == .background) {
+            self.notice = .property_unavailable;
+            return;
+        }
+        if (self.selected_identity == null) {
+            self.setSingleSelection(item);
+            return;
+        }
+        if (self.selected_identity.? == item.identity) {
+            if (self.additional_selection_count == 0) {
+                self.clearSelectionState();
+            } else {
+                const replacement = self.additional_selection[self.additional_selection_count - 1];
+                self.additional_selection_count -= 1;
+                self.selected_identity = replacement.identity;
+                self.selected_source = replacement.source;
+                self.last_objects_primary = null;
+                self.snap_guides = .{};
+            }
+            return;
+        }
+        for (self.additional_selection[0..self.additional_selection_count], 0..) |member, member_index| {
+            if (member.identity != item.identity) continue;
+            self.removeAdditionalSelection(member_index);
+            self.last_objects_primary = null;
+            self.snap_guides = .{};
+            return;
+        }
+        if (self.selectionCount() >= max_selection_items) {
+            self.notice = .selection_capacity_reached;
+            return;
+        }
+        self.additional_selection[self.additional_selection_count] = .{
+            .identity = self.selected_identity.?,
+            .source = self.selected_source,
+        };
+        self.additional_selection_count += 1;
+        self.selected_identity = item.identity;
+        self.selected_source = sourceForSelection(item);
+        self.last_objects_primary = null;
+        self.snap_guides = .{};
+        self.notice = .none;
+    }
+
+    fn handleObjectsScroll(self: *Studio, items: []const slides.SlideItem, viewport: Viewport, input: FrameInput) void {
+        if (input.workspace_scroll == 0 or self.inspector_panel != .objects) return;
+        const layout = objectsLayout(viewport);
+        if (!pointInRectangle(input.pointer_screen, layout.panel)) return;
+        self.objects_first_visible = scrollFirstVisible(
+            self.objects_first_visible,
+            objectItemCount(items),
+            objectRowCapacity(layout),
+            if (input.workspace_scroll > 0) -1 else 1,
+        );
     }
 
     fn handleWorkspaceKeyboard(self: *Studio, items: []slides.SlideItem, workspace: Workspace, input: FrameInput) bool {
@@ -3371,13 +3727,17 @@ pub const Studio = struct {
         resolved_bounds: []const ResolvedBounds,
         viewport: Viewport,
         pointer: rl.Vector2,
+        toggle_selection: bool,
         allow_shared_edit: bool,
     ) bool {
         const layout = uiLayout(viewport);
+        const inspector = objectsLayout(viewport);
         const in_status = pointInRectangle(pointer, statusPanel(viewport));
         const in_toolbar = pointInRectangle(pointer, layout.toolbar);
-        const in_properties = self.selected_identity != null and pointInRectangle(pointer, layout.properties);
-        if (!in_status and !in_toolbar and !in_properties) return false;
+        const in_inspector = pointInRectangle(pointer, inspector.panel);
+        const legacy_properties = viewport.chrome == null and self.selected_identity != null and
+            pointInRectangle(pointer, layout.properties);
+        if (!in_status and !in_toolbar and !in_inspector and !legacy_properties) return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
         if (in_status) return true;
         if (in_toolbar) {
@@ -3386,7 +3746,13 @@ pub const Studio = struct {
                 return true;
             }
             if (pointInRectangle(pointer, layout.properties_dock_toggle)) {
-                self.active_dock = if (self.active_dock == .properties) .none else .properties;
+                const inspector_open = self.active_dock == .objects or self.active_dock == .properties;
+                self.active_dock = if (inspector_open)
+                    .none
+                else if (self.inspector_panel == .objects)
+                    .objects
+                else
+                    .properties;
                 return true;
             }
             if (pointInRectangle(pointer, layout.focus_canvas)) {
@@ -3413,6 +3779,67 @@ pub const Studio = struct {
                 self.cycleMorphState(items, 1);
             }
             return true;
+        }
+        if (in_inspector) {
+            if (pointInRectangle(pointer, inspector.objects_tab)) {
+                self.inspector_panel = .objects;
+                self.active_dock = .objects;
+                return true;
+            }
+            if (pointInRectangle(pointer, inspector.properties_tab)) {
+                self.inspector_panel = .properties;
+                self.active_dock = .properties;
+                return true;
+            }
+            if (self.inspector_panel == .objects) {
+                for (inspector.layer_actions, 0..) |button, index| {
+                    if (pointInRectangle(pointer, button))
+                        return self.emitLayerCommand(items, @enumFromInt(index));
+                }
+                if (pointInRectangle(pointer, inspector.page_previous)) {
+                    self.objects_first_visible = pageFirstVisible(
+                        self.objects_first_visible,
+                        objectItemCount(items),
+                        objectRowCapacity(inspector),
+                        false,
+                    );
+                    return true;
+                }
+                if (pointInRectangle(pointer, inspector.page_next)) {
+                    self.objects_first_visible = pageFirstVisible(
+                        self.objects_first_visible,
+                        objectItemCount(items),
+                        objectRowCapacity(inspector),
+                        true,
+                    );
+                    return true;
+                }
+                for (0..objectRowCapacity(inspector)) |visible_slot| {
+                    const row = objectRowRect(inspector, visible_slot) orelse continue;
+                    if (!pointInRectangle(pointer, row)) continue;
+                    const paint_offset = self.objects_first_visible + visible_slot;
+                    const item_index = objectIndexAtPaintOffset(items, paint_offset) orelse return true;
+                    const item = items[item_index];
+                    if (pointInRectangle(pointer, objectVisibilityRect(row)))
+                        return self.emitItemVisibilityCommand(items, item_index, allow_shared_edit);
+                    if (pointInRectangle(pointer, objectLockRect(row)))
+                        return self.emitItemLockCommand(items, item_index, allow_shared_edit);
+                    if (item.kind == .background) {
+                        self.notice = .property_unavailable;
+                        return true;
+                    }
+                    if (toggle_selection) {
+                        self.toggleObjectSelection(item);
+                    } else {
+                        self.setSingleSelection(item);
+                        self.notice = if (item.locked) .locked_item else .none;
+                    }
+                    self.tool = .select;
+                    return true;
+                }
+                return true;
+            }
+            if (self.selected_identity == null) return true;
         }
         if (pointInRectangle(pointer, layout.edit_text))
             return self.emitSelectedCommand(items, allow_shared_edit, .edit_text);
@@ -3508,6 +3935,7 @@ pub const Studio = struct {
         self.additional_selection_count = 0;
         self.group_drag_count = 0;
         self.snap_guides = .{};
+        self.last_objects_primary = null;
     }
 
     fn clearSelectionState(self: *Studio) void {
@@ -3518,6 +3946,7 @@ pub const Studio = struct {
         self.additional_selection_count = 0;
         self.group_drag_count = 0;
         self.snap_guides = .{};
+        self.last_objects_primary = null;
     }
 
     fn removeAdditionalSelection(self: *Studio, member_index: usize) void {
@@ -3539,6 +3968,7 @@ pub const Studio = struct {
             };
             self.selected_identity = member.identity;
             self.selected_source = member.source;
+            self.last_objects_primary = null;
             return;
         }
     }
@@ -3675,6 +4105,7 @@ pub const Studio = struct {
         for (members[1..], 0..) |member, index| self.additional_selection[index] = member;
         self.group_drag_count = 0;
         self.snap_guides = .{};
+        self.last_objects_primary = null;
     }
 
     fn toggleSelectionAt(
@@ -3701,6 +4132,7 @@ pub const Studio = struct {
                 self.additional_selection_count -= 1;
                 self.selected_identity = replacement.identity;
                 self.selected_source = replacement.source;
+                self.last_objects_primary = null;
                 self.snap_guides = .{};
             }
             return;
@@ -3723,6 +4155,7 @@ pub const Studio = struct {
         self.additional_selection_count += 1;
         self.selected_identity = item.identity;
         self.selected_source = sourceForSelection(item);
+        self.last_objects_primary = null;
         self.snap_guides = .{};
     }
 
@@ -3785,16 +4218,15 @@ pub const Studio = struct {
                 self.clearSelectionState();
                 return;
             };
-            if (items[selected_index].locked) {
-                if (!isConcreteVisibleItem(items[selected_index], resolved_bounds)) {
-                    self.clearSelectionState();
-                    return;
-                }
-            } else if (!isSelectable(items[selected_index], resolved_bounds)) {
-                if (self.interaction != .idle) self.cancelInteraction(items);
+            // The Objects dock is the recovery path for hidden, zero-opacity,
+            // and locked objects. Retain those selections, while still
+            // cancelling a canvas gesture that has become non-interactive.
+            if (items[selected_index].kind == .background) {
                 self.clearSelectionState();
                 return;
             }
+            if (self.interaction != .idle and !isSelectable(items[selected_index], resolved_bounds))
+                self.cancelInteraction(items);
 
             var retained: usize = 0;
             var member_index: usize = 0;
@@ -3805,9 +4237,7 @@ pub const Studio = struct {
                 else
                     itemIndexByIdentity(items, member.identity);
                 const valid_index = rebound_index orelse continue;
-                if (items[valid_index].locked) {
-                    if (!isConcreteVisibleItem(items[valid_index], resolved_bounds)) continue;
-                } else if (!isSelectable(items[valid_index], resolved_bounds)) continue;
+                if (items[valid_index].kind == .background) continue;
                 const rebound_identity = items[valid_index].identity;
                 if (self.selected_identity != null and rebound_identity == self.selected_identity.?) continue;
                 var duplicate = false;
@@ -4770,7 +5200,14 @@ pub const Studio = struct {
         const chrome_visible = if (viewport.chrome) |chrome| chrome.visible else true;
         if (chrome_visible) {
             self.drawToolbar(viewport);
-            if (self.selected_identity != null) {
+            if (viewport.chrome != null and viewport.chrome.?.right_visible) {
+                if (self.inspector_panel == .objects) {
+                    self.drawObjects(items, viewport);
+                } else {
+                    const selected_locked = if (self.selectedIndex(items)) |index| items[index].locked else false;
+                    self.drawProperties(items, resolved_bounds, viewport, selected_locked);
+                }
+            } else if (viewport.chrome == null and self.selected_identity != null) {
                 const selected_locked = if (self.selectedIndex(items)) |index| items[index].locked else false;
                 self.drawProperties(items, resolved_bounds, viewport, selected_locked);
             }
@@ -5025,6 +5462,144 @@ pub const Studio = struct {
         }
     }
 
+    fn drawInspectorTabs(self: Studio, viewport: Viewport) void {
+        const layout = objectsLayout(viewport);
+        drawToggleButton(self, layout.objects_tab, "Objects", self.inspector_panel == .objects);
+        drawToggleButton(self, layout.properties_tab, "Properties", self.inspector_panel == .properties);
+    }
+
+    fn drawObjects(self: Studio, items: []const slides.SlideItem, viewport: Viewport) void {
+        const layout = objectsLayout(viewport);
+        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        drawStudioPanel(layout.panel);
+        self.drawInspectorTabs(viewport);
+        const layer_labels = [_][:0]const u8{ "Back", "Down", "Up", "Front" };
+        for (layout.layer_actions, layer_labels) |button, label| drawCompactButton(self, button, label);
+        drawCompactButton(self, layout.page_previous, "Prev");
+        drawCompactButton(self, layout.page_next, "Next");
+
+        const scale = @min(uiScale(viewport), @as(f32, 1.4));
+        const body_font = scaledUiFont(scale, UiTypography.body);
+        const compact_font = scaledUiFont(scale, UiTypography.compact);
+        const count = objectItemCount(items);
+        for (0..objectRowCapacity(layout)) |visible_slot| {
+            const paint_offset = self.objects_first_visible + visible_slot;
+            const item_index = objectIndexAtPaintOffset(items, paint_offset) orelse break;
+            const item = items[item_index];
+            const row = objectRowRect(layout, visible_slot) orelse break;
+            const selected = item.kind != .background and self.isIdentitySelected(item.identity);
+            const row_color: rl.Color = if (selected)
+                .{ .r = 35, .g = 77, .b = 94, .a = 255 }
+            else if (item.kind == .background)
+                .{ .r = 30, .g = 29, .b = 41, .a = 248 }
+            else if (!item.visible or item.opacity <= 0)
+                .{ .r = 23, .g = 27, .b = 36, .a = 245 }
+            else
+                .{ .r = 27, .g = 34, .b = 49, .a = 250 };
+            rl.drawRectangleRec(row, row_color);
+            rl.drawRectangleLinesEx(row, if (selected) 2 else 1, if (selected)
+                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            else if (item.kind == .background)
+                .{ .r = 153, .g = 116, .b = 177, .a = 210 }
+            else
+                .{ .r = 87, .g = 101, .b = 125, .a = 205 });
+
+            const visibility = objectVisibilityRect(row);
+            const lock = objectLockRect(row);
+            if (item.kind == .background) {
+                drawDisabledBadge(self, visibility, "BG");
+                drawDisabledBadge(self, lock, "--");
+            } else {
+                drawToggleButton(self, visibility, if (item.visible) "Vis" else "Hid", item.visible);
+                drawToggleButton(self, lock, if (item.locked) "L" else "U", item.locked);
+            }
+
+            const text_x = visibility.x + visibility.width + 7;
+            const text_right = lock.x - 7;
+            const text_width = @max(0, text_right - text_x);
+            if (text_width <= 0) continue;
+            rl.beginScissorMode(
+                @intFromFloat(@floor(text_x)),
+                @intFromFloat(@floor(row.y + 2)),
+                @intFromFloat(@ceil(text_width)),
+                @intFromFloat(@ceil(row.height - 4)),
+            );
+            var generated_name: [192]u8 = undefined;
+            const raw_name: []const u8 = if (item.id) |id|
+                std.fmt.bufPrint(&generated_name, "#{s}", .{id}) catch id
+            else switch (item.kind) {
+                .textbox => if (item.text) |value|
+                    firstNonEmptyTextLine(value) orelse
+                        (std.fmt.bufPrint(&generated_name, "Text · line {d}", .{item.source.line_number}) catch "Text")
+                else
+                    std.fmt.bufPrint(&generated_name, "Text · line {d}", .{item.source.line_number}) catch "Text",
+                .img => if (item.img_path) |path| std.fs.path.basename(path) else "Image",
+                .crowd => if (item.crowd) |crowd|
+                    if (crowd.id.len > 0)
+                        std.fmt.bufPrint(&generated_name, "{s} · {s}", .{ @tagName(crowd.kind), crowd.id }) catch "Crowd"
+                    else
+                        @tagName(crowd.kind)
+                else
+                    "Crowd",
+                .background => "Background",
+            };
+            var fitted_name_buffer: [192]u8 = undefined;
+            const fitted_name = self.fitUiText(&fitted_name_buffer, raw_name, body_font, text_width);
+            self.drawUiText(fitted_name, .{ .x = text_x, .y = row.y + 6 }, body_font, if (!item.visible or item.opacity <= 0)
+                .{ .r = 164, .g = 174, .b = 191, .a = 255 }
+            else
+                .white);
+
+            const source = if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource();
+            const type_badge: []const u8 = switch (item.kind) {
+                .background => "BG",
+                .textbox => "Text",
+                .img => "Image",
+                .crowd => if (item.crowd) |crowd| switch (crowd.kind) {
+                    .join => "Crowd join",
+                    .poll => "Crowd poll",
+                } else "Crowd",
+            };
+            const base_badge: []const u8 = switch (item.source.scope) {
+                .none => "Unknown",
+                .direct => "Direct",
+                .component_instance => "Component",
+                .slide_template => "Shared",
+                .slide_instance_override => "Override",
+                .morph_item => "Morph",
+            };
+            const local_badge: []const u8 = if (item.instance_source != null) " · Local" else "";
+            const morph_badge: []const u8 = if (self.active_morph_state) |active_state|
+                if (item.creation_morph_state != null and item.creation_morph_state.? == active_state)
+                    " · Born here"
+                else if (item.state_source_state != null and item.state_source_state.? == active_state)
+                    " · State local"
+                else
+                    " · Inherited"
+            else
+                "";
+            var metadata_buffer: [192]u8 = undefined;
+            const metadata = if (item.kind == .background)
+                std.fmt.bufPrint(&metadata_buffer, "{s} · Paint barrier · {s}{s}{s} · line {d}", .{ type_badge, base_badge, local_badge, morph_badge, source.line_number }) catch "BG · Paint barrier"
+            else if (!item.visible)
+                std.fmt.bufPrint(&metadata_buffer, "{s} · {s}{s}{s} · hidden{s}", .{ type_badge, base_badge, local_badge, morph_badge, if (item.locked) " · locked" else "" }) catch type_badge
+            else if (item.opacity <= 0)
+                std.fmt.bufPrint(&metadata_buffer, "{s} · {s}{s}{s} · 0%{s}", .{ type_badge, base_badge, local_badge, morph_badge, if (item.locked) " · locked" else "" }) catch type_badge
+            else
+                std.fmt.bufPrint(&metadata_buffer, "{s} · {s}{s}{s} · {d:.0}%{s}", .{ type_badge, base_badge, local_badge, morph_badge, item.opacity * 100, if (item.locked) " · locked" else "" }) catch type_badge;
+            var fitted_metadata_buffer: [192]u8 = undefined;
+            const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
+            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = row.y + 31 }, compact_font, .{ .r = 181, .g = 193, .b = 213, .a = 255 });
+            rl.endScissorMode();
+        }
+
+        var page_buffer: [64]u8 = undefined;
+        const first = if (count == 0) 0 else self.objects_first_visible + 1;
+        const last = @min(count, self.objects_first_visible + objectRowCapacity(layout));
+        const page_text = std.fmt.bufPrintZ(&page_buffer, "{d}–{d} / {d}", .{ first, last, count }) catch "Objects";
+        self.drawUiText(page_text, .{ .x = layout.panel.x + 10, .y = layout.page_previous.y + 3 }, compact_font, .{ .r = 181, .g = 193, .b = 213, .a = 255 });
+    }
+
     fn drawToolbar(self: Studio, viewport: Viewport) void {
         const layout = uiLayout(viewport);
         const body_font = scaledUiFont(layout.scale, UiTypography.body);
@@ -5077,7 +5652,12 @@ pub const Studio = struct {
         drawActionButton(self, layout.scene_label, scene_label);
         drawActionButton(self, layout.scene_next, ">");
         drawToggleButton(self, layout.slides_dock_toggle, "Slides", self.active_dock == .slides);
-        drawToggleButton(self, layout.properties_dock_toggle, "Properties", self.active_dock == .properties);
+        drawToggleButton(
+            self,
+            layout.properties_dock_toggle,
+            "Inspector",
+            self.active_dock == .objects or self.active_dock == .properties,
+        );
         drawActionButton(self, layout.focus_canvas, "Focus");
     }
 
@@ -5094,7 +5674,10 @@ pub const Studio = struct {
         const body_font = scaledUiFont(layout.scale, UiTypography.body);
         const secondary: rl.Color = .{ .r = 205, .g = 214, .b = 230, .a = 255 };
         drawStudioPanel(layout.properties);
-        self.drawUiText("PROPERTIES", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + 11 * layout.scale }, heading_font, .white);
+        if (viewport.chrome != null)
+            self.drawInspectorTabs(viewport)
+        else
+            self.drawUiText("PROPERTIES", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + 11 * layout.scale }, heading_font, .white);
         drawActionButton(self, layout.edit_text, "Text");
         drawActionButton(self, layout.duplicate_item, "Dup");
         drawActionButton(self, layout.delete_item, "Del");
@@ -5316,6 +5899,20 @@ fn drawCompactButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) vo
         .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
         font_size,
         .white,
+    );
+}
+
+fn drawDisabledBadge(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
+    if (rect.width <= 0 or rect.height <= 0) return;
+    rl.drawRectangleRec(rect, .{ .r = 24, .g = 25, .b = 33, .a = 225 });
+    rl.drawRectangleLinesEx(rect, 1, .{ .r = 74, .g = 78, .b = 92, .a = 190 });
+    const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
+    const width = studio.measureUiText(label, font_size);
+    studio.drawUiText(
+        label,
+        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
+        font_size,
+        .{ .r = 130, .g = 137, .b = 153, .a = 255 },
     );
 }
 
@@ -8628,7 +9225,7 @@ test "docked frame keeps permanent chrome outside a sixteen by nine canvas" {
         .{ .size = .{ .x = 900, .y = 506 }, .expected_mode = .compact },
         .{ .size = .{ .x = 2560, .y = 1440 }, .expected_mode = .wide },
     };
-    const requested_docks = [_]DockPanel{ .slides, .properties };
+    const requested_docks = [_]DockPanel{ .slides, .objects, .properties };
     for (cases) |case| {
         for (requested_docks) |requested_dock| {
             const content: rl.Rectangle = .{ .x = 37, .y = 19, .width = case.size.x, .height = case.size.y };
@@ -8672,6 +9269,16 @@ test "docked frame keeps permanent chrome outside a sixteen by nine canvas" {
             try std.testing.expectEqual(@as(f32, 1), controls.scale);
             if (frame.chrome.right_visible) {
                 try expectRectangleContained(frame.chrome.right_dock, controls.properties);
+                const objects = objectsLayout(frame.viewport);
+                try expectRectangleContained(frame.chrome.right_dock, objects.panel);
+                try expectRectangleContained(objects.panel, objects.objects_tab);
+                try expectRectangleContained(objects.panel, objects.properties_tab);
+                try expectRectangleContained(objects.panel, objects.rows_clip);
+                try expectRectangleContained(objects.panel, objects.page_previous);
+                try expectRectangleContained(objects.panel, objects.page_next);
+                for (objects.layer_actions) |control| try expectRectangleContained(objects.panel, control);
+                for (0..objectRowCapacity(objects)) |visible_slot|
+                    try expectRectangleContained(objects.rows_clip, objectRowRect(objects, visible_slot).?);
                 const property_controls = [_]rl.Rectangle{
                     controls.edit_text,
                     controls.duplicate_item,
@@ -8719,19 +9326,29 @@ test "medium dock controls switch reserved space without overlaying the canvas" 
         .pointer_screen = rectangleCenter(controls.properties_dock_toggle),
         .pointer_pressed = true,
     });
-    try std.testing.expectEqual(DockPanel.properties, studio.active_dock);
-    const properties_frame = studio.layoutFrame(content);
-    try std.testing.expect(!properties_frame.chrome.left_visible);
-    try std.testing.expect(properties_frame.chrome.right_visible);
+    try std.testing.expectEqual(DockPanel.objects, studio.active_dock);
+    try std.testing.expectEqual(InspectorPanel.objects, studio.inspector_panel);
+    const objects_frame = studio.layoutFrame(content);
+    try std.testing.expect(!objects_frame.chrome.left_visible);
+    try std.testing.expect(objects_frame.chrome.right_visible);
     try std.testing.expect(!rectanglesOverlap(
-        properties_frame.chrome.right_dock,
+        objects_frame.chrome.right_dock,
         .{
-            .x = properties_frame.viewport.slide_top_left.x,
-            .y = properties_frame.viewport.slide_top_left.y,
-            .width = properties_frame.viewport.slide_size.x,
-            .height = properties_frame.viewport.slide_size.y,
+            .x = objects_frame.viewport.slide_top_left.x,
+            .y = objects_frame.viewport.slide_top_left.y,
+            .width = objects_frame.viewport.slide_size.x,
+            .height = objects_frame.viewport.slide_size.y,
         },
     ));
+
+    const inspector = objectsLayout(objects_frame.viewport);
+    _ = studio.update(&items, &.{}, objects_frame.viewport, .{
+        .pointer_screen = rectangleCenter(inspector.properties_tab),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(DockPanel.properties, studio.active_dock);
+    try std.testing.expectEqual(InspectorPanel.properties, studio.inspector_panel);
+    const properties_frame = studio.layoutFrame(content);
 
     const property_controls = uiLayout(properties_frame.viewport);
     _ = studio.update(&items, &.{}, properties_frame.viewport, .{
@@ -8742,8 +9359,155 @@ test "medium dock controls switch reserved space without overlaying the canvas" 
     const canvas_frame = studio.layoutFrame(content);
     try std.testing.expect(!canvas_frame.chrome.left_visible);
     try std.testing.expect(!canvas_frame.chrome.right_visible);
-    try std.testing.expect(canvas_frame.canvas_area.width > properties_frame.canvas_area.width);
-    try std.testing.expect(canvas_frame.viewport.slide_size.x >= properties_frame.viewport.slide_size.x);
+    try std.testing.expect(canvas_frame.canvas_area.width > objects_frame.canvas_area.width);
+    try std.testing.expect(canvas_frame.viewport.slide_size.x >= objects_frame.viewport.slide_size.x);
+}
+
+test "objects inspector mirrors reverse paint order including background barriers" {
+    const items = [_]slides.SlideItem{
+        testItem(601, .textbox, 10, 10, 100, 40),
+        testItem(602, .background, 0, 0, 1920, 1080),
+        testItem(603, .img, 30, 30, 200, 100),
+    };
+    try std.testing.expectEqual(@as(usize, 3), objectItemCount(&items));
+    try std.testing.expectEqual(@as(?usize, 2), objectIndexAtPaintOffset(&items, 0));
+    try std.testing.expectEqual(@as(?usize, 1), objectIndexAtPaintOffset(&items, 1));
+    try std.testing.expectEqual(@as(?usize, 0), objectIndexAtPaintOffset(&items, 2));
+    try std.testing.expectEqual(@as(?usize, null), objectIndexAtPaintOffset(&items, 3));
+}
+
+test "objects inspector selects hidden zero opacity and locked rows by runtime identity" {
+    var items = [_]slides.SlideItem{
+        testItem(610, .background, 0, 0, 1920, 1080),
+        testItem(611, .textbox, 10, 10, 100, 40),
+        testItem(612, .textbox, 30, 30, 100, 40),
+        testItem(613, .textbox, 50, 50, 100, 40),
+    };
+    items[1].visible = false;
+    items[2].opacity = 0;
+    items[3].locked = true;
+    var studio: Studio = .{ .enabled = true, .active_dock = .objects };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = objectsLayout(frame.viewport);
+    const locked_row = objectRowRect(layout, 0).?;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = .{ .x = locked_row.x + 72, .y = locked_row.y + locked_row.height / 2 },
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 613), studio.selected_identity);
+    try std.testing.expectEqual(@as(usize, 1), studio.selectionCount());
+
+    const zero_row = objectRowRect(layout, 1).?;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = .{ .x = zero_row.x + 72, .y = zero_row.y + zero_row.height / 2 },
+        .pointer_pressed = true,
+        .toggle_selection = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 612), studio.selected_identity);
+    try std.testing.expect(studio.isIdentitySelected(613));
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+
+    const hidden_row = objectRowRect(layout, 2).?;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = .{ .x = hidden_row.x + 72, .y = hidden_row.y + hidden_row.height / 2 },
+        .pointer_pressed = true,
+        .toggle_selection = true,
+    });
+    _ = studio.update(&items, &.{}, frame.viewport, .{});
+    try std.testing.expectEqual(@as(?usize, 611), studio.selected_identity);
+    try std.testing.expect(studio.isIdentitySelected(612));
+    try std.testing.expect(studio.isIdentitySelected(613));
+    try std.testing.expectEqual(@as(usize, 3), studio.selectionCount());
+}
+
+test "objects row eye is exact refuses locked items and preserves zero opacity" {
+    var items = [_]slides.SlideItem{
+        testItem(620, .textbox, 10, 10, 100, 40),
+        testItem(621, .textbox, 30, 30, 100, 40),
+    };
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .direct, .line_offset = 20, .patchable = true };
+    items[0].opacity = 0;
+    var studio: Studio = .{ .enabled = true, .active_dock = .objects };
+    setTestSelection(&studio, &items, &.{ 620, 621 });
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = objectsLayout(frame.viewport);
+    const zero_row = objectRowRect(layout, 1).?;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(objectVisibilityRect(zero_row)),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_visible => |command| {
+            try std.testing.expectEqual(@as(usize, 1), command.count);
+            try std.testing.expectEqual(@as(usize, 620), command.targets[0].item_identity);
+            try std.testing.expect(!command.visible);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+    try std.testing.expectEqual(@as(f32, 0), items[0].opacity);
+
+    items[1].locked = true;
+    const locked_row = objectRowRect(layout, 0).?;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(objectVisibilityRect(locked_row)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.locked_item, studio.notice);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(objectLockRect(locked_row)),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_locked => |command| {
+            try std.testing.expectEqual(@as(usize, 1), command.count);
+            try std.testing.expectEqual(@as(usize, 621), command.targets[0].item_identity);
+            try std.testing.expect(!command.locked);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "objects row Alt visibility toggles the shared authored layer" {
+    var items = [_]slides.SlideItem{testItem(630, .textbox, 10, 10, 100, 40)};
+    items[0].id = "hero";
+    items[0].visible = false;
+    items[0].source = .{ .scope = .slide_template, .line_offset = 10, .patchable = true };
+    items[0].shared_template_values = .{
+        .position = items[0].position,
+        .size = items[0].size,
+        .visible = true,
+    };
+    var studio: Studio = .{ .enabled = true, .active_dock = .objects };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const row = objectRowRect(objectsLayout(frame.viewport), 0).?;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(objectVisibilityRect(row)),
+        .pointer_pressed = true,
+        .allow_shared_edit = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_visible => |command| {
+            try std.testing.expectEqual(EditScope.shared_template, command.targets[0].edit_scope);
+            try std.testing.expect(!command.visible);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    items[0].shared_template_values.?.locked = true;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(objectLockRect(row)),
+        .pointer_pressed = true,
+        .allow_shared_edit = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_locked => |command| {
+            try std.testing.expectEqual(EditScope.shared_template, command.targets[0].edit_scope);
+            try std.testing.expect(!command.locked);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
 }
 
 test "Focus Canvas hides chrome but preserves selection and restores with Tab" {

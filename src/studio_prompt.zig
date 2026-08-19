@@ -261,7 +261,7 @@ fn promptHint(kind: Kind) [:0]const u8 {
         .dimension => "Logical slide pixels · use a positive value · Enter commits",
         .color => "Use #RRGGBB or #RRGGBBAA · Enter commits · Esc cancels",
         .font_size => "Positive whole-number pixels · Enter commits · Esc cancels",
-        .opacity => "Use 0.01–1 or 1–100% · zero would make the item unselectable",
+        .opacity => "Use 0–1 or 0–100% · transparent items remain selectable in Objects",
     };
 }
 

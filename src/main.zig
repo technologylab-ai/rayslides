@@ -2058,6 +2058,14 @@ fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticComman
         }
         return false;
     }
+    if (command == .set_visible) {
+        for (command.set_visible.slice()) |target| {
+            if (target.edit_scope != .shared_template) continue;
+            const item = studioItemByIdentity(items, target.item_identity) orelse continue;
+            if (item.instance_source != null) return true;
+        }
+        return false;
+    }
     const target: studio.CommandTarget = switch (command) {
         .edit_text => |value| value,
         .edit_numeric_geometry => |value| value.target,
@@ -2676,7 +2684,7 @@ fn canonicalStudioOpacity(input: []const u8, buffer: []u8) ![]const u8 {
         const percent = try parseStudioFiniteFloat(value[0 .. value.len - 1]);
         break :blk percent / 100;
     } else try parseStudioFiniteFloat(value);
-    if (opacity < 0.01 or opacity > 1) return error.InvalidStudioOpacity;
+    if (opacity < 0 or opacity > 1) return error.InvalidStudioOpacity;
     return formatStudioFloat(buffer, opacity);
 }
 
@@ -2696,8 +2704,10 @@ test "Studio custom property values canonicalize safely" {
     var number_buffer: [64]u8 = undefined;
     try std.testing.expectEqualStrings("0.75", try canonicalStudioOpacity("75%", &number_buffer));
     try std.testing.expectEqualStrings("0.25", try canonicalStudioOpacity("0.25", &number_buffer));
-    try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("0", &number_buffer));
-    try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("0.5%", &number_buffer));
+    try std.testing.expectEqualStrings("0", try canonicalStudioOpacity("0", &number_buffer));
+    try std.testing.expectEqualStrings("0", try canonicalStudioOpacity("0%", &number_buffer));
+    try std.testing.expectEqualStrings("0.005", try canonicalStudioOpacity("0.5%", &number_buffer));
+    try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("-0.1", &number_buffer));
     try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("101%", &number_buffer));
     try std.testing.expectEqualStrings("48", try canonicalStudioFontSize("48", &number_buffer));
     try std.testing.expectError(error.InvalidStudioFontSize, canonicalStudioFontSize("0", &number_buffer));
@@ -3150,6 +3160,356 @@ fn applyStudioLockEdit(
     return recordStudioPatch(history, try source_editor.applyLiteralEdits(G.allocator, source, edits[0..command.count]));
 }
 
+fn planStudioVisibilityEdits(
+    source: []const u8,
+    command: studio.SetVisibleCommand,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+    edits: *[studio.max_selection_items]source_editor.VisibilitySourceEdit,
+) ![]const source_editor.VisibilitySourceEdit {
+    if (command.count == 0 or command.count > studio.max_selection_items) return error.InvalidStudioVisibilityBatch;
+
+    for (command.slice(), 0..) |target, index| {
+        const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+        if (item.kind == .background) return error.ItemHasNoVisibility;
+        // Visibility is a persistent property mutation. A lock protects it in
+        // the same way as geometry, text, color, opacity, and layer order.
+        if (item.locked) return error.StudioItemLocked;
+
+        if (morph_state) |state_index| {
+            if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            switch (morphItemEditTarget(slide, state_index, item)) {
+                .patch => |patch_source| {
+                    if (item.state_source_state != null and item.state_source_state.? == state_index) {
+                        const id = item.id orelse return error.MorphItemNeedsId;
+                        try source_editor.validateMorphMutationTarget(
+                            source,
+                            slide.morph_states.items[state_index].source.line_offset,
+                            patch_source.line_offset,
+                            id,
+                        );
+                        edits[index] = .{ .rewrite_mutation = .{
+                            .directive_offset = patch_source.line_offset,
+                            .item_id = id,
+                            .visible = command.visible,
+                        } };
+                    } else {
+                        if (patch_source.scope == .none or !patch_source.patchable) {
+                            return error.StudioItemHasNoPatchableSource;
+                        }
+                        edits[index] = .{ .patch_item = .{
+                            .directive_offset = patch_source.line_offset,
+                            .visible = command.visible,
+                        } };
+                    }
+                },
+                .insert_local => {
+                    const id = item.id orelse return error.MorphItemNeedsId;
+                    edits[index] = .{ .insert_mutation = .{
+                        .insertion_offset = try source_editor.morphStateEndOffset(
+                            source,
+                            slide.morph_states.items[state_index].source.line_offset,
+                        ),
+                        .item_id = id,
+                        .visible = command.visible,
+                    } };
+                },
+            }
+            continue;
+        }
+
+        switch (target.edit_scope) {
+            .local_instance => {
+                const id = item.id orelse return error.TemplateInstanceItemNeedsId;
+                if (item.instance_source) |instance_source| {
+                    if (!instance_source.patchable) return error.StudioItemHasNoPatchableSource;
+                    try source_editor.validateSlideTemplateOverrideTarget(
+                        source,
+                        slide.pos_in_editor,
+                        instance_source.line_offset,
+                        id,
+                    );
+                    edits[index] = .{ .rewrite_mutation = .{
+                        .directive_offset = instance_source.line_offset,
+                        .item_id = id,
+                        .visible = command.visible,
+                    } };
+                } else {
+                    edits[index] = .{ .insert_mutation = .{
+                        .insertion_offset = try source_editor.slideTemplateVisibilityInsertionOffset(
+                            source,
+                            slide.pos_in_editor,
+                            id,
+                        ),
+                        .item_id = id,
+                        .visible = command.visible,
+                    } };
+                }
+            },
+            .shared_template, .direct => {
+                const source_ref = if (target.edit_scope == .shared_template) item.source else item.effectiveBaseSource();
+                if (source_ref.scope == .none or !source_ref.patchable) {
+                    return error.StudioItemHasNoPatchableSource;
+                }
+                edits[index] = .{ .patch_item = .{
+                    .directive_offset = source_ref.line_offset,
+                    .visible = command.visible,
+                } };
+            },
+        }
+    }
+
+    return edits[0..command.count];
+}
+
+fn applyStudioVisibilityEdit(
+    history: *StudioHistory,
+    command: studio.SetVisibleCommand,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+) !void {
+    const source = G.editor_memory[0..G.source_len];
+    var edits: [studio.max_selection_items]source_editor.VisibilitySourceEdit = undefined;
+    const planned = try planStudioVisibilityEdits(
+        source,
+        command,
+        slide,
+        morph_state,
+        items,
+        &edits,
+    );
+    return recordStudioPatch(history, try source_editor.applyVisibilityEdits(
+        G.allocator,
+        source,
+        planned,
+    ));
+}
+
+test "Studio visibility planner preserves direct template-local and shared ownership" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@box id=hero visible=true text=Hero\n" ++
+        "@box id=badge visible=true text=Badge\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@show hero x=100\n" ++
+        "@box id=local text=Local\n" ++
+        "@popslide layout\n";
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const first_slide = slideshow.slides.items[0];
+    const items = first_slide.items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+
+    var command = studio.SetVisibleCommand{ .count = 3, .visible = false };
+    command.targets[0] = .{
+        .item_identity = items[0].identity,
+        .source = items[0].effectiveBaseSource(),
+        .edit_scope = .local_instance,
+    };
+    command.targets[1] = .{
+        .item_identity = items[1].identity,
+        .source = items[1].effectiveBaseSource(),
+        .edit_scope = .local_instance,
+    };
+    command.targets[2] = .{
+        .item_identity = items[2].identity,
+        .source = items[2].effectiveBaseSource(),
+        .edit_scope = .direct,
+    };
+    var edits: [studio.max_selection_items]source_editor.VisibilitySourceEdit = undefined;
+    const planned = try planStudioVisibilityEdits(
+        source,
+        command,
+        first_slide,
+        null,
+        items,
+        &edits,
+    );
+    const hidden = try source_editor.applyVisibilityEdits(allocator, source, planned);
+    defer hidden.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.source, "@hide hero x=100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.source, "@hide badge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.source, "@box id=local visible=false text=Local") != null);
+
+    var hidden_arena = std.heap.ArenaAllocator.init(allocator);
+    defer hidden_arena.deinit();
+    const hidden_slideshow = try slides.SlideShow.new(hidden_arena.allocator());
+    const hidden_context = try parser.constructSlidesFromBuf(hidden.source, hidden_slideshow, hidden_arena.allocator());
+    defer hidden_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), hidden_context.parser_errors.items.len);
+    for (hidden_slideshow.slides.items[0].items.?.items) |item| try std.testing.expect(!item.visible);
+    for (hidden_slideshow.slides.items[1].items.?.items) |item| try std.testing.expect(item.visible);
+
+    // A shared edit patches the @pushslide-owned creation directive. The
+    // first instance's local @show remains effective, while the uncustomized
+    // second instance receives the new shared value.
+    var shared_command = studio.SetVisibleCommand{ .count = 1, .visible = false };
+    shared_command.targets[0] = .{
+        .item_identity = items[0].identity,
+        .source = items[0].source,
+        .edit_scope = .shared_template,
+    };
+    const shared_planned = try planStudioVisibilityEdits(
+        source,
+        shared_command,
+        first_slide,
+        null,
+        items,
+        &edits,
+    );
+    const shared_hidden = try source_editor.applyVisibilityEdits(allocator, source, shared_planned);
+    defer shared_hidden.deinit(allocator);
+
+    var shared_arena = std.heap.ArenaAllocator.init(allocator);
+    defer shared_arena.deinit();
+    const shared_slideshow = try slides.SlideShow.new(shared_arena.allocator());
+    const shared_context = try parser.constructSlidesFromBuf(shared_hidden.source, shared_slideshow, shared_arena.allocator());
+    defer shared_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), shared_context.parser_errors.items.len);
+    try std.testing.expect(shared_slideshow.slides.items[0].items.?.items[0].visible);
+    try std.testing.expect(!shared_slideshow.slides.items[1].items.?.items[0].visible);
+}
+
+test "Studio visibility planner targets current morph ownership and inherited snapshots" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@slide\n" ++
+        "@box id=base text=Base\n" ++
+        "@state(morph)\n" ++
+        "@set base x=100 color=#010203ff\n" ++
+        "@box id=born text=Born\n" ++
+        "@state(morph)\n";
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = slideshow.slides.items[0];
+    const first_state = slide.morph_states.items[0].items.items;
+
+    var hide = studio.SetVisibleCommand{ .count = 2, .visible = false };
+    for (first_state, 0..) |item, index| hide.targets[index] = .{
+        .item_identity = item.identity,
+        .source = item.effectiveSource(),
+        .edit_scope = .direct,
+    };
+    var edits: [studio.max_selection_items]source_editor.VisibilitySourceEdit = undefined;
+    const planned_hide = try planStudioVisibilityEdits(
+        source,
+        hide,
+        slide,
+        0,
+        first_state,
+        &edits,
+    );
+    const hidden = try source_editor.applyVisibilityEdits(allocator, source, planned_hide);
+    defer hidden.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.source, "@hide base x=100 color=#010203ff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.source, "@box id=born visible=false text=Born") != null);
+
+    var hidden_arena = std.heap.ArenaAllocator.init(allocator);
+    defer hidden_arena.deinit();
+    const hidden_slideshow = try slides.SlideShow.new(hidden_arena.allocator());
+    const hidden_context = try parser.constructSlidesFromBuf(hidden.source, hidden_slideshow, hidden_arena.allocator());
+    defer hidden_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), hidden_context.parser_errors.items.len);
+    const hidden_slide = hidden_slideshow.slides.items[0];
+    for (hidden_slide.morph_states.items[0].items.items) |item| try std.testing.expect(!item.visible);
+
+    const inherited = hidden_slide.morph_states.items[1].items.items;
+    var show_inherited = studio.SetVisibleCommand{ .count = 1, .visible = true };
+    show_inherited.targets[0] = .{
+        .item_identity = inherited[0].identity,
+        .source = inherited[0].effectiveSource(),
+        .edit_scope = .direct,
+    };
+    const planned_show = try planStudioVisibilityEdits(
+        hidden.source,
+        show_inherited,
+        hidden_slide,
+        1,
+        inherited,
+        &edits,
+    );
+    const shown = try source_editor.applyVisibilityEdits(allocator, hidden.source, planned_show);
+    defer shown.deinit(allocator);
+    try std.testing.expect(std.mem.endsWith(u8, shown.source, "@state(morph)\n@show base\n"));
+
+    var shown_arena = std.heap.ArenaAllocator.init(allocator);
+    defer shown_arena.deinit();
+    const shown_slideshow = try slides.SlideShow.new(shown_arena.allocator());
+    const shown_context = try parser.constructSlidesFromBuf(shown.source, shown_slideshow, shown_arena.allocator());
+    defer shown_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), shown_context.parser_errors.items.len);
+    const shown_second = shown_slideshow.slides.items[0].morph_states.items[1].items.items;
+    try std.testing.expect(shown_second[0].visible);
+    try std.testing.expect(!shown_second[1].visible);
+}
+
+test "Studio visibility planner supports component instances and rejects locked batches" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@box id=content text=Component\n" ++
+        "@push card\n" ++
+        "@slide\n" ++
+        "@pop card id=instance x=20 y=30\n" ++
+        "@box id=locked locked=true text=Guarded\n";
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = slideshow.slides.items[0];
+    const items = slide.items.?.items;
+    try std.testing.expectEqual(slides.SourceScope.component_instance, items[0].source.scope);
+
+    var edits: [studio.max_selection_items]source_editor.VisibilitySourceEdit = undefined;
+    var component = studio.SetVisibleCommand{ .count = 1, .visible = false };
+    component.targets[0] = .{
+        .item_identity = items[0].identity,
+        .source = items[0].source,
+        .edit_scope = .direct,
+    };
+    const planned = try planStudioVisibilityEdits(
+        source,
+        component,
+        slide,
+        null,
+        items,
+        &edits,
+    );
+    const hidden = try source_editor.applyVisibilityEdits(allocator, source, planned);
+    defer hidden.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.source, "@pop card id=instance x=20 y=30 visible=false") != null);
+
+    var locked = studio.SetVisibleCommand{ .count = 2, .visible = false };
+    for (items, 0..) |item, index| locked.targets[index] = .{
+        .item_identity = item.identity,
+        .source = item.source,
+        .edit_scope = .direct,
+    };
+    try std.testing.expectError(error.StudioItemLocked, planStudioVisibilityEdits(
+        source,
+        locked,
+        slide,
+        null,
+        items,
+        &edits,
+    ));
+}
+
 const StudioSemanticEditResult = struct {
     source_changed: bool = true,
     slide_index: ?usize = null,
@@ -3532,6 +3892,14 @@ fn applyStudioSemanticEdit(
                 paste_items[0..clipboard.items.items.len],
             ));
             clipboard.paste_generation += 1;
+        },
+        .set_visible => |visibility| {
+            try applyStudioVisibilityEdit(history, visibility, slide, morph_state, items);
+            // Visibility does not add/remove/reorder items, so runtime
+            // identities remain stable across the reparse. Keeping the
+            // source-bound selection is what lets the Objects dock recover a
+            // newly hidden item, including an id-less direct item.
+            return .{ .preserve_selection = true };
         },
         .set_locked => |lock| {
             var all_have_ids = true;
