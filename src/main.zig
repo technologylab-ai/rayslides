@@ -131,6 +131,10 @@ const StudioHistory = struct {
 
 const StudioClipboardItem = struct {
     snippet: []u8,
+    /// Exact `@push` definition used by a captured literal `@pop`. Keeping
+    /// this proof with the owned snippet prevents a paste from silently
+    /// rebinding to a shadowing component definition.
+    component_definition_offset: ?usize = null,
     position: rl.Vector2,
 };
 
@@ -745,6 +749,10 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (G.slideshow_filp_to_load) |filp| {
             studio_mode = .{};
             studio_history.clear();
+            // Component clipboard entries carry source-order definition
+            // provenance. Never let them cross a document reload where the
+            // same name/offset could refer to unrelated source.
+            studio_clipboard.clear();
             studio_bounds.clearRetainingCapacity();
             try loadSlideshow(filp);
             is_pre_rendered = false;
@@ -1189,6 +1197,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                     error.InvalidItemScene,
                     error.UnsupportedItemLayerMove,
                     error.UnsupportedClipboardItem,
+                    error.UnsupportedBatchDeletion,
                     => .structural_source_locked,
                     error.StudioClipboardEmpty => .clipboard_empty,
                     error.LockedLayerBarrier => .locked_item,
@@ -2628,17 +2637,20 @@ fn captureStudioClipboard(
 
     for (command.slice()) |target| {
         const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
-        const snippet = try source_editor.captureItemSnippet(
+        const item_capture = try source_editor.captureItemForPaste(
             clipboard.allocator,
             G.editor_memory[0..G.source_len],
             scene,
             target.source.line_offset,
         );
-        errdefer clipboard.allocator.free(snippet);
-        try captured.append(clipboard.allocator, .{
-            .snippet = snippet,
+        captured.append(clipboard.allocator, .{
+            .snippet = item_capture.snippet,
+            .component_definition_offset = item_capture.component_definition_offset,
             .position = studio.itemGeometry(item.*, resolved_bounds).position,
-        });
+        }) catch |err| {
+            item_capture.deinit(clipboard.allocator);
+            return err;
+        };
     }
 
     // Allocate before clearing so a failed copy never destroys the previous
@@ -2978,6 +2990,45 @@ fn applyStudioSemanticEdit(
                 .{ .x = geometry.position.x + 20, .y = geometry.position.y + 20 },
             ));
         },
+        .duplicate_items => |batch| {
+            if (batch.count == 0 or batch.count > studio.max_selection_items) {
+                return error.InvalidStudioClipboardBatch;
+            }
+            const scene = try studioItemSceneAnchor(slide, morph_state);
+            var targets: [studio.max_selection_items]source_editor.DuplicateItemTarget = undefined;
+            for (batch.slice(), 0..) |target, index| {
+                const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+                if (item.locked or target.edit_scope != .direct or !target.source.patchable) {
+                    return error.UnsupportedItemDuplication;
+                }
+                if (morph_state) |state_index| {
+                    if (!itemBornInMorphState(slide, state_index, item) or item.state_source != null) {
+                        return error.MorphItemDuplicationUnsupported;
+                    }
+                } else switch (target.source.scope) {
+                    .direct, .component_instance => {},
+                    else => return error.UnsupportedItemDuplication,
+                }
+
+                try selection_ids.appendNextUnique();
+                const geometry = studio.itemGeometry(item.*, resolved_bounds);
+                targets[index] = .{
+                    .directive_offset = target.source.line_offset,
+                    .new_id = selection_ids.values.items[index],
+                    .placement = .{
+                        .x = geometry.position.x + 20,
+                        .y = geometry.position.y + 20,
+                    },
+                };
+            }
+            try recordStudioPatch(history, try source_editor.duplicateItems(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                scene,
+                scene,
+                targets[0..batch.count],
+            ));
+        },
         .delete_item => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
             if (morph_state) |state_index| {
@@ -3009,6 +3060,45 @@ fn applyStudioSemanticEdit(
                     },
                 }
             }
+        },
+        .delete_items => |batch| {
+            if (batch.count == 0 or batch.count > studio.max_selection_items) {
+                return error.UnsupportedBatchDeletion;
+            }
+            const scene = try studioItemSceneAnchor(slide, morph_state);
+            var targets: [studio.max_selection_items]source_editor.DeleteItemTarget = undefined;
+            for (batch.slice(), 0..) |target, index| {
+                const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+                if (item.locked or target.edit_scope == .shared_template) {
+                    return error.UnsupportedBatchDeletion;
+                }
+                targets[index] = if (morph_state) |state_index| blk: {
+                    if (itemBornInMorphState(slide, state_index, item)) {
+                        break :blk .{ .authored = .{
+                            .directive_offset = item.source.line_offset,
+                            .item_id = item.id,
+                        } };
+                    }
+                    break :blk .{ .hide = .{
+                        .item_id = item.id orelse return error.MorphItemNeedsId,
+                    } };
+                } else switch (target.edit_scope) {
+                    .direct => .{ .authored = .{
+                        .directive_offset = target.source.line_offset,
+                        .item_id = item.id,
+                    } },
+                    .local_instance => .{ .hide = .{
+                        .item_id = item.id orelse return error.TemplateInstanceItemNeedsId,
+                    } },
+                    .shared_template => unreachable,
+                };
+            }
+            try recordStudioPatch(history, try source_editor.deleteItems(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                scene,
+                targets[0..batch.count],
+            ));
         },
         .edit_text => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
@@ -3092,6 +3182,7 @@ fn applyStudioSemanticEdit(
                 try selection_ids.appendNextUnique();
                 paste_items[index] = .{
                     .snippet = clipboard_item.snippet,
+                    .component_definition_offset = clipboard_item.component_definition_offset,
                     .new_id = selection_ids.values.items[index],
                     .placement = .{
                         .x = clipboard_item.position.x + paste.offset.x * generation,

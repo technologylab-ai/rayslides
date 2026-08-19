@@ -768,3 +768,190 @@ test "Studio lock round trip retains a read-only copy selection" {
         else => return error.UnexpectedSemanticCommand,
     }
 }
+
+test "Studio batch duplicate keeps direct and component items in one source transaction" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@push card x=30 y=40 w=220 h=90 text=Reusable card\n" ++
+        "@slide\n" ++
+        "@box id=title x=100 y=80 w=500 h=100 text=Title\n" ++
+        "@pop card id=card_one x=200 y=260\n";
+    const scene: source_editor.ItemSceneAnchor = .{
+        .base_slide = std.mem.indexOf(u8, source, "@slide").?,
+    };
+    const targets = [_]source_editor.DuplicateItemTarget{
+        .{
+            .directive_offset = std.mem.indexOf(u8, source, "@box id=title").?,
+            .new_id = "title_copy",
+            .placement = .{ .x = 120, .y = 100 },
+        },
+        .{
+            .directive_offset = std.mem.indexOf(u8, source, "@pop card").?,
+            .new_id = "card_copy",
+            .placement = .{ .x = 220, .y = 280 },
+        },
+    };
+
+    const patch = try source_editor.duplicateItems(allocator, source, scene, scene, &targets);
+    defer patch.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expectEqualStrings("title_copy", items[2].id.?);
+    try std.testing.expectEqualStrings("card_copy", items[3].id.?);
+    try std.testing.expectEqualStrings("Reusable card", items[3].text.?);
+    try std.testing.expectEqual(slides.SourceScope.component_instance, items[3].source.scope);
+    try std.testing.expectApproxEqAbs(@as(f32, 220), items[3].position.x, 0.0001);
+}
+
+test "Studio component clipboard proves its reusable definition at paste time" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@push card x=10 y=20 w=200 h=80 text=Original card\n" ++
+        "@slide\n" ++
+        "@pop card id=first\n" ++
+        "@slide\n" ++
+        "@box id=target text=Target\n";
+    const first_slide = std.mem.indexOf(u8, source, "@slide").?;
+    const second_slide = std.mem.lastIndexOf(u8, source, "@slide").?;
+    const captured = try source_editor.captureItemForPaste(
+        allocator,
+        source,
+        .{ .base_slide = first_slide },
+        std.mem.indexOf(u8, source, "@pop card").?,
+    );
+    defer captured.deinit(allocator);
+    try std.testing.expect(captured.component_definition_offset != null);
+
+    const patch = try source_editor.pasteCapturedItem(allocator, source, .{
+        .base_slide = second_slide,
+    }, .{
+        .snippet = captured.snippet,
+        .component_definition_offset = captured.component_definition_offset,
+        .new_id = "pasted_card",
+        .placement = .{ .x = 500, .y = 300 },
+    });
+    defer patch.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const pasted = slideshow.slides.items[1].items.?.items[1];
+    try std.testing.expectEqualStrings("pasted_card", pasted.id.?);
+    try std.testing.expectEqualStrings("Original card", pasted.text.?);
+    try std.testing.expectEqual(slides.SourceScope.component_instance, pasted.source.scope);
+
+    // The exact definition offset is part of the clipboard proof. A stale or
+    // forged proof is rejected rather than letting the @pop silently resolve
+    // to whichever same-named component is in scope at the destination.
+    try std.testing.expectError(error.UnsupportedClipboardItem, source_editor.pasteCapturedItem(
+        allocator,
+        source,
+        .{ .base_slide = second_slide },
+        .{
+            .snippet = captured.snippet,
+            .component_definition_offset = captured.component_definition_offset.? + 1,
+            .new_id = "wrong_card",
+            .placement = .{ .x = 1, .y = 2 },
+        },
+    ));
+}
+
+test "Studio batch delete mixes authored removal with a template-instance hide" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@box id=shared x=10 y=20 text=Shared\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@box id=local x=30 y=40 text=Local\n" ++
+        "@state(morph)\n" ++
+        "@set local x=300\n" ++
+        "@set shared y=200\n" ++
+        "@popslide layout\n";
+    const instance = std.mem.indexOf(u8, source, "@popslide layout").?;
+    const targets = [_]source_editor.DeleteItemTarget{
+        .{ .authored = .{
+            .directive_offset = std.mem.indexOf(u8, source, "@box id=local").?,
+            .item_id = "local",
+        } },
+        .{ .hide = .{ .item_id = "shared" } },
+    };
+    const patch = try source_editor.deleteItems(
+        allocator,
+        source,
+        .{ .base_slide = instance },
+        &targets,
+    );
+    defer patch.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@box id=local") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@set local") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@hide shared\n@state(morph)") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+    const first_base = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), first_base.len);
+    try std.testing.expectEqualStrings("shared", first_base[0].id.?);
+    try std.testing.expect(!first_base[0].visible);
+    try std.testing.expectEqual(@as(usize, 1), slideshow.slides.items[1].items.?.items.len);
+    try std.testing.expectEqualStrings("shared", slideshow.slides.items[1].items.?.items[0].id.?);
+}
+
+test "Studio morph batch deletion removes a current-state birth and all later dependencies" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@slide\n" ++
+        "@box id=base x=10 y=20 text=Base\n" ++
+        "@state(morph)\n" ++
+        "@box id=born x=30 y=40 text=Born\n" ++
+        "@set born x=300\n" ++
+        "@state(morph)\n" ++
+        "@show born\n" ++
+        "@set born y=400\n";
+    const first_state = std.mem.indexOf(u8, source, "@state(morph)").?;
+    const targets = [_]source_editor.DeleteItemTarget{
+        .{ .authored = .{
+            .directive_offset = std.mem.indexOf(u8, source, "@box id=born").?,
+            .item_id = "born",
+        } },
+        .{ .hide = .{ .item_id = "base" } },
+    };
+    const patch = try source_editor.deleteItems(
+        allocator,
+        source,
+        .{ .morph_state = first_state },
+        &targets,
+    );
+    defer patch.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@box id=born") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@set born") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@show born") == null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items[0].morph_states.items.len);
+    for (slideshow.slides.items[0].morph_states.items) |state| {
+        try std.testing.expectEqual(@as(usize, 1), state.items.items.len);
+        try std.testing.expectEqualStrings("base", state.items.items[0].id.?);
+        try std.testing.expect(!state.items.items[0].visible);
+    }
+}

@@ -30,11 +30,44 @@ pub const LayerMove = enum {
     to_front,
 };
 
+/// One physically authored item to duplicate into an authored destination
+/// scene. All offsets refer to the original source; caller order is retained.
+pub const DuplicateItemTarget = struct {
+    directive_offset: usize,
+    new_id: []const u8,
+    placement: DuplicateItemPlacement,
+};
+
+/// One atomic delete intention. Authored targets remove their complete source
+/// unit and later morph dependencies. Hide targets append canonical `@hide`
+/// mutations for inherited items in a template-instance base or morph state.
+pub const DeleteItemTarget = union(enum) {
+    authored: struct {
+        directive_offset: usize,
+        item_id: ?[]const u8,
+    },
+    hide: struct {
+        item_id: []const u8,
+    },
+};
+
+/// Owned clipboard source plus the exact component definition used by a
+/// literal `@pop` instance. A direct `@box` has a null definition offset.
+pub const CapturedItem = struct {
+    snippet: []u8,
+    component_definition_offset: ?usize = null,
+
+    pub fn deinit(self: CapturedItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.snippet);
+    }
+};
+
 /// One already-captured item to paste. The snippet is borrowed for the call;
 /// the result owns its rewritten copy. Every caller-supplied ID must be unique
 /// across both the destination document and this batch.
 pub const CapturedPasteItem = struct {
     snippet: []const u8,
+    component_definition_offset: ?usize = null,
     new_id: []const u8,
     placement: DuplicateItemPlacement,
 };
@@ -111,6 +144,7 @@ pub const PatchError = error{
     UnsupportedSharedTemplateDeletion,
     UnsupportedSlidePromotion,
     UnsafeSlideGlobalDirective,
+    UnsupportedBatchDeletion,
 };
 
 /// Exact physical bytes owned by one rendered slide.
@@ -1554,29 +1588,81 @@ pub fn reorderItemLayer(
     return reorderItemsLayer(allocator, source, scene, &offsets, move);
 }
 
-/// Capture one complete literal direct box unit for a future paste. The caller
-/// owns the returned bytes. Capture reuses the same scene/ownership proof as
-/// layer operations, but deliberately excludes backgrounds, crowd panels,
-/// component/template instances, generated source, and mutations.
+/// Capture one complete literal direct box or component-instance unit for a
+/// future paste. Component captures retain the exact latest preceding `@push`
+/// definition offset so a destination cannot silently bind the clone to a
+/// shadowing definition. The caller owns the returned bytes.
+pub fn captureItemForPaste(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    directive_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!CapturedItem {
+    const captured = try captureItemView(allocator, source, scene, directive_offset);
+    return .{
+        .snippet = try allocator.dupe(u8, captured.snippet),
+        .component_definition_offset = captured.component_definition_offset,
+    };
+}
+
+/// Backward-compatible box-only capture. Use `captureItemForPaste` when a
+/// literal `@pop` component instance should retain its definition metadata.
 pub fn captureItemSnippet(
     allocator: std.mem.Allocator,
     source: []const u8,
     scene: ItemSceneAnchor,
     directive_offset: usize,
 ) (std.mem.Allocator.Error || PatchError)![]u8 {
+    const captured = try captureItemView(allocator, source, scene, directive_offset);
+    if (captured.component_definition_offset != null) return error.UnsupportedClipboardItem;
+    return allocator.dupe(u8, captured.snippet);
+}
+
+const CapturedItemView = struct {
+    snippet: []const u8,
+    component_definition_offset: ?usize,
+};
+
+fn captureItemView(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    directive_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!CapturedItemView {
     const range = try resolveItemScene(source, scene);
     var units = std.ArrayList(ItemSourceUnit).empty;
     defer units.deinit(allocator);
-    try collectSceneItemUnits(allocator, source, range, &units);
+    collectSceneItemUnits(allocator, source, range, &units) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnsupportedClipboardItem,
+    };
     for (units.items) |unit| {
         if (unit.directive_offset != directive_offset) continue;
-        const line = try directiveLine(source, directive_offset);
-        if (!std.mem.eql(u8, directiveName(source[line.start..line.content_end]), "@box")) {
+        const line = directiveLine(source, directive_offset) catch
+            return error.UnsupportedClipboardItem;
+        const text = source[line.start..line.content_end];
+        const name = directiveName(text);
+        if (!(std.mem.eql(u8, name, "@box") or std.mem.eql(u8, name, "@pop"))) {
             return error.UnsupportedClipboardItem;
         }
         const snippet = source[unit.start..unit.end];
-        _ = try validateCapturedItemSnippet(snippet);
-        return allocator.dupe(u8, snippet);
+        const info = try validateCapturedItemSnippet(snippet);
+        if (std.mem.eql(u8, name, "@box")) {
+            if (info.component_name != null) return error.UnsupportedClipboardItem;
+            return .{ .snippet = snippet, .component_definition_offset = null };
+        }
+        if (range.kind == .morph or info.component_name == null) {
+            return error.UnsupportedClipboardItem;
+        }
+        const definition_offset = try resolveLiteralComponentDefinitionBefore(
+            source,
+            directive_offset,
+            info.component_name.?,
+        );
+        return .{
+            .snippet = snippet,
+            .component_definition_offset = definition_offset,
+        };
     }
     return error.UnsupportedClipboardItem;
 }
@@ -1602,8 +1688,21 @@ pub fn pasteCapturedItems(
         for (items[0..index]) |previous| {
             if (std.mem.eql(u8, previous.new_id, item.new_id)) return error.ItemIdCollision;
         }
-        const item_offset = try validateCapturedItemSnippet(item.snippet);
-        if (range.kind == .morph and capturedSnippetHasAnimation(item.snippet, item_offset)) {
+        const info = try validateCapturedItemSnippet(item.snippet);
+        if (info.component_name) |component_name| {
+            if (range.kind == .morph) return error.UnsupportedClipboardItem;
+            const captured_definition = item.component_definition_offset orelse
+                return error.UnsupportedClipboardItem;
+            const destination_definition = try resolveLiteralComponentDefinitionBefore(
+                source,
+                range.end,
+                component_name,
+            );
+            if (destination_definition != captured_definition) return error.UnsupportedClipboardItem;
+        } else if (item.component_definition_offset != null) {
+            return error.UnsupportedClipboardItem;
+        }
+        if (range.kind == .morph and capturedSnippetHasAnimation(item.snippet, info.directive_offset)) {
             return error.UnsupportedClipboardItem;
         }
         try validateCoordinate(item.placement.x);
@@ -1614,7 +1713,7 @@ pub fn pasteCapturedItems(
     var payload = std.ArrayList(u8).empty;
     defer payload.deinit(allocator);
     for (items) |item| {
-        const directive_offset = try validateCapturedItemSnippet(item.snippet);
+        const info = try validateCapturedItemSnippet(item.snippet);
         var x_buffer: [64]u8 = undefined;
         var y_buffer: [64]u8 = undefined;
         const patches = [_]LiteralAttributePatch{
@@ -1626,7 +1725,7 @@ pub fn pasteCapturedItems(
         const canonical = try patchLiteralAttributes(
             allocator,
             item.snippet,
-            directive_offset,
+            info.directive_offset,
             &patches,
         );
         defer canonical.deinit(allocator);
@@ -1653,6 +1752,43 @@ pub fn pasteCapturedItem(
 ) (std.mem.Allocator.Error || PatchError)!PatchResult {
     const items = [_]CapturedPasteItem{item};
     return pasteCapturedItems(allocator, source, destination_scene, &items);
+}
+
+/// Atomically duplicate an ordered batch of physically authored direct boxes
+/// and literal component instances into one destination scene. This is the
+/// in-document counterpart of capture/paste and uses the same definition,
+/// uniqueness, animation, and scene preflight before emitting one PatchResult.
+pub fn duplicateItems(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    source_scene: ItemSceneAnchor,
+    destination_scene: ItemSceneAnchor,
+    targets: []const DuplicateItemTarget,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (targets.len == 0) return error.UnsupportedItemDuplication;
+    var paste_items = try allocator.alloc(CapturedPasteItem, targets.len);
+    defer allocator.free(paste_items);
+
+    for (targets, 0..) |target, index| {
+        for (targets[0..index]) |previous| {
+            if (previous.directive_offset == target.directive_offset) {
+                return error.UnsupportedItemDuplication;
+            }
+        }
+        const captured = try captureItemView(
+            allocator,
+            source,
+            source_scene,
+            target.directive_offset,
+        );
+        paste_items[index] = .{
+            .snippet = captured.snippet,
+            .component_definition_offset = captured.component_definition_offset,
+            .new_id = target.new_id,
+            .placement = target.placement,
+        };
+    }
+    return pasteCapturedItems(allocator, source, destination_scene, paste_items);
 }
 
 /// Delete exactly the physical directive line beginning at `directive_offset`,
@@ -1723,6 +1859,133 @@ pub fn deleteItemCascadingMorphMutations(
         cursor = line.full_end;
     }
     sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+const BatchDeleteDependency = struct {
+    id: []const u8,
+    authored_offset: usize,
+};
+
+/// Atomically delete physically authored items and/or hide inherited items in
+/// one exact base/current-state scene. Authored removal owns pending `@anim`,
+/// the complete directive body/comments, and every later literal morph
+/// mutation targeting its unique ID before the next rendered slide. Hide
+/// targets become canonical state/base-local `@hide` lines at the scene end.
+/// Shared template definitions, backgrounds, generated dependencies, stale
+/// offsets, duplicate targets, and ambiguous IDs reject before any output is
+/// produced.
+pub fn deleteItems(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    targets: []const DeleteItemTarget,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (targets.len == 0) return error.UnsupportedBatchDeletion;
+    const range = resolveItemScene(source, scene) catch return error.UnsupportedBatchDeletion;
+    const logical_end = try batchDeleteLogicalSlideEnd(source, range);
+
+    var units = std.ArrayList(ItemSourceUnit).empty;
+    defer units.deinit(allocator);
+    collectSceneItemUnits(allocator, source, range, &units) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnsupportedBatchDeletion,
+    };
+
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    var dependencies = std.ArrayList(BatchDeleteDependency).empty;
+    defer dependencies.deinit(allocator);
+    var hide_ids = std.ArrayList([]const u8).empty;
+    defer hide_ids.deinit(allocator);
+
+    for (targets, 0..) |target, target_index| {
+        switch (target) {
+            .authored => |authored| {
+                for (targets[0..target_index]) |previous| switch (previous) {
+                    .authored => |prior| if (prior.directive_offset == authored.directive_offset) {
+                        return error.UnsupportedBatchDeletion;
+                    },
+                    .hide => {},
+                };
+
+                const unit = findItemSourceUnit(units.items, authored.directive_offset) orelse
+                    return error.UnsupportedBatchDeletion;
+                const line = directiveLine(source, authored.directive_offset) catch
+                    return error.UnsupportedBatchDeletion;
+                const text = source[line.start..line.content_end];
+                const name = directiveName(text);
+                if (!(std.mem.eql(u8, name, "@box") or std.mem.eql(u8, name, "@pop")) or
+                    hasPotentialLetExpansion(source[unit.start..unit.end]) or
+                    directiveHasDynamicIdentity(text, name))
+                {
+                    return error.UnsupportedBatchDeletion;
+                }
+                const actual_id = literalEmittedItemId(text, name);
+                if (authored.item_id) |expected_id| {
+                    if (!isLiteralItemId(expected_id) or actual_id == null or
+                        !std.mem.eql(u8, expected_id, actual_id.?))
+                    {
+                        return error.UnsupportedBatchDeletion;
+                    }
+                    if (batchDeleteIdSeen(dependencies.items, hide_ids.items, expected_id)) {
+                        return error.UnsupportedBatchDeletion;
+                    }
+                    try dependencies.append(allocator, .{
+                        .id = expected_id,
+                        .authored_offset = authored.directive_offset,
+                    });
+                } else if (actual_id != null) {
+                    // Omitting a real ID would skip dependency cleanup.
+                    return error.UnsupportedBatchDeletion;
+                }
+                try edits.append(allocator, .{
+                    .start = unit.start,
+                    .end = unit.end,
+                    .replacement = "",
+                });
+            },
+            .hide => |hide| {
+                if (range.kind == .base or !isLiteralItemId(hide.item_id) or
+                    batchDeleteIdSeen(dependencies.items, hide_ids.items, hide.item_id))
+                {
+                    return error.UnsupportedBatchDeletion;
+                }
+                try hide_ids.append(allocator, hide.item_id);
+            },
+        }
+    }
+
+    try appendBatchDeleteDependencyEdits(
+        allocator,
+        source,
+        range.start,
+        logical_end,
+        dependencies.items,
+        &edits,
+    );
+
+    var hide_payload = std.ArrayList(u8).empty;
+    defer hide_payload.deinit(allocator);
+    if (hide_ids.items.len > 0) {
+        const newline = lineEndingNear(source, range.end);
+        if (batchInsertionNeedsSeparator(source, range.end, edits.items)) {
+            try hide_payload.appendSlice(allocator, newline);
+        }
+        for (hide_ids.items) |id| {
+            try hide_payload.appendSlice(allocator, "@hide ");
+            try hide_payload.appendSlice(allocator, id);
+            try hide_payload.appendSlice(allocator, newline);
+        }
+        try edits.append(allocator, .{
+            .start = range.end,
+            .end = range.end,
+            .replacement = hide_payload.items,
+        });
+    }
+
+    sortEditsByPosition(edits.items);
+    try validateNonOverlappingEdits(edits.items);
     return applyEdits(allocator, source, edits.items);
 }
 
@@ -2983,6 +3246,133 @@ fn collectSceneItemUnits(
     }
 }
 
+fn findItemSourceUnit(units: []const ItemSourceUnit, directive_offset: usize) ?ItemSourceUnit {
+    for (units) |unit| {
+        if (unit.directive_offset == directive_offset) return unit;
+    }
+    return null;
+}
+
+fn batchDeleteIdSeen(
+    dependencies: []const BatchDeleteDependency,
+    hide_ids: []const []const u8,
+    id: []const u8,
+) bool {
+    for (dependencies) |dependency| {
+        if (std.mem.eql(u8, dependency.id, id)) return true;
+    }
+    for (hide_ids) |hidden| {
+        if (std.mem.eql(u8, hidden, id)) return true;
+    }
+    return false;
+}
+
+fn batchDeleteLogicalSlideEnd(source: []const u8, range: ItemSceneRange) PatchError!usize {
+    var cursor = range.end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isRenderedSlideAnchor(name)) return cursor;
+            // This authored slide is being captured as a shared definition;
+            // group deletion deliberately has no shared/transitive mode.
+            if (std.mem.eql(u8, name, "@pushslide")) {
+                return error.UnsupportedBatchDeletion;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return source.len;
+}
+
+fn appendBatchDeleteDependencyEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_start: usize,
+    slide_end: usize,
+    dependencies: []const BatchDeleteDependency,
+    edits: *std.ArrayList(Edit),
+) (std.mem.Allocator.Error || PatchError)!void {
+    var identity_counts = try allocator.alloc(usize, dependencies.len);
+    defer allocator.free(identity_counts);
+    @memset(identity_counts, 0);
+
+    var cursor = slide_start;
+    while (cursor < slide_end) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > slide_end) return error.UnsupportedBatchDeletion;
+        const text = source[cursor..line.content_end];
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedBatchDeletion;
+
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (directiveEmitsSlideItem(name)) {
+                if (directiveHasDynamicIdentity(text, name)) {
+                    return error.UnsupportedBatchDeletion;
+                }
+                if (literalEmittedItemId(text, name)) |candidate_id| {
+                    for (dependencies, 0..) |dependency, index| {
+                        if (std.mem.eql(u8, dependency.id, candidate_id)) {
+                            identity_counts[index] += 1;
+                        }
+                    }
+                }
+            } else if (isMorphMutationDirective(name)) {
+                const target = validateSlideTemplateOverrideDirectiveLine(text) catch
+                    return error.UnsupportedBatchDeletion;
+                var dependency_index: ?usize = null;
+                for (dependencies, 0..) |dependency, index| {
+                    if (cursor > dependency.authored_offset and
+                        std.mem.eql(u8, dependency.id, target))
+                    {
+                        dependency_index = index;
+                        break;
+                    }
+                }
+                if (dependency_index != null) {
+                    const animation_start = itemOwnedAnimationStart(source, cursor) catch
+                        return error.UnsupportedBatchDeletion;
+                    if (animation_start != cursor) return error.UnsupportedBatchDeletion;
+                    const dependency_end = itemBodyEndOffset(source, line.full_end);
+                    if (dependency_end > slide_end or
+                        hasPotentialLetExpansion(source[cursor..dependency_end]))
+                    {
+                        return error.UnsupportedBatchDeletion;
+                    }
+                    try edits.append(allocator, .{
+                        .start = cursor,
+                        .end = dependency_end,
+                        .replacement = "",
+                    });
+                    cursor = dependency_end;
+                    continue;
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+    for (identity_counts) |count| {
+        if (count != 1) return error.UnsupportedBatchDeletion;
+    }
+}
+
+fn batchInsertionNeedsSeparator(source: []const u8, insertion_offset: usize, deletions: []const Edit) bool {
+    if (insertion_offset == 0 or insertion_offset == sourceStart(source)) return false;
+    var preceding = insertion_offset;
+    var found = true;
+    while (found) {
+        found = false;
+        for (deletions) |edit| {
+            if (edit.replacement.len == 0 and edit.end == preceding and edit.start < edit.end) {
+                preceding = edit.start;
+                found = true;
+                break;
+            }
+        }
+    }
+    return preceding > sourceStart(source) and source[preceding - 1] != '\n';
+}
+
 fn validatePasteDestination(source: []const u8, range: ItemSceneRange) PatchError!void {
     var pending_animation = false;
     var cursor = range.start;
@@ -3028,7 +3418,12 @@ fn validateNoDynamicItemIdentities(source: []const u8) PatchError!void {
     }
 }
 
-fn validateCapturedItemSnippet(snippet: []const u8) PatchError!usize {
+const CapturedSnippetInfo = struct {
+    directive_offset: usize,
+    component_name: ?[]const u8,
+};
+
+fn validateCapturedItemSnippet(snippet: []const u8) PatchError!CapturedSnippetInfo {
     if (snippet.len == 0 or std.mem.startsWith(u8, snippet, utf8_bom) or
         hasPotentialLetExpansion(snippet))
     {
@@ -3041,6 +3436,7 @@ fn validateCapturedItemSnippet(snippet: []const u8) PatchError!usize {
     }
 
     var item_offset: ?usize = null;
+    var component_name: ?[]const u8 = null;
     var saw_animation = false;
     var cursor: usize = 0;
     while (cursor < snippet.len) {
@@ -3050,9 +3446,19 @@ fn validateCapturedItemSnippet(snippet: []const u8) PatchError!usize {
             const name = directiveName(text);
             if (item_offset == null and isAnimationDirective(name)) {
                 saw_animation = true;
-            } else if (item_offset == null and std.mem.eql(u8, name, "@box")) {
+            } else if (item_offset == null and
+                (std.mem.eql(u8, name, "@box") or std.mem.eql(u8, name, "@pop")))
+            {
                 if (directiveHasDynamicIdentity(text, name)) return error.UnsupportedClipboardItem;
-                try validateClipboardDirectiveAttributes(text, name.len);
+                var attributes_start = name.len;
+                if (std.mem.eql(u8, name, "@pop")) {
+                    const component = directiveContextName(text, name.len) orelse
+                        return error.UnsupportedClipboardItem;
+                    if (!isReusableName(component)) return error.UnsupportedClipboardItem;
+                    component_name = component;
+                    attributes_start = @intFromPtr(component.ptr) - @intFromPtr(text.ptr) + component.len;
+                }
+                try validateClipboardDirectiveAttributes(text, attributes_start);
                 item_offset = cursor;
             } else {
                 return error.UnsupportedClipboardItem;
@@ -3064,11 +3470,14 @@ fn validateCapturedItemSnippet(snippet: []const u8) PatchError!usize {
         }
         cursor = line.full_end;
     }
-    return item_offset orelse error.UnsupportedClipboardItem;
+    return .{
+        .directive_offset = item_offset orelse return error.UnsupportedClipboardItem,
+        .component_name = component_name,
+    };
 }
 
-fn validateClipboardDirectiveAttributes(line: []const u8, name_len: usize) PatchError!void {
-    var cursor = name_len;
+fn validateClipboardDirectiveAttributes(line: []const u8, attributes_start: usize) PatchError!void {
+    var cursor = attributes_start;
     while (cursor < line.len) {
         while (cursor < line.len and isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
         if (cursor == line.len) break;
@@ -3084,7 +3493,7 @@ fn validateClipboardDirectiveAttributes(line: []const u8, name_len: usize) Patch
         validateLiteralPatch(.{ .key = key, .value = value }) catch
             return error.UnsupportedClipboardItem;
 
-        var earlier_cursor = name_len;
+        var earlier_cursor = attributes_start;
         while (earlier_cursor < token_start) {
             while (earlier_cursor < token_start and isHorizontalWhitespace(line[earlier_cursor])) : (earlier_cursor += 1) {}
             if (earlier_cursor == token_start) break;
@@ -3175,6 +3584,44 @@ fn hasPotentialLetExpansion(value: []const u8) bool {
     const first = std.mem.indexOfScalar(u8, value, '$') orelse return false;
     const last = std.mem.lastIndexOfScalar(u8, value, '$') orelse return false;
     return first != last;
+}
+
+/// Resolve the parser-effective literal component definition at one source
+/// position. Any preceding let-expanded line could synthesize or rename a
+/// shadowing `@push`, so component clipboard provenance is intentionally
+/// unavailable in such a prefix.
+fn resolveLiteralComponentDefinitionBefore(
+    source: []const u8,
+    before_offset: usize,
+    component_name: []const u8,
+) PatchError!usize {
+    if (!isReusableName(component_name) or
+        before_offset > source.len or
+        !isPhysicalLineBoundary(source, before_offset))
+    {
+        return error.UnsupportedClipboardItem;
+    }
+
+    var latest: ?usize = null;
+    var cursor = sourceStart(source);
+    while (cursor < before_offset) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > before_offset) return error.UnsupportedClipboardItem;
+        const text = source[cursor..line.content_end];
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedClipboardItem;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@push")) {
+                const candidate = directiveContextName(text, name.len) orelse
+                    return error.UnsupportedClipboardItem;
+                if (!isReusableName(candidate)) return error.UnsupportedClipboardItem;
+                if (std.mem.eql(u8, candidate, component_name)) latest = cursor;
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (cursor != before_offset) return error.UnsupportedClipboardItem;
+    return latest orelse error.UnsupportedClipboardItem;
 }
 
 fn hasLiteralItemId(source: []const u8, sought: []const u8) bool {
@@ -3518,6 +3965,13 @@ fn sortEditsByPosition(edits: []Edit) void {
         while (moving > 0 and edits[moving].start < edits[moving - 1].start) : (moving -= 1) {
             std.mem.swap(Edit, &edits[moving], &edits[moving - 1]);
         }
+    }
+}
+
+fn validateNonOverlappingEdits(edits: []const Edit) PatchError!void {
+    if (edits.len < 2) return;
+    for (edits[0 .. edits.len - 1], edits[1..]) |left, right| {
+        if (right.start < left.end) return error.OverlappingSourceEdits;
     }
 }
 
@@ -5632,6 +6086,202 @@ test "clipboard capture and atomic paste preserve boxes and unlock copies" {
     try std.testing.expect(!items[2].locked);
 }
 
+test "component clipboard preserves exact definition and rejects unsafe destinations" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@push card img=photo.png scale=0.5 ratio=1.4\r\n" ++
+        "@slide\r\n" ++
+        "@anim(fade) duration=0.4\r\n" ++
+        "@pop card id=first x=10 y=20 locked=true\r\n" ++
+        "# owned pop note\r\n" ++
+        "@slide\r\n" ++
+        "@box id=target text=Target\r\n" ++
+        "@state(morph)\r\n";
+    const first_slide = std.mem.indexOf(u8, source, "@slide").?;
+    const second_slide = std.mem.lastIndexOf(u8, source, "@slide").?;
+    const captured = try captureItemForPaste(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = first_slide },
+        std.mem.indexOf(u8, source, "@pop card").?,
+    );
+    defer captured.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?usize, utf8_bom.len), captured.component_definition_offset);
+    try std.testing.expectError(error.UnsupportedClipboardItem, captureItemSnippet(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = first_slide },
+        std.mem.indexOf(u8, source, "@pop card").?,
+    ));
+
+    const item: CapturedPasteItem = .{
+        .snippet = captured.snippet,
+        .component_definition_offset = captured.component_definition_offset,
+        .new_id = "card_copy",
+        .placement = .{ .x = 100, .y = 200 },
+    };
+    const pasted = try pasteCapturedItem(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = second_slide },
+        item,
+    );
+    defer pasted.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pasted.source,
+        "@pop card id=card_copy x=100 y=200 locked=false\r\n# owned pop note\r\n@state",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, pasted.source, "id=card_copy x=100 y=200 w=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pasted.source, "id=card_copy x=100 y=200 h=") == null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(pasted.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const copied = deck.slides.items[1].items.?.items[1];
+    try std.testing.expectEqualStrings("card_copy", copied.id.?);
+    try std.testing.expectEqual(slides.SourceScope.component_instance, copied.source.scope);
+    try std.testing.expect(!copied.locked);
+    try std.testing.expect(copied.animation != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), copied.size.x, 0.0001);
+
+    try std.testing.expectError(error.UnsupportedClipboardItem, pasteCapturedItem(
+        std.testing.allocator,
+        source,
+        .{ .morph_state = std.mem.indexOf(u8, source, "@state").? },
+        item,
+    ));
+
+    const shadowed =
+        "@push card text=First\n" ++
+        "@push card text=Second\n" ++
+        "@slide\n" ++
+        "@box id=target text=Target\n";
+    const shadow_item: CapturedPasteItem = .{
+        .snippet = "@pop card id=old\n",
+        .component_definition_offset = 0,
+        .new_id = "copy",
+        .placement = .{ .x = 1, .y = 2 },
+    };
+    try std.testing.expectError(error.UnsupportedClipboardItem, pasteCapturedItem(
+        std.testing.allocator,
+        shadowed,
+        .{ .base_slide = std.mem.indexOf(u8, shadowed, "@slide").? },
+        shadow_item,
+    ));
+
+    const shifted =
+        "# inserted before captured definition\n" ++
+        "@push card text=First\n" ++
+        "@slide\n";
+    try std.testing.expectError(error.UnsupportedClipboardItem, pasteCapturedItem(
+        std.testing.allocator,
+        shifted,
+        .{ .base_slide = std.mem.indexOf(u8, shifted, "@slide").? },
+        shadow_item,
+    ));
+
+    const generated =
+        "@let attrs=text=Generated\n" ++
+        "$definition$\n" ++
+        "@push card text=Card\n" ++
+        "@slide\n";
+    const generated_item: CapturedPasteItem = .{
+        .snippet = "@pop card id=old\n",
+        .component_definition_offset = std.mem.indexOf(u8, generated, "@push card").?,
+        .new_id = "copy",
+        .placement = .{ .x = 1, .y = 2 },
+    };
+    try std.testing.expectError(error.UnsupportedClipboardItem, pasteCapturedItem(
+        std.testing.allocator,
+        generated,
+        .{ .base_slide = std.mem.indexOf(u8, generated, "@slide").? },
+        generated_item,
+    ));
+}
+
+test "batch duplication atomically copies boxes and exact component instances" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@push card text=Card\n" ++
+        "@slide\n" ++
+        "@box id=photo img=photo.png x=10 y=20 scale=0.5 ratio=1.4 locked=true\n" ++
+        "# photo note\n" ++
+        "@pop card id=card_one x=30 y=40 locked=true\n" ++
+        "# card note";
+    const slide = std.mem.indexOf(u8, source, "@slide").?;
+    const targets = [_]DuplicateItemTarget{
+        .{
+            .directive_offset = std.mem.indexOf(u8, source, "@box id=photo").?,
+            .new_id = "photo_copy",
+            .placement = .{ .x = 110, .y = 120 },
+        },
+        .{
+            .directive_offset = std.mem.indexOf(u8, source, "@pop card").?,
+            .new_id = "card_copy",
+            .placement = .{ .x = 130, .y = 140 },
+        },
+    };
+    const result = try duplicateItems(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = slide },
+        .{ .base_slide = slide },
+        &targets,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "@box id=photo_copy img=photo.png x=110 y=120 scale=0.5 ratio=1.4 locked=false",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "@pop card id=card_copy x=130 y=140 locked=false",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "photo_copy img=photo.png x=110 y=120 w=") == null);
+    try std.testing.expect(std.mem.endsWith(u8, result.source, "# card note\n"));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expectEqualStrings("photo_copy", items[2].id.?);
+    try std.testing.expectEqualStrings("card_copy", items[3].id.?);
+    try std.testing.expect(!items[2].locked);
+    try std.testing.expect(!items[3].locked);
+
+    const colliding = [_]DuplicateItemTarget{
+        .{
+            .directive_offset = targets[0].directive_offset,
+            .new_id = "same",
+            .placement = .{ .x = 1, .y = 2 },
+        },
+        .{
+            .directive_offset = targets[1].directive_offset,
+            .new_id = "same",
+            .placement = .{ .x = 3, .y = 4 },
+        },
+    };
+    try std.testing.expectError(error.ItemIdCollision, duplicateItems(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = slide },
+        .{ .base_slide = slide },
+        &colliding,
+    ));
+}
+
 test "clipboard paste supports popslide morph births and rejects animated snippets" {
     const parser = @import("parser.zig");
     const slides = @import("slides.zig");
@@ -5887,6 +6537,170 @@ test "cascading semantic deletion removes later morph mutations only on current 
     try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
     try std.testing.expectEqual(@as(usize, 2), deck.slides.items.len);
     try std.testing.expectEqualStrings("remove", deck.slides.items[1].items.?.items[0].id.?);
+}
+
+test "batch deletion mixes local removal and inherited hide in a popslide base" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@push card img=photo.png scale=0.5\r\n" ++
+        "@box id=shared text=Shared\r\n" ++
+        "@pushslide layout\r\n" ++
+        "@popslide layout\r\n" ++
+        "@set shared x=10\r\n" ++
+        "@anim(fade) duration=0.4\r\n" ++
+        "# owned animation note\r\n" ++
+        "@box id=local x=20 y=30\r\n" ++
+        "Local body\r\n" ++
+        "# owned local note\r\n" ++
+        "@pop card id=component x=40 y=50\r\n" ++
+        "# owned component note\r\n" ++
+        "@state(morph)\r\n" ++
+        "@set local x=200\r\n" ++
+        "# owned local mutation note\r\n" ++
+        "@hide component\r\n" ++
+        "@set shared y=100\r\n" ++
+        "@slide\r\n" ++
+        "@box id=local text=Same ID next slide\r\n";
+    const targets = [_]DeleteItemTarget{
+        .{ .authored = .{
+            .directive_offset = std.mem.indexOf(u8, source, "@box id=local x=").?,
+            .item_id = "local",
+        } },
+        .{ .hide = .{ .item_id = "shared" } },
+        .{ .authored = .{
+            .directive_offset = std.mem.indexOf(u8, source, "@pop card id=component").?,
+            .item_id = "component",
+        } },
+    };
+    const result = try deleteItems(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = std.mem.indexOf(u8, source, "@popslide").? },
+        &targets,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.source, utf8_bom));
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@hide shared\r\n@state(morph)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@box id=local x=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@pop card id=component") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@set local") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@hide component") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "owned local") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "owned component") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "@box id=local text=Same ID next slide") != null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deck.slides.items.len);
+    try std.testing.expectEqualStrings("local", deck.slides.items[1].items.?.items[0].id.?);
+}
+
+test "batch deletion handles morph births and rejects generated dependencies atomically" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@push card text=Card\n" ++
+        "@slide\n" ++
+        "@box id=base text=Base\n" ++
+        "@state(morph)\n" ++
+        "@box id=born text=Born\n" ++
+        "# born note\n" ++
+        "@pop card id=born_card\n" ++
+        "@set born x=100\n";
+    const targets = [_]DeleteItemTarget{
+        .{ .authored = .{
+            .directive_offset = std.mem.indexOf(u8, source, "@box id=born").?,
+            .item_id = "born",
+        } },
+        .{ .authored = .{
+            .directive_offset = std.mem.indexOf(u8, source, "@pop card id=born_card").?,
+            .item_id = "born_card",
+        } },
+        .{ .hide = .{ .item_id = "base" } },
+    };
+    const result = try deleteItems(
+        std.testing.allocator,
+        source,
+        .{ .morph_state = std.mem.indexOf(u8, source, "@state").? },
+        &targets,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.endsWith(u8, result.source, "@state(morph)\n@hide base\n"));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const dynamic =
+        "@slide\n" ++
+        "@box id=remove text=Remove\n" ++
+        "@state(morph)\n" ++
+        "@set remove $move$\n";
+    const dynamic_target = [_]DeleteItemTarget{.{ .authored = .{
+        .directive_offset = std.mem.indexOf(u8, dynamic, "@box").?,
+        .item_id = "remove",
+    } }};
+    try std.testing.expectError(error.UnsupportedBatchDeletion, deleteItems(
+        std.testing.allocator,
+        dynamic,
+        .{ .base_slide = 0 },
+        &dynamic_target,
+    ));
+    try std.testing.expectEqualStrings(
+        "@slide\n@box id=remove text=Remove\n@state(morph)\n@set remove $move$\n",
+        dynamic,
+    );
+
+    const direct_hide = [_]DeleteItemTarget{.{ .hide = .{ .item_id = "base" } }};
+    try std.testing.expectError(error.UnsupportedBatchDeletion, deleteItems(
+        std.testing.allocator,
+        "@slide\n@box id=base text=Base\n",
+        .{ .base_slide = 0 },
+        &direct_hide,
+    ));
+}
+
+test "batch deletion of a morph birth removes same and later state mutations" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box id=base text=Base\n" ++
+        "@state(morph)\n" ++
+        "@box id=born text=Born\n" ++
+        "@set born x=100\n" ++
+        "# same-state dependency\n" ++
+        "@state(morph)\n" ++
+        "@show born y=200\n" ++
+        "# later-state dependency\n";
+    const target = [_]DeleteItemTarget{.{ .authored = .{
+        .directive_offset = std.mem.indexOf(u8, source, "@box id=born").?,
+        .item_id = "born",
+    } }};
+    const result = try deleteItems(
+        std.testing.allocator,
+        source,
+        .{ .morph_state = std.mem.indexOf(u8, source, "@state").? },
+        &target,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "born") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.source, "dependency") == null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
 }
 
 test "shared template deletion owns item animation body and exact instance dependencies" {

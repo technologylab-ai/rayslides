@@ -81,29 +81,37 @@ for auto-sized images. The property panel edits text, duplicates or deletes
 the object, promotes it for reuse, applies palette colors, and aligns it to any
 slide edge or center. Shift-click toggles objects into an ordered
 multi-selection, and <kbd>Cmd/Ctrl-A</kbd> selects every editable object in the
-current scene. A group can be dragged or nudged as one unit; the same alignment
-buttons align its members to the selection bounds, while **H Gap** and **V
-Gap** distribute three or more objects with equal spacing. Group changes are
-written atomically as one undoable source edit. Resize, text, color, promotion,
-duplication, and deletion remain single-object operations for now; Studio
-refuses them for a group instead of silently changing only its primary item.
+current scene. Drag an empty part of the canvas to marquee-select everything
+the rectangle overlaps; hold <kbd>Shift</kbd> to toggle the marquee hits against
+the selection that existed when the drag began. A group can be dragged or
+nudged as one unit; the same alignment buttons align its members to the
+selection bounds, while **H Gap** and **V Gap** distribute three or more
+objects with equal spacing. Group moves, layer changes, duplication, and
+deletion are each written atomically as one undoable source edit. Resize, text,
+color, and promotion remain single-object operations; Studio refuses them for
+a group instead of silently changing only its primary item. Batch duplicate or
+delete is likewise refused as a whole when any selected object's source
+ownership cannot be handled safely.
 The **Layer** controls move one or several selected objects backward, forward,
 to the back, or to the front while preserving the group's internal paint
 order. A layer change is also one atomic source edit.
 <kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new slide immediately after the
 current one. <kbd>Esc</kbd> cancels an active drag or tool, then leaves Studio.
 
-<kbd>Cmd/Ctrl-C</kbd> copies selected authored boxes to Studio's internal object
+<kbd>Cmd/Ctrl-C</kbd> copies selected authored objects to Studio's internal
 clipboard; <kbd>Cmd/Ctrl-V</kbd> pastes fresh objects into the current base or
 morph scene. Every pasted object receives a unique `id=`, is offset by 20
 logical pixels on each successive paste, and the entire paste is one undoable
-edit. Auto-sized images retain automatic sizing. The initial safe clipboard
-scope is deliberately narrow: copy accepts literal direct `@box` items in the
-base scene, while generated items, reusable instances, inherited template
-objects, backgrounds, and Crowdplay panels are refused without changing the
-source. Clipboard snippets remain source-faithful rather than materializing
-inherited defaults, so pasting onto a slide with different font or color
-defaults may intentionally adopt that destination's appearance.
+edit. Auto-sized images retain automatic sizing. The safe clipboard scope is
+deliberately source-aware: copy accepts literal direct `@box` items and direct
+`@pop` component instances in the base scene. A copied `@pop` remembers the
+exact `@push` definition it resolved to, and paste is refused if the destination
+would bind it to a shadowing definition. Component instances are base-scene
+only, while ordinary boxes may be pasted into a morph scene. Generated items,
+inherited slide-template objects, backgrounds, and Crowdplay panels are refused
+without changing the source. Clipboard snippets remain source-faithful rather
+than materializing inherited defaults, so pasting onto a slide with different
+font or color defaults may intentionally adopt that destination's appearance.
 
 **Lock** writes `locked=true` on selected objects. Locked objects remain in the
 rendered deck but are excluded from normal clicking, select-all, snapping,
@@ -177,13 +185,15 @@ scoped, so a library item can only be placed after its definition.
 | Hold <kbd>Shift</kbd> while resizing | Preserve the object's aspect ratio |
 | Hold <kbd>Cmd/Ctrl</kbd> while dragging | Temporarily bypass smart guides and grid snapping |
 | <kbd>Shift</kbd> + click | Add or remove an object from the current selection |
+| Drag empty canvas | Marquee-select every overlapping object |
+| <kbd>Shift</kbd> + drag empty canvas | Toggle marquee hits against the starting selection |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>A</kbd> | Select every editable object in the current scene |
-| <kbd>Cmd/Ctrl</kbd> + <kbd>C</kbd> | Copy the selected direct boxes to Studio's object clipboard |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>C</kbd> | Copy selected direct boxes or direct component instances |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>V</kbd> | Paste clipboard objects, offset by another 20 pixels |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>[</kbd> / <kbd>]</kbd> | Move the selection one layer down / up |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>[</kbd> / <kbd>]</kbd> | Move the selection to the back / front |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>L</kbd> | Lock or unlock the selected objects |
-| <kbd>Backspace</kbd> | Delete the selected object |
+| <kbd>Backspace</kbd> | Atomically delete the selected object or selection |
 | Hold <kbd>Alt</kbd> while editing a template item | Edit its shared definition instead of this instance |
 | <kbd>Enter</kbd> | Edit the selected object's text |
 | <kbd>P</kbd> | Promote the selected object for reuse |
@@ -193,7 +203,7 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Cmd/Ctrl</kbd> + <kbd>N</kbd> | Insert a new slide after this slide |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd> | Promote the current slide to a reusable slide template |
 | <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Select the previous or next slide in Studio |
-| <kbd>Cmd/Ctrl</kbd> + <kbd>D</kbd> | Duplicate the selected object, or the current slide when no object is selected |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>D</kbd> | Atomically duplicate the selected object(s), or the current slide when none are selected |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Backspace</kbd> | Delete the current slide (except the only slide) |
 | <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>Up/Down</kbd> | Move the current slide when no object is selected; otherwise nudge the shared template item by ten |
 
@@ -214,12 +224,13 @@ ordinary content underneath the slide background. If a layout cannot be moved,
 copied, or duplicated unambiguously, Studio refuses the whole operation and
 leaves the source intact.
 
-Object duplication is also source-aware: it copies the complete item body and
-owned reveal animation, assigns a fresh stable `id=`, offsets the clone by 20
-logical pixels, and leaves auto-image sizing untouched. Inherited morph items,
-local slide-template clones, generated directives, and crowd panels are
-conservatively refused when they cannot be duplicated without changing their
-ownership semantics. Hold <kbd>Alt</kbd> with **Dup** or
+Object duplication is also source-aware: it copies each complete item body and
+owned reveal animation, assigns fresh stable `id=` values, offsets the clones
+by 20 logical pixels, and leaves auto-image sizing untouched. A mixed batch of
+direct boxes and direct `@pop` component instances is committed as one edit.
+Inherited morph items, local slide-template clones, generated directives, and
+crowd panels are conservatively refused when they cannot be duplicated without
+changing their ownership semantics. Hold <kbd>Alt</kbd> with **Dup** or
 <kbd>Cmd/Ctrl-D</kbd> to duplicate an uncustomized item in the shared slide
 template.
 

@@ -20,6 +20,7 @@ pub const default_handle_size: f32 = 14;
 pub const default_min_item_size: f32 = 8;
 pub const default_snap_threshold_screen: f32 = 8;
 pub const default_grid_spacing: f32 = 20;
+pub const marquee_drag_threshold_screen: f32 = 3;
 pub const max_selection_items: usize = 64;
 
 pub const SourceRef = slides.SourceRef;
@@ -180,6 +181,62 @@ fn pointInGeometry(point: rl.Vector2, geometry: Geometry) bool {
         point.y >= geometry.position.y and
         point.x <= geometry.position.x + geometry.size.x and
         point.y <= geometry.position.y + geometry.size.y;
+}
+
+fn clampLogicalPoint(point: rl.Vector2, logical_size: rl.Vector2) rl.Vector2 {
+    return .{
+        .x = std.math.clamp(point.x, 0, logical_size.x),
+        .y = std.math.clamp(point.y, 0, logical_size.y),
+    };
+}
+
+fn marqueeGeometry(marquee: Marquee) Geometry {
+    const min_x = @min(marquee.start.x, marquee.current.x);
+    const min_y = @min(marquee.start.y, marquee.current.y);
+    return .{
+        .position = .{ .x = min_x, .y = min_y },
+        .size = .{
+            .x = @max(marquee.start.x, marquee.current.x) - min_x,
+            .y = @max(marquee.start.y, marquee.current.y) - min_y,
+        },
+    };
+}
+
+fn marqueeExceededDragThreshold(marquee: Marquee, viewport: Viewport) bool {
+    if (!viewport.valid()) return false;
+    const dx = @abs(marquee.current.x - marquee.start.x) * viewport.slide_size.x / viewport.logical_size.x;
+    const dy = @abs(marquee.current.y - marquee.start.y) * viewport.slide_size.y / viewport.logical_size.y;
+    return @max(dx, dy) >= marquee_drag_threshold_screen;
+}
+
+fn clipGeometryToSlide(geometry: Geometry, logical_size: rl.Vector2) ?Geometry {
+    const min_x = @max(@as(f32, 0), geometry.position.x);
+    const min_y = @max(@as(f32, 0), geometry.position.y);
+    const max_x = @min(logical_size.x, geometry.position.x + geometry.size.x);
+    const max_y = @min(logical_size.y, geometry.position.y + geometry.size.y);
+    if (max_x <= min_x or max_y <= min_y) return null;
+    return .{
+        .position = .{ .x = min_x, .y = min_y },
+        .size = .{ .x = max_x - min_x, .y = max_y - min_y },
+    };
+}
+
+fn geometriesOverlap(a: Geometry, b: Geometry) bool {
+    return a.position.x < b.position.x + b.size.x and
+        a.position.x + a.size.x > b.position.x and
+        a.position.y < b.position.y + b.size.y and
+        a.position.y + a.size.y > b.position.y;
+}
+
+fn memberSliceContains(members: []const SelectionMember, identity: usize) bool {
+    return memberSliceIndex(members, identity) != null;
+}
+
+fn memberSliceIndex(members: []const SelectionMember, identity: usize) ?usize {
+    for (members, 0..) |member, index| {
+        if (member.identity == identity) return index;
+    }
+    return null;
 }
 
 fn resolvedBoundsForIdentity(bounds: []const ResolvedBounds, identity: usize) ?ResolvedBounds {
@@ -496,6 +553,15 @@ fn sourceEqual(a: slides.SourceRef, b: slides.SourceRef) bool {
         a.line_offset == b.line_offset and a.patchable == b.patchable;
 }
 
+fn batchHasNonLocalSource(targets: []const CommandTarget, candidate: CommandTarget) bool {
+    if (candidate.edit_scope == .local_instance) return false;
+    for (targets) |target| {
+        if (target.edit_scope == .local_instance) continue;
+        if (sourceEqual(target.source, candidate.source)) return true;
+    }
+    return false;
+}
+
 fn sourceScopeLabel(scope: slides.SourceScope) []const u8 {
     return switch (scope) {
         .none => "source unknown",
@@ -533,6 +599,8 @@ pub const Notice = enum {
     shared_template_auto_size,
     local_override_needs_unique_id,
     duplicate_item_unsupported,
+    multi_duplicate_unsupported,
+    multi_delete_unsupported,
     multi_selection_property_unsupported,
     selection_capacity_reached,
     distribution_needs_three,
@@ -623,6 +691,17 @@ pub const CopyItemsCommand = struct {
     count: usize = 0,
 
     pub fn slice(self: *const CopyItemsCommand) []const CommandTarget {
+        return self.targets[0..self.count];
+    }
+};
+
+/// One source-atomic item operation. Targets are stored in paint order so the
+/// integration layer can preserve relative order while planning the rewrite.
+pub const ItemBatchCommand = struct {
+    targets: [max_selection_items]CommandTarget = undefined,
+    count: usize = 0,
+
+    pub fn slice(self: *const ItemBatchCommand) []const CommandTarget {
         return self.targets[0..self.count];
     }
 };
@@ -721,7 +800,9 @@ pub const Workspace = struct {
 pub const SemanticCommand = union(enum) {
     add_item: AddItemCommand,
     duplicate_item: CommandTarget,
+    duplicate_items: ItemBatchCommand,
     delete_item: CommandTarget,
+    delete_items: ItemBatchCommand,
     edit_text: CommandTarget,
     set_foreground: ColorCommand,
     set_background: ColorCommand,
@@ -1277,6 +1358,17 @@ const SelectionMember = struct {
     source: ?slides.SourceRef = null,
 };
 
+/// Marquee selection is deliberately separate from geometry Interaction:
+/// none of the selected items is mutated while the rubber band is active.
+const Marquee = struct {
+    active: bool = false,
+    start: rl.Vector2 = .zero(),
+    current: rl.Vector2 = .zero(),
+    extend: bool = false,
+    snapshot: [max_selection_items]SelectionMember = undefined,
+    snapshot_count: usize = 0,
+};
+
 const GroupDragMember = struct {
     identity: usize,
     before: Geometry,
@@ -1313,6 +1405,7 @@ pub const Studio = struct {
     additional_selection: [max_selection_items - 1]SelectionMember = undefined,
     additional_selection_count: usize = 0,
     interaction: Interaction = .idle,
+    marquee: Marquee = .{},
     handle_size_screen: f32 = default_handle_size,
     min_item_size: f32 = default_min_item_size,
     snap_threshold_screen: f32 = default_snap_threshold_screen,
@@ -1362,6 +1455,7 @@ pub const Studio = struct {
     pub fn markSourceChanged(self: *Studio) void {
         self.copy_is_current = false;
         self.snap_guides = .{};
+        self.marquee.active = false;
         // Library commands retain only a workspace index. Any source rewrite
         // can reorder the catalog, so a prior selection must not silently
         // resolve to a different reusable afterward.
@@ -1373,7 +1467,7 @@ pub const Studio = struct {
     }
 
     pub fn interactionActive(self: Studio) bool {
-        return self.interaction != .idle;
+        return self.interaction != .idle or self.marquee.active;
     }
 
     /// Returns and clears the most recent non-geometry UI intention.
@@ -1399,6 +1493,7 @@ pub const Studio = struct {
 
     pub fn setTool(self: *Studio, tool: Tool, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
         self.tool = tool;
         self.notice = .none;
     }
@@ -1445,10 +1540,12 @@ pub const Studio = struct {
 
     pub fn cancelActiveInteraction(self: *Studio, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
     }
 
     pub fn toggle(self: *Studio, items: []slides.SlideItem) void {
         if (self.enabled and self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
         self.enabled = !self.enabled;
         if (!self.enabled) {
             self.tool = .select;
@@ -1464,6 +1561,7 @@ pub const Studio = struct {
 
     pub fn disable(self: *Studio, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
         self.enabled = false;
         self.tool = .select;
         self.active_morph_state = null;
@@ -1477,6 +1575,7 @@ pub const Studio = struct {
 
     pub fn clearSelection(self: *Studio, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
         self.selected_identity = null;
         self.selected_source = null;
         self.additional_selection_count = 0;
@@ -1661,6 +1760,24 @@ pub const Studio = struct {
 
         self.validateSelection(items, resolved_bounds);
 
+        // A marquee owns the pointer until release. Keeping this path ahead
+        // of shortcuts prevents an unrelated command from observing a
+        // half-finished selection gesture.
+        if (self.marquee.active) {
+            if (input.cancel_pressed) {
+                self.marquee.active = false;
+                self.notice = .none;
+                return null;
+            }
+            if (input.pointer_down or input.pointer_released) {
+                if (screenToLogical(viewport, input.pointer_screen)) |pointer| {
+                    self.marquee.current = clampLogicalPoint(pointer, viewport.logical_size);
+                }
+            }
+            if (input.pointer_released) self.finishMarquee(items, resolved_bounds, viewport);
+            return null;
+        }
+
         if (input.paste_pressed) {
             if (self.interaction != .idle) self.cancelInteraction(items);
             self.tool = .select;
@@ -1815,56 +1932,37 @@ pub const Studio = struct {
         }
 
         if (input.pointer_pressed and self.interaction == .idle) {
-            if (input.toggle_selection) {
-                self.toggleSelectionAt(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical);
+            if (!viewport.containsScreenPoint(input.pointer_screen) or pointer_logical == null) {
+                if (!input.toggle_selection) self.clearSelection(items);
                 return null;
             }
-            if (self.selectionCount() > 1) {
-                const hit_index = if (viewport.containsScreenPoint(input.pointer_screen) and pointer_logical != null)
-                    hitTest(items, resolved_bounds, pointer_logical.?)
-                else
-                    null;
-                if (hit_index) |index| {
-                    if (self.isIdentitySelected(items[index].identity)) {
-                        self.makeSelectionPrimary(items[index].identity);
-                        self.beginGroupMove(items, resolved_bounds, pointer_logical.?, input.allow_shared_edit);
-                    } else {
-                        self.selectAndBeginMove(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical, input.allow_shared_edit);
-                    }
+            const pointer = pointer_logical.?;
+            const hit_index = hitTest(items, resolved_bounds, pointer);
+            if (input.toggle_selection) {
+                if (hit_index != null) {
+                    self.toggleSelectionAt(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical);
                 } else {
-                    self.clearSelection(items);
+                    self.beginMarquee(pointer, true);
                 }
-            } else if (self.selectedGeometry(items, resolved_bounds)) |selected_geometry| {
-                if (self.resizeHandleRect(viewport, selected_geometry)) |handle| {
-                    if (pointInRectangle(input.pointer_screen, handle)) {
-                        const selected_index = self.selectedIndex(items) orelse return null;
-                        if (items[selected_index].locked) {
-                            self.notice = .locked_item;
-                            return null;
-                        }
-                        const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
-                        if (!sharedResizeSupported(items[selected_index], edit_scope)) {
-                            self.notice = .shared_template_auto_size;
-                            return null;
-                        }
-                        self.beginInteraction(
-                            .resizing,
-                            selected_geometry,
-                            Geometry.fromItem(items[selected_index]),
-                            sourceGeometryForEdit(items[selected_index], selected_geometry, edit_scope),
-                            edit_scope == .shared_template and items[selected_index].instance_source != null,
-                            pointer_logical orelse return null,
-                            edit_scope,
-                        );
-                    } else {
-                        self.selectAndBeginMove(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical, input.allow_shared_edit);
-                    }
+                return null;
+            }
+            if (hit_index) |index| {
+                // A selected member owns the gesture before empty-canvas
+                // marquee selection is considered, preserving group moves.
+                if (self.selectionCount() > 1 and self.isIdentitySelected(items[index].identity)) {
+                    self.makeSelectionPrimary(items[index].identity);
+                    self.beginGroupMove(items, resolved_bounds, pointer, input.allow_shared_edit);
                 } else {
                     self.selectAndBeginMove(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical, input.allow_shared_edit);
                 }
             } else {
-                self.selectAndBeginMove(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical, input.allow_shared_edit);
+                self.beginMarquee(pointer, false);
             }
+        }
+
+        if (self.marquee.active) {
+            if (input.pointer_released) self.finishMarquee(items, resolved_bounds, viewport);
+            return null;
         }
 
         if (self.interaction != .idle and (input.pointer_down or input.pointer_released)) {
@@ -1920,45 +2018,134 @@ pub const Studio = struct {
     const TargetCommandKind = enum { delete_item, edit_text, promote_to_reusable };
 
     fn emitDuplicateItem(self: *Studio, items: []slides.SlideItem, allow_shared_edit: bool) bool {
-        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() == 0) return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
-        if (self.selectionCount() > 1) {
-            self.notice = .multi_selection_property_unsupported;
-            return true;
-        }
+        if (self.selectionCount() > 1) return self.emitDuplicateItems(items, allow_shared_edit);
+        const index = self.selectedIndex(items) orelse return false;
+        const target = self.duplicateTarget(items, index, allow_shared_edit, true) orelse return true;
+        self.pending_semantic_command = .{ .duplicate_item = target };
+        return true;
+    }
+
+    fn duplicateTarget(
+        self: *Studio,
+        items: []const slides.SlideItem,
+        index: usize,
+        allow_shared_edit: bool,
+        allow_shared_definition: bool,
+    ) ?CommandTarget {
         if (items[index].locked) {
             self.notice = .locked_item;
-            return true;
+            return null;
         }
         const item = items[index];
 
         const edit_scope: EditScope = if (self.active_morph_state) |state_index| blk: {
             if (item.creation_morph_state == null or item.creation_morph_state.? != state_index or item.state_source != null) {
                 self.notice = .duplicate_item_unsupported;
-                return true;
+                return null;
             }
-            break :blk self.editScopeForItem(items, index, false) orelse return true;
+            break :blk self.editScopeForItem(items, index, false) orelse return null;
         } else switch (item.source.scope) {
-            .direct, .component_instance => self.editScopeForItem(items, index, false) orelse return true,
+            .direct, .component_instance => self.editScopeForItem(items, index, false) orelse return null,
             .slide_template => blk: {
-                if (!allow_shared_edit) {
+                if (!allow_shared_definition or !allow_shared_edit) {
                     self.notice = .duplicate_item_unsupported;
-                    return true;
+                    return null;
                 }
-                const scope = self.editScopeForItem(items, index, true) orelse return true;
+                const scope = self.editScopeForItem(items, index, true) orelse return null;
                 if (scope != .shared_template) {
                     self.notice = .duplicate_item_unsupported;
-                    return true;
+                    return null;
                 }
                 break :blk scope;
             },
             else => {
                 self.notice = .duplicate_item_unsupported;
-                return true;
+                return null;
             },
         };
 
-        self.pending_semantic_command = .{ .duplicate_item = self.selectedTarget(items, edit_scope) orelse return true };
+        return .{
+            .item_identity = item.identity,
+            .source = self.commandSource(item, edit_scope),
+            .edit_scope = edit_scope,
+        };
+    }
+
+    fn emitDuplicateItems(self: *Studio, items: []const slides.SlideItem, allow_shared_edit: bool) bool {
+        var command = ItemBatchCommand{};
+        for (items, 0..) |item, item_index| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            const target = self.duplicateTarget(items, item_index, allow_shared_edit, false) orelse {
+                if (self.notice == .duplicate_item_unsupported) self.notice = .multi_duplicate_unsupported;
+                return true;
+            };
+            if (batchHasNonLocalSource(command.slice(), target)) {
+                self.notice = .multi_duplicate_unsupported;
+                return true;
+            }
+            command.targets[command.count] = target;
+            command.count += 1;
+        }
+        if (command.count != self.selectionCount()) {
+            self.notice = .multi_duplicate_unsupported;
+            return true;
+        }
+        self.notice = .none;
+        self.pending_semantic_command = .{ .duplicate_items = command };
+        return true;
+    }
+
+    fn emitDeleteItems(self: *Studio, items: []const slides.SlideItem, allow_shared_edit: bool) bool {
+        var command = ItemBatchCommand{};
+        for (items, 0..) |item, item_index| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            if (item.locked) {
+                self.notice = .locked_item;
+                return true;
+            }
+            const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return true;
+            // Dependency-aware shared-definition deletion remains a deliberate
+            // single-target action in v1. Local instance and morph hides may
+            // safely coexist with physically authored removals in one plan.
+            if (edit_scope == .shared_template) {
+                self.notice = .multi_delete_unsupported;
+                return true;
+            }
+            const needs_identified_hide = if (self.active_morph_state) |state_index|
+                item.creation_morph_state == null or item.creation_morph_state.? != state_index
+            else
+                edit_scope == .local_instance;
+            if (needs_identified_hide and !itemIdIsUnique(items, item_index)) {
+                self.notice = .local_override_needs_unique_id;
+                return true;
+            }
+            const target_source = if (self.active_morph_state) |state_index|
+                if (item.creation_morph_state != null and item.creation_morph_state.? == state_index)
+                    item.source
+                else
+                    self.commandSource(item, edit_scope)
+            else
+                self.commandSource(item, edit_scope);
+            const target: CommandTarget = .{
+                .item_identity = item.identity,
+                .source = target_source,
+                .edit_scope = edit_scope,
+            };
+            if (batchHasNonLocalSource(command.slice(), target)) {
+                self.notice = .multi_delete_unsupported;
+                return true;
+            }
+            command.targets[command.count] = target;
+            command.count += 1;
+        }
+        if (command.count != self.selectionCount()) {
+            self.notice = .multi_delete_unsupported;
+            return true;
+        }
+        self.notice = .none;
+        self.pending_semantic_command = .{ .delete_items = command };
         return true;
     }
 
@@ -1971,6 +2158,7 @@ pub const Studio = struct {
         const index = self.selectedIndex(items) orelse return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
         if (self.selectionCount() > 1) {
+            if (kind == .delete_item) return self.emitDeleteItems(items, allow_shared_edit);
             self.notice = .multi_selection_property_unsupported;
             return true;
         }
@@ -2075,9 +2263,9 @@ pub const Studio = struct {
     ) ?CommandTarget {
         const item = items[item_index];
         if ((!copy_only and item.locked) or item.kind == .crowd or item.kind == .background or !item.source.patchable) return null;
-        if (itemIndexByUniqueSource(items, item.source) != item_index) return null;
         if (copy_only) {
-            if (self.active_morph_state != null or item.source.scope != .direct) return null;
+            if (self.active_morph_state != null or
+                (item.source.scope != .direct and item.source.scope != .component_instance)) return null;
         } else if (self.active_morph_state) |state_index| {
             if (item.creation_morph_state == null or item.creation_morph_state.? != state_index or
                 item.source.scope != .morph_item) return null;
@@ -2103,6 +2291,10 @@ pub const Studio = struct {
                 self.notice = if (item.locked) .locked_item else .layer_selection_unsupported;
                 return true;
             };
+            if (batchHasNonLocalSource(command.slice(), target)) {
+                self.notice = .layer_selection_unsupported;
+                return true;
+            }
             command.targets[command.count] = target;
             command.count += 1;
         }
@@ -2125,6 +2317,10 @@ pub const Studio = struct {
                 self.notice = .copy_selection_unsupported;
                 return true;
             };
+            if (batchHasNonLocalSource(command.slice(), target)) {
+                self.notice = .copy_selection_unsupported;
+                return true;
+            }
             command.targets[command.count] = target;
             command.count += 1;
         }
@@ -2705,6 +2901,7 @@ pub const Studio = struct {
 
     fn clearSelectionState(self: *Studio) void {
         self.interaction = .idle;
+        self.marquee.active = false;
         self.selected_identity = null;
         self.selected_source = null;
         self.additional_selection_count = 0;
@@ -2733,6 +2930,140 @@ pub const Studio = struct {
             self.selected_source = member.source;
             return;
         }
+    }
+
+    fn beginMarquee(self: *Studio, pointer: rl.Vector2, extend: bool) void {
+        self.marquee = .{
+            .active = true,
+            .start = pointer,
+            .current = pointer,
+            .extend = extend,
+        };
+        const count = self.selectionCount();
+        for (0..count) |selection_index| {
+            self.marquee.snapshot[selection_index] = .{
+                .identity = self.selectedIdentityAt(selection_index).?,
+                .source = if (selection_index == 0)
+                    self.selected_source
+                else
+                    self.additional_selection[selection_index - 1].source,
+            };
+        }
+        self.marquee.snapshot_count = count;
+        self.snap_guides = .{};
+    }
+
+    fn finishMarquee(
+        self: *Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+    ) void {
+        const marquee = self.marquee;
+        self.marquee.active = false;
+        if (!marqueeExceededDragThreshold(marquee, viewport)) {
+            if (!marquee.extend) self.clearSelectionState();
+            return;
+        }
+
+        var result: [max_selection_items]SelectionMember = undefined;
+        var result_count: usize = 0;
+        if (!marquee.extend) {
+            var hit_count: usize = 0;
+            for (items) |item| {
+                if (!self.marqueeIntersectsItem(marquee, item, resolved_bounds, viewport.logical_size)) continue;
+                hit_count += 1;
+                if (hit_count > max_selection_items) {
+                    self.notice = .selection_capacity_reached;
+                    return;
+                }
+                result[result_count] = .{ .identity = item.identity, .source = sourceForSelection(item) };
+                result_count += 1;
+            }
+        } else {
+            var removed_count: usize = 0;
+            var added_count: usize = 0;
+            for (items) |item| {
+                if (!self.marqueeIntersectsItem(marquee, item, resolved_bounds, viewport.logical_size)) continue;
+                if (memberSliceContains(marquee.snapshot[0..marquee.snapshot_count], item.identity))
+                    removed_count += 1
+                else
+                    added_count += 1;
+            }
+            const retained_count = marquee.snapshot_count - removed_count;
+            if (retained_count + added_count > max_selection_items) {
+                self.notice = .selection_capacity_reached;
+                return;
+            }
+            for (marquee.snapshot[0..marquee.snapshot_count]) |member| {
+                const item_index = itemIndexByIdentity(items, member.identity);
+                const toggled_off = if (item_index) |index|
+                    self.marqueeIntersectsItem(marquee, items[index], resolved_bounds, viewport.logical_size)
+                else
+                    false;
+                if (toggled_off) continue;
+                result[result_count] = member;
+                result_count += 1;
+            }
+            for (items) |item| {
+                if (!self.marqueeIntersectsItem(marquee, item, resolved_bounds, viewport.logical_size) or
+                    memberSliceContains(marquee.snapshot[0..marquee.snapshot_count], item.identity)) continue;
+                result[result_count] = .{ .identity = item.identity, .source = sourceForSelection(item) };
+                result_count += 1;
+            }
+        }
+
+        if (result_count == 0) {
+            self.clearSelectionState();
+            self.notice = .none;
+            return;
+        }
+
+        // Keep the gesture-start primary when Shift leaves it selected.
+        // Otherwise make the topmost surviving paint-order item primary.
+        var primary_index: ?usize = null;
+        if (marquee.extend and marquee.snapshot_count > 0) {
+            primary_index = memberSliceIndex(result[0..result_count], marquee.snapshot[0].identity);
+        }
+        if (primary_index == null) {
+            var item_index = items.len;
+            while (item_index > 0) {
+                item_index -= 1;
+                if (memberSliceIndex(result[0..result_count], items[item_index].identity)) |index| {
+                    primary_index = index;
+                    break;
+                }
+            }
+        }
+        if (primary_index) |index| {
+            const primary = result[index];
+            result[index] = result[0];
+            result[0] = primary;
+        }
+        self.applySelectionMembers(result[0..result_count]);
+        self.notice = .none;
+    }
+
+    fn marqueeIntersectsItem(
+        self: Studio,
+        marquee: Marquee,
+        item: slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        logical_size: rl.Vector2,
+    ) bool {
+        _ = self;
+        if (!isSelectable(item, resolved_bounds)) return false;
+        const clipped_item = clipGeometryToSlide(itemGeometry(item, resolved_bounds), logical_size) orelse return false;
+        return geometriesOverlap(marqueeGeometry(marquee), clipped_item);
+    }
+
+    fn applySelectionMembers(self: *Studio, members: []const SelectionMember) void {
+        self.selected_identity = members[0].identity;
+        self.selected_source = members[0].source;
+        self.additional_selection_count = members.len - 1;
+        for (members[1..], 0..) |member, index| self.additional_selection[index] = member;
+        self.group_drag_count = 0;
+        self.snap_guides = .{};
     }
 
     fn toggleSelectionAt(
@@ -3739,6 +4070,13 @@ pub const Studio = struct {
 
         if (self.grid_snapping) self.drawLogicalGrid(viewport);
 
+        if (self.marquee.active) {
+            if (geometryToScreenRect(viewport, marqueeGeometry(self.marquee))) |rect| {
+                rl.drawRectangleRec(rect, .{ .r = 80, .g = 215, .b = 255, .a = 38 });
+                rl.drawRectangleLinesEx(rect, 2, .{ .r = 80, .g = 215, .b = 255, .a = 230 });
+            }
+        }
+
         for (items) |item| {
             if (!item.locked or !isConcreteVisibleItem(item, resolved_bounds)) continue;
             const badge = lockBadgeRect(viewport, itemGeometry(item, resolved_bounds)) orelse continue;
@@ -4173,15 +4511,17 @@ pub const Studio = struct {
             .shared_template_auto_size => "Shared resize needs explicit template width and height",
             .local_override_needs_unique_id => "Add a unique id=... to create a local override; Alt edits the shared template",
             .duplicate_item_unsupported => "Duplicate is not source-safe here; use a direct item, current-state birth, or Alt on a template item",
+            .multi_duplicate_unsupported => "Duplicate selection is not source-safe here; no items were duplicated",
+            .multi_delete_unsupported => "Delete selection is not source-safe here; no items were deleted",
             .multi_selection_property_unsupported => "That property is single-item only; align, distribute, move, or nudge the selection",
-            .selection_capacity_reached => "Selection is limited to 64 items; the remaining items were left unselected",
+            .selection_capacity_reached => "Selection is limited to 64 items",
             .distribution_needs_three => "Equal-gap distribution needs at least three selected items",
             .generated_source_read_only => "Read-only in Studio: this item directive is produced with @let",
             .property_unavailable => "That property does not apply to this kind of item",
             .base_scene_only => "That action is available in the BASE scene",
             .structural_source_locked => "Slide structure is source-scoped here; no changes were made",
             .layer_selection_unsupported => "Layer changes need literal direct items in this scene; nothing moved",
-            .copy_selection_unsupported => "Copy needs literal direct box items; nothing was copied",
+            .copy_selection_unsupported => "Copy needs literal base-scene boxes or component instances; nothing was copied",
             .clipboard_empty => "Copy one or more items before pasting",
             .locked_item => "Unlock this item before editing it",
             .library_name_conflict => "That library name is already defined",
@@ -4862,6 +5202,191 @@ test "Shift click toggles membership and keeps the last added item primary" {
     try std.testing.expectEqual(@as(?usize, 1), studio.selectedIdentityAt(0));
 }
 
+test "plain marquee matches selectable items including read-only bounds but excludes edge contact" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .img, 300, 300, 0, 0),
+        testItem(3, .textbox, 380, 300, 60, 80),
+        testItem(4, .textbox, 200, 300, 60, 80),
+        testItem(5, .textbox, 250, 300, 60, 80),
+        testItem(6, .textbox, -20, 300, 100, 80),
+        testItem(7, .textbox, 450, 300, 100, 80),
+    };
+    for (&items, 0..) |*item, index| item.source.line_offset = index + 1;
+    items[2].locked = true;
+    items[3].visible = false;
+    items[4].source.patchable = false;
+    const bounds = [_]ResolvedBounds{.{
+        .identity = 2,
+        .position = .{ .x = 300, .y = 300 },
+        .size = .{ .x = 100, .y = 80 },
+    }};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 5 };
+
+    _ = studio.update(&items, &bounds, viewport, .{
+        .pointer_screen = .{ .x = 50, .y = 250 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expect(studio.marquee.active);
+    try std.testing.expect(studio.interactionActive());
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    _ = studio.update(&items, &bounds, viewport, .{
+        .pointer_screen = .{ .x = 450, .y = 450 },
+        .pointer_released = true,
+    });
+
+    try std.testing.expect(!studio.marquee.active);
+    try std.testing.expectEqual(@as(usize, 4), studio.selectionCount());
+    try std.testing.expect(studio.isIdentitySelected(1));
+    try std.testing.expect(studio.isIdentitySelected(2));
+    try std.testing.expect(studio.isIdentitySelected(6));
+    try std.testing.expect(!studio.isIdentitySelected(3));
+    try std.testing.expect(!studio.isIdentitySelected(4));
+    try std.testing.expect(studio.isIdentitySelected(5));
+    try std.testing.expect(!studio.isIdentitySelected(7));
+    try std.testing.expectEqual(@as(?usize, 6), studio.selectedIdentityAt(0));
+}
+
+test "Shift marquee toggles against its snapshot and preserves or replaces primary predictably" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+        testItem(3, .textbox, 500, 300, 100, 80),
+    };
+    for (&items, 0..) |*item, index| item.source.line_offset = index + 1;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 1, 2 });
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 250, .y = 250 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .toggle_selection = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 650, .y = 450 },
+        .pointer_released = true,
+    });
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+    try std.testing.expect(studio.isIdentitySelected(1));
+    try std.testing.expect(studio.isIdentitySelected(3));
+    try std.testing.expect(!studio.isIdentitySelected(2));
+    try std.testing.expectEqual(@as(?usize, 1), studio.selectedIdentityAt(0));
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 50, .y = 250 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .toggle_selection = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 220, .y = 450 },
+        .pointer_released = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 3), studio.selectedIdentityAt(0));
+}
+
+test "marquee sub-threshold click and Escape have conventional selection semantics" {
+    var items = [_]slides.SlideItem{testItem(1, .textbox, 100, 300, 100, 80)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 1 };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 50, .y = 250 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .toggle_selection = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 51, .y = 251 },
+        .pointer_released = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 1), studio.selected_identity);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 50, .y = 250 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{ .cancel_pressed = true });
+    try std.testing.expect(!studio.marquee.active);
+    try std.testing.expectEqual(@as(?usize, 1), studio.selected_identity);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 50, .y = 250 },
+        .pointer_pressed = true,
+        .pointer_released = true,
+    });
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
+}
+
+test "marquee capacity overflow is atomic and retains the gesture-start selection" {
+    var items: [66]slides.SlideItem = undefined;
+    for (&items, 0..) |*item, index| {
+        const x: f32 = @floatFromInt(20 + (index % 13) * 100);
+        const y: f32 = @floatFromInt(300 + (index / 13) * 80);
+        item.* = testItem(index + 1, .textbox, x, y, 20, 20);
+        item.source.line_offset = index + 1;
+    }
+    items[65].position = .{ .x = 1700, .y = 900 };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 66 };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 5, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 1500, .y = 800 },
+        .pointer_released = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 66), studio.selectedIdentityAt(0));
+    try std.testing.expectEqual(Notice.selection_capacity_reached, studio.notice);
+
+    studio.notice = .none;
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 5, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .toggle_selection = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 1500, .y = 800 },
+        .pointer_released = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 66), studio.selectedIdentityAt(0));
+    try std.testing.expectEqual(Notice.selection_capacity_reached, studio.notice);
+}
+
+test "pressing a selected member starts group movement instead of a marquee or group resize" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+    };
+    items[0].source.line_offset = 1;
+    items[1].source.line_offset = 2;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 2, 1 });
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(Interaction.moving, studio.interaction);
+    try std.testing.expectEqual(@as(usize, 2), studio.group_drag_count);
+    try std.testing.expect(!studio.marquee.active);
+    _ = studio.update(&items, &.{}, viewport, .{ .cancel_pressed = true });
+}
+
 test "select all filters the scene and reports the fixed selection capacity" {
     var items: [66]slides.SlideItem = undefined;
     for (&items, 0..) |*item, index| {
@@ -5184,7 +5709,7 @@ test "any shared-template group member disables instance object guides" {
     try std.testing.expectEqual(EditScope.shared_template, shared_batch.commands[1].edit_scope);
 }
 
-test "multi-selection semantic properties are refused without targeting primary" {
+test "multi-selection single-item properties are refused and duplicate preflights the whole selection" {
     var items = [_]slides.SlideItem{
         testItem(1, .textbox, 100, 300, 100, 80),
         testItem(2, .textbox, 300, 300, 100, 80),
@@ -5197,7 +5722,7 @@ test "multi-selection semantic properties are refused without targeting primary"
     try std.testing.expectEqual(Notice.multi_selection_property_unsupported, studio.notice);
     try std.testing.expect(studio.takeSemanticCommand() == null);
     _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
-    try std.testing.expectEqual(Notice.multi_selection_property_unsupported, studio.notice);
+    try std.testing.expectEqual(Notice.multi_duplicate_unsupported, studio.notice);
     try std.testing.expect(studio.takeSemanticCommand() == null);
 }
 
@@ -6055,6 +6580,88 @@ test "template duplication is shared-only including customized instances" {
     }
 }
 
+test "multi duplicate emits one paint-ordered atomic intention for direct and component sources" {
+    var items = [_]slides.SlideItem{
+        testItem(191, .textbox, 100, 100, 100, 80),
+        testItem(192, .textbox, 300, 100, 100, 80),
+        testItem(193, .img, 500, 100, 100, 80),
+    };
+    items[0].source = .{ .scope = .direct, .line_number = 1, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .component_instance, .line_number = 2, .line_offset = 20, .patchable = true };
+    items[2].source = .{ .scope = .direct, .line_number = 3, .line_offset = 30, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 193, 191, 192 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_items => |command| {
+            try std.testing.expectEqual(@as(usize, 3), command.count);
+            try std.testing.expectEqual(@as(usize, 191), command.targets[0].item_identity);
+            try std.testing.expectEqual(@as(usize, 192), command.targets[1].item_identity);
+            try std.testing.expectEqual(@as(usize, 193), command.targets[2].item_identity);
+            for (command.slice()) |target| try std.testing.expectEqual(EditScope.direct, target.edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "multi duplicate rejects templates shared targets locks and duplicate physical sources atomically" {
+    var items = [_]slides.SlideItem{
+        testItem(194, .textbox, 100, 100, 100, 80),
+        testItem(195, .textbox, 300, 100, 100, 80),
+    };
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .slide_template, .line_offset = 20, .patchable = true };
+    items[1].id = "template-item";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 194, 195 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true, .allow_shared_edit = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.multi_duplicate_unsupported, studio.notice);
+
+    items[1].source = items[0].source;
+    items[1].source.scope = .component_instance;
+    items[0].source.scope = .component_instance;
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.multi_duplicate_unsupported, studio.notice);
+
+    items[1].source.line_offset = 20;
+    items[1].locked = true;
+    setTestSelection(&studio, &items, &.{ 194, 195 });
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.locked_item, studio.notice);
+}
+
+test "multi duplicate supports only unmodified births in the current morph state" {
+    var items = [_]slides.SlideItem{
+        testItem(196, .textbox, 100, 100, 100, 80),
+        testItem(197, .textbox, 300, 100, 100, 80),
+    };
+    for (&items, 0..) |*item, index| {
+        item.source = .{ .scope = .morph_item, .line_offset = (index + 1) * 10, .patchable = true };
+        item.creation_morph_state = 0;
+    }
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .active_morph_state = 0, .morph_state_count = 1 };
+    setTestSelection(&studio, &items, &.{ 197, 196 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .duplicate_items);
+
+    items[1].state_source = .{ .scope = .morph_item, .line_offset = 40, .patchable = true };
+    items[1].state_source_state = 0;
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.multi_duplicate_unsupported, studio.notice);
+}
+
 test "morph duplication allows only an unmodified current-state birth" {
     var items = [_]slides.SlideItem{testItem(184, .textbox, 100, 100, 300, 100)};
     items[0].source = .{ .scope = .morph_item, .line_number = 5, .line_offset = 50, .patchable = true };
@@ -6137,6 +6744,102 @@ test "identified template delete and foreground color emit local targets" {
         },
         else => return error.UnexpectedSemanticCommand,
     }
+}
+
+test "multi delete mixes physical removal and identified local hide in one paint-ordered intention" {
+    var items = [_]slides.SlideItem{
+        testItem(198, .textbox, 100, 100, 100, 80),
+        testItem(199, .textbox, 300, 100, 100, 80),
+    };
+    items[0].source = .{ .scope = .direct, .line_number = 1, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .slide_template, .line_number = 2, .line_offset = 20, .patchable = true };
+    items[1].instance_source = .{ .scope = .slide_instance_override, .line_number = 8, .line_offset = 80, .patchable = true };
+    items[1].id = "local-item";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 199, 198 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .delete_items => |command| {
+            try std.testing.expectEqual(@as(usize, 2), command.count);
+            try std.testing.expectEqual(@as(usize, 198), command.targets[0].item_identity);
+            try std.testing.expectEqual(EditScope.direct, command.targets[0].edit_scope);
+            try std.testing.expectEqual(@as(usize, 199), command.targets[1].item_identity);
+            try std.testing.expectEqual(EditScope.local_instance, command.targets[1].edit_scope);
+            try std.testing.expectEqual(@as(usize, 80), command.targets[1].source.line_offset);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "multi delete rejects shared-definition locked generated and ambiguous targets without a partial command" {
+    var items = [_]slides.SlideItem{
+        testItem(200, .textbox, 100, 100, 100, 80),
+        testItem(201, .textbox, 300, 100, 100, 80),
+    };
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .slide_template, .line_offset = 20, .patchable = true };
+    items[1].id = "shared-item";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 200, 201 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true, .allow_shared_edit = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.multi_delete_unsupported, studio.notice);
+
+    items[1].source = .{ .scope = .direct, .line_offset = 20, .patchable = true };
+    items[1].locked = true;
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.locked_item, studio.notice);
+
+    items[1].locked = false;
+    items[1].source.patchable = false;
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.generated_source_read_only, studio.notice);
+
+    items[1].source = items[0].source;
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.multi_delete_unsupported, studio.notice);
+}
+
+test "multi delete accepts a current-state birth plus an identified inherited morph hide" {
+    var items = [_]slides.SlideItem{
+        testItem(202, .textbox, 100, 100, 100, 80),
+        testItem(203, .textbox, 300, 100, 100, 80),
+    };
+    items[0].source = .{ .scope = .morph_item, .line_offset = 10, .patchable = true };
+    items[0].creation_morph_state = 0;
+    items[0].state_source = .{ .scope = .morph_item, .line_offset = 11, .patchable = true };
+    items[0].state_source_state = 0;
+    items[1].source = .{ .scope = .direct, .line_offset = 20, .patchable = true };
+    items[1].id = "inherited";
+    items[1].state_source = .{ .scope = .morph_item, .line_offset = 21, .patchable = true };
+    items[1].state_source_state = 0;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .active_morph_state = 0, .morph_state_count = 1 };
+    setTestSelection(&studio, &items, &.{ 203, 202 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .delete_items => |command| {
+            try std.testing.expectEqual(@as(usize, 2), command.count);
+            try std.testing.expectEqual(@as(usize, 202), command.targets[0].item_identity);
+            try std.testing.expectEqual(@as(usize, 10), command.targets[0].source.line_offset);
+            try std.testing.expectEqual(@as(usize, 203), command.targets[1].item_identity);
+            try std.testing.expectEqual(@as(usize, 21), command.targets[1].source.line_offset);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[1].id = null;
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.local_override_needs_unique_id, studio.notice);
 }
 
 test "template background color emits local and shared targets" {
@@ -6828,10 +7531,21 @@ test "copy emits literal direct items in paint order and paste is one offset int
 
     items[1].source.scope = .component_instance;
     _ = studio.update(&items, &.{}, viewport, .{ .copy_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .copy_items => |command| {
+            try std.testing.expectEqual(@as(usize, 2), command.count);
+            try std.testing.expectEqual(SourceScope.component_instance, command.targets[1].source.scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[0].source = items[1].source;
+    _ = studio.update(&items, &.{}, viewport, .{ .copy_pressed = true });
     try std.testing.expect(studio.takeSemanticCommand() == null);
     try std.testing.expectEqual(Notice.copy_selection_unsupported, studio.notice);
 
     items[0].locked = true;
+    items[0].source = .{ .scope = .direct, .line_number = 1, .line_offset = 10, .patchable = true };
     studio.setSingleSelection(items[0]);
     _ = studio.update(&items, &.{}, viewport, .{ .copy_pressed = true });
     switch (studio.takeSemanticCommand().?) {
