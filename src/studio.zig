@@ -1216,12 +1216,23 @@ pub const Workspace = struct {
     /// Explicit semantic states for the current slide. Base is always scene
     /// zero and therefore is not repeated in this slice.
     morph_states: []const MorphStateSummary = &.{},
+    /// Application-owned capabilities surfaced to command discovery without
+    /// exposing history or clipboard implementation details.
+    undo_available: bool = false,
+    redo_available: bool = false,
+    clipboard_item_count: usize = 0,
 };
 
 /// Source-level intentions emitted by the visual controls. Unlike
 /// GeometryCommand, these never mutate SlideItem; the integration layer can
 /// prompt for text/path details and atomically rewrite/reparse the `.sld`.
 pub const SemanticCommand = union(enum) {
+    /// Application-level intentions surfaced through the command palette.
+    /// The integration retains ownership of persistence and history stacks.
+    save_document: void,
+    save_document_copy: void,
+    undo: void,
+    redo: void,
     /// Replaces the pristine untitled placeholder with an ordinary starter
     /// `.sld` source in one undoable edit.
     create_starter_deck: NewDeckPreset,
@@ -1306,6 +1317,7 @@ pub const UiLayout = struct {
     scene_next: rl.Rectangle,
     slides_dock_toggle: rl.Rectangle = empty_ui_rectangle,
     properties_dock_toggle: rl.Rectangle = empty_ui_rectangle,
+    command_palette: rl.Rectangle = empty_ui_rectangle,
     focus_canvas: rl.Rectangle = empty_ui_rectangle,
     properties: rl.Rectangle,
     edit_text: rl.Rectangle,
@@ -1914,6 +1926,14 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = slides_toggle_width,
         .height = tool_size,
     } else empty_ui_rectangle;
+    const command_width: f32 = @as(f32, if (compact_toolbar) 92 else 112) * scale;
+    const command_anchor_x = if (slides_dock_toggle.width > 0) slides_dock_toggle.x else focus_canvas.x;
+    const command_palette: rl.Rectangle = if (docked) .{
+        .x = command_anchor_x - dock_button_gap - command_width,
+        .y = focus_canvas.y,
+        .width = command_width,
+        .height = tool_size,
+    } else empty_ui_rectangle;
 
     const property_width: f32 = if (docked and viewport.chrome.?.right_visible)
         viewport.chrome.?.right_dock.width
@@ -2061,6 +2081,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .scene_next = scene_next,
             .slides_dock_toggle = slides_dock_toggle,
             .properties_dock_toggle = properties_dock_toggle,
+            .command_palette = command_palette,
             .focus_canvas = focus_canvas,
             .properties = properties,
             .edit_text = edit_text,
@@ -2213,6 +2234,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .scene_next = scene_next,
         .slides_dock_toggle = slides_dock_toggle,
         .properties_dock_toggle = properties_dock_toggle,
+        .command_palette = command_palette,
         .focus_canvas = focus_canvas,
         .properties = properties,
         .edit_text = edit_text,
@@ -2257,6 +2279,155 @@ pub const MorphTimelineLayout = struct {
     card_gap: f32,
     compact: bool,
 };
+
+pub const CommandId = enum {
+    save,
+    save_copy,
+    undo,
+    redo,
+    tool_select,
+    tool_text,
+    tool_bullets,
+    tool_image,
+    tool_rectangle,
+    tool_library,
+    new_slide,
+    previous_slide,
+    next_slide,
+    duplicate_slide,
+    delete_slide,
+    toggle_grid,
+    focus_canvas,
+    show_slides,
+    show_objects,
+    show_properties,
+    edit_text,
+    copy_items,
+    paste_items,
+    duplicate_items,
+    delete_items,
+    toggle_lock,
+    reuse_or_detach,
+    add_morph_state,
+    duplicate_morph_state,
+    rename_morph_state,
+    delete_morph_state,
+};
+
+const CommandSpec = struct {
+    id: CommandId,
+    category: [:0]const u8,
+    title: [:0]const u8,
+    description: [:0]const u8,
+    keywords: [:0]const u8,
+    shortcut: [:0]const u8 = "",
+};
+
+const command_specs = [_]CommandSpec{
+    .{ .id = .save, .category = "FILE", .title = "Save document", .description = "Save this source-backed deck", .keywords = "write persist document file", .shortcut = "Cmd/Ctrl S" },
+    .{ .id = .save_copy, .category = "FILE", .title = "Save a copy", .description = "Write a new .edited.sld copy", .keywords = "duplicate export backup file", .shortcut = "Shift Cmd/Ctrl S" },
+    .{ .id = .undo, .category = "HISTORY", .title = "Undo", .description = "Restore the previous source transaction", .keywords = "back history revert", .shortcut = "Cmd/Ctrl Z" },
+    .{ .id = .redo, .category = "HISTORY", .title = "Redo", .description = "Reapply the next source transaction", .keywords = "forward history repeat", .shortcut = "Shift Cmd/Ctrl Z" },
+    .{ .id = .tool_select, .category = "TOOLS", .title = "Select tool", .description = "Select, move, resize, and marquee objects", .keywords = "pointer move resize marquee", .shortcut = "V" },
+    .{ .id = .tool_text, .category = "TOOLS", .title = "Add text", .description = "Place a new source-backed text box", .keywords = "textbox type label", .shortcut = "T" },
+    .{ .id = .tool_bullets, .category = "TOOLS", .title = "Add bullet list", .description = "Place a new bulleted text box", .keywords = "list bullets", .shortcut = "B" },
+    .{ .id = .tool_image, .category = "TOOLS", .title = "Add image", .description = "Place an image from a relative path", .keywords = "picture photo asset", .shortcut = "I" },
+    .{ .id = .tool_rectangle, .category = "TOOLS", .title = "Add rectangle", .description = "Place a colored shape", .keywords = "shape box background", .shortcut = "R" },
+    .{ .id = .tool_library, .category = "TOOLS", .title = "Place library element", .description = "Choose and place a reusable element", .keywords = "reuse component library", .shortcut = "U" },
+    .{ .id = .new_slide, .category = "SLIDES", .title = "New slide", .description = "Append a blank authored slide", .keywords = "add page deck", .shortcut = "Cmd/Ctrl N" },
+    .{ .id = .previous_slide, .category = "SLIDES", .title = "Previous slide", .description = "Select the previous slide in the deck", .keywords = "page back navigate", .shortcut = "Page Up" },
+    .{ .id = .next_slide, .category = "SLIDES", .title = "Next slide", .description = "Select the next slide in the deck", .keywords = "page forward navigate", .shortcut = "Page Down" },
+    .{ .id = .duplicate_slide, .category = "SLIDES", .title = "Duplicate slide", .description = "Duplicate the current complete slide", .keywords = "copy page deck", .shortcut = "Cmd/Ctrl D" },
+    .{ .id = .delete_slide, .category = "SLIDES", .title = "Delete slide", .description = "Remove the current slide atomically", .keywords = "remove page deck", .shortcut = "Cmd/Ctrl Backspace" },
+    .{ .id = .toggle_grid, .category = "VIEW", .title = "Toggle grid", .description = "Show or hide the snapping grid", .keywords = "guides snap view", .shortcut = "G" },
+    .{ .id = .focus_canvas, .category = "VIEW", .title = "Focus Canvas", .description = "Hide or restore permanent Studio chrome", .keywords = "zen canvas hide docks", .shortcut = "Tab" },
+    .{ .id = .show_slides, .category = "VIEW", .title = "Show Slides and Library", .description = "Open the deck organizer dock", .keywords = "left dock organizer reusable" },
+    .{ .id = .show_objects, .category = "VIEW", .title = "Show Objects", .description = "Open the source-aware object stack", .keywords = "layers inspector right dock" },
+    .{ .id = .show_properties, .category = "VIEW", .title = "Show Properties", .description = "Open precise inline object properties", .keywords = "inspector right dock values" },
+    .{ .id = .edit_text, .category = "SELECTION", .title = "Edit selected text", .description = "Focus the selected object's inline text field", .keywords = "rename content property", .shortcut = "Enter" },
+    .{ .id = .copy_items, .category = "SELECTION", .title = "Copy selected objects", .description = "Copy authored objects to Studio's clipboard", .keywords = "clipboard items", .shortcut = "Cmd/Ctrl C" },
+    .{ .id = .paste_items, .category = "SELECTION", .title = "Paste objects", .description = "Paste copied objects with fresh IDs", .keywords = "clipboard clone items", .shortcut = "Cmd/Ctrl V" },
+    .{ .id = .duplicate_items, .category = "SELECTION", .title = "Duplicate selected objects", .description = "Duplicate the selection in one transaction", .keywords = "clone copy items", .shortcut = "Cmd/Ctrl D" },
+    .{ .id = .delete_items, .category = "SELECTION", .title = "Delete selected objects", .description = "Delete the selection in one transaction", .keywords = "remove hide items", .shortcut = "Backspace" },
+    .{ .id = .toggle_lock, .category = "SELECTION", .title = "Lock or unlock selection", .description = "Protect selected objects from canvas edits", .keywords = "freeze protect objects", .shortcut = "Cmd/Ctrl L" },
+    .{ .id = .reuse_or_detach, .category = "COMPOSITION", .title = "Reuse or detach selection", .description = "Promote direct items or detach a safe instance", .keywords = "component group template reusable", .shortcut = "P" },
+    .{ .id = .add_morph_state, .category = "MORPH", .title = "Add morph state", .description = "Append a cumulative semantic state", .keywords = "animation scene transition" },
+    .{ .id = .duplicate_morph_state, .category = "MORPH", .title = "Duplicate morph state", .description = "Insert an empty state from this snapshot", .keywords = "animation scene copy" },
+    .{ .id = .rename_morph_state, .category = "MORPH", .title = "Name morph state", .description = "Set the selected state's timeline label", .keywords = "animation scene label" },
+    .{ .id = .delete_morph_state, .category = "MORPH", .title = "Delete morph state", .description = "Remove the selected complete state block", .keywords = "animation scene remove" },
+};
+
+pub const CommandPaletteLayout = struct {
+    scale: f32,
+    panel: rl.Rectangle,
+    search: rl.Rectangle,
+    rows_clip: rl.Rectangle,
+    footer: rl.Rectangle,
+    row_height: f32,
+    row_gap: f32,
+};
+
+pub fn commandPaletteLayout(viewport: Viewport) CommandPaletteLayout {
+    const scale = uiScale(viewport);
+    const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
+        .x = viewport.slide_top_left.x,
+        .y = viewport.slide_top_left.y,
+        .width = viewport.slide_size.x,
+        .height = viewport.slide_size.y,
+    };
+    const margin = 20 * scale;
+    const panel_width = @min(780 * scale, @max(0, bounds.width - margin * 2));
+    const panel_height = @min(590 * scale, @max(0, bounds.height - margin * 2));
+    const panel: rl.Rectangle = .{
+        .x = bounds.x + (bounds.width - panel_width) / 2,
+        .y = bounds.y + @max(margin, (bounds.height - panel_height) * 0.18),
+        .width = panel_width,
+        .height = panel_height,
+    };
+    const inset = 18 * scale;
+    const search_height = 58 * scale;
+    const footer_height = 38 * scale;
+    const search: rl.Rectangle = .{
+        .x = panel.x + inset,
+        .y = panel.y + inset,
+        .width = @max(0, panel.width - inset * 2),
+        .height = search_height,
+    };
+    const footer: rl.Rectangle = .{
+        .x = panel.x + inset,
+        .y = panel.y + panel.height - inset - footer_height,
+        .width = @max(0, panel.width - inset * 2),
+        .height = footer_height,
+    };
+    return .{
+        .scale = scale,
+        .panel = panel,
+        .search = search,
+        .rows_clip = .{
+            .x = search.x,
+            .y = search.y + search.height + 12 * scale,
+            .width = search.width,
+            .height = @max(0, footer.y - 10 * scale - (search.y + search.height + 12 * scale)),
+        },
+        .footer = footer,
+        .row_height = 62 * scale,
+        .row_gap = 6 * scale,
+    };
+}
+
+pub fn commandPaletteRowCapacity(layout: CommandPaletteLayout) usize {
+    return rowsThatFit(layout.rows_clip.height, layout.row_height, layout.row_gap);
+}
+
+pub fn commandPaletteRowRect(layout: CommandPaletteLayout, visible_slot: usize) ?rl.Rectangle {
+    if (visible_slot >= commandPaletteRowCapacity(layout)) return null;
+    return .{
+        .x = layout.rows_clip.x,
+        .y = layout.rows_clip.y + @as(f32, @floatFromInt(visible_slot)) * (layout.row_height + layout.row_gap),
+        .width = layout.rows_clip.width,
+        .height = layout.row_height,
+    };
+}
 
 /// Bottom chrome timeline. It lives inside the reserved status shell, never
 /// over the slide canvas, so scene authoring remains unobscured.
@@ -2333,10 +2504,16 @@ pub const FrameInput = struct {
     inline_home_pressed: bool = false,
     inline_end_pressed: bool = false,
     inline_submit_pressed: bool = false,
+    /// Elapsed seconds since the previous update. Tests inject this value to
+    /// exercise delayed hover help without sleeping.
+    frame_time: f32 = 1.0 / 60.0,
     shortcut_modifier_down: bool = false,
     shift_down: bool = false,
     toggle_pressed: bool = false,
     toggle_focus_canvas_pressed: bool = false,
+    command_palette_pressed: bool = false,
+    palette_previous_pressed: bool = false,
+    palette_next_pressed: bool = false,
     cancel_pressed: bool = false,
     pointer_screen: rl.Vector2 = .{ .x = 0, .y = 0 },
     pointer_pressed: bool = false,
@@ -2417,10 +2594,14 @@ pub const FrameInput = struct {
             .inline_home_pressed = keyPressedOrRepeated(.home),
             .inline_end_pressed = keyPressedOrRepeated(.end),
             .inline_submit_pressed = rl.isKeyPressed(.enter),
+            .frame_time = rl.getFrameTime(),
             .shortcut_modifier_down = shortcut_modifier,
             .shift_down = shift,
             .toggle_pressed = rl.isKeyPressed(.e),
             .toggle_focus_canvas_pressed = rl.isKeyPressed(.tab),
+            .command_palette_pressed = shortcut_modifier and rl.isKeyPressed(.k),
+            .palette_previous_pressed = keyPressedOrRepeated(.up),
+            .palette_next_pressed = keyPressedOrRepeated(.down),
             .cancel_pressed = rl.isKeyPressed(.escape),
             .pointer_screen = rl.getMousePosition(),
             .pointer_pressed = rl.isMouseButtonPressed(.left),
@@ -2589,6 +2770,87 @@ const InlineEditor = struct {
     }
 };
 
+pub const max_command_query_bytes: usize = 128;
+pub const tooltip_delay_seconds: f32 = 0.55;
+pub const tooltip_pointer_tolerance: f32 = 5;
+
+const CommandPaletteState = struct {
+    active: bool = false,
+    query: [max_command_query_bytes + 1]u8 = [_]u8{0} ** (max_command_query_bytes + 1),
+    len: usize = 0,
+    selected_result: usize = 0,
+    first_visible: usize = 0,
+
+    fn text(self: *const CommandPaletteState) []const u8 {
+        return self.query[0..self.len];
+    }
+};
+
+const TooltipTarget = struct {
+    key: u16,
+    anchor: rl.Rectangle,
+    title: [:0]const u8,
+    detail: [:0]const u8,
+    shortcut: [:0]const u8 = "",
+};
+
+const TooltipState = struct {
+    target: ?TooltipTarget = null,
+    pointer_origin: rl.Vector2 = .zero(),
+    elapsed: f32 = 0,
+
+    fn visible(self: TooltipState) bool {
+        return self.target != null and self.elapsed >= tooltip_delay_seconds;
+    }
+};
+
+const CommandAvailability = struct {
+    enabled: bool,
+    reason: [:0]const u8 = "",
+};
+
+fn asciiLower(value: u8) u8 {
+    return if (value >= 'A' and value <= 'Z') value + ('a' - 'A') else value;
+}
+
+fn containsAsciiInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var matches = true;
+        for (needle, 0..) |byte, offset| {
+            if (asciiLower(haystack[start + offset]) != asciiLower(byte)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
+    }
+    return false;
+}
+
+fn commandMatches(spec: CommandSpec, query: []const u8) bool {
+    if (query.len == 0) return true;
+    return containsAsciiInsensitive(spec.title, query) or
+        containsAsciiInsensitive(spec.category, query) or
+        containsAsciiInsensitive(spec.description, query) or
+        containsAsciiInsensitive(spec.keywords, query) or
+        containsAsciiInsensitive(spec.shortcut, query);
+}
+
+fn hoveredTooltip(
+    pointer: rl.Vector2,
+    key: u16,
+    anchor: rl.Rectangle,
+    title: [:0]const u8,
+    detail: [:0]const u8,
+    shortcut: [:0]const u8,
+) ?TooltipTarget {
+    if (!pointInRectangle(pointer, anchor)) return null;
+    return .{ .key = key, .anchor = anchor, .title = title, .detail = detail, .shortcut = shortcut };
+}
+
 pub const Studio = struct {
     enabled: bool = false,
     /// Focus Canvas keeps editing/selection live while hiding all permanent
@@ -2632,6 +2894,8 @@ pub const Studio = struct {
     pending_geometry_command: ?GeometryCommand = null,
     pending_geometry_batch: ?GeometryBatchCommand = null,
     inline_editor: InlineEditor = .{},
+    command_palette: CommandPaletteState = .{},
+    tooltip: TooltipState = .{},
     composition_context: ?CompositionContext = null,
     group_drag: [max_selection_items]GroupDragMember = undefined,
     group_drag_count: usize = 0,
@@ -2689,6 +2953,43 @@ pub const Studio = struct {
         return self.inline_editor.active;
     }
 
+    pub fn commandPaletteActive(self: Studio) bool {
+        return self.command_palette.active;
+    }
+
+    /// Non-mutating launch hook used by screenshot/regression tooling. Normal
+    /// product interaction continues through the visible button or Cmd/Ctrl-K.
+    pub fn openCommandPaletteForDiagnostics(self: *Studio, items: []slides.SlideItem) void {
+        self.openCommandPalette(items);
+    }
+
+    /// Keeps the real hover-help renderer visible for deterministic visual
+    /// QA without synthesizing global pointer events across macOS Spaces.
+    pub fn showCommandTooltipForDiagnostics(self: *Studio, viewport: Viewport) void {
+        const anchor = uiLayout(viewport).command_palette;
+        if (anchor.width <= 0 or anchor.height <= 0) return;
+        self.command_palette = .{};
+        self.tooltip = .{
+            .target = .{
+                .key = 27,
+                .anchor = anchor,
+                .title = "Command palette",
+                .detail = "Search every contextual Studio action",
+                .shortcut = "Cmd/Ctrl K",
+            },
+            .pointer_origin = .{ .x = anchor.x + anchor.width / 2, .y = anchor.y + anchor.height / 2 },
+            .elapsed = tooltip_delay_seconds,
+        };
+    }
+
+    pub fn tooltipVisible(self: Studio) bool {
+        return self.tooltip.visible();
+    }
+
+    pub fn textEntryActive(self: Studio) bool {
+        return self.inline_editor.active or self.command_palette.active;
+    }
+
     pub fn inlineEditField(self: Studio) ?InlineField {
         return if (self.inline_editor.active) self.inline_editor.field else null;
     }
@@ -2729,6 +3030,448 @@ pub const Studio = struct {
 
     fn cancelInlineEdit(self: *Studio) void {
         self.inline_editor = .{};
+    }
+
+    fn openCommandPalette(self: *Studio, items: []slides.SlideItem) void {
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
+        self.resetTooltip();
+        self.command_palette = .{ .active = true };
+        self.notice = .none;
+    }
+
+    fn closeCommandPalette(self: *Studio) void {
+        self.command_palette = .{};
+    }
+
+    fn resetTooltip(self: *Studio) void {
+        self.tooltip = .{};
+    }
+
+    fn tooltipTargetAtPoint(
+        self: Studio,
+        viewport: Viewport,
+        workspace: Workspace,
+        pointer: rl.Vector2,
+    ) ?TooltipTarget {
+        const layout = uiLayout(viewport);
+        const tool_titles = [_][:0]const u8{ "Select tool", "Add text", "Add bullets", "Add image", "Add rectangle", "Place reusable" };
+        const tool_details = [_][:0]const u8{
+            "Move, resize, marquee, and inspect objects",
+            "Place a new source-backed text box",
+            "Place a source-backed bulleted list",
+            "Choose and place an image asset",
+            "Draw a filled presentation shape",
+            "Place an element from the reusable Library",
+        };
+        const tool_shortcuts = [_][:0]const u8{ "V", "T", "B", "I", "R", "U" };
+        for (layout.tool_buttons, 0..) |button, index| {
+            if (hoveredTooltip(pointer, @intCast(1 + index), button, tool_titles[index], tool_details[index], tool_shortcuts[index])) |target| return target;
+        }
+        const chrome_targets = [_]TooltipTarget{
+            .{ .key = 20, .anchor = layout.new_slide, .title = "New slide", .detail = "Append a blank authored slide", .shortcut = "Cmd/Ctrl N" },
+            .{ .key = 21, .anchor = layout.grid_toggle, .title = "Snapping grid", .detail = "Show the grid and snap gestures to it", .shortcut = "G" },
+            .{ .key = 22, .anchor = layout.scene_previous, .title = "Previous scene", .detail = "Cycle backward through BASE and morph states", .shortcut = "[" },
+            .{ .key = 23, .anchor = layout.scene_label, .title = "Morph scene", .detail = "Click to cycle BASE and cumulative states", .shortcut = "[ / ]" },
+            .{ .key = 24, .anchor = layout.scene_next, .title = "Next scene", .detail = "Cycle forward through BASE and morph states", .shortcut = "]" },
+            .{ .key = 25, .anchor = layout.slides_dock_toggle, .title = "Slides and Library", .detail = "Open the deck organizer and reusable Library" },
+            .{ .key = 26, .anchor = layout.properties_dock_toggle, .title = "Inspector", .detail = "Open Objects or precise Properties" },
+            .{ .key = 27, .anchor = layout.command_palette, .title = "Command palette", .detail = "Search every contextual Studio action", .shortcut = "Cmd/Ctrl K" },
+            .{ .key = 28, .anchor = layout.focus_canvas, .title = "Focus Canvas", .detail = "Hide Studio chrome while keeping editing live", .shortcut = "Tab" },
+        };
+        for (chrome_targets) |target| {
+            if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+        }
+
+        const objects = objectsLayout(viewport);
+        const inspector_targets = [_]TooltipTarget{
+            .{ .key = 40, .anchor = objects.objects_tab, .title = "Objects", .detail = "Inspect paint order, visibility, locks, and provenance" },
+            .{ .key = 41, .anchor = objects.properties_tab, .title = "Properties", .detail = "Edit exact values without leaving the canvas" },
+        };
+        for (inspector_targets) |target| {
+            if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+        }
+        if (self.inspector_panel == .objects) {
+            const layer_titles = [_][:0]const u8{ "Send to back", "Move backward", "Move forward", "Bring to front" };
+            const layer_details = [_][:0]const u8{
+                "Move the selection to the back of its safe source segment",
+                "Move the selection down one source-backed layer",
+                "Move the selection up one source-backed layer",
+                "Move the selection to the front of its safe source segment",
+            };
+            const layer_shortcuts = [_][:0]const u8{ "Shift Cmd/Ctrl [", "Cmd/Ctrl [", "Cmd/Ctrl ]", "Shift Cmd/Ctrl ]" };
+            for (objects.layer_actions, 0..) |button, index| {
+                if (hoveredTooltip(pointer, @intCast(50 + index), button, layer_titles[index], layer_details[index], layer_shortcuts[index])) |target| return target;
+            }
+            if (hoveredTooltip(pointer, 54, objects.page_previous, "Previous object page", "Show earlier Objects rows", "")) |target| return target;
+            if (hoveredTooltip(pointer, 55, objects.page_next, "Next object page", "Show later Objects rows", "")) |target| return target;
+        } else {
+            const property_targets = [_]TooltipTarget{
+                .{ .key = 60, .anchor = layout.edit_text, .title = "Text", .detail = "Edit text inline; Shift-Enter adds a new line", .shortcut = "Enter" },
+                .{ .key = 61, .anchor = layout.duplicate_item, .title = "Duplicate", .detail = "Clone the selection in one undoable transaction", .shortcut = "Cmd/Ctrl D" },
+                .{ .key = 62, .anchor = layout.delete_item, .title = "Delete", .detail = "Remove or locally hide the selected object", .shortcut = "Backspace" },
+                .{ .key = 63, .anchor = layout.promote, .title = "Reuse or detach", .detail = "Promote authored content or detach a safe instance", .shortcut = "P" },
+                .{ .key = 64, .anchor = layout.custom_foreground, .title = "Foreground color", .detail = "Enter an exact #RRGGBB or #RRGGBBAA value" },
+                .{ .key = 65, .anchor = layout.custom_background, .title = "Background color", .detail = "Enter an exact fill color or reset its override" },
+                .{ .key = 66, .anchor = layout.clear_background, .title = "No background", .detail = "Clear the selected object's authored fill" },
+                .{ .key = 67, .anchor = layout.font_size, .title = "Font size", .detail = "Set precise source-backed type size" },
+                .{ .key = 68, .anchor = layout.opacity, .title = "Opacity", .detail = "Set opacity from 0 to 100 percent" },
+                .{ .key = 69, .anchor = layout.lock_item, .title = "Lock selection", .detail = "Protect selected objects from canvas mutations", .shortcut = "Cmd/Ctrl L" },
+            };
+            for (property_targets) |target| {
+                if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+            }
+            const geometry_titles = [_][:0]const u8{ "X position", "Y position", "Width", "Height" };
+            const geometry_details = [_][:0]const u8{
+                "Set the exact horizontal coordinate",
+                "Set the exact vertical coordinate",
+                "Set explicit width without changing height",
+                "Set explicit height without changing width",
+            };
+            for (layout.geometry_fields, 0..) |field, index| {
+                if (hoveredTooltip(pointer, @intCast(70 + index), field, geometry_titles[index], geometry_details[index], "")) |target| return target;
+            }
+        }
+
+        if (workspace.visible) {
+            const deck = workspaceLayout(viewport);
+            const deck_titles = [_][:0]const u8{ "New slide", "Duplicate slide", "Delete slide", "Move slide up", "Move slide down", "Make template" };
+            const deck_details = [_][:0]const u8{
+                "Append a blank source-backed slide",
+                "Duplicate the complete current slide",
+                "Delete the current complete slide",
+                "Move the current slide earlier in the deck",
+                "Move the current slide later in the deck",
+                "Promote this slide to a reusable template",
+            };
+            for (deck.organizer_actions, 0..) |button, index| {
+                if (hoveredTooltip(pointer, @intCast(100 + index), button, deck_titles[index], deck_details[index], "")) |target| return target;
+            }
+            const library_targets = [_]TooltipTarget{
+                .{ .key = 110, .anchor = deck.library_use, .title = "Use reusable", .detail = "Place the selected Library definition" },
+                .{ .key = 111, .anchor = deck.library_rename, .title = "Rename reusable", .detail = "Rename its safe source-order uses atomically" },
+                .{ .key = 112, .anchor = deck.library_delete, .title = "Delete reusable", .detail = "Delete only when no live use depends on it" },
+                .{ .key = 113, .anchor = deck.library_cleanup, .title = "Clean Library", .detail = "Preview then remove safely unreachable definitions" },
+            };
+            for (library_targets) |target| {
+                if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+            }
+
+            const morph = morphTimelineLayout(viewport);
+            const morph_titles = [_][:0]const u8{ "Add state", "Duplicate state", "Name state", "Delete state", "Move state earlier", "Move state later" };
+            const morph_details = [_][:0]const u8{
+                "Append a cumulative semantic morph state",
+                "Insert a new state from the selected snapshot",
+                "Give the selected state a source-backed label",
+                "Delete the selected complete state block",
+                "Move the selected state earlier in the timeline",
+                "Move the selected state later in the timeline",
+            };
+            for (morph.actions, 0..) |button, index| {
+                if (hoveredTooltip(pointer, @intCast(120 + index), button, morph_titles[index], morph_details[index], "")) |target| return target;
+            }
+        }
+        return null;
+    }
+
+    fn updateTooltip(self: *Studio, viewport: Viewport, workspace: Workspace, input: FrameInput) void {
+        if (self.command_palette.active or self.inline_editor.active or self.interaction != .idle or
+            self.marquee.active or input.pointer_pressed or input.pointer_down)
+        {
+            self.resetTooltip();
+            return;
+        }
+        const target = self.tooltipTargetAtPoint(viewport, workspace, input.pointer_screen) orelse {
+            self.resetTooltip();
+            return;
+        };
+        if (self.tooltip.target == null or self.tooltip.target.?.key != target.key) {
+            self.tooltip = .{ .target = target, .pointer_origin = input.pointer_screen };
+            return;
+        }
+        const delta = input.pointer_screen.subtract(self.tooltip.pointer_origin);
+        if (delta.length() > tooltip_pointer_tolerance * uiScale(viewport)) {
+            self.tooltip.pointer_origin = input.pointer_screen;
+            self.tooltip.elapsed = 0;
+        } else {
+            self.tooltip.elapsed += @max(@as(f32, 0), input.frame_time);
+        }
+        self.tooltip.target = target;
+    }
+
+    fn commandResultCount(self: Studio) usize {
+        var count: usize = 0;
+        for (command_specs) |spec| if (commandMatches(spec, self.command_palette.text())) {
+            count += 1;
+        };
+        return count;
+    }
+
+    fn commandSpecAtResult(self: Studio, result_index: usize) ?CommandSpec {
+        var found: usize = 0;
+        for (command_specs) |spec| {
+            if (!commandMatches(spec, self.command_palette.text())) continue;
+            if (found == result_index) return spec;
+            found += 1;
+        }
+        return null;
+    }
+
+    fn commandAvailability(
+        self: Studio,
+        items: []const slides.SlideItem,
+        workspace: Workspace,
+        id: CommandId,
+    ) CommandAvailability {
+        const selection_count = self.selectionCount();
+        const selected_item: ?slides.SlideItem = if (selection_count == 1)
+            if (self.selectedIndex(items)) |index| items[index] else null
+        else
+            null;
+        return switch (id) {
+            .save,
+            .save_copy,
+            .tool_select,
+            .tool_text,
+            .tool_bullets,
+            .tool_image,
+            .tool_rectangle,
+            .toggle_grid,
+            .focus_canvas,
+            .show_slides,
+            .show_objects,
+            .show_properties,
+            => .{ .enabled = true },
+            .undo => if (workspace.undo_available)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "Nothing to undo" },
+            .redo => if (workspace.redo_available)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "Nothing to redo" },
+            .tool_library => if (workspace.library.len > 0)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "The Library has no visible reusable entries" },
+            .paste_items => if (workspace.clipboard_item_count > 0)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "Copy one or more objects first" },
+            .new_slide => if (workspace.visible)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "Studio deck workspace is unavailable" },
+            .previous_slide => if (summaryOffsetForSlide(workspace.slides, workspace.current_slide)) |offset|
+                if (offset > 0) .{ .enabled = true } else .{ .enabled = false, .reason = "Already on the first slide" }
+            else
+                .{ .enabled = false, .reason = "No current slide" },
+            .next_slide => if (summaryOffsetForSlide(workspace.slides, workspace.current_slide)) |offset|
+                if (offset + 1 < workspace.slides.len) .{ .enabled = true } else .{ .enabled = false, .reason = "Already on the last slide" }
+            else
+                .{ .enabled = false, .reason = "No current slide" },
+            .duplicate_slide => if (workspace.slides.len > 0)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "No slide to duplicate" },
+            .delete_slide => if (workspace.slides.len > 1)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "A deck must keep at least one slide" },
+            .edit_text => if (selected_item) |item|
+                if (item.locked)
+                    .{ .enabled = false, .reason = "Unlock the selected object first" }
+                else if (item.kind == .textbox)
+                    .{ .enabled = true }
+                else
+                    .{ .enabled = false, .reason = "Text editing needs one text object" }
+            else
+                .{ .enabled = false, .reason = "Select one text object" },
+            .copy_items, .duplicate_items, .delete_items, .toggle_lock, .reuse_or_detach => if (selection_count > 0)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "Select one or more objects" },
+            .add_morph_state => if (workspace.visible)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "No active slide" },
+            .duplicate_morph_state, .rename_morph_state, .delete_morph_state => if (self.active_morph_state != null)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "Select a morph-state card first" },
+        };
+    }
+
+    fn ensureCommandSelectionVisible(self: *Studio, viewport: Viewport) void {
+        const count = self.commandResultCount();
+        if (count == 0) {
+            self.command_palette.selected_result = 0;
+            self.command_palette.first_visible = 0;
+            return;
+        }
+        self.command_palette.selected_result = @min(self.command_palette.selected_result, count - 1);
+        const capacity = commandPaletteRowCapacity(commandPaletteLayout(viewport));
+        if (capacity == 0) {
+            self.command_palette.first_visible = 0;
+            return;
+        }
+        if (self.command_palette.selected_result < self.command_palette.first_visible)
+            self.command_palette.first_visible = self.command_palette.selected_result;
+        if (self.command_palette.selected_result >= self.command_palette.first_visible + capacity)
+            self.command_palette.first_visible = self.command_palette.selected_result + 1 - capacity;
+        self.command_palette.first_visible = @min(self.command_palette.first_visible, count - @min(count, capacity));
+    }
+
+    fn appendCommandQuery(self: *Studio, value: []const u8) void {
+        if (!std.unicode.utf8ValidateSlice(value) or value.len > max_command_query_bytes - self.command_palette.len) return;
+        @memcpy(self.command_palette.query[self.command_palette.len .. self.command_palette.len + value.len], value);
+        self.command_palette.len += value.len;
+        self.command_palette.query[self.command_palette.len] = 0;
+        self.command_palette.selected_result = 0;
+        self.command_palette.first_visible = 0;
+    }
+
+    fn removeCommandQueryCodepoint(self: *Studio) void {
+        if (self.command_palette.len == 0) return;
+        var start = self.command_palette.len - 1;
+        while (start > 0 and self.command_palette.query[start] & 0xc0 == 0x80) start -= 1;
+        self.command_palette.len = start;
+        self.command_palette.query[start] = 0;
+        self.command_palette.selected_result = 0;
+        self.command_palette.first_visible = 0;
+    }
+
+    fn executeCommand(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        workspace: Workspace,
+        id: CommandId,
+    ) void {
+        self.closeCommandPalette();
+        switch (id) {
+            .save => self.pending_semantic_command = .{ .save_document = {} },
+            .save_copy => self.pending_semantic_command = .{ .save_document_copy = {} },
+            .undo => self.pending_semantic_command = .{ .undo = {} },
+            .redo => self.pending_semantic_command = .{ .redo = {} },
+            .tool_select => self.setTool(.select, items),
+            .tool_text => self.setTool(.add_text, items),
+            .tool_bullets => self.setTool(.add_bullets, items),
+            .tool_image => self.setTool(.add_image, items),
+            .tool_rectangle => self.setTool(.add_shape, items),
+            .tool_library => self.setTool(.add_reusable, items),
+            .new_slide => self.pending_semantic_command = .{ .new_slide = {} },
+            .previous_slide, .next_slide => {
+                const current = summaryOffsetForSlide(workspace.slides, workspace.current_slide) orelse return;
+                const desired = if (id == .previous_slide) current -| 1 else current + 1;
+                if (desired < workspace.slides.len) self.emitSlideSelection(items, workspace.slides[desired].index);
+            },
+            .duplicate_slide => self.pending_semantic_command = .{ .duplicate_slide = workspace.current_slide },
+            .delete_slide => self.pending_semantic_command = .{ .delete_slide = workspace.current_slide },
+            .toggle_grid => self.grid_snapping = !self.grid_snapping,
+            .focus_canvas => {
+                self.focus_canvas = !self.focus_canvas;
+                self.snap_guides = .{};
+            },
+            .show_slides => {
+                self.focus_canvas = false;
+                self.active_dock = .slides;
+            },
+            .show_objects => {
+                self.focus_canvas = false;
+                self.active_dock = .objects;
+                self.inspector_panel = .objects;
+            },
+            .show_properties => {
+                self.focus_canvas = false;
+                self.active_dock = .properties;
+                self.inspector_panel = .properties;
+            },
+            .edit_text => {
+                self.revealInlineProperties();
+                _ = self.beginInlineEdit(items, resolved_bounds, .text, false);
+            },
+            .copy_items => _ = self.emitCopyItems(items),
+            .paste_items => self.pending_semantic_command = .{ .paste_items = .{} },
+            .duplicate_items => _ = self.emitDuplicateItem(items, false),
+            .delete_items => _ = self.emitSelectedCommand(items, false, .delete_item),
+            .toggle_lock => _ = self.emitSelectedLockCommand(items, false),
+            .reuse_or_detach => _ = self.emitPromoteOrDetach(items, false),
+            .add_morph_state => self.pending_semantic_command = .{ .add_morph_state = .{ .active_state = self.active_morph_state } },
+            .duplicate_morph_state => {
+                if (self.active_morph_state) |state|
+                    self.pending_semantic_command = .{ .duplicate_morph_state = state };
+            },
+            .rename_morph_state => {
+                if (self.active_morph_state) |state|
+                    self.pending_semantic_command = .{ .rename_morph_state = state };
+            },
+            .delete_morph_state => {
+                if (self.active_morph_state) |state|
+                    self.pending_semantic_command = .{ .delete_morph_state = state };
+            },
+        }
+        _ = viewport;
+    }
+
+    fn handleCommandPalette(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        workspace: Workspace,
+        input: FrameInput,
+    ) bool {
+        if (!self.command_palette.active) return false;
+        if (input.command_palette_pressed or input.cancel_pressed) {
+            self.closeCommandPalette();
+            return true;
+        }
+
+        if (input.inline_paste) |paste| self.appendCommandQuery(paste);
+        if (input.inline_backspace_pressed) self.removeCommandQueryCodepoint();
+        if (!input.shortcut_modifier_down and input.inline_chars_len > 0)
+            self.appendCommandQuery(input.inline_chars[0..input.inline_chars_len]);
+
+        const count = self.commandResultCount();
+        if (input.palette_previous_pressed and count > 0)
+            self.command_palette.selected_result = if (self.command_palette.selected_result == 0) count - 1 else self.command_palette.selected_result - 1;
+        if (input.palette_next_pressed and count > 0)
+            self.command_palette.selected_result = (self.command_palette.selected_result + 1) % count;
+        if (input.workspace_scroll != 0 and count > 0) {
+            if (input.workspace_scroll > 0)
+                self.command_palette.selected_result = self.command_palette.selected_result -| 1
+            else
+                self.command_palette.selected_result = @min(count - 1, self.command_palette.selected_result + 1);
+        }
+        self.ensureCommandSelectionVisible(viewport);
+
+        const layout = commandPaletteLayout(viewport);
+        if (input.pointer_pressed) {
+            if (!pointInRectangle(input.pointer_screen, layout.panel)) {
+                self.closeCommandPalette();
+                return true;
+            }
+            const capacity = commandPaletteRowCapacity(layout);
+            for (0..capacity) |slot| {
+                const row = commandPaletteRowRect(layout, slot) orelse break;
+                if (!pointInRectangle(input.pointer_screen, row)) continue;
+                const result_index = self.command_palette.first_visible + slot;
+                if (result_index >= count) break;
+                self.command_palette.selected_result = result_index;
+                const spec = self.commandSpecAtResult(result_index) orelse break;
+                if (self.commandAvailability(items, workspace, spec.id).enabled)
+                    self.executeCommand(items, resolved_bounds, viewport, workspace, spec.id);
+                return true;
+            }
+        }
+        if (input.inline_submit_pressed and count > 0) {
+            const spec = self.commandSpecAtResult(self.command_palette.selected_result) orelse return true;
+            if (self.commandAvailability(items, workspace, spec.id).enabled)
+                self.executeCommand(items, resolved_bounds, viewport, workspace, spec.id);
+        }
+        return true;
     }
 
     fn setInlineBuffer(self: *Studio, value: []const u8) bool {
@@ -3400,6 +4143,8 @@ pub const Studio = struct {
     }
 
     pub fn markSourceChanged(self: *Studio) void {
+        self.closeCommandPalette();
+        self.resetTooltip();
         self.copy_is_current = false;
         self.snap_guides = .{};
         self.marquee.active = false;
@@ -3513,6 +4258,8 @@ pub const Studio = struct {
 
     pub fn toggle(self: *Studio, items: []slides.SlideItem) void {
         self.cancelInlineEdit();
+        self.closeCommandPalette();
+        self.resetTooltip();
         if (self.enabled and self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.enabled = !self.enabled;
@@ -3532,6 +4279,8 @@ pub const Studio = struct {
 
     pub fn disable(self: *Studio, items: []slides.SlideItem) void {
         self.cancelInlineEdit();
+        self.closeCommandPalette();
+        self.resetTooltip();
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.composition_context = null;
@@ -3782,12 +4531,18 @@ pub const Studio = struct {
         }
 
         self.validateSelection(items, resolved_bounds);
+        if (self.handleCommandPalette(items, resolved_bounds, viewport, workspace, input)) return null;
         if (self.inline_editor.active and workspace.visible and self.last_workspace_slide != null and
             self.last_workspace_slide.? != workspace.current_slide)
         {
             self.cancelInlineEdit();
         }
         if (self.handleInlineEditor(items, resolved_bounds, viewport, input)) return null;
+        if (input.command_palette_pressed) {
+            self.openCommandPalette(items);
+            return null;
+        }
+        self.updateTooltip(viewport, workspace, input);
         if (input.toggle_pressed) {
             self.toggle(items);
             return null;
@@ -5324,6 +6079,10 @@ pub const Studio = struct {
         if (self.interaction != .idle) self.cancelInteraction(items);
         if (in_status) return true;
         if (in_toolbar) {
+            if (pointInRectangle(pointer, layout.command_palette)) {
+                self.openCommandPalette(items);
+                return true;
+            }
             if (pointInRectangle(pointer, layout.slides_dock_toggle)) {
                 self.active_dock = if (self.active_dock == .slides) .none else .slides;
                 return true;
@@ -5528,7 +6287,81 @@ pub const Studio = struct {
         viewport: Viewport,
         workspace: Workspace,
     ) ?GeometryCommand {
-        return self.updateWithWorkspace(items, resolved_bounds, viewport, workspace, FrameInput.fromRaylib());
+        const input = FrameInput.fromRaylib();
+        const result = self.updateWithWorkspace(items, resolved_bounds, viewport, workspace, input);
+        rl.setMouseCursor(self.mouseCursorForPoint(items, resolved_bounds, viewport, workspace, input.pointer_screen));
+        return result;
+    }
+
+    fn mouseCursorForPoint(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        workspace: Workspace,
+        pointer: rl.Vector2,
+    ) rl.MouseCursor {
+        if (!self.enabled) return .arrow;
+        if (self.command_palette.active) {
+            const layout = commandPaletteLayout(viewport);
+            if (pointInRectangle(pointer, layout.search)) return .ibeam;
+            for (0..commandPaletteRowCapacity(layout)) |slot| {
+                const row = commandPaletteRowRect(layout, slot) orelse break;
+                if (!pointInRectangle(pointer, row)) continue;
+                const result_index = self.command_palette.first_visible + slot;
+                const spec = self.commandSpecAtResult(result_index) orelse return .arrow;
+                return if (self.commandAvailability(items, workspace, spec.id).enabled) .pointing_hand else .not_allowed;
+            }
+            return .arrow;
+        }
+        if (self.inline_editor.active) {
+            const field = inlineFieldRect(uiLayout(viewport), self.inline_editor.field);
+            if (pointInRectangle(pointer, field)) return .ibeam;
+        }
+        if (self.tooltipTargetAtPoint(viewport, workspace, pointer) != null) return .pointing_hand;
+
+        const objects = objectsLayout(viewport);
+        for (0..objectRowCapacity(objects)) |slot| {
+            const row = objectRowRect(objects, slot) orelse break;
+            if (pointInRectangle(pointer, row)) return .pointing_hand;
+        }
+        if (workspace.visible) {
+            const deck = workspaceLayout(viewport);
+            for (0..slideCardCapacity(deck)) |slot| {
+                const card = slideCardRect(deck, slot) orelse break;
+                if (pointInRectangle(pointer, card)) return .pointing_hand;
+            }
+            for (0..libraryRowCapacity(deck)) |slot| {
+                const row = libraryRowRect(deck, slot) orelse break;
+                if (pointInRectangle(pointer, row)) return .pointing_hand;
+            }
+        }
+
+        const slide_rect: rl.Rectangle = .{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        };
+        if (!pointInRectangle(pointer, slide_rect)) return .arrow;
+        if (self.tool != .select) return .crosshair;
+        if (self.selectionCount() == 1) {
+            if (self.selectedIndex(items)) |index| {
+                if (self.resizeHandleRect(viewport, itemGeometry(items[index], resolved_bounds))) |handle| {
+                    if (pointInRectangle(pointer, handle)) return .resize_nwse;
+                }
+            }
+        }
+        const logical = screenToLogical(viewport, pointer) orelse return .arrow;
+        var index = items.len;
+        while (index > 0) {
+            index -= 1;
+            const item = items[index];
+            if (!isConcreteVisibleItem(item, resolved_bounds)) continue;
+            if (!pointInGeometry(logical, itemGeometry(item, resolved_bounds))) continue;
+            return if (item.locked) .not_allowed else .resize_all;
+        }
+        return .arrow;
     }
 
     fn sourceForSelection(item: slides.SlideItem) ?slides.SourceRef {
@@ -6933,6 +7766,7 @@ pub const Studio = struct {
         self.draw(items, resolved_bounds, viewport);
         self.drawWorkspaceBackground(viewport, workspace);
         self.drawWorkspaceOverlay(viewport, workspace);
+        self.drawDiscoveryOverlay(items, viewport, workspace);
     }
 
     pub fn drawWorkspaceBackground(self: Studio, viewport: Viewport, workspace: Workspace) void {
@@ -7083,6 +7917,286 @@ pub const Studio = struct {
             rl.endScissorMode();
         }
         if (workspace.new_deck) self.drawNewDeckChooser(viewport);
+    }
+
+    /// Draws transient discovery chrome after the workspace thumbnails and
+    /// permanent panels. Keeping this separate from drawWorkspaceOverlay()
+    /// guarantees the palette is never buried beneath a preview texture.
+    pub fn drawDiscoveryOverlay(
+        self: Studio,
+        items: []const slides.SlideItem,
+        viewport: Viewport,
+        workspace: Workspace,
+    ) void {
+        if (!self.enabled) return;
+        if (self.command_palette.active) {
+            self.drawCommandPalette(items, viewport, workspace);
+        } else if (self.tooltip.visible()) {
+            self.drawTooltip(viewport);
+        }
+    }
+
+    fn drawCommandPalette(
+        self: Studio,
+        items: []const slides.SlideItem,
+        viewport: Viewport,
+        workspace: Workspace,
+    ) void {
+        const layout = commandPaletteLayout(viewport);
+        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        };
+        const scale = layout.scale;
+        const heading_font = scaledUiFont(scale, 20);
+        const body_font = scaledUiFont(scale, UiTypography.body);
+        const compact_font = scaledUiFont(scale, UiTypography.compact);
+
+        // A deep translucent scrim and three offset shadow layers make the
+        // palette read as a floating instrument without feeling disconnected
+        // from the live deck beneath it.
+        rl.drawRectangleRec(bounds, .{ .r = 2, .g = 5, .b = 12, .a = 188 });
+        rl.drawRectangleRounded(.{
+            .x = layout.panel.x + 12 * scale,
+            .y = layout.panel.y + 16 * scale,
+            .width = layout.panel.width,
+            .height = layout.panel.height,
+        }, 0.035, 12, .{ .r = 0, .g = 0, .b = 0, .a = 72 });
+        rl.drawRectangleRounded(.{
+            .x = layout.panel.x + 5 * scale,
+            .y = layout.panel.y + 7 * scale,
+            .width = layout.panel.width,
+            .height = layout.panel.height,
+        }, 0.035, 12, .{ .r = 0, .g = 0, .b = 0, .a = 118 });
+        rl.drawRectangleRounded(layout.panel, 0.035, 12, .{ .r = 10, .g = 16, .b = 29, .a = 252 });
+        rl.drawRectangleRoundedLinesEx(layout.panel, 0.035, 12, 2 * scale, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
+        rl.drawRectangleRec(.{
+            .x = layout.panel.x + 18 * scale,
+            .y = layout.panel.y,
+            .width = @max(0, layout.panel.width * 0.34),
+            .height = 3 * scale,
+        }, .{ .r = 255, .g = 92, .b = 198, .a = 245 });
+
+        rl.drawRectangleRounded(layout.search, 0.12, 8, .{ .r = 21, .g = 31, .b = 49, .a = 255 });
+        rl.drawRectangleRoundedLinesEx(layout.search, 0.12, 8, 1.5 * scale, .{ .r = 91, .g = 116, .b = 153, .a = 235 });
+        const badge: rl.Rectangle = .{
+            .x = layout.search.x + 10 * scale,
+            .y = layout.search.y + 10 * scale,
+            .width = 62 * scale,
+            .height = layout.search.height - 20 * scale,
+        };
+        rl.drawRectangleRounded(badge, 0.24, 6, .{ .r = 29, .g = 124, .b = 153, .a = 255 });
+        self.drawUiText("CMD K", .{
+            .x = badge.x + 8 * scale,
+            .y = badge.y + (badge.height - @as(f32, @floatFromInt(compact_font))) / 2,
+        }, compact_font, .white);
+        const query: [:0]const u8 = self.command_palette.query[0..self.command_palette.len :0];
+        const query_source: []const u8 = if (query.len > 0) query else "Search commands, tools, and actions…";
+        var query_buffer: [256]u8 = undefined;
+        const fitted_query = self.fitUiText(
+            &query_buffer,
+            query_source,
+            heading_font,
+            @max(0, layout.search.width - 98 * scale),
+        );
+        self.drawUiText(fitted_query, .{
+            .x = badge.x + badge.width + 14 * scale,
+            .y = layout.search.y + (layout.search.height - @as(f32, @floatFromInt(heading_font))) / 2,
+        }, heading_font, if (query.len > 0) .white else .{ .r = 148, .g = 163, .b = 188, .a = 255 });
+        if (query.len > 0) {
+            const query_width = self.measureUiText(fitted_query, heading_font);
+            rl.drawRectangleRec(.{
+                .x = @min(layout.search.x + layout.search.width - 18 * scale, badge.x + badge.width + 15 * scale + query_width),
+                .y = layout.search.y + 16 * scale,
+                .width = 2 * scale,
+                .height = layout.search.height - 32 * scale,
+            }, .{ .r = 255, .g = 104, .b = 205, .a = 235 });
+        }
+
+        const count = self.commandResultCount();
+        const capacity = commandPaletteRowCapacity(layout);
+        rl.beginScissorMode(
+            @intFromFloat(@floor(layout.rows_clip.x)),
+            @intFromFloat(@floor(layout.rows_clip.y)),
+            @intFromFloat(@ceil(layout.rows_clip.width)),
+            @intFromFloat(@ceil(layout.rows_clip.height)),
+        );
+        for (0..capacity) |slot| {
+            const result_index = self.command_palette.first_visible + slot;
+            if (result_index >= count) break;
+            const spec = self.commandSpecAtResult(result_index) orelse break;
+            const availability = self.commandAvailability(items, workspace, spec.id);
+            const selected = result_index == self.command_palette.selected_result;
+            const row = commandPaletteRowRect(layout, slot) orelse break;
+            const fill: rl.Color = if (selected)
+                .{ .r = 28, .g = 68, .b = 91, .a = 255 }
+            else if (availability.enabled)
+                .{ .r = 20, .g = 27, .b = 42, .a = 246 }
+            else
+                .{ .r = 17, .g = 22, .b = 34, .a = 235 };
+            rl.drawRectangleRounded(row, 0.08, 7, fill);
+            rl.drawRectangleRoundedLinesEx(row, 0.08, 7, if (selected) 2 * scale else scale, if (selected)
+                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            else
+                .{ .r = 63, .g = 76, .b = 98, .a = 205 });
+            if (selected) rl.drawRectangleRec(.{
+                .x = row.x,
+                .y = row.y + 9 * scale,
+                .width = 4 * scale,
+                .height = row.height - 18 * scale,
+            }, .{ .r = 255, .g = 92, .b = 198, .a = 255 });
+
+            const category_width = @max(58 * scale, self.measureUiText(spec.category, compact_font) + 16 * scale);
+            const category_rect: rl.Rectangle = .{
+                .x = row.x + 12 * scale,
+                .y = row.y + 10 * scale,
+                .width = category_width,
+                .height = 22 * scale,
+            };
+            rl.drawRectangleRounded(category_rect, 0.28, 6, if (availability.enabled)
+                .{ .r = 76, .g = 48, .b = 106, .a = 245 }
+            else
+                .{ .r = 50, .g = 48, .b = 61, .a = 220 });
+            self.drawUiText(spec.category, .{
+                .x = category_rect.x + 8 * scale,
+                .y = category_rect.y + (category_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
+            }, compact_font, if (availability.enabled) .white else .{ .r = 133, .g = 137, .b = 150, .a = 255 });
+
+            const shortcut_width: f32 = if (spec.shortcut.len > 0)
+                self.measureUiText(spec.shortcut, compact_font) + 18 * scale
+            else
+                0;
+            const text_x = category_rect.x + category_rect.width + 14 * scale;
+            const text_width = @max(0, row.x + row.width - text_x - shortcut_width - 22 * scale);
+            var title_buffer: [160]u8 = undefined;
+            const title = self.fitUiText(&title_buffer, spec.title, body_font, text_width);
+            self.drawUiText(title, .{ .x = text_x, .y = row.y + 8 * scale }, body_font, if (availability.enabled)
+                .white
+            else
+                .{ .r = 137, .g = 143, .b = 158, .a = 255 });
+            var detail_buffer: [224]u8 = undefined;
+            const detail = self.fitUiText(
+                &detail_buffer,
+                if (availability.enabled) spec.description else availability.reason,
+                compact_font,
+                text_width,
+            );
+            self.drawUiText(detail, .{ .x = text_x, .y = row.y + 35 * scale }, compact_font, if (availability.enabled)
+                .{ .r = 173, .g = 188, .b = 211, .a = 255 }
+            else
+                .{ .r = 203, .g = 136, .b = 157, .a = 255 });
+
+            if (spec.shortcut.len > 0) {
+                const shortcut_rect: rl.Rectangle = .{
+                    .x = row.x + row.width - shortcut_width - 11 * scale,
+                    .y = row.y + (row.height - 28 * scale) / 2,
+                    .width = shortcut_width,
+                    .height = 28 * scale,
+                };
+                rl.drawRectangleRounded(shortcut_rect, 0.22, 6, .{ .r = 7, .g = 11, .b = 21, .a = 230 });
+                rl.drawRectangleRoundedLinesEx(shortcut_rect, 0.22, 6, scale, .{ .r = 81, .g = 94, .b = 119, .a = 210 });
+                self.drawUiText(spec.shortcut, .{
+                    .x = shortcut_rect.x + 9 * scale,
+                    .y = shortcut_rect.y + (shortcut_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
+                }, compact_font, if (availability.enabled) .white else .{ .r = 116, .g = 120, .b = 132, .a = 255 });
+            }
+        }
+        rl.endScissorMode();
+
+        if (count == 0) {
+            self.drawUiText("No matching commands", .{
+                .x = layout.rows_clip.x + 8 * scale,
+                .y = layout.rows_clip.y + 18 * scale,
+            }, heading_font, .{ .r = 184, .g = 194, .b = 214, .a = 255 });
+        }
+        var result_buffer: [64]u8 = undefined;
+        const result_text = std.fmt.bufPrintZ(&result_buffer, "{d} command{s}", .{ count, if (count == 1) "" else "s" }) catch "commands";
+        self.drawUiText(result_text, .{
+            .x = layout.footer.x,
+            .y = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2,
+        }, compact_font, .{ .r = 150, .g = 166, .b = 191, .a = 255 });
+        const help = "Up/Down navigate   Enter run   Esc close";
+        const help_width = self.measureUiText(help, compact_font);
+        self.drawUiText(help, .{
+            .x = layout.footer.x + layout.footer.width - help_width,
+            .y = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2,
+        }, compact_font, .{ .r = 185, .g = 198, .b = 218, .a = 255 });
+    }
+
+    fn drawTooltip(self: Studio, viewport: Viewport) void {
+        const target = self.tooltip.target orelse return;
+        const scale = uiScale(viewport);
+        const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        };
+        const margin = 12 * scale;
+        const panel_width = @min(430 * scale, @max(220 * scale, bounds.width - margin * 2));
+        const panel_height: f32 = 88 * scale;
+        var x = target.anchor.x + target.anchor.width / 2 - panel_width / 2;
+        x = std.math.clamp(x, bounds.x + margin, @max(bounds.x + margin, bounds.x + bounds.width - panel_width - margin));
+        const below = target.anchor.y + target.anchor.height + 10 * scale;
+        const above = target.anchor.y - panel_height - 10 * scale;
+        const y = if (below + panel_height <= bounds.y + bounds.height - margin)
+            below
+        else
+            @max(bounds.y + margin, above);
+        const panel: rl.Rectangle = .{ .x = x, .y = y, .width = panel_width, .height = panel_height };
+        rl.drawRectangleRounded(.{
+            .x = panel.x + 5 * scale,
+            .y = panel.y + 7 * scale,
+            .width = panel.width,
+            .height = panel.height,
+        }, 0.08, 8, .{ .r = 0, .g = 0, .b = 0, .a = 105 });
+        rl.drawRectangleRounded(panel, 0.08, 8, .{ .r = 12, .g = 18, .b = 31, .a = 252 });
+        rl.drawRectangleRoundedLinesEx(panel, 0.08, 8, 1.5 * scale, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
+        rl.drawRectangleRec(.{
+            .x = panel.x + 12 * scale,
+            .y = panel.y,
+            .width = @min(118 * scale, panel.width - 24 * scale),
+            .height = 3 * scale,
+        }, .{ .r = 255, .g = 92, .b = 198, .a = 245 });
+
+        const title_font = scaledUiFont(scale, UiTypography.body);
+        const detail_font = scaledUiFont(scale, UiTypography.compact);
+        const shortcut_width: f32 = if (target.shortcut.len > 0)
+            self.measureUiText(target.shortcut, detail_font) + 18 * scale
+        else
+            0;
+        var title_buffer: [160]u8 = undefined;
+        const title = self.fitUiText(
+            &title_buffer,
+            target.title,
+            title_font,
+            @max(0, panel.width - 28 * scale - shortcut_width),
+        );
+        self.drawUiText(title, .{ .x = panel.x + 14 * scale, .y = panel.y + 13 * scale }, title_font, .white);
+        if (target.shortcut.len > 0) {
+            const shortcut: rl.Rectangle = .{
+                .x = panel.x + panel.width - shortcut_width - 12 * scale,
+                .y = panel.y + 10 * scale,
+                .width = shortcut_width,
+                .height = 27 * scale,
+            };
+            rl.drawRectangleRounded(shortcut, 0.24, 6, .{ .r = 35, .g = 48, .b = 70, .a = 245 });
+            self.drawUiText(target.shortcut, .{
+                .x = shortcut.x + 9 * scale,
+                .y = shortcut.y + (shortcut.height - @as(f32, @floatFromInt(detail_font))) / 2,
+            }, detail_font, .{ .r = 218, .g = 228, .b = 243, .a = 255 });
+        }
+        var detail_buffer: [256]u8 = undefined;
+        const detail = self.fitUiText(
+            &detail_buffer,
+            target.detail,
+            detail_font,
+            panel.width - 28 * scale,
+        );
+        self.drawUiText(detail, .{ .x = panel.x + 14 * scale, .y = panel.y + 49 * scale }, detail_font, .{ .r = 178, .g = 193, .b = 217, .a = 255 });
     }
 
     fn drawMorphTimeline(self: Studio, viewport: Viewport, workspace: Workspace) void {
@@ -7511,6 +8625,7 @@ pub const Studio = struct {
             "Inspector",
             self.active_dock == .objects or self.active_dock == .properties,
         );
+        drawActionButton(self, layout.command_palette, "Commands");
         drawActionButton(self, layout.focus_canvas, "Focus");
     }
 
@@ -12943,6 +14058,189 @@ test "Studio morph timeline is contained and keeps the active card visible" {
         .pointer_screen = rectangleCenter(morphTimelineLayout(viewport).panel),
     });
     try std.testing.expect(studio.morph_first_visible < before_scroll);
+}
+
+test "command palette layout is contained and scales with Studio chrome" {
+    const sizes = [_]rl.Vector2{
+        .{ .x = 900, .y = 506 },
+        .{ .x = 1600, .y = 900 },
+        .{ .x = 3840, .y = 2160 },
+    };
+    var previous_row_height: f32 = 0;
+    for (sizes) |size| {
+        const frame = frameLayout(.{ .x = 0, .y = 0, .width = size.x, .height = size.y }, true, false, .slides);
+        const layout = commandPaletteLayout(frame.viewport);
+        const chrome = uiLayout(frame.viewport);
+        try expectRectangleContained(frame.chrome.content, layout.panel);
+        try expectRectangleContained(chrome.toolbar, chrome.command_palette);
+        try std.testing.expect(!rectanglesOverlap(chrome.scene_next, chrome.command_palette));
+        try std.testing.expect(!rectanglesOverlap(chrome.command_palette, chrome.focus_canvas));
+        try std.testing.expect(!rectanglesOverlap(chrome.command_palette, chrome.slides_dock_toggle));
+        try expectRectangleContained(layout.panel, layout.search);
+        try expectRectangleContained(layout.panel, layout.rows_clip);
+        try expectRectangleContained(layout.panel, layout.footer);
+        try std.testing.expect(commandPaletteRowCapacity(layout) >= 3);
+        for (0..commandPaletteRowCapacity(layout)) |slot|
+            try expectRectangleContained(layout.rows_clip, commandPaletteRowRect(layout, slot).?);
+        try std.testing.expect(layout.row_height >= previous_row_height);
+        previous_row_height = layout.row_height;
+    }
+}
+
+test "command palette filters and executes contextual actions" {
+    var studio: Studio = .{ .enabled = true };
+    var items = [_]slides.SlideItem{};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0 };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(uiLayout(viewport).command_palette),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.commandPaletteActive());
+    try std.testing.expectEqual(command_specs.len, studio.commandResultCount());
+
+    var typed: FrameInput = .{};
+    @memcpy(typed.inline_chars[0..4], "grid");
+    typed.inline_chars_len = 4;
+    // The palette owns input: even a simultaneous global G intention cannot
+    // toggle the grid behind the search surface.
+    typed.toggle_grid_pressed = true;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    try std.testing.expectEqual(@as(usize, 1), studio.commandResultCount());
+    try std.testing.expectEqual(CommandId.toggle_grid, studio.commandSpecAtResult(0).?.id);
+    try std.testing.expect(!studio.grid_snapping);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    try std.testing.expect(!studio.commandPaletteActive());
+    try std.testing.expect(studio.grid_snapping);
+}
+
+test "disabled command palette actions explain context and stay open" {
+    var studio: Studio = .{ .enabled = true };
+    var items = [_]slides.SlideItem{};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0 };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, true, false, .slides).viewport;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .command_palette_pressed = true });
+    var typed: FrameInput = .{};
+    const query = "delete slide";
+    @memcpy(typed.inline_chars[0..query.len], query);
+    typed.inline_chars_len = query.len;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    try std.testing.expectEqual(@as(usize, 1), studio.commandResultCount());
+    const spec = studio.commandSpecAtResult(0).?;
+    try std.testing.expectEqual(CommandId.delete_slide, spec.id);
+    const availability = studio.commandAvailability(&items, workspace, spec.id);
+    try std.testing.expect(!availability.enabled);
+    try std.testing.expect(availability.reason.len > 0);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    try std.testing.expect(studio.commandPaletteActive());
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "command palette emits application save and history intentions" {
+    var studio: Studio = .{ .enabled = true };
+    var items = [_]slides.SlideItem{};
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, true, false, .slides).viewport;
+    const workspace: Workspace = .{ .visible = true, .undo_available = true };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .command_palette_pressed = true });
+    var typed: FrameInput = .{};
+    const query = "save document";
+    @memcpy(typed.inline_chars[0..query.len], query);
+    typed.inline_chars_len = query.len;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .save_document => {},
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .command_palette_pressed = true });
+    typed = .{};
+    @memcpy(typed.inline_chars[0..4], "undo");
+    typed.inline_chars_len = 4;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .undo => {},
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "tooltips appear after a stable delay and reset on motion or click" {
+    var studio: Studio = .{ .enabled = true };
+    var items = [_]slides.SlideItem{};
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const point = rectangleCenter(uiLayout(viewport).tool_buttons[1]);
+    const hover: FrameInput = .{ .pointer_screen = point, .frame_time = 0.3 };
+    _ = studio.update(&items, &.{}, viewport, hover);
+    try std.testing.expect(!studio.tooltipVisible());
+    _ = studio.update(&items, &.{}, viewport, hover);
+    try std.testing.expect(!studio.tooltipVisible());
+    _ = studio.update(&items, &.{}, viewport, hover);
+    try std.testing.expect(studio.tooltipVisible());
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = point.x + 8, .y = point.y },
+        .frame_time = 0.3,
+    });
+    try std.testing.expect(!studio.tooltipVisible());
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = point,
+        .pointer_pressed = true,
+        .frame_time = 1,
+    });
+    try std.testing.expect(!studio.tooltipVisible());
+}
+
+test "palette and inline editing suppress contextual tooltips" {
+    var items = [_]slides.SlideItem{testItem(990, .textbox, 100, 100, 300, 80)};
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 990,
+    };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .properties).viewport;
+    const tool_point = rectangleCenter(uiLayout(viewport).tool_buttons[0]);
+    _ = studio.update(&items, &.{}, viewport, .{ .pointer_screen = tool_point, .frame_time = 1 });
+    _ = studio.update(&items, &.{}, viewport, .{ .pointer_screen = tool_point, .frame_time = 1 });
+    try std.testing.expect(studio.tooltipVisible());
+    _ = studio.update(&items, &.{}, viewport, .{ .command_palette_pressed = true });
+    try std.testing.expect(!studio.tooltipVisible());
+    _ = studio.update(&items, &.{}, viewport, .{ .cancel_pressed = true });
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(uiLayout(viewport).edit_text),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.inlineEditActive());
+    try std.testing.expect(!studio.tooltipVisible());
+}
+
+test "mouse cursor communicates palette chrome and canvas affordances" {
+    var items = [_]slides.SlideItem{testItem(991, .textbox, 100, 100, 300, 80)};
+    var studio: Studio = .{ .enabled = true, .selected_identity = 991 };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const workspace: Workspace = .{ .visible = true };
+    try std.testing.expectEqual(
+        rl.MouseCursor.pointing_hand,
+        studio.mouseCursorForPoint(&items, &.{}, viewport, workspace, rectangleCenter(uiLayout(viewport).tool_buttons[0])),
+    );
+    const item_screen = logicalToScreen(viewport, .{ .x = 150, .y = 130 }).?;
+    try std.testing.expectEqual(rl.MouseCursor.resize_all, studio.mouseCursorForPoint(&items, &.{}, viewport, workspace, item_screen));
+    studio.tool = .add_text;
+    try std.testing.expectEqual(rl.MouseCursor.crosshair, studio.mouseCursorForPoint(&items, &.{}, viewport, workspace, item_screen));
+
+    studio.openCommandPalette(&items);
+    try std.testing.expectEqual(
+        rl.MouseCursor.ibeam,
+        studio.mouseCursorForPoint(&items, &.{}, viewport, workspace, rectangleCenter(commandPaletteLayout(viewport).search)),
+    );
 }
 
 fn rectangleCenter(rect: rl.Rectangle) rl.Vector2 {

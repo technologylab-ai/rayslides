@@ -129,12 +129,27 @@ or duplicate state-born IDs. Labels are deliberately omitted from the copy
 until the author names it. BASE remains the immutable authored root: it can
 seed the first state but cannot be renamed, deleted, or reordered.
 
+## Completed tranche: Command discovery and contextual help
+
+- [x] Add a searchable command palette, opened from a visible **Commands**
+  control or <kbd>Cmd/Ctrl-K</kbd>, covering tools, document history, slides,
+  selection actions, docks, composition, and morph-state operations.
+- [x] Filter by title, category, description, keywords, and shortcut; support
+  keyboard navigation, pointer selection, scrolling, and UTF-8-safe input.
+- [x] Keep contextually unavailable actions visible with a concrete reason,
+  including first/last slide, empty selection, missing morph state, empty
+  clipboard, and unavailable Undo/Redo history.
+- [x] Add delayed, movement-sensitive hover help across Studio chrome, with
+  polished bounded cards that scale with the complete authoring shell.
+- [x] Add pointer feedback for links/actions, inline text, creation tools,
+  moving, resizing, and locked objects without changing source or history.
+- [x] Route Save, Save Copy, Undo, and Redo through the same application-owned
+  persistence/history boundaries as their keyboard equivalents.
+
 ## Planned tranches
 
 ### Precision and polish
 
-- Keyboard-accessible command discovery, contextual help, and improved cursor
-  feedback.
 - Optional rulers, measurements, safe-area guides, zoom, and pan.
 - Performance work for large decks and richer integration-level history tests.
 

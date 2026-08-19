@@ -89,6 +89,16 @@ rows, buttons, and hit targets—rather than enlarging labels inside fixed
 panels. Retina framebuffer density is left to the platform so it is not counted
 twice; the scaling follows the usable logical window size.
 
+Click **Commands** or press <kbd>Cmd/Ctrl-K</kbd> to open Studio's contextual
+command palette. Search by action, category, description, keyword, or shortcut;
+use <kbd>Up</kbd>/<kbd>Down</kbd> and <kbd>Enter</kbd> to run an action. Commands
+that are unsafe in the current slide, scene, selection, history, or clipboard
+remain visible with the reason they are unavailable, so shortcut memorization
+is optional rather than required. Studio also provides delayed hover help for
+its tools, docks, Properties, layer controls, slide organizer, Library, and
+morph timeline. The tooltips and pointer shapes disappear during gestures and
+text entry, keeping the canvas calm while actively editing.
+
 The right inspector opens on **Objects**, a front-to-back paint-order list for
 the active base or morph scene. It includes hidden, fully transparent, and
 locked objects so they remain recoverable when canvas hit-testing cannot reach
@@ -208,11 +218,18 @@ source.
 Press <kbd>F3</kbd>, or launch with `--diagnostics`, to show frame time, the
 one-second peak and slow-frame count, render-graph rebuild time, slideshow
 arena capacity, mouse coordinates, and window size. Slow frames are also
-rate-limited in the log while diagnostics are active.
+rate-limited in the log while diagnostics are active. In Studio the HUD uses
+the free toolbar span between the authoring controls and Commands/Focus, so it
+does not cover slide content; narrow layouts hide it rather than crowding the
+controls.
 `--diagnostics-select=ID` opens Studio with the unique authored `id=` selected
 in Properties; this is a non-mutating QA aid. Normal playback uses synchronized
 presentation plus a 60 Hz fallback; Beast Mode intentionally disables both
 limits.
+`--diagnostics-command-palette` opens Studio with the command palette visible,
+which makes compact/default/large screenshot regression checks deterministic.
+`--diagnostics-command-tooltip` similarly holds the Commands hover card open
+for deterministic typography and containment QA across macOS Spaces.
 
 Studio edits the `.sld` document rather than maintaining a separate opaque
 scene. It changes only the source owned by the selected object and preserves
@@ -244,6 +261,7 @@ scoped, so a library item can only be placed after its definition.
 
 | Studio shortcut | Description |
 | --------------- | ----------- |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> | Open the searchable contextual command palette |
 | <kbd>1</kbd>–<kbd>4</kbd> on the new-deck chooser | Create Blank, Midnight, Editorial, or Aurora |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, then atomically save changes to its `.sld` file |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, or save an `*.edited.sld` copy of a named deck |

@@ -689,7 +689,7 @@ const FrameDiagnostics = struct {
         );
     }
 
-    fn draw(self: FrameDiagnostics, font: rl.Font, beast_mode: bool, origin: rl.Vector2) void {
+    fn draw(self: FrameDiagnostics, font: rl.Font, beast_mode: bool, placement: FrameDiagnosticsPlacement) void {
         if (!self.enabled) return;
         var frame_buffer: [192]u8 = undefined;
         var graph_buffer: [192]u8 = undefined;
@@ -710,15 +710,90 @@ const FrameDiagnostics = struct {
             "MOUSE {d:.0}, {d:.0}   WINDOW {d} x {d}",
             .{ mouse.x, mouse.y, rl.getScreenWidth(), rl.getScreenHeight() },
         ) catch return;
-        const x: i32 = @intFromFloat(origin.x + 8);
-        const y: i32 = @intFromFloat(origin.y + 8);
-        rl.drawRectangle(x, y, 560, 78, .{ .r = 5, .g = 11, .b = 22, .a = 230 });
-        rl.drawRectangleLines(x, y, 560, 78, .{ .r = 119, .g = 226, .b = 255, .a = 210 });
-        rl.drawTextEx(font, frame_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 7) }, 16, 0, .white);
-        rl.drawTextEx(font, graph_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 30) }, 14, 0, .{ .r = 170, .g = 205, .b = 222, .a = 255 });
-        rl.drawTextEx(font, input_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 50) }, 14, 0, .{ .r = 170, .g = 205, .b = 222, .a = 255 });
+        switch (placement) {
+            .hidden => return,
+            .overlay => |origin| {
+                const x: i32 = @intFromFloat(origin.x + 8);
+                const y: i32 = @intFromFloat(origin.y + 8);
+                rl.drawRectangle(x, y, 560, 78, .{ .r = 5, .g = 11, .b = 22, .a = 230 });
+                rl.drawRectangleLines(x, y, 560, 78, .{ .r = 119, .g = 226, .b = 255, .a = 210 });
+                rl.drawTextEx(font, frame_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 7) }, 16, 0, .white);
+                rl.drawTextEx(font, graph_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 30) }, 14, 0, .{ .r = 170, .g = 205, .b = 222, .a = 255 });
+                rl.drawTextEx(font, input_text, .{ .x = @floatFromInt(x + 10), .y = @floatFromInt(y + 50) }, 14, 0, .{ .r = 170, .g = 205, .b = 222, .a = 255 });
+            },
+            .toolbar => |slot| {
+                const scale = @max(@as(f32, 0.75), slot.height / 58);
+                const panel_height = @min(slot.height, 54 * scale);
+                const panel: rl.Rectangle = .{
+                    .x = slot.x,
+                    .y = slot.y + (slot.height - panel_height) / 2,
+                    .width = slot.width,
+                    .height = panel_height,
+                };
+                var compact_frame_buffer: [160]u8 = undefined;
+                var compact_graph_buffer: [192]u8 = undefined;
+                const roomy = panel.width >= 540 * scale;
+                const compact_frame = if (roomy)
+                    frame_text
+                else
+                    std.fmt.bufPrintZ(
+                        &compact_frame_buffer,
+                        "FRAME {d:.1}   PEAK {d:.1}   SLOW {d}/s",
+                        .{ self.latest_frame_ms, self.sampled_peak_ms, self.sampled_slow_frames },
+                    ) catch return;
+                const compact_graph = if (roomy)
+                    std.fmt.bufPrintZ(
+                        &compact_graph_buffer,
+                        "REBUILD {d:.1} ms   ARENA {d:.1} KiB   BUILDS {d}   MOUSE {d:.0}, {d:.0}",
+                        .{ self.last_pre_render_ms, @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0, self.pre_render_count, mouse.x, mouse.y },
+                    ) catch return
+                else
+                    std.fmt.bufPrintZ(
+                        &compact_graph_buffer,
+                        "BUILD {d:.0} ms   {d:.0} KiB   #{d}   {s}",
+                        .{ self.last_pre_render_ms, @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0, self.pre_render_count, if (beast_mode) "UNCAPPED" else "VSYNC" },
+                    ) catch return;
+                rl.drawRectangleRec(panel, .{ .r = 5, .g = 11, .b = 22, .a = 235 });
+                rl.drawRectangleLinesEx(panel, @max(@as(f32, 1), scale), .{ .r = 119, .g = 226, .b = 255, .a = 185 });
+                rl.drawRectangleRec(.{ .x = panel.x, .y = panel.y, .width = 3 * scale, .height = panel.height }, .{ .r = 239, .g = 69, .b = 154, .a = 255 });
+                rl.beginScissorMode(
+                    @intFromFloat(panel.x + 5 * scale),
+                    @intFromFloat(panel.y),
+                    @intFromFloat(@max(0, panel.width - 8 * scale)),
+                    @intFromFloat(panel.height),
+                );
+                defer rl.endScissorMode();
+                rl.drawTextEx(font, compact_frame, .{ .x = panel.x + 11 * scale, .y = panel.y + 7 * scale }, 14 * scale, 0, .white);
+                rl.drawTextEx(font, compact_graph, .{ .x = panel.x + 11 * scale, .y = panel.y + 29 * scale }, 13 * scale, 0, .{ .r = 170, .g = 205, .b = 222, .a = 255 });
+            },
+        }
     }
 };
+
+const FrameDiagnosticsPlacement = union(enum) {
+    overlay: rl.Vector2,
+    toolbar: rl.Rectangle,
+    hidden: void,
+};
+
+fn frameDiagnosticsPlacement(viewport: studio.Viewport, fallback_origin: rl.Vector2) FrameDiagnosticsPlacement {
+    if (viewport.chrome) |chrome| {
+        if (chrome.visible) {
+            const layout = studio.uiLayout(viewport);
+            const scale = chrome.scale;
+            const left = layout.scene_next.x + layout.scene_next.width + 10 * scale;
+            const right = layout.command_palette.x - 10 * scale;
+            if (right - left >= 330 * scale) return .{ .toolbar = .{
+                .x = left,
+                .y = chrome.toolbar.y + 6 * scale,
+                .width = right - left,
+                .height = @max(0, chrome.toolbar.height - 12 * scale),
+            } };
+            return .hidden;
+        }
+    }
+    return .{ .overlay = fallback_origin };
+}
 
 test "frame diagnostics rolls peak and slow-frame counts" {
     var diagnostics = FrameDiagnostics{};
@@ -728,6 +803,23 @@ test "frame diagnostics rolls peak and slow-frame counts" {
     diagnostics.observeFrame(2.1);
     try std.testing.expectApproxEqAbs(@as(f64, 1044), diagnostics.sampled_peak_ms, 0.001);
     try std.testing.expectEqual(@as(usize, 2), diagnostics.sampled_slow_frames);
+}
+
+test "frame diagnostics use the free Studio toolbar span without overlapping controls" {
+    const frame = studio.frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides);
+    const placement = frameDiagnosticsPlacement(frame.viewport, .zero());
+    const slot = switch (placement) {
+        .toolbar => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    const layout = studio.uiLayout(frame.viewport);
+    try std.testing.expect(slot.x >= layout.scene_next.x + layout.scene_next.width);
+    try std.testing.expect(slot.x + slot.width <= layout.command_palette.x);
+    try std.testing.expect(slot.y >= frame.chrome.toolbar.y);
+    try std.testing.expect(slot.y + slot.height <= frame.chrome.toolbar.y + frame.chrome.toolbar.height);
+
+    const compact = studio.frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 506 }, true, false, .slides);
+    try std.testing.expect(frameDiagnosticsPlacement(compact.viewport, .zero()) == .hidden);
 }
 
 pub fn main(init: std.process.Init) anyerror!void {
@@ -741,6 +833,8 @@ pub fn main(init: std.process.Init) anyerror!void {
     crowd_options.host = defaultCrowdHost(&crowd_host_buffer);
     var launch_studio = false;
     var diagnostics_enabled = false;
+    var diagnostics_command_palette = false;
+    var diagnostics_command_tooltip = false;
     var diagnostics_select_buffer: [128]u8 = undefined;
     var diagnostics_select_id: ?[]const u8 = null;
 
@@ -762,6 +856,14 @@ pub fn main(init: std.process.Init) anyerror!void {
                 launch_studio = true;
             } else if (std.mem.eql(u8, arg, "--diagnostics")) {
                 diagnostics_enabled = true;
+            } else if (std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
+                diagnostics_enabled = true;
+                diagnostics_command_palette = true;
+                launch_studio = true;
+            } else if (std.mem.eql(u8, arg, "--diagnostics-command-tooltip")) {
+                diagnostics_enabled = true;
+                diagnostics_command_tooltip = true;
+                launch_studio = true;
             } else if (std.mem.startsWith(u8, arg, "--diagnostics-select=")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
@@ -828,6 +930,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var beast_mode: bool = false;
     var frame_diagnostics = FrameDiagnostics{ .enabled = diagnostics_enabled };
     var diagnostics_selection_pending = diagnostics_select_id;
+    var diagnostics_command_palette_pending = diagnostics_command_palette;
 
     // Main game loop
     var is_pre_rendered: bool = false;
@@ -871,7 +974,8 @@ pub fn main(init: std.process.Init) anyerror!void {
         const window_close_requested = window_close_now and !window_close_seen;
         window_close_seen = window_close_now;
         const inline_edit_active_at_frame_start = studio_mode.inlineEditActive();
-        const text_input_active_at_frame_start = property_prompt.active or inline_edit_active_at_frame_start;
+        const command_palette_active_at_frame_start = studio_mode.commandPaletteActive();
+        const text_input_active_at_frame_start = property_prompt.active or studio_mode.textEntryActive();
         // A modal or inline property draft is not part of the persisted source
         // yet. Do not let the OS close button silently throw it away; after
         // submitting or cancelling, Q/Escape (or a fresh close request)
@@ -1088,6 +1192,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
             diagnostics_selection_pending = null;
         }
+        if (diagnostics_command_palette_pending) {
+            studio_mode.openCommandPaletteForDiagnostics(studio_items);
+            diagnostics_command_palette_pending = false;
+        }
         if (rl.isWindowResized()) studio_mode.cancelActiveInteraction(studio_items);
 
         studio_slide_summaries.clearRetainingCapacity();
@@ -1135,6 +1243,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .library = studio_library_entries.items,
                 .morph_states = studio_morph_summaries.items,
                 .new_deck = pristineUntitledDeck(),
+                .undo_available = studio_history.undo_stack.items.len > 0,
+                .redo_available = studio_history.redo_stack.items.len > 0,
+                .clipboard_item_count = studio_clipboard.items.items.len,
             };
         }
         studio_mode.setCompositionContext(if (studio_mode.capturesInput() and current_slide != null)
@@ -1153,6 +1264,10 @@ pub fn main(init: std.process.Init) anyerror!void {
         var semantic_text: ?[]const u8 = null;
         var inline_field_to_finish: ?studio.InlineField = null;
         var inline_commit_completed = false;
+        // false requests Undo, true requests Redo. Palette history commands
+        // are applied after drawing, at the same safe graph-lifetime boundary
+        // as their keyboard equivalents.
+        var history_command_requested: ?bool = null;
         var studio_slide_to_select: ?usize = null;
         var source_graph_reparsed_this_frame = false;
         const prompt_was_active = property_prompt.active;
@@ -1194,10 +1309,44 @@ pub fn main(init: std.process.Init) anyerror!void {
             studio_mode.updateWithWorkspaceFromRaylib(studio_items, studio_bounds.items, studio_viewport, studio_workspace)
         else
             null;
+        if (diagnostics_command_tooltip and studio_mode.capturesInput() and !export_controller.running) {
+            studio_mode.showCommandTooltipForDiagnostics(studio_viewport);
+        }
         const studio_geometry_batch: ?studio.GeometryBatchCommand = studio_mode.takeGeometryBatch();
         if (!prompt_was_active) {
             if (studio_mode.takeSemanticCommand()) |command| {
                 switch (command) {
+                    .save_document => {
+                        if (G.slideshow_filp == null) {
+                            pending_save_as = true;
+                            property_prompt.begin(.document_path, "untitled.sld");
+                        } else if (saveEditorSource()) |_| {
+                            studio_mode.markSaved();
+                            studio_mode.setNotice(.saved);
+                            log.info("Studio source saved", .{});
+                        } else |err| {
+                            studio_mode.setNotice(if (err == error.SourceChangedOnDisk)
+                                .source_changed_on_disk
+                            else
+                                .save_failed);
+                            log.err("Studio save failed: {any}", .{err});
+                        }
+                    },
+                    .save_document_copy => {
+                        if (G.slideshow_filp == null) {
+                            pending_save_as = true;
+                            property_prompt.begin(.document_path, "untitled.sld");
+                        } else if (saveEditorSourceCopy()) |copy_path| {
+                            studio_mode.markCopySaved();
+                            log.info("Studio copy saved to {s}", .{copy_path});
+                            gpa.free(copy_path);
+                        } else |err| {
+                            studio_mode.setNotice(.save_failed);
+                            log.err("Studio Save Copy failed: {any}", .{err});
+                        }
+                    },
+                    .undo => history_command_requested = false,
+                    .redo => history_command_requested = true,
                     .add_item => |add| switch (add.kind) {
                         .text => {
                             pending_semantic_command = command;
@@ -1565,8 +1714,14 @@ pub fn main(init: std.process.Init) anyerror!void {
             if (laser_pointer.show and !studio_mode.capturesInput()) try laser_pointer.draw();
             if (banner.show) banner.render();
 
-            frame_diagnostics.draw(G.studio_ui_font, beast_mode, slide_tl);
+            frame_diagnostics.draw(G.studio_ui_font, beast_mode, frameDiagnosticsPlacement(studio_viewport, slide_tl));
             property_prompt.draw(window_size);
+            if (!export_controller.running) {
+                // Discovery chrome is intentionally last: command search and
+                // hover help must remain legible above diagnostics and every
+                // persistent Studio surface.
+                studio_mode.drawDiscoveryOverlay(studio_items, studio_viewport, studio_workspace);
+            }
         }
 
         if (studio_geometry_batch) |batch| {
@@ -1764,10 +1919,16 @@ pub fn main(init: std.process.Init) anyerror!void {
             studio_mode.inlineEditActive(),
             inline_commit_completed,
         );
+        if (command_palette_active_at_frame_start and !studio_mode.commandPaletteActive()) {
+            // Native close flags can remain latched on macOS. Closing the
+            // palette must make the deferred request observable again.
+            window_close_seen = false;
+        }
 
+        const keyboard_history_requested = !property_prompt.active and !studio_mode.textEntryActive() and
+            shortcutModifierDown() and rl.isKeyPressed(.z);
         if (!source_graph_reparsed_this_frame and studio_mode.capturesInput() and
-            !property_prompt.active and !studio_mode.inlineEditActive() and
-            shortcutModifierDown() and rl.isKeyPressed(.z))
+            (keyboard_history_requested or history_command_requested != null))
         {
             // Undo owns the source graph. End a transient pointer gesture before
             // reparsing so it cannot later release stale pre-undo geometry.
@@ -1775,7 +1936,9 @@ pub fn main(init: std.process.Init) anyerror!void {
             // identity onto a following sibling. Clear the source-bound
             // selection before reparsing so undo/redo can never retarget it.
             studio_mode.clearSelection(studio_items);
-            const changed = if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift))
+            const redo_requested = history_command_requested orelse
+                (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift));
+            const changed = if (redo_requested)
                 redoStudioEdit(&studio_history, &studio_mode)
             else
                 undoStudioEdit(&studio_history, &studio_mode);
@@ -1812,7 +1975,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             _ = crowd_runtime.resetActive();
         }
 
-        if (!property_prompt.active and !studio_mode.inlineEditActive() and rl.isKeyPressed(.f)) {
+        if (!property_prompt.active and !studio_mode.textEntryActive() and rl.isKeyPressed(.f)) {
             if (!manual_fullscreen) {
                 windowed_width = screenWidth;
                 windowed_height = screenHeight;
@@ -1843,7 +2006,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!property_prompt.active and !studio_mode.inlineEditActive() and (rl.isKeyPressed(.q) or
+        if (!property_prompt.active and !studio_mode.textEntryActive() and (rl.isKeyPressed(.q) or
             (rl.isKeyPressed(.escape) and !studio_active_at_frame_start)))
         {
             if (readyToQuitPreservingEdits(&studio_mode)) break;
@@ -4737,6 +4900,7 @@ fn applyStudioSemanticEdit(
 ) !StudioSemanticEditResult {
     const slide = slide_opt orelse return error.NoStudioSlide;
     switch (command) {
+        .save_document, .save_document_copy, .undo, .redo => return error.NonSourceStudioCommand,
         .create_starter_deck => |preset| {
             if (!pristineUntitledDeck()) return error.StarterDeckUnavailable;
             try recordStudioPatch(history, try starterDeckPatch(
