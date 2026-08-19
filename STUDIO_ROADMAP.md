@@ -31,7 +31,10 @@ sessions.
   promotion, local template-instance overrides, shared edits, and semantic
   morph-state editing.
 - Responsive docked Studio chrome, Focus Canvas, and a dedicated embedded UI
-  font, while presentation and export retain the full slide viewport.
+  font, while presentation and export retain the full slide viewport. The
+  complete chrome now scales coherently from 1x to 2x on large logical window
+  surfaces: docks, rows, timeline cards, hit targets, and type all grow
+  together without changing the compact-window floor.
 - A source-aware Objects inspector for the active base or morph scene. It shows
   every meaningful object in paint order, including hidden, fully
   transparent, and locked items that cannot be reached reliably on the canvas.
@@ -132,9 +135,6 @@ seed the first state but cannot be renamed, deleted, or reordered.
 
 - Keyboard-accessible command discovery, contextual help, and improved cursor
   feedback.
-- Scale the complete Studio chrome coherently for native 4K, high-DPI, and
-  projector use—dock widths, rows, hit targets, and typography together rather
-  than enlarging text inside fixed panels.
 - Optional rulers, measurements, safe-area guides, zoom, and pan.
 - Performance work for large decks and richer integration-level history tests.
 

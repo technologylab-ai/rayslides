@@ -83,6 +83,11 @@ together; narrower windows reserve one dock at a time through the toolbar
 toggles. Press <kbd>Tab</kbd> for **Focus Canvas**, which hides all chrome while
 leaving selection, guides, and direct manipulation active. Studio uses an
 embedded, compact UI typeface independently of any fonts chosen by the deck.
+When the window is enlarged beyond the 1600×900 reference surface, the whole
+authoring shell scales coherently up to 2×—type, docks, timeline cards, object
+rows, buttons, and hit targets—rather than enlarging labels inside fixed
+panels. Retina framebuffer density is left to the platform so it is not counted
+twice; the scaling follows the usable logical window size.
 
 The right inspector opens on **Objects**, a front-to-back paint-order list for
 the active base or morph scene. It includes hidden, fully transparent, and

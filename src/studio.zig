@@ -40,10 +40,11 @@ pub const UiTypography = struct {
 
 pub fn uiScale(viewport: Viewport) f32 {
     if (!viewport.valid()) return 1;
-    // Dock metrics are expressed in screen pixels by frameLayout. Scaling
-    // their children again from the fitted canvas would overflow the chrome
-    // on large displays.
-    if (viewport.chrome != null) return 1;
+    // Docked Studio uses one scale for both the shell and every child metric.
+    // This avoids the old failure mode where larger type overflowed fixed
+    // docks and, conversely, fixed 14-16 px chrome stayed tiny on a large
+    // external display.
+    if (viewport.chrome) |chrome| return chrome.scale;
     const reference_width: f32 = 1280;
     const reference_height: f32 = 720;
     return std.math.clamp(
@@ -193,6 +194,9 @@ const empty_frame_rectangle: rl.Rectangle = .{ .x = 0, .y = 0, .width = 0, .heig
 /// permanent control surface is outside the slide viewport.
 pub const ChromeLayout = struct {
     content: rl.Rectangle,
+    /// Coherent scale for shell geometry, nested controls, hit targets, and
+    /// typography. A 1600x900 logical window is the 1x reference surface.
+    scale: f32 = 1,
     toolbar: rl.Rectangle = empty_frame_rectangle,
     left_dock: rl.Rectangle = empty_frame_rectangle,
     right_dock: rl.Rectangle = empty_frame_rectangle,
@@ -263,6 +267,20 @@ fn fitSlideViewport(rect: rl.Rectangle) Viewport {
     };
 }
 
+/// Logical-window scaling deliberately does not multiply by framebuffer DPI:
+/// on macOS a Retina window already reports point-sized coordinates and is
+/// rendered at a denser backing resolution. Scaling from the usable logical
+/// surface keeps ordinary laptop windows stable while making native large
+/// windows and projector/full-screen layouts materially easier to read.
+pub fn chromeScale(content: rl.Rectangle) f32 {
+    if (content.width <= 0 or content.height <= 0) return 1;
+    return std.math.clamp(
+        @min(content.width / 1600, content.height / 900),
+        1,
+        2,
+    );
+}
+
 /// Builds a responsive docked editor surface. Wide windows reserve both
 /// docks. Medium and compact windows reserve the requested dock only, so a
 /// dock never becomes a canvas-covering drawer. Focus Canvas uses the complete
@@ -279,10 +297,11 @@ pub fn frameLayout(
         .width = @max(0, content.width),
         .height = @max(0, content.height),
     };
+    const scale = chromeScale(safe_content);
     if (!studio_visible or focus_canvas) {
-        const canvas_area = insetRectangle(safe_content, if (studio_visible) 12 else 0);
+        const canvas_area = insetRectangle(safe_content, if (studio_visible) 12 * scale else 0);
         var viewport = fitSlideViewport(canvas_area);
-        const chrome: ChromeLayout = .{ .content = safe_content };
+        const chrome: ChromeLayout = .{ .content = safe_content, .scale = scale };
         viewport.chrome = chrome;
         return .{
             .mode = .focus,
@@ -292,17 +311,19 @@ pub fn frameLayout(
         };
     }
 
-    const mode: FrameMode = if (safe_content.width >= 1480 and safe_content.height >= 700)
+    const normalized_width = safe_content.width / scale;
+    const normalized_height = safe_content.height / scale;
+    const mode: FrameMode = if (normalized_width >= 1480 and normalized_height >= 700)
         .wide
-    else if (safe_content.width >= 1100 and safe_content.height >= 620)
+    else if (normalized_width >= 1100 and normalized_height >= 620)
         .medium
     else
         .compact;
     const compact_shell = mode == .compact;
-    const gap: f32 = if (compact_shell) 8 else 10;
-    const edge: f32 = 12;
-    const toolbar_height: f32 = if (compact_shell) 64 else 70;
-    const status_height: f32 = if (compact_shell) 76 else 116;
+    const gap: f32 = @as(f32, if (compact_shell) 8 else 10) * scale;
+    const edge: f32 = 12 * scale;
+    const toolbar_height: f32 = @as(f32, if (compact_shell) 64 else 70) * scale;
+    const status_height: f32 = @as(f32, if (compact_shell) 76 else 116) * scale;
     const toolbar: rl.Rectangle = .{
         .x = safe_content.x,
         .y = safe_content.y,
@@ -329,13 +350,13 @@ pub fn frameLayout(
     const right_visible = mode == .wide or (mode != .wide and
         (active_dock == .objects or active_dock == .properties));
     const left_width: f32 = if (mode == .wide)
-        std.math.clamp(safe_content.width * 0.16, 248, 304)
+        std.math.clamp(normalized_width * 0.16, 248, 304) * scale
     else
-        @min(@as(f32, 264), @max(@as(f32, 220), safe_content.width * 0.29));
+        @min(@as(f32, 264), @max(@as(f32, 220), normalized_width * 0.29)) * scale;
     const right_width: f32 = if (mode == .wide)
-        std.math.clamp(safe_content.width * 0.18, 304, 344)
+        std.math.clamp(normalized_width * 0.18, 304, 344) * scale
     else
-        @min(@as(f32, 304), @max(@as(f32, 272), safe_content.width * 0.32));
+        @min(@as(f32, 304), @max(@as(f32, 272), normalized_width * 0.32)) * scale;
     const left_dock: rl.Rectangle = if (left_visible) .{
         .x = body.x,
         .y = body.y,
@@ -358,6 +379,7 @@ pub fn frameLayout(
     };
     const chrome: ChromeLayout = .{
         .content = safe_content,
+        .scale = scale,
         .toolbar = toolbar,
         .left_dock = left_dock,
         .right_dock = right_dock,
@@ -1341,6 +1363,7 @@ pub const workspace_min_height: f32 = 260;
 /// derived with slideCardRect/libraryRowRect so the layout remains allocation-
 /// free even for very large decks.
 pub const WorkspaceLayout = struct {
+    scale: f32 = 1,
     sidebar: rl.Rectangle,
     organizer: rl.Rectangle,
     organizer_actions: [organizer_action_count]rl.Rectangle,
@@ -1366,28 +1389,30 @@ pub const SlidePreviewSlot = struct {
 };
 
 pub fn workspaceLayout(viewport: Viewport) WorkspaceLayout {
-    const margin: f32 = 12;
-    const gap: f32 = 8;
+    const scale = if (viewport.chrome != null) uiScale(viewport) else 1;
+    const margin: f32 = 12 * scale;
+    const gap: f32 = 8 * scale;
     if (viewport.chrome) |chrome| {
         if (!chrome.visible or !chrome.left_visible or chrome.left_dock.width <= 0 or chrome.left_dock.height <= 0)
             return emptyWorkspaceLayout();
-        return workspaceLayoutInSidebar(chrome.left_dock, gap);
+        return workspaceLayoutInSidebar(chrome.left_dock, gap, scale);
     }
     const toolbar = uiLayout(viewport).toolbar;
     const status = statusPanel(viewport);
     const available_height = @max(0, status.y - gap - (toolbar.y + toolbar.height + gap));
-    const sidebar_width = @min(@max(228, viewport.slide_size.x * 0.255), 304);
+    const sidebar_width = @min(@max(228 * scale, viewport.slide_size.x * 0.255), 304 * scale);
     const sidebar: rl.Rectangle = .{
         .x = viewport.slide_top_left.x + margin,
         .y = toolbar.y + toolbar.height + gap,
-        .width = @min(sidebar_width, @max(120, viewport.slide_size.x - margin * 2)),
+        .width = @min(sidebar_width, @max(120 * scale, viewport.slide_size.x - margin * 2)),
         .height = available_height,
     };
-    return workspaceLayoutInSidebar(sidebar, gap);
+    return workspaceLayoutInSidebar(sidebar, gap, scale);
 }
 
 fn emptyWorkspaceLayout() WorkspaceLayout {
     return .{
+        .scale = 1,
         .sidebar = empty_frame_rectangle,
         .organizer = empty_frame_rectangle,
         .organizer_actions = [_]rl.Rectangle{empty_frame_rectangle} ** organizer_action_count,
@@ -1405,38 +1430,38 @@ fn emptyWorkspaceLayout() WorkspaceLayout {
     };
 }
 
-fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32) WorkspaceLayout {
-    const organizer_height = @min(@max(190, @floor(sidebar.height * 0.61)), @max(130, sidebar.height - 126));
+fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) WorkspaceLayout {
+    const organizer_height = @min(@max(190 * scale, @floor(sidebar.height * 0.61)), @max(130 * scale, sidebar.height - 126 * scale));
     const organizer: rl.Rectangle = .{ .x = sidebar.x, .y = sidebar.y, .width = sidebar.width, .height = organizer_height };
 
-    const action_gap: f32 = 4;
-    const action_width = (organizer.width - 24 - action_gap * (organizer_action_count - 1)) / organizer_action_count;
+    const action_gap: f32 = 4 * scale;
+    const action_width = (organizer.width - 24 * scale - action_gap * (organizer_action_count - 1)) / organizer_action_count;
     var organizer_actions: [organizer_action_count]rl.Rectangle = undefined;
     for (&organizer_actions, 0..) |*button, index| button.* = .{
-        .x = organizer.x + 12 + @as(f32, @floatFromInt(index)) * (action_width + action_gap),
-        .y = organizer.y + 34,
+        .x = organizer.x + 12 * scale + @as(f32, @floatFromInt(index)) * (action_width + action_gap),
+        .y = organizer.y + 34 * scale,
         .width = action_width,
-        .height = 28,
+        .height = 28 * scale,
     };
-    const pager_width: f32 = 56;
-    const pager_y = organizer.y + organizer.height - 29;
+    const pager_width: f32 = 56 * scale;
+    const pager_y = organizer.y + organizer.height - 29 * scale;
     const slide_page_previous: rl.Rectangle = .{
-        .x = organizer.x + organizer.width - 12 - pager_width * 2 - action_gap,
+        .x = organizer.x + organizer.width - 12 * scale - pager_width * 2 - action_gap,
         .y = pager_y,
         .width = pager_width,
-        .height = 22,
+        .height = 22 * scale,
     };
     const slide_page_next: rl.Rectangle = .{
         .x = slide_page_previous.x + pager_width + action_gap,
         .y = pager_y,
         .width = pager_width,
-        .height = 22,
+        .height = 22 * scale,
     };
     const slide_cards_clip: rl.Rectangle = .{
-        .x = organizer.x + 8,
-        .y = organizer.y + 70,
-        .width = organizer.width - 16,
-        .height = @max(0, pager_y - 5 - (organizer.y + 70)),
+        .x = organizer.x + 8 * scale,
+        .y = organizer.y + 70 * scale,
+        .width = organizer.width - 16 * scale,
+        .height = @max(0, pager_y - 5 * scale - (organizer.y + 70 * scale)),
     };
 
     const library_y = organizer.y + organizer.height + gap;
@@ -1444,15 +1469,15 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32) WorkspaceLayout {
         .x = sidebar.x,
         .y = library_y,
         .width = sidebar.width,
-        .height = @max(92, sidebar.y + sidebar.height - library_y),
+        .height = @max(92 * scale, sidebar.y + sidebar.height - library_y),
     };
-    const library_action_gap: f32 = 4;
-    const library_action_width: f32 = 40;
+    const library_action_gap: f32 = 4 * scale;
+    const library_action_width: f32 = 40 * scale;
     const library_cleanup: rl.Rectangle = .{
-        .x = library.x + library.width - 12 - library_action_width,
-        .y = library.y + 5,
+        .x = library.x + library.width - 12 * scale - library_action_width,
+        .y = library.y + 5 * scale,
         .width = library_action_width,
-        .height = 26,
+        .height = 26 * scale,
     };
     const library_delete: rl.Rectangle = .{
         .x = library_cleanup.x - library_action_gap - library_action_width,
@@ -1472,26 +1497,27 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32) WorkspaceLayout {
         .width = library_action_width,
         .height = library_delete.height,
     };
-    const library_pager_y = library.y + library.height - 29;
+    const library_pager_y = library.y + library.height - 29 * scale;
     const library_page_previous: rl.Rectangle = .{
-        .x = library.x + library.width - 12 - pager_width * 2 - action_gap,
+        .x = library.x + library.width - 12 * scale - pager_width * 2 - action_gap,
         .y = library_pager_y,
         .width = pager_width,
-        .height = 22,
+        .height = 22 * scale,
     };
     const library_page_next: rl.Rectangle = .{
         .x = library_page_previous.x + pager_width + action_gap,
         .y = library_pager_y,
         .width = pager_width,
-        .height = 22,
+        .height = 22 * scale,
     };
     const library_rows_clip: rl.Rectangle = .{
-        .x = library.x + 8,
-        .y = library.y + 40,
-        .width = library.width - 16,
-        .height = @max(0, library_pager_y - 5 - (library.y + 40)),
+        .x = library.x + 8 * scale,
+        .y = library.y + 40 * scale,
+        .width = library.width - 16 * scale,
+        .height = @max(0, library_pager_y - 5 * scale - (library.y + 40 * scale)),
     };
     return .{
+        .scale = scale,
         .sidebar = sidebar,
         .organizer = organizer,
         .organizer_actions = organizer_actions,
@@ -1510,38 +1536,43 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32) WorkspaceLayout {
 }
 
 pub fn slideCardCapacity(layout: WorkspaceLayout) usize {
-    return rowsThatFit(layout.slide_cards_clip.height, slide_card_height, slide_card_gap);
+    return rowsThatFit(layout.slide_cards_clip.height, slide_card_height * layout.scale, slide_card_gap * layout.scale);
 }
 
 pub fn libraryRowCapacity(layout: WorkspaceLayout) usize {
-    return rowsThatFit(layout.library_rows_clip.height, library_row_height, library_row_gap);
+    return rowsThatFit(layout.library_rows_clip.height, library_row_height * layout.scale, library_row_gap * layout.scale);
+}
+
+fn workspaceHasRoom(layout: WorkspaceLayout) bool {
+    return layout.sidebar.height >= workspace_min_height * layout.scale;
 }
 
 pub fn slideCardRect(layout: WorkspaceLayout, visible_slot: usize) ?rl.Rectangle {
     if (visible_slot >= slideCardCapacity(layout)) return null;
     return .{
         .x = layout.slide_cards_clip.x,
-        .y = layout.slide_cards_clip.y + @as(f32, @floatFromInt(visible_slot)) * (slide_card_height + slide_card_gap),
+        .y = layout.slide_cards_clip.y + @as(f32, @floatFromInt(visible_slot)) * (slide_card_height + slide_card_gap) * layout.scale,
         .width = layout.slide_cards_clip.width,
-        .height = slide_card_height,
+        .height = slide_card_height * layout.scale,
     };
 }
 
 /// The 16:9 area reserved inside a slide card. Callers may render a true slide
 /// thumbnail here between drawWorkspaceBackground and drawWorkspaceOverlay.
 pub fn slidePreviewRect(card: rl.Rectangle) rl.Rectangle {
-    const height = @min(card.height - 12, (card.width * 0.54) * 9 / 16);
+    const inset = card.height * (6.0 / slide_card_height);
+    const height = @min(card.height - inset * 2, (card.width * 0.54) * 9 / 16);
     const width = height * 16 / 9;
-    return .{ .x = card.x + 6, .y = card.y + (card.height - height) / 2, .width = width, .height = height };
+    return .{ .x = card.x + inset, .y = card.y + (card.height - height) / 2, .width = width, .height = height };
 }
 
 pub fn libraryRowRect(layout: WorkspaceLayout, visible_slot: usize) ?rl.Rectangle {
     if (visible_slot >= libraryRowCapacity(layout)) return null;
     return .{
         .x = layout.library_rows_clip.x,
-        .y = layout.library_rows_clip.y + @as(f32, @floatFromInt(visible_slot)) * (library_row_height + library_row_gap),
+        .y = layout.library_rows_clip.y + @as(f32, @floatFromInt(visible_slot)) * (library_row_height + library_row_gap) * layout.scale,
         .width = layout.library_rows_clip.width,
-        .height = library_row_height,
+        .height = library_row_height * layout.scale,
     };
 }
 
@@ -1666,6 +1697,7 @@ pub const object_row_gap: f32 = 5;
 /// Stable geometry for the tabbed Objects/Properties inspector. Rows are
 /// intentionally derived separately so large scenes remain allocation-free.
 pub const ObjectsLayout = struct {
+    scale: f32 = 1,
     panel: rl.Rectangle,
     objects_tab: rl.Rectangle,
     properties_tab: rl.Rectangle,
@@ -1677,6 +1709,7 @@ pub const ObjectsLayout = struct {
 
 fn emptyObjectsLayout() ObjectsLayout {
     return .{
+        .scale = 1,
         .panel = empty_frame_rectangle,
         .objects_tab = empty_frame_rectangle,
         .properties_tab = empty_frame_rectangle,
@@ -1692,14 +1725,15 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
     if (!chrome.visible or !chrome.right_visible or chrome.right_dock.width <= 0 or chrome.right_dock.height <= 0)
         return emptyObjectsLayout();
     const panel = chrome.right_dock;
-    const inset: f32 = 10;
-    const gap: f32 = 5;
+    const scale = uiScale(viewport);
+    const inset: f32 = 10 * scale;
+    const gap: f32 = 5 * scale;
     const tab_width = (panel.width - inset * 2 - gap) / 2;
     const objects_tab: rl.Rectangle = .{
         .x = panel.x + inset,
-        .y = panel.y + 7,
+        .y = panel.y + 7 * scale,
         .width = tab_width,
-        .height = 28,
+        .height = 28 * scale,
     };
     const properties_tab: rl.Rectangle = .{
         .x = objects_tab.x + objects_tab.width + gap,
@@ -1707,22 +1741,22 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
         .width = tab_width,
         .height = objects_tab.height,
     };
-    const action_gap: f32 = 5;
+    const action_gap: f32 = 5 * scale;
     const action_width = (panel.width - inset * 2 - action_gap * 3) / 4;
     var layer_actions: [4]rl.Rectangle = undefined;
     for (&layer_actions, 0..) |*button, index| button.* = .{
         .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (action_width + action_gap),
-        .y = panel.y + 43,
+        .y = panel.y + 43 * scale,
         .width = action_width,
-        .height = 29,
+        .height = 29 * scale,
     };
-    const pager_width: f32 = 58;
-    const pager_y = panel.y + panel.height - 29;
+    const pager_width: f32 = 58 * scale;
+    const pager_y = panel.y + panel.height - 29 * scale;
     const page_next: rl.Rectangle = .{
         .x = panel.x + panel.width - inset - pager_width,
         .y = pager_y,
         .width = pager_width,
-        .height = 22,
+        .height = 22 * scale,
     };
     const page_previous: rl.Rectangle = .{
         .x = page_next.x - gap - pager_width,
@@ -1731,15 +1765,16 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
         .height = page_next.height,
     };
     return .{
+        .scale = scale,
         .panel = panel,
         .objects_tab = objects_tab,
         .properties_tab = properties_tab,
         .layer_actions = layer_actions,
         .rows_clip = .{
-            .x = panel.x + 7,
-            .y = panel.y + 80,
-            .width = panel.width - 14,
-            .height = @max(0, pager_y - 6 - (panel.y + 80)),
+            .x = panel.x + 7 * scale,
+            .y = panel.y + 80 * scale,
+            .width = panel.width - 14 * scale,
+            .height = @max(0, pager_y - 6 * scale - (panel.y + 80 * scale)),
         },
         .page_previous = page_previous,
         .page_next = page_next,
@@ -1747,25 +1782,27 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
 }
 
 pub fn objectRowCapacity(layout: ObjectsLayout) usize {
-    return rowsThatFit(layout.rows_clip.height, object_row_height, object_row_gap);
+    return rowsThatFit(layout.rows_clip.height, object_row_height * layout.scale, object_row_gap * layout.scale);
 }
 
 pub fn objectRowRect(layout: ObjectsLayout, visible_slot: usize) ?rl.Rectangle {
     if (visible_slot >= objectRowCapacity(layout)) return null;
     return .{
         .x = layout.rows_clip.x,
-        .y = layout.rows_clip.y + @as(f32, @floatFromInt(visible_slot)) * (object_row_height + object_row_gap),
+        .y = layout.rows_clip.y + @as(f32, @floatFromInt(visible_slot)) * (object_row_height + object_row_gap) * layout.scale,
         .width = layout.rows_clip.width,
-        .height = object_row_height,
+        .height = object_row_height * layout.scale,
     };
 }
 
 pub fn objectVisibilityRect(row: rl.Rectangle) rl.Rectangle {
-    return .{ .x = row.x + 5, .y = row.y + 8, .width = 36, .height = row.height - 16 };
+    const scale = row.height / object_row_height;
+    return .{ .x = row.x + 5 * scale, .y = row.y + 8 * scale, .width = 36 * scale, .height = row.height - 16 * scale };
 }
 
 pub fn objectLockRect(row: rl.Rectangle) rl.Rectangle {
-    return .{ .x = row.x + row.width - 41, .y = row.y + 8, .width = 36, .height = row.height - 16 };
+    const scale = row.height / object_row_height;
+    return .{ .x = row.x + row.width - 41 * scale, .y = row.y + 8 * scale, .width = 36 * scale, .height = row.height - 16 * scale };
 }
 
 pub fn objectItemCount(items: []const slides.SlideItem) usize {
@@ -2212,6 +2249,7 @@ fn statusPanel(viewport: Viewport) rl.Rectangle {
 
 pub const morph_timeline_action_count: usize = 6;
 pub const MorphTimelineLayout = struct {
+    scale: f32 = 1,
     panel: rl.Rectangle,
     cards_clip: rl.Rectangle,
     actions: [morph_timeline_action_count]rl.Rectangle,
@@ -2225,6 +2263,7 @@ pub const MorphTimelineLayout = struct {
 pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
     const panel = statusPanel(viewport);
     if (panel.width <= 0 or panel.height <= 0) return .{
+        .scale = 1,
         .panel = empty_frame_rectangle,
         .cards_clip = empty_frame_rectangle,
         .actions = [_]rl.Rectangle{empty_frame_rectangle} ** morph_timeline_action_count,
@@ -2232,12 +2271,13 @@ pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
         .card_gap = 0,
         .compact = true,
     };
-    const compact = panel.height < 100;
-    const padding: f32 = if (compact) 6 else 8;
-    const gap: f32 = 5;
-    const action_width: f32 = if (compact) 43 else 52;
-    const action_height: f32 = if (compact) 34 else 32;
-    const card_height: f32 = if (compact) 34 else 68;
+    const scale = if (viewport.chrome != null) uiScale(viewport) else 1;
+    const compact = panel.height < 100 * scale;
+    const padding: f32 = @as(f32, if (compact) 6 else 8) * scale;
+    const gap: f32 = 5 * scale;
+    const action_width: f32 = @as(f32, if (compact) 43 else 52) * scale;
+    const action_height: f32 = @as(f32, if (compact) 34 else 32) * scale;
+    const card_height: f32 = @as(f32, if (compact) 34 else 68) * scale;
     const actions_width = action_width * morph_timeline_action_count + gap * (morph_timeline_action_count - 1);
     var actions: [morph_timeline_action_count]rl.Rectangle = undefined;
     const actions_x = panel.x + panel.width - padding - actions_width;
@@ -2248,6 +2288,7 @@ pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
         .height = action_height,
     };
     return .{
+        .scale = scale,
         .panel = panel,
         .cards_clip = .{
             .x = panel.x + padding,
@@ -2256,8 +2297,8 @@ pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
             .height = card_height,
         },
         .actions = actions,
-        .card_width = if (compact) 112 else 154,
-        .card_gap = 6,
+        .card_width = @as(f32, if (compact) 112 else 154) * scale,
+        .card_gap = 6 * scale,
         .compact = compact,
     };
 }
@@ -4701,7 +4742,7 @@ pub const Studio = struct {
     ) ?SlidePreviewSlot {
         if (!workspace.visible) return null;
         const layout = workspaceLayout(viewport);
-        if (layout.sidebar.height < workspace_min_height) return null;
+        if (!workspaceHasRoom(layout)) return null;
         const card = slideCardRect(layout, visible_slot) orelse return null;
         const summary_index = self.organizer_first_visible + visible_slot;
         if (summary_index >= workspace.slides.len) return null;
@@ -4719,7 +4760,7 @@ pub const Studio = struct {
         visible_slot: usize,
     ) ?usize {
         const layout = workspaceLayout(viewport);
-        if (!workspace.visible or layout.sidebar.height < workspace_min_height or libraryRowRect(layout, visible_slot) == null) return null;
+        if (!workspace.visible or !workspaceHasRoom(layout) or libraryRowRect(layout, visible_slot) == null) return null;
         const index = self.library_first_visible + visible_slot;
         return if (index < workspace.library.len) index else null;
     }
@@ -4918,7 +4959,7 @@ pub const Studio = struct {
             return;
         }
         const layout = workspaceLayout(viewport);
-        if (layout.sidebar.height < workspace_min_height) return;
+        if (!workspaceHasRoom(layout)) return;
         if (pointInRectangle(input.pointer_screen, layout.organizer)) {
             self.organizer_first_visible = scrollFirstVisible(
                 self.organizer_first_visible,
@@ -4945,7 +4986,7 @@ pub const Studio = struct {
     ) bool {
         if (self.handleMorphTimelineClick(items, viewport, workspace, pointer)) return true;
         const layout = workspaceLayout(viewport);
-        if (layout.sidebar.height < workspace_min_height) return false;
+        if (!workspaceHasRoom(layout)) return false;
         const in_organizer = pointInRectangle(pointer, layout.organizer);
         const in_library = pointInRectangle(pointer, layout.library);
         if (!in_organizer and !in_library) return false;
@@ -6897,7 +6938,7 @@ pub const Studio = struct {
     pub fn drawWorkspaceBackground(self: Studio, viewport: Viewport, workspace: Workspace) void {
         if (!self.enabled or !workspace.visible) return;
         const layout = workspaceLayout(viewport);
-        if (layout.sidebar.height < workspace_min_height) return;
+        if (!workspaceHasRoom(layout)) return;
         drawStudioPanel(layout.organizer);
         drawStudioPanel(layout.library);
         for (0..slideCardCapacity(layout)) |visible_slot| {
@@ -6923,15 +6964,12 @@ pub const Studio = struct {
         if (!self.enabled or !workspace.visible) return;
         self.drawMorphTimeline(viewport, workspace);
         const layout = workspaceLayout(viewport);
-        if (layout.sidebar.height < workspace_min_height) return;
-        // Sidebar rows have fixed logical heights, so they scale more
-        // conservatively than the canvas controls while still remaining
-        // readable from a distance on large external displays.
-        const font_scale = @min(uiScale(viewport), @as(f32, 1.4));
+        if (!workspaceHasRoom(layout)) return;
+        const font_scale = layout.scale;
         const heading_font = scaledUiFont(font_scale, UiTypography.heading);
         const body_font = scaledUiFont(font_scale, UiTypography.body);
         const compact_font = scaledUiFont(font_scale, UiTypography.compact);
-        self.drawUiText("SLIDES", .{ .x = layout.organizer.x + 12, .y = layout.organizer.y + 9 }, heading_font, .white);
+        self.drawUiText("SLIDES", .{ .x = layout.organizer.x + 12 * font_scale, .y = layout.organizer.y + 9 * font_scale }, heading_font, .white);
         const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down", "Tpl" };
         for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(self, button, label);
         drawCompactButton(self, layout.slide_page_previous, "Prev");
@@ -6951,21 +6989,21 @@ pub const Studio = struct {
             rl.drawRectangleLinesEx(slidePreviewRect(card), 1, .{ .r = 145, .g = 158, .b = 180, .a = 220 });
 
             const preview = slidePreviewRect(card);
-            const text_x = preview.x + preview.width + 9;
-            const text_width = @max(0, card.x + card.width - text_x - 7);
+            const text_x = preview.x + preview.width + 9 * font_scale;
+            const text_width = @max(0, card.x + card.width - text_x - 7 * font_scale);
             if (text_width <= 0) continue;
             rl.beginScissorMode(
                 @intFromFloat(@floor(text_x)),
-                @intFromFloat(@floor(card.y + 2)),
+                @intFromFloat(@floor(card.y + 2 * font_scale)),
                 @intFromFloat(@ceil(text_width)),
-                @intFromFloat(@ceil(card.height - 4)),
+                @intFromFloat(@ceil(card.height - 4 * font_scale)),
             );
             var line_buffer: [96]u8 = undefined;
             const slide_number = std.fmt.bufPrintZ(&line_buffer, "SLIDE {d}", .{summary.index + 1}) catch "SLIDE";
-            self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 7 }, compact_font, if (active) border else .white);
+            self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 7 * font_scale }, compact_font, if (active) border else .white);
             var title_buffer: [96]u8 = undefined;
             const title = self.fitUiText(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title, body_font, text_width);
-            self.drawUiText(title, .{ .x = text_x, .y = card.y + 28 }, body_font, .white);
+            self.drawUiText(title, .{ .x = text_x, .y = card.y + 28 * font_scale }, body_font, .white);
             var metadata_buffer: [96]u8 = undefined;
             const metadata = std.fmt.bufPrintZ(
                 &metadata_buffer,
@@ -6974,11 +7012,11 @@ pub const Studio = struct {
             ) catch "slide details";
             var fitted_metadata_buffer: [96]u8 = undefined;
             const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
-            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = card.y + 57 }, compact_font, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = card.y + 57 * font_scale }, compact_font, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
             rl.endScissorMode();
         }
 
-        self.drawUiText("LIBRARY", .{ .x = layout.library.x + 12, .y = layout.library.y + 9 }, heading_font, .white);
+        self.drawUiText("LIBRARY", .{ .x = layout.library.x + 12 * font_scale, .y = layout.library.y + 9 * font_scale }, heading_font, .white);
         drawCompactButton(self, layout.library_use, "Use");
         drawCompactButton(self, layout.library_rename, "Ren");
         drawCompactButton(self, layout.library_delete, "Del");
@@ -7007,7 +7045,7 @@ pub const Studio = struct {
                 .group => "GROUP",
                 .slide_template => "SLIDE",
             };
-            const badge_rect: rl.Rectangle = .{ .x = row.x + 7, .y = row.y + 9, .width = 48, .height = 28 };
+            const badge_rect: rl.Rectangle = .{ .x = row.x + 7 * font_scale, .y = row.y + 9 * font_scale, .width = 48 * font_scale, .height = 28 * font_scale };
             rl.drawRectangleRec(badge_rect, switch (entry.kind) {
                 .element => .{ .r = 43, .g = 123, .b = 151, .a = if (entry.available) 255 else 100 },
                 .group => .{ .r = 170, .g = 91, .b = 126, .a = if (entry.available) 255 else 100 },
@@ -7018,18 +7056,18 @@ pub const Studio = struct {
                 .x = badge_rect.x + (badge_rect.width - badge_width) / 2,
                 .y = badge_rect.y + (badge_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
             }, compact_font, .white);
-            const text_x = row.x + 64;
-            const text_width = @max(0, row.x + row.width - text_x - 7);
+            const text_x = row.x + 64 * font_scale;
+            const text_width = @max(0, row.x + row.width - text_x - 7 * font_scale);
             if (text_width <= 0) continue;
             rl.beginScissorMode(
                 @intFromFloat(@floor(text_x)),
-                @intFromFloat(@floor(row.y + 2)),
+                @intFromFloat(@floor(row.y + 2 * font_scale)),
                 @intFromFloat(@ceil(text_width)),
-                @intFromFloat(@ceil(row.height - 4)),
+                @intFromFloat(@ceil(row.height - 4 * font_scale)),
             );
             var name_buffer: [128]u8 = undefined;
             const name = self.fitUiText(&name_buffer, entry.name, body_font, text_width);
-            self.drawUiText(name, .{ .x = text_x, .y = row.y + 6 }, body_font, if (entry.available)
+            self.drawUiText(name, .{ .x = text_x, .y = row.y + 6 * font_scale }, body_font, if (entry.available)
                 .white
             else
                 .{ .r = 130, .g = 136, .b = 149, .a = 255 });
@@ -7038,7 +7076,7 @@ pub const Studio = struct {
                 "unused"
             else
                 std.fmt.bufPrintZ(&usage_buffer, "{d} use{s}", .{ entry.use_count, if (entry.use_count == 1) "" else "s" }) catch "used";
-            self.drawUiText(usage, .{ .x = text_x, .y = row.y + 27 }, compact_font, if (entry.deletable)
+            self.drawUiText(usage, .{ .x = text_x, .y = row.y + 27 * font_scale }, compact_font, if (entry.deletable)
                 .{ .r = 126, .g = 231, .b = 177, .a = 255 }
             else
                 .{ .r = 168, .g = 179, .b = 198, .a = 255 });
@@ -7051,15 +7089,15 @@ pub const Studio = struct {
         const layout = morphTimelineLayout(viewport);
         if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
         const active_scene = if (self.active_morph_state) |state| state + 1 else 0;
-        const body_font: i32 = if (layout.compact) UiTypography.compact else UiTypography.body;
-        const meta_font: i32 = UiTypography.compact;
+        const body_font = scaledUiFont(layout.scale, if (layout.compact) UiTypography.compact else UiTypography.body);
+        const meta_font = scaledUiFont(layout.scale, UiTypography.compact);
 
         // Repaint the complete card band plus the text baseline immediately
         // below it. drawStatus() runs first; without the extra baseline clear,
         // the lower halves of its shortcut text peek out beneath the cards.
         // The notice row starts lower (or directly after compact cards) and
         // remains available for source/edit feedback.
-        const repaint_height = layout.cards_clip.height + @as(f32, if (layout.compact) 8 else 18);
+        const repaint_height = layout.cards_clip.height + @as(f32, if (layout.compact) 8 else 18) * layout.scale;
         rl.drawRectangleRec(.{
             .x = layout.panel.x + 1,
             .y = layout.panel.y + 1,
@@ -7106,11 +7144,11 @@ pub const Studio = struct {
                 &fitted_title_buffer,
                 title_source,
                 body_font,
-                card.width - 18,
+                card.width - 18 * layout.scale,
             );
             self.drawUiText(fitted_title, .{
-                .x = card.x + 9,
-                .y = card.y + @as(f32, if (layout.compact) 9 else 8),
+                .x = card.x + 9 * layout.scale,
+                .y = card.y + @as(f32, if (layout.compact) 9 else 8) * layout.scale,
             }, body_font, .white);
 
             if (!layout.compact) {
@@ -7134,9 +7172,9 @@ pub const Studio = struct {
                     &fitted_metadata_buffer,
                     metadata,
                     meta_font,
-                    card.width - 18,
+                    card.width - 18 * layout.scale,
                 );
-                self.drawUiText(fitted_metadata, .{ .x = card.x + 9, .y = card.y + 38 }, meta_font, .{
+                self.drawUiText(fitted_metadata, .{ .x = card.x + 9 * layout.scale, .y = card.y + 38 * layout.scale }, meta_font, .{
                     .r = 190,
                     .g = 202,
                     .b = 222,
@@ -7147,9 +7185,9 @@ pub const Studio = struct {
             if (scene_index > 0 and visible_slot > 0) {
                 const line_y = card.y + card.height / 2;
                 rl.drawLineEx(
-                    .{ .x = card.x - layout.card_gap + 1, .y = line_y },
-                    .{ .x = card.x - 2, .y = line_y },
-                    2,
+                    .{ .x = card.x - layout.card_gap + 1 * layout.scale, .y = line_y },
+                    .{ .x = card.x - 2 * layout.scale, .y = line_y },
+                    2 * layout.scale,
                     .{ .r = 190, .g = 133, .b = 255, .a = 210 },
                 );
             }
@@ -7274,7 +7312,7 @@ pub const Studio = struct {
         drawCompactButton(self, layout.page_previous, "Prev");
         drawCompactButton(self, layout.page_next, "Next");
 
-        const scale = @min(uiScale(viewport), @as(f32, 1.4));
+        const scale = layout.scale;
         const body_font = scaledUiFont(scale, UiTypography.body);
         const compact_font = scaledUiFont(scale, UiTypography.compact);
         const count = objectItemCount(items);
@@ -7310,15 +7348,15 @@ pub const Studio = struct {
                 drawToggleButton(self, lock, if (item.locked) "L" else "U", item.locked);
             }
 
-            const text_x = visibility.x + visibility.width + 7;
-            const text_right = lock.x - 7;
+            const text_x = visibility.x + visibility.width + 7 * scale;
+            const text_right = lock.x - 7 * scale;
             const text_width = @max(0, text_right - text_x);
             if (text_width <= 0) continue;
             rl.beginScissorMode(
                 @intFromFloat(@floor(text_x)),
-                @intFromFloat(@floor(row.y + 2)),
+                @intFromFloat(@floor(row.y + 2 * scale)),
                 @intFromFloat(@ceil(text_width)),
-                @intFromFloat(@ceil(row.height - 4)),
+                @intFromFloat(@ceil(row.height - 4 * scale)),
             );
             var generated_name: [192]u8 = undefined;
             const raw_name: []const u8 = if (item.id) |id|
@@ -7341,7 +7379,7 @@ pub const Studio = struct {
             };
             var fitted_name_buffer: [192]u8 = undefined;
             const fitted_name = self.fitUiText(&fitted_name_buffer, raw_name, body_font, text_width);
-            self.drawUiText(fitted_name, .{ .x = text_x, .y = row.y + 6 }, body_font, if (!item.visible or item.opacity <= 0)
+            self.drawUiText(fitted_name, .{ .x = text_x, .y = row.y + 6 * scale }, body_font, if (!item.visible or item.opacity <= 0)
                 .{ .r = 164, .g = 174, .b = 191, .a = 255 }
             else
                 .white);
@@ -7404,7 +7442,7 @@ pub const Studio = struct {
                 std.fmt.bufPrint(&metadata_buffer, "{s} · {s}{s}{s} · {d:.0}%{s}", .{ type_badge, base_badge, local_badge, morph_badge, item.opacity * 100, if (item.locked) " · locked" else "" }) catch type_badge;
             var fitted_metadata_buffer: [192]u8 = undefined;
             const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
-            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = row.y + 31 }, compact_font, .{ .r = 181, .g = 193, .b = 213, .a = 255 });
+            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = row.y + 31 * scale }, compact_font, .{ .r = 181, .g = 193, .b = 213, .a = 255 });
             rl.endScissorMode();
         }
 
@@ -7412,7 +7450,7 @@ pub const Studio = struct {
         const first = if (count == 0) 0 else self.objects_first_visible + 1;
         const last = @min(count, self.objects_first_visible + objectRowCapacity(layout));
         const page_text = std.fmt.bufPrintZ(&page_buffer, "{d}–{d} / {d}", .{ first, last, count }) catch "Objects";
-        self.drawUiText(page_text, .{ .x = layout.panel.x + 10, .y = layout.page_previous.y + 3 }, compact_font, .{ .r = 181, .g = 193, .b = 213, .a = 255 });
+        self.drawUiText(page_text, .{ .x = layout.panel.x + 10 * scale, .y = layout.page_previous.y + 3 * scale }, compact_font, .{ .r = 181, .g = 193, .b = 213, .a = 255 });
     }
 
     fn drawToolbar(self: Studio, viewport: Viewport) void {
@@ -11543,6 +11581,7 @@ test "docked frame keeps permanent chrome outside a sixteen by nine canvas" {
         .{ .size = .{ .x = 900, .y = 600 }, .expected_mode = .compact },
         .{ .size = .{ .x = 900, .y = 506 }, .expected_mode = .compact },
         .{ .size = .{ .x = 2560, .y = 1440 }, .expected_mode = .wide },
+        .{ .size = .{ .x = 3840, .y = 2160 }, .expected_mode = .wide },
     };
     const requested_docks = [_]DockPanel{ .slides, .objects, .properties };
     for (cases) |case| {
@@ -11559,7 +11598,9 @@ test "docked frame keeps permanent chrome outside a sixteen by nine canvas" {
             );
             const logical_probe: rl.Vector2 = .{ .x = 713.5, .y = 402.25 };
             const screen_probe = logicalToScreen(frame.viewport, logical_probe).?;
-            try expectVector(logical_probe, screenToLogical(frame.viewport, screen_probe).?);
+            const roundtrip_probe = screenToLogical(frame.viewport, screen_probe).?;
+            try std.testing.expectApproxEqAbs(logical_probe.x, roundtrip_probe.x, 0.001);
+            try std.testing.expectApproxEqAbs(logical_probe.y, roundtrip_probe.y, 0.001);
             const slide_rect: rl.Rectangle = .{
                 .x = frame.viewport.slide_top_left.x,
                 .y = frame.viewport.slide_top_left.y,
@@ -11585,7 +11626,7 @@ test "docked frame keeps permanent chrome outside a sixteen by nine canvas" {
             try expectRectangleContained(frame.chrome.toolbar, controls.slides_dock_toggle);
             try expectRectangleContained(frame.chrome.toolbar, controls.properties_dock_toggle);
             try expectRectangleContained(frame.chrome.toolbar, controls.focus_canvas);
-            try std.testing.expectEqual(@as(f32, 1), controls.scale);
+            try std.testing.expectApproxEqAbs(frame.chrome.scale, controls.scale, 0.0001);
             if (frame.chrome.right_visible) {
                 try expectRectangleContained(frame.chrome.right_dock, controls.properties);
                 const objects = objectsLayout(frame.viewport);
@@ -11630,6 +11671,47 @@ test "docked frame keeps permanent chrome outside a sixteen by nine canvas" {
     const minimum_workspace = workspaceLayout(minimum_compact.viewport);
     try std.testing.expect(slideCardCapacity(minimum_workspace) >= 1);
     try std.testing.expect(libraryRowCapacity(minimum_workspace) >= 1);
+}
+
+test "large dock chrome scales shell rows typography and hit targets together" {
+    try std.testing.expectApproxEqAbs(@as(f32, 1), chromeScale(.{ .x = 0, .y = 0, .width = 900, .height = 506 }), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), chromeScale(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), chromeScale(.{ .x = 0, .y = 0, .width = 1920, .height = 1080 }), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.6), chromeScale(.{ .x = 0, .y = 0, .width = 2560, .height = 1440 }), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), chromeScale(.{ .x = 0, .y = 0, .width = 3840, .height = 2160 }), 0.0001);
+
+    const reference = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .objects);
+    const large = frameLayout(.{ .x = 0, .y = 0, .width = 3840, .height = 2160 }, true, false, .objects);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), large.chrome.scale, 0.0001);
+    try std.testing.expectApproxEqAbs(reference.chrome.toolbar.height * 2, large.chrome.toolbar.height, 0.0001);
+
+    const reference_ui = uiLayout(reference.viewport);
+    const large_ui = uiLayout(large.viewport);
+    try std.testing.expectApproxEqAbs(reference_ui.tool_buttons[0].height * 2, large_ui.tool_buttons[0].height, 0.0001);
+    try std.testing.expect(scaledUiFont(large_ui.scale, UiTypography.body) >= scaledUiFont(reference_ui.scale, UiTypography.body) * 2);
+
+    const reference_workspace = workspaceLayout(reference.viewport);
+    const large_workspace = workspaceLayout(large.viewport);
+    try std.testing.expectApproxEqAbs(slideCardRect(reference_workspace, 0).?.height * 2, slideCardRect(large_workspace, 0).?.height, 0.0001);
+    try std.testing.expectApproxEqAbs(libraryRowRect(reference_workspace, 0).?.height * 2, libraryRowRect(large_workspace, 0).?.height, 0.0001);
+
+    const reference_objects = objectsLayout(reference.viewport);
+    const large_objects = objectsLayout(large.viewport);
+    try std.testing.expectApproxEqAbs(objectRowRect(reference_objects, 0).?.height * 2, objectRowRect(large_objects, 0).?.height, 0.0001);
+    try std.testing.expectApproxEqAbs(objectVisibilityRect(objectRowRect(reference_objects, 0).?).width * 2, objectVisibilityRect(objectRowRect(large_objects, 0).?).width, 0.0001);
+
+    const reference_timeline = morphTimelineLayout(reference.viewport);
+    const large_timeline = morphTimelineLayout(large.viewport);
+    try std.testing.expectApproxEqAbs(reference_timeline.actions[0].height * 2, large_timeline.actions[0].height, 0.0001);
+    try std.testing.expectApproxEqAbs(reference_timeline.card_width * 2, large_timeline.card_width, 0.0001);
+
+    var items = [_]slides.SlideItem{testItem(910, .textbox, 100, 100, 300, 100)};
+    var studio: Studio = .{ .enabled = true, .inspector_panel = .properties };
+    _ = studio.update(&items, &.{}, large.viewport, .{
+        .pointer_screen = rectangleCenter(large_objects.objects_tab),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(InspectorPanel.objects, studio.inspector_panel);
 }
 
 test "medium dock controls switch reserved space without overlaying the canvas" {
