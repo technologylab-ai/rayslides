@@ -99,6 +99,18 @@ its tools, docks, Properties, layer controls, slide organizer, Library, and
 morph timeline. The tooltips and pointer shapes disappear during gestures and
 text entry, keeping the canvas calm while actively editing.
 
+Press <kbd>Cmd/Ctrl-F</kbd> to search the panel under the pointer (or the active
+dock): Slides, Library, or Objects. Search filters immediately without changing
+the `.sld`, history, or dirty state. Use <kbd>Up</kbd>/<kbd>Down</kbd>,
+<kbd>Home</kbd>/<kbd>End</kbd>, or the wheel to choose a result, then
+<kbd>Enter</kbd> to jump to its slide, reusable definition, or object. While a
+Find field is active, <kbd>Tab</kbd>/<kbd>Shift-Tab</kbd> cycles among all three
+panels; each panel remembers its own query. <kbd>Esc</kbd> returns keyboard focus
+to Studio while keeping the useful filter visible, and the pink × clears it.
+Object filtering always retains full-slide Background rows because they are
+real paint-order barriers, not cosmetic list entries. The command palette also
+offers **Find a slide**, **Find a library entry**, and **Find an object**.
+
 Studio's precision view is entirely editor-side: use **Commands** to toggle
 calibrated rulers, 5% action-safe and 10% title-safe guides, or live dimensions
 and edge distances for the current selection. <kbd>Cmd/Ctrl</kbd>-wheel zooms
@@ -249,6 +261,10 @@ and a 110% canvas view for deterministic precision-surface QA; pair it with
 stress deck with reusable elements and morph states. `COUNT` accepts 1–200;
 the deck is intentionally untitled and does not touch a file unless you
 explicitly save it.
+`--diagnostics-find-slide=QUERY` opens the real slide-picker Find field with a
+deterministic query, and `--diagnostics-window=WIDTHxHEIGHT` requests an exact
+Studio client size (minimum 900×506). Together they make compact/default/large
+navigation screenshots reproducible without synthesizing global key input.
 
 Studio edits the `.sld` document rather than maintaining a separate opaque
 scene. It changes only the source owned by the selected object and preserves
@@ -281,6 +297,7 @@ scoped, so a library item can only be placed after its definition.
 | Studio shortcut | Description |
 | --------------- | ----------- |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> | Open the searchable contextual command palette |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>F</kbd> | Find and jump within Slides, Library, or Objects |
 | <kbd>1</kbd>–<kbd>4</kbd> on the new-deck chooser | Create Blank, Midnight, Editorial, or Aurora |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, then atomically save changes to its `.sld` file |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, or save an `*.edited.sld` copy of a named deck |

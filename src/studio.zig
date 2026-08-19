@@ -907,6 +907,27 @@ fn firstNonEmptyTextLine(value: []const u8) ?[]const u8 {
     return null;
 }
 
+fn objectDisplayName(item: slides.SlideItem, buffer: *[192]u8) []const u8 {
+    return if (item.id) |id|
+        std.fmt.bufPrint(buffer, "#{s}", .{id}) catch id
+    else switch (item.kind) {
+        .textbox => if (item.text) |value|
+            firstNonEmptyTextLine(value) orelse
+                (std.fmt.bufPrint(buffer, "Text · line {d}", .{item.source.line_number}) catch "Text")
+        else
+            std.fmt.bufPrint(buffer, "Text · line {d}", .{item.source.line_number}) catch "Text",
+        .img => if (item.img_path) |path| std.fs.path.basename(path) else "Image",
+        .crowd => if (item.crowd) |crowd|
+            if (crowd.id.len > 0)
+                std.fmt.bufPrint(buffer, "{s} · {s}", .{ @tagName(crowd.kind), crowd.id }) catch "Crowd"
+            else
+                @tagName(crowd.kind)
+        else
+            "Crowd",
+        .background => "Background",
+    };
+}
+
 pub const Interaction = enum {
     idle,
     moving,
@@ -1462,6 +1483,7 @@ pub const WorkspaceLayout = struct {
     library_delete: rl.Rectangle,
     library_cleanup: rl.Rectangle,
     library_rows_clip: rl.Rectangle,
+    library_page_status: rl.Rectangle,
     library_page_previous: rl.Rectangle,
     library_page_next: rl.Rectangle,
 };
@@ -1519,6 +1541,7 @@ fn emptyWorkspaceLayout() WorkspaceLayout {
         .library_delete = empty_frame_rectangle,
         .library_cleanup = empty_frame_rectangle,
         .library_rows_clip = empty_frame_rectangle,
+        .library_page_status = empty_frame_rectangle,
         .library_page_previous = empty_frame_rectangle,
         .library_page_next = empty_frame_rectangle,
     };
@@ -1604,6 +1627,12 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
         .width = pager_width,
         .height = 22 * scale,
     };
+    const library_page_status: rl.Rectangle = .{
+        .x = library.x + 12 * scale,
+        .y = library_pager_y,
+        .width = @max(0, library_page_previous.x - action_gap - (library.x + 12 * scale)),
+        .height = 22 * scale,
+    };
     const library_page_next: rl.Rectangle = .{
         .x = library_page_previous.x + pager_width + action_gap,
         .y = library_pager_y,
@@ -1631,6 +1660,7 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
         .library_delete = library_delete,
         .library_cleanup = library_cleanup,
         .library_rows_clip = library_rows_clip,
+        .library_page_status = library_page_status,
         .library_page_previous = library_page_previous,
         .library_page_next = library_page_next,
     };
@@ -1804,6 +1834,7 @@ pub const ObjectsLayout = struct {
     properties_tab: rl.Rectangle,
     layer_actions: [4]rl.Rectangle,
     rows_clip: rl.Rectangle,
+    page_status: rl.Rectangle,
     page_previous: rl.Rectangle,
     page_next: rl.Rectangle,
 };
@@ -1816,6 +1847,7 @@ fn emptyObjectsLayout() ObjectsLayout {
         .properties_tab = empty_frame_rectangle,
         .layer_actions = [_]rl.Rectangle{empty_frame_rectangle} ** 4,
         .rows_clip = empty_frame_rectangle,
+        .page_status = empty_frame_rectangle,
         .page_previous = empty_frame_rectangle,
         .page_next = empty_frame_rectangle,
     };
@@ -1865,6 +1897,12 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
         .width = pager_width,
         .height = page_next.height,
     };
+    const page_status: rl.Rectangle = .{
+        .x = panel.x + inset,
+        .y = pager_y,
+        .width = @max(0, page_previous.x - gap - (panel.x + inset)),
+        .height = page_next.height,
+    };
     return .{
         .scale = scale,
         .panel = panel,
@@ -1877,6 +1915,7 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
             .width = panel.width - 14 * scale,
             .height = @max(0, pager_y - 6 * scale - (panel.y + 80 * scale)),
         },
+        .page_status = page_status,
         .page_previous = page_previous,
         .page_next = page_next,
     };
@@ -2396,6 +2435,9 @@ pub const CommandId = enum {
     show_slides,
     show_objects,
     show_properties,
+    find_slides,
+    find_library,
+    find_objects,
     edit_text,
     copy_items,
     paste_items,
@@ -2445,6 +2487,9 @@ const command_specs = [_]CommandSpec{
     .{ .id = .show_slides, .category = "VIEW", .title = "Show Slides and Library", .description = "Open the deck organizer dock", .keywords = "left dock organizer reusable" },
     .{ .id = .show_objects, .category = "VIEW", .title = "Show Objects", .description = "Open the source-aware object stack", .keywords = "layers inspector right dock" },
     .{ .id = .show_properties, .category = "VIEW", .title = "Show Properties", .description = "Open precise inline object properties", .keywords = "inspector right dock values" },
+    .{ .id = .find_slides, .category = "FIND", .title = "Find a slide", .description = "Filter the slide picker and jump to a result", .keywords = "search deck title number navigate", .shortcut = "Cmd/Ctrl F" },
+    .{ .id = .find_library, .category = "FIND", .title = "Find a library entry", .description = "Filter reusable elements, groups, and slide templates", .keywords = "search reuse component group template" },
+    .{ .id = .find_objects, .category = "FIND", .title = "Find an object", .description = "Filter the source-aware object stack", .keywords = "search layers id text image hidden locked" },
     .{ .id = .edit_text, .category = "SELECTION", .title = "Edit selected text", .description = "Focus the selected object's inline text field", .keywords = "rename content property", .shortcut = "Enter" },
     .{ .id = .copy_items, .category = "SELECTION", .title = "Copy selected objects", .description = "Copy authored objects to Studio's clipboard", .keywords = "clipboard items", .shortcut = "Cmd/Ctrl C" },
     .{ .id = .paste_items, .category = "SELECTION", .title = "Paste objects", .description = "Paste copied objects with fresh IDs", .keywords = "clipboard clone items", .shortcut = "Cmd/Ctrl V" },
@@ -2613,6 +2658,7 @@ pub const FrameInput = struct {
     toggle_pressed: bool = false,
     toggle_focus_canvas_pressed: bool = false,
     command_palette_pressed: bool = false,
+    find_pressed: bool = false,
     palette_previous_pressed: bool = false,
     palette_next_pressed: bool = false,
     cancel_pressed: bool = false,
@@ -2718,6 +2764,7 @@ pub const FrameInput = struct {
             .toggle_pressed = rl.isKeyPressed(.e),
             .toggle_focus_canvas_pressed = rl.isKeyPressed(.tab),
             .command_palette_pressed = shortcut_modifier and rl.isKeyPressed(.k),
+            .find_pressed = shortcut_modifier and rl.isKeyPressed(.f),
             .palette_previous_pressed = keyPressedOrRepeated(.up),
             .palette_next_pressed = keyPressedOrRepeated(.down),
             .cancel_pressed = rl.isKeyPressed(.escape),
@@ -2903,6 +2950,7 @@ const InlineEditor = struct {
 };
 
 pub const max_command_query_bytes: usize = 128;
+pub const max_panel_search_bytes: usize = 128;
 pub const tooltip_delay_seconds: f32 = 0.55;
 pub const tooltip_pointer_tolerance: f32 = 5;
 
@@ -2915,6 +2963,36 @@ const CommandPaletteState = struct {
 
     fn text(self: *const CommandPaletteState) []const u8 {
         return self.query[0..self.len];
+    }
+};
+
+const SearchPanel = enum {
+    slides,
+    library,
+    objects,
+};
+
+const PanelSearchState = struct {
+    query: [max_panel_search_bytes + 1]u8 = [_]u8{0} ** (max_panel_search_bytes + 1),
+    len: usize = 0,
+    select_all: bool = false,
+    selected_result: usize = 0,
+    first_visible: usize = 0,
+
+    fn text(self: *const PanelSearchState) []const u8 {
+        return self.query[0..self.len];
+    }
+
+    fn resetResults(self: *PanelSearchState) void {
+        self.selected_result = 0;
+        self.first_visible = 0;
+    }
+
+    fn clear(self: *PanelSearchState) void {
+        self.len = 0;
+        self.query[0] = 0;
+        self.select_all = false;
+        self.resetResults();
     }
 };
 
@@ -3033,6 +3111,10 @@ pub const Studio = struct {
     pending_geometry_batch: ?GeometryBatchCommand = null,
     inline_editor: InlineEditor = .{},
     command_palette: CommandPaletteState = .{},
+    active_search: ?SearchPanel = null,
+    slide_search: PanelSearchState = .{},
+    library_search: PanelSearchState = .{},
+    objects_search: PanelSearchState = .{},
     tooltip: TooltipState = .{},
     composition_context: ?CompositionContext = null,
     group_drag: [max_selection_items]GroupDragMember = undefined,
@@ -3216,6 +3298,16 @@ pub const Studio = struct {
         self.openCommandPalette(items);
     }
 
+    /// Opens the real slide-picker Find field with a deterministic query for
+    /// large-deck visual and performance regression checks.
+    pub fn openSlideSearchForDiagnostics(self: *Studio, query: []const u8) bool {
+        if (!std.unicode.utf8ValidateSlice(query) or query.len > max_panel_search_bytes) return false;
+        self.slide_search.clear();
+        self.activatePanelSearch(.slides);
+        self.appendPanelSearchQuery(.slides, query);
+        return true;
+    }
+
     /// Keeps the real hover-help renderer visible for deterministic visual
     /// QA without synthesizing global pointer events across macOS Spaces.
     pub fn showCommandTooltipForDiagnostics(self: *Studio, viewport: Viewport) void {
@@ -3251,7 +3343,7 @@ pub const Studio = struct {
     }
 
     pub fn textEntryActive(self: Studio) bool {
-        return self.inline_editor.active or self.command_palette.active;
+        return self.inline_editor.active or self.command_palette.active or self.active_search != null;
     }
 
     pub fn inlineEditField(self: Studio) ?InlineField {
@@ -3300,6 +3392,7 @@ pub const Studio = struct {
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.resetTooltip();
+        self.active_search = null;
         self.command_palette = .{ .active = true };
         self.notice = .none;
     }
@@ -3356,6 +3449,7 @@ pub const Studio = struct {
             if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
         }
         if (self.inspector_panel == .objects) {
+            if (hoveredTooltip(pointer, 56, objects.page_status, "Find objects", "Filter by name, text, type, source, or status", "Cmd/Ctrl F")) |target| return target;
             const layer_titles = [_][:0]const u8{ "Send to back", "Move backward", "Move forward", "Bring to front" };
             const layer_details = [_][:0]const u8{
                 "Move the selection to the back of its safe source segment",
@@ -3399,6 +3493,8 @@ pub const Studio = struct {
 
         if (workspace.visible) {
             const deck = workspaceLayout(viewport);
+            if (hoveredTooltip(pointer, 114, deck.slide_page_status, "Find slides", "Filter by title, number, item count, or state count", "Cmd/Ctrl F")) |target| return target;
+            if (hoveredTooltip(pointer, 115, deck.library_page_status, "Find reusable", "Filter reusable elements, groups, and slide templates", "")) |target| return target;
             const deck_titles = [_][:0]const u8{ "New slide", "Duplicate slide", "Delete slide", "Move slide up", "Move slide down", "Make template" };
             const deck_details = [_][:0]const u8{
                 "Append a blank source-backed slide",
@@ -3440,7 +3536,7 @@ pub const Studio = struct {
 
     fn updateTooltip(self: *Studio, viewport: Viewport, workspace: Workspace, input: FrameInput) void {
         if (self.command_palette.active or self.inline_editor.active or self.interaction != .idle or self.view_panning or
-            self.marquee.active or input.pointer_pressed or input.pointer_down)
+            self.marquee.active or self.active_search != null or input.pointer_pressed or input.pointer_down)
         {
             self.resetTooltip();
             return;
@@ -3512,6 +3608,18 @@ pub const Studio = struct {
             .show_objects,
             .show_properties,
             => .{ .enabled = true },
+            .find_slides => if (workspace.slides.len > 0)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "The deck has no slides" },
+            .find_library => if (workspace.library.len > 0)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "The Library has no visible reusable entries" },
+            .find_objects => if (items.len > 0)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "The active scene has no objects" },
             .undo => if (workspace.undo_available)
                 .{ .enabled = true }
             else
@@ -3611,6 +3719,262 @@ pub const Studio = struct {
         self.command_palette.first_visible = 0;
     }
 
+    fn panelSearch(self: *Studio, panel: SearchPanel) *PanelSearchState {
+        return switch (panel) {
+            .slides => &self.slide_search,
+            .library => &self.library_search,
+            .objects => &self.objects_search,
+        };
+    }
+
+    fn panelSearchConst(self: *const Studio, panel: SearchPanel) *const PanelSearchState {
+        return switch (panel) {
+            .slides => &self.slide_search,
+            .library => &self.library_search,
+            .objects => &self.objects_search,
+        };
+    }
+
+    fn activatePanelSearch(self: *Studio, panel: SearchPanel) void {
+        self.focus_canvas = false;
+        self.command_palette = .{};
+        self.cancelInlineEdit();
+        self.active_search = panel;
+        switch (panel) {
+            .slides, .library => self.active_dock = .slides,
+            .objects => {
+                self.active_dock = .objects;
+                self.inspector_panel = .objects;
+            },
+        }
+        const search = self.panelSearch(panel);
+        if (search.len == 0) {
+            search.first_visible = switch (panel) {
+                .slides => self.organizer_first_visible,
+                .library => self.library_first_visible,
+                .objects => self.objects_first_visible,
+            };
+            search.selected_result = search.first_visible;
+        }
+        search.select_all = true;
+        self.notice = .none;
+        self.resetTooltip();
+    }
+
+    fn searchPanelForShortcut(self: Studio, viewport: Viewport, pointer: rl.Vector2) SearchPanel {
+        const workspace = workspaceLayout(viewport);
+        if (pointInRectangle(pointer, workspace.library)) return .library;
+        if (pointInRectangle(pointer, workspace.organizer)) return .slides;
+        if (pointInRectangle(pointer, objectsLayout(viewport).panel)) return .objects;
+        if (self.active_dock == .objects or self.active_dock == .properties) return .objects;
+        return .slides;
+    }
+
+    fn panelSearchField(viewport: Viewport, panel: SearchPanel) rl.Rectangle {
+        return switch (panel) {
+            .slides => workspaceLayout(viewport).slide_page_status,
+            .library => workspaceLayout(viewport).library_page_status,
+            .objects => objectsLayout(viewport).page_status,
+        };
+    }
+
+    fn panelSearchCapacity(viewport: Viewport, panel: SearchPanel) usize {
+        return switch (panel) {
+            .slides => slideCardCapacity(workspaceLayout(viewport)),
+            .library => libraryRowCapacity(workspaceLayout(viewport)),
+            .objects => objectRowCapacity(objectsLayout(viewport)),
+        };
+    }
+
+    fn panelSearchResultCount(
+        self: Studio,
+        panel: SearchPanel,
+        items: []const slides.SlideItem,
+        workspace: Workspace,
+    ) usize {
+        const query = self.panelSearchConst(panel).text();
+        return switch (panel) {
+            .slides => slideSearchResultCount(workspace.slides, query),
+            .library => librarySearchResultCount(workspace.library, query),
+            .objects => objectSearchResultCount(items, query),
+        };
+    }
+
+    fn ensurePanelSearchSelectionVisible(
+        self: *Studio,
+        panel: SearchPanel,
+        items: []const slides.SlideItem,
+        viewport: Viewport,
+        workspace: Workspace,
+    ) void {
+        const count = self.panelSearchResultCount(panel, items, workspace);
+        const search = self.panelSearch(panel);
+        if (count == 0) {
+            search.selected_result = 0;
+            search.first_visible = 0;
+            return;
+        }
+        search.selected_result = @min(search.selected_result, count - 1);
+        const capacity = panelSearchCapacity(viewport, panel);
+        search.first_visible = revealIndex(
+            search.first_visible,
+            search.selected_result,
+            count,
+            capacity,
+        );
+    }
+
+    fn appendPanelSearchQuery(self: *Studio, panel: SearchPanel, value: []const u8) void {
+        if (!std.unicode.utf8ValidateSlice(value)) return;
+        const search = self.panelSearch(panel);
+        const replaced_len: usize = if (search.select_all) 0 else search.len;
+        if (value.len > max_panel_search_bytes - replaced_len) return;
+        if (search.select_all) search.len = 0;
+        @memcpy(search.query[search.len .. search.len + value.len], value);
+        search.len += value.len;
+        search.query[search.len] = 0;
+        search.select_all = false;
+        search.resetResults();
+    }
+
+    fn removePanelSearchCodepoint(self: *Studio, panel: SearchPanel) void {
+        const search = self.panelSearch(panel);
+        if (search.select_all) {
+            search.clear();
+            return;
+        }
+        if (search.len == 0) return;
+        var start = search.len - 1;
+        while (start > 0 and search.query[start] & 0xc0 == 0x80) start -= 1;
+        search.len = start;
+        search.query[start] = 0;
+        search.resetResults();
+    }
+
+    fn activateSearchResult(
+        self: *Studio,
+        panel: SearchPanel,
+        items: []slides.SlideItem,
+        workspace: Workspace,
+    ) void {
+        const search = self.panelSearchConst(panel);
+        switch (panel) {
+            .slides => {
+                const summary_index = slideSummaryIndexAtSearchResult(
+                    workspace.slides,
+                    search.text(),
+                    search.selected_result,
+                ) orelse return;
+                self.emitSlideSelection(items, workspace.slides[summary_index].index);
+            },
+            .library => {
+                const entry_index = libraryIndexAtSearchResult(
+                    workspace.library,
+                    search.text(),
+                    search.selected_result,
+                ) orelse return;
+                if (!workspace.library[entry_index].available) {
+                    self.notice = .property_unavailable;
+                    return;
+                }
+                self.selected_library_index = entry_index;
+                self.tool = .select;
+                self.notice = .none;
+            },
+            .objects => {
+                const item_index = objectIndexAtSearchResult(
+                    items,
+                    search.text(),
+                    search.selected_result,
+                ) orelse return;
+                const item = items[item_index];
+                if (item.kind == .background) {
+                    self.notice = .property_unavailable;
+                    return;
+                }
+                self.setSingleSelection(item);
+                self.tool = .select;
+                self.notice = if (item.locked) .locked_item else .none;
+            },
+        }
+        self.active_search = null;
+    }
+
+    fn handlePanelSearch(
+        self: *Studio,
+        items: []slides.SlideItem,
+        viewport: Viewport,
+        workspace: Workspace,
+        input: FrameInput,
+    ) bool {
+        const panel = self.active_search orelse return false;
+        if (input.command_palette_pressed) return false;
+        if (input.cancel_pressed) {
+            self.active_search = null;
+            return true;
+        }
+        if (input.find_pressed) {
+            self.panelSearch(panel).select_all = true;
+            return true;
+        }
+        if (input.toggle_focus_canvas_pressed) {
+            const next: SearchPanel = if (input.shift_down)
+                switch (panel) {
+                    .slides => .objects,
+                    .library => .slides,
+                    .objects => .library,
+                }
+            else switch (panel) {
+                .slides => .library,
+                .library => .objects,
+                .objects => .slides,
+            };
+            self.activatePanelSearch(next);
+            return true;
+        }
+
+        const field = panelSearchField(viewport, panel);
+        if (input.pointer_pressed) {
+            if (!pointInRectangle(input.pointer_screen, field)) {
+                self.active_search = null;
+                return false;
+            }
+            const search = self.panelSearch(panel);
+            const clear_width = 24 * uiScale(viewport);
+            if (search.len > 0 and input.pointer_screen.x >= field.x + field.width - clear_width) {
+                search.clear();
+            } else {
+                search.select_all = true;
+            }
+            return true;
+        }
+
+        if (input.inline_paste) |paste| self.appendPanelSearchQuery(panel, paste);
+        if (input.select_all_pressed) self.panelSearch(panel).select_all = true;
+        if (input.inline_backspace_pressed or input.inline_delete_pressed) self.removePanelSearchCodepoint(panel);
+        if (!input.shortcut_modifier_down and input.inline_chars_len > 0)
+            self.appendPanelSearchQuery(panel, input.inline_chars[0..input.inline_chars_len]);
+
+        const count = self.panelSearchResultCount(panel, items, workspace);
+        const search = self.panelSearch(panel);
+        if (input.palette_previous_pressed and count > 0)
+            search.selected_result = if (search.selected_result == 0) count - 1 else search.selected_result - 1;
+        if (input.palette_next_pressed and count > 0)
+            search.selected_result = (search.selected_result + 1) % count;
+        if (input.inline_home_pressed and count > 0) search.selected_result = 0;
+        if (input.inline_end_pressed and count > 0) search.selected_result = count - 1;
+        if (input.workspace_scroll != 0 and count > 0) {
+            if (input.workspace_scroll > 0)
+                search.selected_result -|= 1
+            else
+                search.selected_result = @min(count - 1, search.selected_result + 1);
+        }
+        self.ensurePanelSearchSelectionVisible(panel, items, viewport, workspace);
+        if (input.inline_submit_pressed and count > 0)
+            self.activateSearchResult(panel, items, workspace);
+        return true;
+    }
+
     fn executeCommand(
         self: *Studio,
         items: []slides.SlideItem,
@@ -3664,6 +4028,9 @@ pub const Studio = struct {
                 self.active_dock = .properties;
                 self.inspector_panel = .properties;
             },
+            .find_slides => self.activatePanelSearch(.slides),
+            .find_library => self.activatePanelSearch(.library),
+            .find_objects => self.activatePanelSearch(.objects),
             .edit_text => {
                 self.revealInlineProperties();
                 _ = self.beginInlineEdit(items, resolved_bounds, .text, false);
@@ -4398,6 +4765,34 @@ pub const Studio = struct {
         }
     }
 
+    /// Fits the end of an active one-line value so newly typed characters and
+    /// the caret never disappear beyond the field's right edge.
+    fn fitUiTextTail(self: Studio, buffer: []u8, value: []const u8, font_size: i32, max_width: f32) [:0]const u8 {
+        std.debug.assert(buffer.len >= 5);
+        if (value.len + 1 <= buffer.len) {
+            @memcpy(buffer[0..value.len], value);
+            buffer[value.len] = 0;
+            const complete = buffer[0..value.len :0];
+            if (self.measureUiText(complete, font_size) <= max_width) return complete;
+        }
+        const ellipsis = "…";
+        var start: usize = 0;
+        while (start < value.len) {
+            const suffix_len = value.len - start;
+            if (ellipsis.len + suffix_len + 1 <= buffer.len) {
+                @memcpy(buffer[0..ellipsis.len], ellipsis);
+                @memcpy(buffer[ellipsis.len .. ellipsis.len + suffix_len], value[start..]);
+                buffer[ellipsis.len + suffix_len] = 0;
+                const candidate = buffer[0 .. ellipsis.len + suffix_len :0];
+                if (self.measureUiText(candidate, font_size) <= max_width) return candidate;
+            }
+            start += 1;
+            while (start < value.len and value[start] & 0xc0 == 0x80) start += 1;
+        }
+        buffer[0] = 0;
+        return buffer[0..0 :0];
+    }
+
     pub fn status(self: Studio) Status {
         if (!self.enabled) return .inactive;
         return switch (self.interaction) {
@@ -4818,6 +5213,11 @@ pub const Studio = struct {
         if (self.handleInlineEditor(items, resolved_bounds, viewport, input)) return null;
         if (input.command_palette_pressed) {
             self.openCommandPalette(items);
+            return null;
+        }
+        if (self.handlePanelSearch(items, viewport, workspace, input)) return null;
+        if (input.find_pressed) {
+            self.activatePanelSearch(self.searchPanelForShortcut(viewport, input.pointer_screen));
             return null;
         }
         self.updateTooltip(viewport, workspace, input);
@@ -5781,8 +6181,13 @@ pub const Studio = struct {
         const layout = workspaceLayout(viewport);
         if (!workspaceHasRoom(layout)) return null;
         const card = slideCardRect(layout, visible_slot) orelse return null;
-        const summary_index = self.organizer_first_visible + visible_slot;
-        if (summary_index >= workspace.slides.len) return null;
+        const search_engaged = self.active_search == .slides or self.slide_search.len > 0;
+        const result_index = (if (search_engaged) self.slide_search.first_visible else self.organizer_first_visible) + visible_slot;
+        const summary_index = slideSummaryIndexAtSearchResult(
+            workspace.slides,
+            if (search_engaged) self.slide_search.text() else "",
+            result_index,
+        ) orelse return null;
         return .{
             .summary_index = summary_index,
             .slide_index = workspace.slides[summary_index].index,
@@ -5798,8 +6203,13 @@ pub const Studio = struct {
     ) ?usize {
         const layout = workspaceLayout(viewport);
         if (!workspace.visible or !workspaceHasRoom(layout) or libraryRowRect(layout, visible_slot) == null) return null;
-        const index = self.library_first_visible + visible_slot;
-        return if (index < workspace.library.len) index else null;
+        const search_engaged = self.active_search == .library or self.library_search.len > 0;
+        const result_index = (if (search_engaged) self.library_search.first_visible else self.library_first_visible) + visible_slot;
+        return libraryIndexAtSearchResult(
+            workspace.library,
+            if (search_engaged) self.library_search.text() else "",
+            result_index,
+        );
     }
 
     fn normalizeWorkspace(self: *Studio, viewport: Viewport, workspace: Workspace) void {
@@ -5810,6 +6220,16 @@ pub const Studio = struct {
             workspace.slides.len,
             slide_capacity,
         );
+        const slide_result_count = slideSearchResultCount(workspace.slides, self.slide_search.text());
+        self.slide_search.first_visible = clampFirstVisible(
+            self.slide_search.first_visible,
+            slide_result_count,
+            slide_capacity,
+        );
+        if (slide_result_count == 0)
+            self.slide_search.selected_result = 0
+        else
+            self.slide_search.selected_result = @min(self.slide_search.selected_result, slide_result_count - 1);
         if (self.last_workspace_slide == null or self.last_workspace_slide.? != workspace.current_slide) {
             const changed_slide = self.last_workspace_slide != null;
             if (summaryOffsetForSlide(workspace.slides, workspace.current_slide)) |offset| {
@@ -5832,6 +6252,16 @@ pub const Studio = struct {
             workspace.library.len,
             library_capacity,
         );
+        const library_result_count = librarySearchResultCount(workspace.library, self.library_search.text());
+        self.library_search.first_visible = clampFirstVisible(
+            self.library_search.first_visible,
+            library_result_count,
+            library_capacity,
+        );
+        if (library_result_count == 0)
+            self.library_search.selected_result = 0
+        else
+            self.library_search.selected_result = @min(self.library_search.selected_result, library_result_count - 1);
         if (self.selected_library_index) |index| {
             if (index >= workspace.library.len or !workspace.library[index].available) {
                 self.selected_library_index = null;
@@ -5847,10 +6277,30 @@ pub const Studio = struct {
             objectItemCount(items),
             capacity,
         );
+        const object_result_count = objectSearchResultCount(items, self.objects_search.text());
+        self.objects_search.first_visible = clampFirstVisible(
+            self.objects_search.first_visible,
+            object_result_count,
+            capacity,
+        );
+        if (object_result_count == 0)
+            self.objects_search.selected_result = 0
+        else
+            self.objects_search.selected_result = @min(self.objects_search.selected_result, object_result_count - 1);
         const primary = self.selected_identity;
         if (primary == self.last_objects_primary) return;
         self.last_objects_primary = primary;
         if (primary) |identity| {
+            if (self.active_search == .objects or self.objects_search.len > 0) {
+                if (objectSearchResultByIdentity(items, self.objects_search.text(), identity)) |result_index| {
+                    self.objects_search.first_visible = revealIndex(
+                        self.objects_search.first_visible,
+                        result_index,
+                        object_result_count,
+                        capacity,
+                    );
+                }
+            }
             if (objectPaintOffsetByIdentity(items, identity)) |offset| {
                 self.objects_first_visible = revealIndex(
                     self.objects_first_visible,
@@ -5912,12 +6362,26 @@ pub const Studio = struct {
         if (input.workspace_scroll == 0 or self.inspector_panel != .objects) return;
         const layout = objectsLayout(viewport);
         if (!pointInRectangle(input.pointer_screen, layout.panel)) return;
-        self.objects_first_visible = scrollFirstVisible(
-            self.objects_first_visible,
-            objectItemCount(items),
-            objectRowCapacity(layout),
-            if (input.workspace_scroll > 0) -1 else 1,
-        );
+        const search_engaged = self.active_search == .objects or self.objects_search.len > 0;
+        const count = if (search_engaged)
+            objectSearchResultCount(items, self.objects_search.text())
+        else
+            objectItemCount(items);
+        if (search_engaged) {
+            self.objects_search.first_visible = scrollFirstVisible(
+                self.objects_search.first_visible,
+                count,
+                objectRowCapacity(layout),
+                if (input.workspace_scroll > 0) -1 else 1,
+            );
+        } else {
+            self.objects_first_visible = scrollFirstVisible(
+                self.objects_first_visible,
+                count,
+                objectRowCapacity(layout),
+                if (input.workspace_scroll > 0) -1 else 1,
+            );
+        }
     }
 
     fn handleWorkspaceKeyboard(self: *Studio, items: []slides.SlideItem, workspace: Workspace, input: FrameInput) bool {
@@ -5998,19 +6462,47 @@ pub const Studio = struct {
         const layout = workspaceLayout(viewport);
         if (!workspaceHasRoom(layout)) return;
         if (pointInRectangle(input.pointer_screen, layout.organizer)) {
-            self.organizer_first_visible = scrollFirstVisible(
-                self.organizer_first_visible,
-                workspace.slides.len,
-                slideCardCapacity(layout),
-                if (input.workspace_scroll > 0) -1 else 1,
-            );
+            const search_engaged = self.active_search == .slides or self.slide_search.len > 0;
+            const count = if (search_engaged)
+                slideSearchResultCount(workspace.slides, self.slide_search.text())
+            else
+                workspace.slides.len;
+            if (search_engaged) {
+                self.slide_search.first_visible = scrollFirstVisible(
+                    self.slide_search.first_visible,
+                    count,
+                    slideCardCapacity(layout),
+                    if (input.workspace_scroll > 0) -1 else 1,
+                );
+            } else {
+                self.organizer_first_visible = scrollFirstVisible(
+                    self.organizer_first_visible,
+                    count,
+                    slideCardCapacity(layout),
+                    if (input.workspace_scroll > 0) -1 else 1,
+                );
+            }
         } else if (pointInRectangle(input.pointer_screen, layout.library)) {
-            self.library_first_visible = scrollFirstVisible(
-                self.library_first_visible,
-                workspace.library.len,
-                libraryRowCapacity(layout),
-                if (input.workspace_scroll > 0) -1 else 1,
-            );
+            const search_engaged = self.active_search == .library or self.library_search.len > 0;
+            const count = if (search_engaged)
+                librarySearchResultCount(workspace.library, self.library_search.text())
+            else
+                workspace.library.len;
+            if (search_engaged) {
+                self.library_search.first_visible = scrollFirstVisible(
+                    self.library_search.first_visible,
+                    count,
+                    libraryRowCapacity(layout),
+                    if (input.workspace_scroll > 0) -1 else 1,
+                );
+            } else {
+                self.library_first_visible = scrollFirstVisible(
+                    self.library_first_visible,
+                    count,
+                    libraryRowCapacity(layout),
+                    if (input.workspace_scroll > 0) -1 else 1,
+                );
+            }
         }
     }
 
@@ -6065,19 +6557,32 @@ pub const Studio = struct {
                 }
                 return true;
             }
+            if (pointInRectangle(pointer, layout.slide_page_status)) {
+                self.activatePanelSearch(.slides);
+                return true;
+            }
+            const slide_search_engaged = self.active_search == .slides or self.slide_search.len > 0;
+            const slide_count = if (slide_search_engaged)
+                slideSearchResultCount(workspace.slides, self.slide_search.text())
+            else
+                workspace.slides.len;
+            const slide_first_visible = if (slide_search_engaged)
+                &self.slide_search.first_visible
+            else
+                &self.organizer_first_visible;
             if (pointInRectangle(pointer, layout.slide_page_previous)) {
-                self.organizer_first_visible = pageFirstVisible(
-                    self.organizer_first_visible,
-                    workspace.slides.len,
+                slide_first_visible.* = pageFirstVisible(
+                    slide_first_visible.*,
+                    slide_count,
                     slideCardCapacity(layout),
                     false,
                 );
                 return true;
             }
             if (pointInRectangle(pointer, layout.slide_page_next)) {
-                self.organizer_first_visible = pageFirstVisible(
-                    self.organizer_first_visible,
-                    workspace.slides.len,
+                slide_first_visible.* = pageFirstVisible(
+                    slide_first_visible.*,
+                    slide_count,
                     slideCardCapacity(layout),
                     true,
                 );
@@ -6086,9 +6591,15 @@ pub const Studio = struct {
             for (0..slideCardCapacity(layout)) |visible_slot| {
                 const card = slideCardRect(layout, visible_slot) orelse continue;
                 if (!pointInRectangle(pointer, card)) continue;
-                const summary_index = self.organizer_first_visible + visible_slot;
-                if (summary_index < workspace.slides.len) {
-                    self.emitSlideSelection(items, workspace.slides[summary_index].index);
+                const result_index = slide_first_visible.* + visible_slot;
+                const summary_index = if (slide_search_engaged)
+                    slideSummaryIndexAtSearchResult(workspace.slides, self.slide_search.text(), result_index)
+                else if (result_index < workspace.slides.len)
+                    result_index
+                else
+                    null;
+                if (summary_index) |index| {
+                    self.emitSlideSelection(items, workspace.slides[index].index);
                 }
                 return true;
             }
@@ -6118,19 +6629,32 @@ pub const Studio = struct {
             }
             return true;
         }
+        if (pointInRectangle(pointer, layout.library_page_status)) {
+            self.activatePanelSearch(.library);
+            return true;
+        }
+        const library_search_engaged = self.active_search == .library or self.library_search.len > 0;
+        const library_count = if (library_search_engaged)
+            librarySearchResultCount(workspace.library, self.library_search.text())
+        else
+            workspace.library.len;
+        const library_first_visible = if (library_search_engaged)
+            &self.library_search.first_visible
+        else
+            &self.library_first_visible;
         if (pointInRectangle(pointer, layout.library_page_previous)) {
-            self.library_first_visible = pageFirstVisible(
-                self.library_first_visible,
-                workspace.library.len,
+            library_first_visible.* = pageFirstVisible(
+                library_first_visible.*,
+                library_count,
                 libraryRowCapacity(layout),
                 false,
             );
             return true;
         }
         if (pointInRectangle(pointer, layout.library_page_next)) {
-            self.library_first_visible = pageFirstVisible(
-                self.library_first_visible,
-                workspace.library.len,
+            library_first_visible.* = pageFirstVisible(
+                library_first_visible.*,
+                library_count,
                 libraryRowCapacity(layout),
                 true,
             );
@@ -6139,7 +6663,11 @@ pub const Studio = struct {
         for (0..libraryRowCapacity(layout)) |visible_slot| {
             const row = libraryRowRect(layout, visible_slot) orelse continue;
             if (!pointInRectangle(pointer, row)) continue;
-            const entry_index = self.library_first_visible + visible_slot;
+            const result_index = library_first_visible.* + visible_slot;
+            const entry_index = if (library_search_engaged)
+                libraryIndexAtSearchResult(workspace.library, self.library_search.text(), result_index) orelse return true
+            else
+                result_index;
             if (entry_index >= workspace.library.len) return true;
             const entry = workspace.library[entry_index];
             if (!entry.available) {
@@ -6420,19 +6948,32 @@ pub const Studio = struct {
                     if (pointInRectangle(pointer, button))
                         return self.emitLayerCommand(items, @enumFromInt(index));
                 }
+                if (pointInRectangle(pointer, inspector.page_status)) {
+                    self.activatePanelSearch(.objects);
+                    return true;
+                }
+                const object_search_engaged = self.active_search == .objects or self.objects_search.len > 0;
+                const object_count = if (object_search_engaged)
+                    objectSearchResultCount(items, self.objects_search.text())
+                else
+                    objectItemCount(items);
+                const object_first_visible = if (object_search_engaged)
+                    &self.objects_search.first_visible
+                else
+                    &self.objects_first_visible;
                 if (pointInRectangle(pointer, inspector.page_previous)) {
-                    self.objects_first_visible = pageFirstVisible(
-                        self.objects_first_visible,
-                        objectItemCount(items),
+                    object_first_visible.* = pageFirstVisible(
+                        object_first_visible.*,
+                        object_count,
                         objectRowCapacity(inspector),
                         false,
                     );
                     return true;
                 }
                 if (pointInRectangle(pointer, inspector.page_next)) {
-                    self.objects_first_visible = pageFirstVisible(
-                        self.objects_first_visible,
-                        objectItemCount(items),
+                    object_first_visible.* = pageFirstVisible(
+                        object_first_visible.*,
+                        object_count,
                         objectRowCapacity(inspector),
                         true,
                     );
@@ -6441,8 +6982,11 @@ pub const Studio = struct {
                 for (0..objectRowCapacity(inspector)) |visible_slot| {
                     const row = objectRowRect(inspector, visible_slot) orelse continue;
                     if (!pointInRectangle(pointer, row)) continue;
-                    const paint_offset = self.objects_first_visible + visible_slot;
-                    const item_index = objectIndexAtPaintOffset(items, paint_offset) orelse return true;
+                    const paint_offset = object_first_visible.* + visible_slot;
+                    const item_index = if (object_search_engaged)
+                        objectIndexAtSearchResult(items, self.objects_search.text(), paint_offset) orelse return true
+                    else
+                        objectIndexAtPaintOffset(items, paint_offset) orelse return true;
                     const item = items[item_index];
                     if (pointInRectangle(pointer, objectVisibilityRect(row)))
                         return self.emitItemVisibilityCommand(items, item_index, allow_shared_edit);
@@ -6613,6 +7157,7 @@ pub const Studio = struct {
         }
         if (workspace.visible) {
             const deck = workspaceLayout(viewport);
+            if (pointInRectangle(pointer, deck.slide_page_status) or pointInRectangle(pointer, deck.library_page_status)) return .ibeam;
             for (0..slideCardCapacity(deck)) |slot| {
                 const card = slideCardRect(deck, slot) orelse break;
                 if (pointInRectangle(pointer, card)) return .pointing_hand;
@@ -8214,21 +8759,100 @@ pub const Studio = struct {
         drawStudioPanel(layout.organizer);
         drawStudioPanel(layout.library);
         for (0..slideCardCapacity(layout)) |visible_slot| {
-            const summary_index = self.organizer_first_visible + visible_slot;
-            if (summary_index >= workspace.slides.len) break;
+            if (self.visibleSlidePreview(viewport, workspace, visible_slot) == null) break;
             const card = slideCardRect(layout, visible_slot) orelse break;
             rl.drawRectangleRec(card, .{ .r = 25, .g = 31, .b = 45, .a = 250 });
             rl.drawRectangleRec(slidePreviewRect(card), .{ .r = 4, .g = 7, .b = 13, .a = 255 });
         }
         for (0..libraryRowCapacity(layout)) |visible_slot| {
-            const entry_index = self.library_first_visible + visible_slot;
-            if (entry_index >= workspace.library.len) break;
+            const entry_index = self.visibleLibraryIndex(viewport, workspace, visible_slot) orelse break;
             const row = libraryRowRect(layout, visible_slot) orelse break;
             const entry = workspace.library[entry_index];
             rl.drawRectangleRec(row, if (entry.available)
                 .{ .r = 25, .g = 31, .b = 45, .a = 250 }
             else
                 .{ .r = 22, .g = 25, .b = 32, .a = 245 });
+        }
+    }
+
+    fn drawPanelSearchField(
+        self: Studio,
+        rect: rl.Rectangle,
+        search: PanelSearchState,
+        active: bool,
+        placeholder: []const u8,
+        inactive_status: []const u8,
+        result_count: usize,
+        font_size: i32,
+    ) void {
+        if (rect.width <= 0 or rect.height <= 0) return;
+        const engaged = active or search.len > 0;
+        rl.drawRectangleRounded(rect, 0.16, 6, if (engaged)
+            .{ .r = 18, .g = 31, .b = 48, .a = 255 }
+        else
+            .{ .r = 22, .g = 28, .b = 40, .a = 235 });
+        rl.drawRectangleRoundedLinesEx(rect, 0.16, 6, if (active) 2 else 1, if (active)
+            .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+        else if (search.len > 0)
+            .{ .r = 255, .g = 92, .b = 198, .a = 220 }
+        else
+            .{ .r = 87, .g = 101, .b = 125, .a = 190 });
+
+        var label_buffer: [192]u8 = undefined;
+        const raw_label: []const u8 = if (active and search.len > 0)
+            search.text()
+        else if (search.len > 0)
+            std.fmt.bufPrint(&label_buffer, "{s}  ·  {d}", .{ search.text(), result_count }) catch search.text()
+        else if (active)
+            placeholder
+        else
+            inactive_status;
+        const right_padding: f32 = if (search.len > 0) 23 else 7;
+        var fitted_buffer: [192]u8 = undefined;
+        const available_width = @max(0, rect.width - 9 - right_padding);
+        const fitted = if (active and search.len > 0)
+            self.fitUiTextTail(&fitted_buffer, raw_label, font_size, available_width)
+        else
+            self.fitUiText(&fitted_buffer, raw_label, font_size, available_width);
+        const text_position: rl.Vector2 = .{
+            .x = rect.x + 7,
+            .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2,
+        };
+        if (active and search.select_all and search.len > 0) {
+            rl.drawRectangleRec(.{
+                .x = text_position.x - 2,
+                .y = rect.y + 3,
+                .width = @min(available_width + 4, self.measureUiText(fitted, font_size) + 4),
+                .height = @max(0, rect.height - 6),
+            }, .{ .r = 43, .g = 123, .b = 151, .a = 190 });
+        }
+        self.drawUiText(fitted, .{
+            .x = text_position.x,
+            .y = text_position.y,
+        }, font_size, if (search.len > 0)
+            .white
+        else if (active)
+            .{ .r = 157, .g = 181, .b = 210, .a = 255 }
+        else
+            .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+        if (active and (!search.select_all or search.len == 0)) {
+            const caret_x = if (search.len == 0)
+                text_position.x
+            else
+                @min(rect.x + rect.width - right_padding - 2, text_position.x + self.measureUiText(fitted, font_size) + 1);
+            rl.drawRectangleRec(.{
+                .x = caret_x,
+                .y = rect.y + 4,
+                .width = 1.5,
+                .height = @max(0, rect.height - 8),
+            }, .{ .r = 114, .g = 226, .b = 255, .a = 255 });
+        }
+        if (search.len > 0) {
+            const clear_label: [:0]const u8 = "×";
+            self.drawUiText(clear_label, .{
+                .x = rect.x + rect.width - 18,
+                .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2,
+            }, font_size, .{ .r = 255, .g = 143, .b = 211, .a = 255 });
         }
     }
 
@@ -8244,36 +8868,42 @@ pub const Studio = struct {
         self.drawUiText("SLIDES", .{ .x = layout.organizer.x + 12 * font_scale, .y = layout.organizer.y + 9 * font_scale }, heading_font, .white);
         const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down", "Tpl" };
         for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(self, button, label);
+        const slide_search_engaged = self.active_search == .slides or self.slide_search.len > 0;
+        const slide_result_count = if (slide_search_engaged)
+            slideSearchResultCount(workspace.slides, self.slide_search.text())
+        else
+            workspace.slides.len;
+        const slide_first_visible = if (slide_search_engaged)
+            self.slide_search.first_visible
+        else
+            self.organizer_first_visible;
         var slide_progress_buffer: [64]u8 = undefined;
         const current_summary = currentSlideOrdinal(workspace);
         const slide_progress = std.fmt.bufPrintZ(
             &slide_progress_buffer,
-            "{d} / {d}",
+            "{d} / {d}  Find",
             .{ current_summary, workspace.slides.len },
         ) catch "slides";
-        var fitted_progress_buffer: [64]u8 = undefined;
-        const fitted_progress = self.fitUiText(
-            &fitted_progress_buffer,
+        self.drawPanelSearchField(
+            layout.slide_page_status,
+            self.slide_search,
+            self.active_search == .slides,
+            "Find slides…",
             slide_progress,
+            slide_result_count,
             compact_font,
-            layout.slide_page_status.width,
-        );
-        self.drawUiText(
-            fitted_progress,
-            .{
-                .x = layout.slide_page_status.x,
-                .y = layout.slide_page_status.y +
-                    (layout.slide_page_status.height - @as(f32, @floatFromInt(compact_font))) / 2,
-            },
-            compact_font,
-            .{ .r = 185, .g = 196, .b = 215, .a = 255 },
         );
         drawCompactButton(self, layout.slide_page_previous, "Prev");
         drawCompactButton(self, layout.slide_page_next, "Next");
 
         for (0..slideCardCapacity(layout)) |visible_slot| {
-            const summary_index = self.organizer_first_visible + visible_slot;
-            if (summary_index >= workspace.slides.len) break;
+            const result_index = slide_first_visible + visible_slot;
+            const summary_index = if (slide_search_engaged)
+                slideSummaryIndexAtSearchResult(workspace.slides, self.slide_search.text(), result_index) orelse break
+            else if (result_index < workspace.slides.len)
+                result_index
+            else
+                break;
             const summary = workspace.slides[summary_index];
             const card = slideCardRect(layout, visible_slot) orelse break;
             const active = summary.index == workspace.current_slide;
@@ -8282,6 +8912,8 @@ pub const Studio = struct {
             else
                 .{ .r = 103, .g = 117, .b = 140, .a = 210 };
             rl.drawRectangleLinesEx(card, if (active) 3 else 1, border);
+            if (self.active_search == .slides and result_index == self.slide_search.selected_result)
+                rl.drawRectangleLinesEx(.{ .x = card.x + 3, .y = card.y + 3, .width = card.width - 6, .height = card.height - 6 }, 2, .{ .r = 255, .g = 92, .b = 198, .a = 235 });
             rl.drawRectangleLinesEx(slidePreviewRect(card), 1, .{ .r = 145, .g = 158, .b = 180, .a = 220 });
 
             const preview = slidePreviewRect(card);
@@ -8321,11 +8953,42 @@ pub const Studio = struct {
             layout.library_cleanup,
             if (self.library_cleanup_preview_ready) "Apply" else "Clean",
         );
+        const library_search_engaged = self.active_search == .library or self.library_search.len > 0;
+        const library_result_count = if (library_search_engaged)
+            librarySearchResultCount(workspace.library, self.library_search.text())
+        else
+            workspace.library.len;
+        const library_first_visible = if (library_search_engaged)
+            self.library_search.first_visible
+        else
+            self.library_first_visible;
+        var library_progress_buffer: [64]u8 = undefined;
+        const library_first = if (library_result_count == 0) 0 else library_first_visible + 1;
+        const library_last = @min(library_result_count, library_first_visible + libraryRowCapacity(layout));
+        const library_progress = std.fmt.bufPrintZ(
+            &library_progress_buffer,
+            "{d}–{d} / {d}  Find",
+            .{ library_first, library_last, library_result_count },
+        ) catch "Find reusable";
+        self.drawPanelSearchField(
+            layout.library_page_status,
+            self.library_search,
+            self.active_search == .library,
+            "Find reusable…",
+            library_progress,
+            library_result_count,
+            compact_font,
+        );
         drawCompactButton(self, layout.library_page_previous, "Prev");
         drawCompactButton(self, layout.library_page_next, "Next");
         for (0..libraryRowCapacity(layout)) |visible_slot| {
-            const entry_index = self.library_first_visible + visible_slot;
-            if (entry_index >= workspace.library.len) break;
+            const result_index = library_first_visible + visible_slot;
+            const entry_index = if (library_search_engaged)
+                libraryIndexAtSearchResult(workspace.library, self.library_search.text(), result_index) orelse break
+            else if (result_index < workspace.library.len)
+                result_index
+            else
+                break;
             const entry = workspace.library[entry_index];
             const row = libraryRowRect(layout, visible_slot) orelse break;
             const selected = self.selected_library_index != null and self.selected_library_index.? == entry_index;
@@ -8336,6 +8999,8 @@ pub const Studio = struct {
             else
                 .{ .r = 103, .g = 117, .b = 140, .a = 210 };
             rl.drawRectangleLinesEx(row, if (selected) 2 else 1, border);
+            if (self.active_search == .library and result_index == self.library_search.selected_result)
+                rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 2, .{ .r = 255, .g = 92, .b = 198, .a = 235 });
             const badge: [:0]const u8 = switch (entry.kind) {
                 .element => "ITEM",
                 .group => "GROUP",
@@ -8891,10 +9556,21 @@ pub const Studio = struct {
         const scale = layout.scale;
         const body_font = scaledUiFont(scale, UiTypography.body);
         const compact_font = scaledUiFont(scale, UiTypography.compact);
-        const count = objectItemCount(items);
+        const object_search_engaged = self.active_search == .objects or self.objects_search.len > 0;
+        const count = if (object_search_engaged)
+            objectSearchResultCount(items, self.objects_search.text())
+        else
+            objectItemCount(items);
+        const first_visible = if (object_search_engaged)
+            self.objects_search.first_visible
+        else
+            self.objects_first_visible;
         for (0..objectRowCapacity(layout)) |visible_slot| {
-            const paint_offset = self.objects_first_visible + visible_slot;
-            const item_index = objectIndexAtPaintOffset(items, paint_offset) orelse break;
+            const paint_offset = first_visible + visible_slot;
+            const item_index = if (object_search_engaged)
+                objectIndexAtSearchResult(items, self.objects_search.text(), paint_offset) orelse break
+            else
+                objectIndexAtPaintOffset(items, paint_offset) orelse break;
             const item = items[item_index];
             const row = objectRowRect(layout, visible_slot) orelse break;
             const selected = item.kind != .background and self.isIdentitySelected(item.identity);
@@ -8913,6 +9589,8 @@ pub const Studio = struct {
                 .{ .r = 153, .g = 116, .b = 177, .a = 210 }
             else
                 .{ .r = 87, .g = 101, .b = 125, .a = 205 });
+            if (self.active_search == .objects and paint_offset == self.objects_search.selected_result)
+                rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 2, .{ .r = 255, .g = 92, .b = 198, .a = 235 });
 
             const visibility = objectVisibilityRect(row);
             const lock = objectLockRect(row);
@@ -8935,24 +9613,7 @@ pub const Studio = struct {
                 @intFromFloat(@ceil(row.height - 4 * scale)),
             );
             var generated_name: [192]u8 = undefined;
-            const raw_name: []const u8 = if (item.id) |id|
-                std.fmt.bufPrint(&generated_name, "#{s}", .{id}) catch id
-            else switch (item.kind) {
-                .textbox => if (item.text) |value|
-                    firstNonEmptyTextLine(value) orelse
-                        (std.fmt.bufPrint(&generated_name, "Text · line {d}", .{item.source.line_number}) catch "Text")
-                else
-                    std.fmt.bufPrint(&generated_name, "Text · line {d}", .{item.source.line_number}) catch "Text",
-                .img => if (item.img_path) |path| std.fs.path.basename(path) else "Image",
-                .crowd => if (item.crowd) |crowd|
-                    if (crowd.id.len > 0)
-                        std.fmt.bufPrint(&generated_name, "{s} · {s}", .{ @tagName(crowd.kind), crowd.id }) catch "Crowd"
-                    else
-                        @tagName(crowd.kind)
-                else
-                    "Crowd",
-                .background => "Background",
-            };
+            const raw_name = objectDisplayName(item, &generated_name);
             var fitted_name_buffer: [192]u8 = undefined;
             const fitted_name = self.fitUiText(&fitted_name_buffer, raw_name, body_font, text_width);
             self.drawUiText(fitted_name, .{ .x = text_x, .y = row.y + 6 * scale }, body_font, if (!item.visible or item.opacity <= 0)
@@ -9023,10 +9684,18 @@ pub const Studio = struct {
         }
 
         var page_buffer: [64]u8 = undefined;
-        const first = if (count == 0) 0 else self.objects_first_visible + 1;
-        const last = @min(count, self.objects_first_visible + objectRowCapacity(layout));
-        const page_text = std.fmt.bufPrintZ(&page_buffer, "{d}–{d} / {d}", .{ first, last, count }) catch "Objects";
-        self.drawUiText(page_text, .{ .x = layout.panel.x + 10 * scale, .y = layout.page_previous.y + 3 * scale }, compact_font, .{ .r = 181, .g = 193, .b = 213, .a = 255 });
+        const first = if (count == 0) 0 else first_visible + 1;
+        const last = @min(count, first_visible + objectRowCapacity(layout));
+        const page_text = std.fmt.bufPrintZ(&page_buffer, "{d}–{d} / {d}  Find", .{ first, last, count }) catch "Find objects";
+        self.drawPanelSearchField(
+            layout.page_status,
+            self.objects_search,
+            self.active_search == .objects,
+            "Find objects…",
+            page_text,
+            count,
+            compact_font,
+        );
     }
 
     fn drawToolbar(self: Studio, viewport: Viewport) void {
@@ -9888,6 +10557,141 @@ fn pointInRectangle(point: rl.Vector2, rect: rl.Rectangle) bool {
 fn summaryOffsetForSlide(summaries: []const SlideSummary, slide_index: usize) ?usize {
     for (summaries, 0..) |summary, offset| {
         if (summary.index == slide_index) return offset;
+    }
+    return null;
+}
+
+fn slideMatchesSearch(summary: SlideSummary, query: []const u8) bool {
+    if (query.len == 0 or containsAsciiInsensitive(summary.title, query)) return true;
+    var metadata_buffer: [96]u8 = undefined;
+    const metadata = std.fmt.bufPrint(
+        &metadata_buffer,
+        "slide {d} {d} items {d} states",
+        .{ summary.index + 1, summary.item_count, summary.morph_count },
+    ) catch return false;
+    return containsAsciiInsensitive(metadata, query);
+}
+
+fn slideSearchResultCount(summaries: []const SlideSummary, query: []const u8) usize {
+    if (query.len == 0) return summaries.len;
+    var count: usize = 0;
+    for (summaries) |summary| if (slideMatchesSearch(summary, query)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn slideSummaryIndexAtSearchResult(
+    summaries: []const SlideSummary,
+    query: []const u8,
+    result_index: usize,
+) ?usize {
+    if (query.len == 0) return if (result_index < summaries.len) result_index else null;
+    var found: usize = 0;
+    for (summaries, 0..) |summary, summary_index| {
+        if (!slideMatchesSearch(summary, query)) continue;
+        if (found == result_index) return summary_index;
+        found += 1;
+    }
+    return null;
+}
+
+fn libraryEntryMatchesSearch(entry: LibraryEntry, query: []const u8) bool {
+    if (query.len == 0 or containsAsciiInsensitive(entry.name, query)) return true;
+    var metadata_buffer: [96]u8 = undefined;
+    const metadata = std.fmt.bufPrint(
+        &metadata_buffer,
+        "{s} {d} uses {s}",
+        .{ @tagName(entry.kind), entry.use_count, if (entry.available) "available" else "unavailable" },
+    ) catch return false;
+    return containsAsciiInsensitive(metadata, query);
+}
+
+fn librarySearchResultCount(entries: []const LibraryEntry, query: []const u8) usize {
+    if (query.len == 0) return entries.len;
+    var count: usize = 0;
+    for (entries) |entry| if (libraryEntryMatchesSearch(entry, query)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn libraryIndexAtSearchResult(
+    entries: []const LibraryEntry,
+    query: []const u8,
+    result_index: usize,
+) ?usize {
+    if (query.len == 0) return if (result_index < entries.len) result_index else null;
+    var found: usize = 0;
+    for (entries, 0..) |entry, entry_index| {
+        if (!libraryEntryMatchesSearch(entry, query)) continue;
+        if (found == result_index) return entry_index;
+        found += 1;
+    }
+    return null;
+}
+
+fn objectMatchesSearch(item: slides.SlideItem, query: []const u8) bool {
+    if (query.len == 0) return true;
+    // Backgrounds are structural paint barriers. Keeping them in every
+    // filtered result prevents search from implying that objects on opposite
+    // sides are adjacent or safely reorderable.
+    if (item.kind == .background) return true;
+    var name_buffer: [192]u8 = undefined;
+    if (containsAsciiInsensitive(objectDisplayName(item, &name_buffer), query)) return true;
+    if (item.text) |value| if (containsAsciiInsensitive(value, query)) return true;
+    if (item.img_path) |value| if (containsAsciiInsensitive(value, query)) return true;
+    if (containsAsciiInsensitive(sourceScopeLabel(item.source.scope), query)) return true;
+    const type_name: []const u8 = switch (item.kind) {
+        .textbox => "text textbox",
+        .img => "image picture",
+        .crowd => "crowd crowdplay",
+        .background => "background barrier",
+    };
+    if (containsAsciiInsensitive(type_name, query)) return true;
+    if (!item.visible and containsAsciiInsensitive("hidden", query)) return true;
+    if (item.opacity <= 0 and containsAsciiInsensitive("transparent 0%", query)) return true;
+    if (item.locked and containsAsciiInsensitive("locked", query)) return true;
+    return false;
+}
+
+fn objectSearchResultCount(items: []const slides.SlideItem, query: []const u8) usize {
+    if (query.len == 0) return items.len;
+    var count: usize = 0;
+    for (items) |item| if (objectMatchesSearch(item, query)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn objectIndexAtSearchResult(
+    items: []const slides.SlideItem,
+    query: []const u8,
+    result_index: usize,
+) ?usize {
+    if (query.len == 0) return objectIndexAtPaintOffset(items, result_index);
+    var found: usize = 0;
+    var paint_offset: usize = 0;
+    while (objectIndexAtPaintOffset(items, paint_offset)) |item_index| : (paint_offset += 1) {
+        if (!objectMatchesSearch(items[item_index], query)) continue;
+        if (found == result_index) return item_index;
+        found += 1;
+    }
+    return null;
+}
+
+fn objectSearchResultByIdentity(
+    items: []const slides.SlideItem,
+    query: []const u8,
+    identity: usize,
+) ?usize {
+    var result_index: usize = 0;
+    var paint_offset: usize = 0;
+    while (objectIndexAtPaintOffset(items, paint_offset)) |item_index| : (paint_offset += 1) {
+        const item = items[item_index];
+        if (!objectMatchesSearch(item, query)) continue;
+        if (item.identity == identity) return result_index;
+        result_index += 1;
     }
     return null;
 }
@@ -12375,6 +13179,16 @@ test "workspace layout exposes bounded slide thumbnail slots" {
     try std.testing.expect(!pointInRectangle(rectangleCenter(layout.library), layout.organizer));
     try std.testing.expect(layout.slide_page_status.x + layout.slide_page_status.width < layout.slide_page_previous.x);
     try std.testing.expect(layout.slide_page_status.width >= 72 * layout.scale);
+    try std.testing.expect(layout.library_page_status.x + layout.library_page_status.width < layout.library_page_previous.x);
+    try std.testing.expect(layout.library_page_status.width >= 72 * layout.scale);
+    const inspector = objectsLayout(frameLayout(
+        .{ .x = 0, .y = 0, .width = 1600, .height = 900 },
+        true,
+        false,
+        .objects,
+    ).viewport);
+    try std.testing.expect(inspector.page_status.x + inspector.page_status.width <= inspector.page_previous.x);
+    try std.testing.expect(inspector.page_status.width >= 40 * inspector.scale);
 
     const progress_summaries = [_]SlideSummary{
         .{ .index = 4 },
@@ -12500,6 +13314,128 @@ test "organizer paging and wheel scrolling expose later summaries" {
         .workspace_scroll = 1,
     });
     try std.testing.expectEqual(page_start - 1, studio.organizer_first_visible);
+}
+
+test "panel search maps slide library and object results without hiding paint barriers" {
+    const summaries = [_]SlideSummary{
+        .{ .index = 0, .title = "Opening", .item_count = 2 },
+        .{ .index = 119, .title = "Architecture", .item_count = 12, .morph_count = 3 },
+        .{ .index = 2, .title = "Closing" },
+    };
+    try std.testing.expectEqual(@as(usize, 1), slideSearchResultCount(&summaries, "120"));
+    try std.testing.expectEqual(@as(?usize, 1), slideSummaryIndexAtSearchResult(&summaries, "120", 0));
+    try std.testing.expectEqual(@as(usize, 1), slideSearchResultCount(&summaries, "ARCH"));
+
+    const entries = [_]LibraryEntry{
+        .{ .kind = .element, .name = "caption" },
+        .{ .kind = .group, .name = "hero_pair", .use_count = 2 },
+        .{ .kind = .slide_template, .name = "chapter" },
+    };
+    try std.testing.expectEqual(@as(usize, 1), librarySearchResultCount(&entries, "group"));
+    try std.testing.expectEqual(@as(?usize, 1), libraryIndexAtSearchResult(&entries, "2 USES", 0));
+
+    var items = [_]slides.SlideItem{
+        testItem(1, .background, 0, 0, 1920, 1080),
+        testItem(2, .textbox, 100, 100, 400, 100),
+        testItem(3, .textbox, 100, 260, 400, 100),
+    };
+    items[1].text = "ordinary caption";
+    items[2].id = "secret_note";
+    items[2].visible = false;
+    items[2].locked = true;
+    try std.testing.expectEqual(@as(usize, 2), objectSearchResultCount(&items, "locked"));
+    try std.testing.expectEqual(@as(?usize, 2), objectIndexAtSearchResult(&items, "locked", 0));
+    try std.testing.expectEqual(@as(?usize, 0), objectIndexAtSearchResult(&items, "locked", 1));
+    try std.testing.expectEqual(@as(usize, 2), objectSearchResultCount(&items, "caption"));
+}
+
+test "find shortcut filters slide thumbnails and Enter jumps to the raw slide" {
+    var items: [0]slides.SlideItem = .{};
+    const summaries = [_]SlideSummary{
+        .{ .index = 4, .title = "Opening" },
+        .{ .index = 11, .title = "Architecture" },
+        .{ .index = 23, .title = "Closing notes" },
+    };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 4 };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .find_pressed = true });
+    try std.testing.expectEqual(SearchPanel.slides, studio.active_search.?);
+    var typed: FrameInput = .{};
+    const query = "closing";
+    @memcpy(typed.inline_chars[0..query.len], query);
+    typed.inline_chars_len = query.len;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    try std.testing.expectEqual(@as(usize, 1), slideSearchResultCount(&summaries, studio.slide_search.text()));
+    const preview = studio.visibleSlidePreview(viewport, workspace, 0).?;
+    try std.testing.expectEqual(@as(usize, 2), preview.summary_index);
+    try std.testing.expectEqual(@as(usize, 23), preview.slide_index);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    try std.testing.expect(studio.active_search == null);
+    switch (studio.takeSemanticCommand().?) {
+        .select_slide => |index| try std.testing.expectEqual(@as(usize, 23), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "Tab cycles independent panel searches and object search recovers hidden rows" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .background, 0, 0, 1920, 1080),
+        testItem(2, .textbox, 100, 100, 400, 100),
+    };
+    items[1].id = "hidden_agenda";
+    items[1].visible = false;
+    const summaries = [_]SlideSummary{.{ .index = 0, .title = "Opening" }};
+    const entries = [_]LibraryEntry{
+        .{ .kind = .element, .name = "caption" },
+        .{ .kind = .slide_template, .name = "chapter" },
+    };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .library = &entries };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .find_pressed = true });
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .toggle_focus_canvas_pressed = true });
+    try std.testing.expectEqual(SearchPanel.library, studio.active_search.?);
+    var typed: FrameInput = .{};
+    @memcpy(typed.inline_chars[0..7], "chapter");
+    typed.inline_chars_len = 7;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    try std.testing.expectEqual(@as(?usize, 1), studio.visibleLibraryIndex(viewport, workspace, 0));
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .toggle_focus_canvas_pressed = true });
+    try std.testing.expectEqual(SearchPanel.objects, studio.active_search.?);
+    typed = .{};
+    const object_query = "hidden_agenda";
+    @memcpy(typed.inline_chars[0..object_query.len], object_query);
+    typed.inline_chars_len = object_query.len;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    // The hidden object is first in reverse paint order; the Background row
+    // remains as the second structural result.
+    try std.testing.expectEqual(@as(usize, 2), objectSearchResultCount(&items, studio.objects_search.text()));
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    try std.testing.expectEqual(@as(?usize, 2), studio.selected_identity);
+    try std.testing.expect(studio.active_search == null);
+    try std.testing.expectEqualStrings("chapter", studio.library_search.text());
+    try std.testing.expect(!studio.dirty);
+}
+
+test "panel search rejects oversized replacement without losing the visible query" {
+    var studio: Studio = .{ .enabled = true };
+    studio.activatePanelSearch(.slides);
+    studio.appendPanelSearchQuery(.slides, "architecture");
+    studio.slide_search.select_all = true;
+    const oversized = [_]u8{'x'} ** (max_panel_search_bytes + 1);
+    studio.appendPanelSearchQuery(.slides, &oversized);
+    try std.testing.expectEqualStrings("architecture", studio.slide_search.text());
+    try std.testing.expect(studio.slide_search.select_all);
+
+    const invalid_utf8 = [_]u8{ 0xf0, 0x28, 0x8c, 0x28 };
+    studio.appendPanelSearchQuery(.slides, &invalid_utf8);
+    try std.testing.expectEqualStrings("architecture", studio.slide_search.text());
+    try std.testing.expect(!studio.dirty);
 }
 
 test "library selection persists while Use places elements or creates template slides" {
@@ -14677,6 +15613,27 @@ test "disabled command palette actions explain context and stay open" {
     _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
     try std.testing.expect(studio.commandPaletteActive());
     try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "command palette discovers and opens panel searches" {
+    var studio: Studio = .{ .enabled = true };
+    var items = [_]slides.SlideItem{};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const entries = [_]LibraryEntry{.{ .kind = .group, .name = "hero" }};
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .library = &entries };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, true, false, .slides).viewport;
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .command_palette_pressed = true });
+    var typed: FrameInput = .{};
+    const query = "library entry";
+    @memcpy(typed.inline_chars[0..query.len], query);
+    typed.inline_chars_len = query.len;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    try std.testing.expectEqual(@as(usize, 1), studio.commandResultCount());
+    try std.testing.expectEqual(CommandId.find_library, studio.commandSpecAtResult(0).?.id);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    try std.testing.expect(!studio.commandPaletteActive());
+    try std.testing.expectEqual(SearchPanel.library, studio.active_search.?);
 }
 
 test "command palette emits application save and history intentions" {

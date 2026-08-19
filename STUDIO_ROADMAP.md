@@ -182,12 +182,33 @@ ReleaseSafe live QA on the 160-slide stress deck holds Studio preparation at
 effectively 0.00 ms per steady frame, builds the complete render graph in
 about 6.7 ms on the test Mac, and remains synchronized to the 60 Hz display.
 
+## Completed tranche: Large-project navigation
+
+- [x] Add source-neutral Find fields to Slides, Library, and Objects with
+  case-insensitive title/name/type/source/status matching.
+- [x] Make <kbd>Cmd/Ctrl-F</kbd> context-aware, keep independent per-panel
+  queries, and use <kbd>Tab</kbd>/<kbd>Shift-Tab</kbd> to cycle Find surfaces.
+- [x] Support keyboard, wheel, paging, and pointer result navigation, with
+  Enter jumping to the original slide/library/object index.
+- [x] Keep Background paint barriers in filtered Objects results so search
+  never implies unsafe layer adjacency.
+- [x] Route live slide thumbnails and all click/draw/page mappings through the
+  same filtered result set; preserve the current `slide / total` footer when
+  Find is inactive.
+- [x] Surface all three Find commands in the contextual command palette and
+  delayed hover help without adding source, dirty, or history state.
+- [x] Add deterministic `--diagnostics-find-slide=QUERY` and
+  `--diagnostics-window=WIDTHxHEIGHT` launch hooks for visual regression QA.
+
+ReleaseSafe visual QA covers the live 160-slide parser-backed deck at the
+monitor-aware default size and an exact 900×600 client area on macOS workspace
+12. The active query, result focus, thumbnail, pager, Library, toolbar, and
+morph strip remain legible and non-overlapping in both configurations.
+
 ## Planned tranches
 
-### Large-project navigation and edit-time scaling
+### Edit-time scaling
 
-- Add search/filter/jump surfaces for Slides, Objects, and Library without
-  hiding source-ownership barriers or changing document state.
 - Rebuild only provably affected render-graph regions after edits; retain the
   current atomic full-deck fallback whenever dependencies are ambiguous.
 - Add automated performance and screenshot baselines for compact, default,

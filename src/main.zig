@@ -71,11 +71,27 @@ fn studioStartupWindowSize(monitor_width: i32, monitor_height: i32) WindowDimens
     return .{ .width = width, .height = height };
 }
 
+fn parseDiagnosticWindowSize(value: []const u8) ?WindowDimensions {
+    const separator = std.mem.indexOfScalar(u8, value, 'x') orelse return null;
+    const width = std.fmt.parseInt(i32, value[0..separator], 10) catch return null;
+    const height = std.fmt.parseInt(i32, value[separator + 1 ..], 10) catch return null;
+    if (width < 900 or height < 506 or width > 7680 or height > 4320) return null;
+    return .{ .width = width, .height = height };
+}
+
 test "Studio startup window fits common monitor sizes" {
     try std.testing.expectEqual(WindowDimensions{ .width = 1600, .height = 900 }, studioStartupWindowSize(1920, 1080));
     try std.testing.expectEqual(WindowDimensions{ .width = 1296, .height = 729 }, studioStartupWindowSize(1440, 900));
     try std.testing.expectEqual(WindowDimensions{ .width = 1137, .height = 640 }, studioStartupWindowSize(1366, 768));
     try std.testing.expectEqual(WindowDimensions{ .width = 1280, .height = 720 }, studioStartupWindowSize(0, 0));
+}
+
+test "diagnostic window size is explicit and safely bounded" {
+    try std.testing.expectEqual(WindowDimensions{ .width = 900, .height = 600 }, parseDiagnosticWindowSize("900x600").?);
+    try std.testing.expectEqual(WindowDimensions{ .width = 1920, .height = 1080 }, parseDiagnosticWindowSize("1920x1080").?);
+    try std.testing.expect(parseDiagnosticWindowSize("899x600") == null);
+    try std.testing.expect(parseDiagnosticWindowSize("900x500") == null);
+    try std.testing.expect(parseDiagnosticWindowSize("wide") == null);
 }
 
 const SourceChange = struct {
@@ -967,8 +983,11 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_command_tooltip = false;
     var diagnostics_precision_view = false;
     var diagnostics_large_deck_count: ?usize = null;
+    var diagnostics_window_size: ?WindowDimensions = null;
     var diagnostics_select_buffer: [128]u8 = undefined;
     var diagnostics_select_id: ?[]const u8 = null;
+    var diagnostics_find_slide_buffer: [studio.max_panel_search_bytes]u8 = undefined;
+    var diagnostics_find_slide_query: ?[]const u8 = null;
 
     // get args
     const slideshow_to_load: ?[]const u8 = blk: {
@@ -1007,6 +1026,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                 diagnostics_enabled = true;
                 diagnostics_large_deck_count = count;
                 launch_studio = true;
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-window=")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_window_size = parseDiagnosticWindowSize(arg["--diagnostics-window=".len..]) orelse
+                    std.process.fatal("Invalid diagnostics window size; use WIDTHxHEIGHT (minimum 900x506)", .{});
             } else if (std.mem.startsWith(u8, arg, "--diagnostics-select=")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
@@ -1015,6 +1039,14 @@ pub fn main(init: std.process.Init) anyerror!void {
                     "{s}",
                     .{arg["--diagnostics-select=".len..]},
                 ) catch std.process.fatal("Diagnostics selection ID is too long", .{});
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-find-slide=")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_find_slide_query = std.fmt.bufPrint(
+                    &diagnostics_find_slide_buffer,
+                    "{s}",
+                    .{arg["--diagnostics-find-slide=".len..]},
+                ) catch std.process.fatal("Diagnostics slide query is too long", .{});
             } else if (slideshow_arg == null) {
                 slideshow_arg = arg;
             } else {
@@ -1040,7 +1072,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     rl.setWindowMinSize(900, 506);
     if (starts_in_studio) {
         const monitor = rl.getCurrentMonitor();
-        const dimensions = studioStartupWindowSize(
+        const dimensions = diagnostics_window_size orelse studioStartupWindowSize(
             rl.getMonitorWidth(monitor),
             rl.getMonitorHeight(monitor),
         );
@@ -1077,6 +1109,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_selection_pending = diagnostics_select_id;
     var diagnostics_command_palette_pending = diagnostics_command_palette;
     var diagnostics_precision_view_pending = diagnostics_precision_view;
+    var diagnostics_find_slide_pending = diagnostics_find_slide_query;
 
     // Main game loop
     var is_pre_rendered: bool = false;
@@ -1349,6 +1382,11 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (diagnostics_precision_view_pending) {
             studio_mode.showPrecisionViewForDiagnostics();
             diagnostics_precision_view_pending = false;
+        }
+        if (diagnostics_find_slide_pending) |query| {
+            if (!studio_mode.openSlideSearchForDiagnostics(query))
+                log.warn("diagnostics could not open slide search for invalid query", .{});
+            diagnostics_find_slide_pending = null;
         }
         if (rl.isWindowResized()) studio_mode.cancelActiveInteraction(studio_items);
 
