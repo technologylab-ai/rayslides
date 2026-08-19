@@ -19,6 +19,7 @@ const studio_catalog = @import("studio_catalog.zig");
 const studio_prompt = @import("studio_prompt.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const SlideShow = slides.SlideShow;
+const studio_ui_font_data = @embedFile("assets/Calibri Regular.ttf");
 
 comptime {
     if (studio.max_selection_items > renderer.max_item_geometry_previews)
@@ -44,6 +45,35 @@ const CrowdOptions = struct {
     host_explicit: bool = false,
     port: u16 = 7331,
 };
+
+const WindowDimensions = struct {
+    width: i32,
+    height: i32,
+};
+
+/// Studio benefits from more room than the presentation-only window, but a
+/// literal 1920x1080 client area does not fit on a 1080p desktop once window
+/// chrome and the OS shelf are considered. Start from 1600x900 and preserve
+/// 16:9 while clamping to a conservative fraction of the active monitor.
+fn studioStartupWindowSize(monitor_width: i32, monitor_height: i32) WindowDimensions {
+    if (monitor_width <= 0 or monitor_height <= 0) return .{ .width = 1280, .height = 720 };
+    const max_width = @max(@as(i32, 1), @divFloor(monitor_width * 9, 10));
+    const max_height = @max(@as(i32, 1), @divFloor(monitor_height * 5, 6));
+    var width: i32 = @min(1600, max_width);
+    var height: i32 = @divFloor(width * 9, 16);
+    if (height > @min(@as(i32, 900), max_height)) {
+        height = @min(@as(i32, 900), max_height);
+        width = @divFloor(height * 16, 9);
+    }
+    return .{ .width = width, .height = height };
+}
+
+test "Studio startup window fits common monitor sizes" {
+    try std.testing.expectEqual(WindowDimensions{ .width = 1600, .height = 900 }, studioStartupWindowSize(1920, 1080));
+    try std.testing.expectEqual(WindowDimensions{ .width = 1296, .height = 729 }, studioStartupWindowSize(1440, 900));
+    try std.testing.expectEqual(WindowDimensions{ .width = 1137, .height = 640 }, studioStartupWindowSize(1366, 768));
+    try std.testing.expectEqual(WindowDimensions{ .width = 1280, .height = 720 }, studioStartupWindowSize(0, 0));
+}
 
 const SourceChange = struct {
     before: []u8,
@@ -591,13 +621,30 @@ pub fn main(init: std.process.Init) anyerror!void {
         break :blk try std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{selected});
     };
 
-    const windowWidth: i32 = if (rl.getScreenWidth() >= 1920) 1920 else 1280;
-    const windowHeight: i32 = if (rl.getScreenHeight() >= 1080) 1080 else 720;
+    const starts_in_studio = launch_studio or slideshow_to_load == null;
+    const windowWidth: i32 = 1280;
+    const windowHeight: i32 = 720;
     var screenWidth: i32 = windowWidth;
     var screenHeight: i32 = windowHeight;
 
     rl.setConfigFlags(.{ .window_resizable = true });
     rl.initWindow(screenWidth, screenHeight, "rayslides");
+    rl.setWindowMinSize(900, 506);
+    if (starts_in_studio) {
+        const monitor = rl.getCurrentMonitor();
+        const dimensions = studioStartupWindowSize(
+            rl.getMonitorWidth(monitor),
+            rl.getMonitorHeight(monitor),
+        );
+        rl.setWindowSize(dimensions.width, dimensions.height);
+        const monitor_position = rl.getMonitorPosition(monitor);
+        rl.setWindowPosition(
+            @intFromFloat(monitor_position.x + @as(f32, @floatFromInt(rl.getMonitorWidth(monitor) - dimensions.width)) / 2),
+            @intFromFloat(monitor_position.y + @as(f32, @floatFromInt(rl.getMonitorHeight(monitor) - dimensions.height)) / 2),
+        );
+        screenWidth = dimensions.width;
+        screenHeight = dimensions.height;
+    }
     // Studio owns Escape while editing (cancel drag, then leave Studio). Keep
     // Raylib from closing the process before the frame can consume the key.
     rl.setExitKey(.null);
@@ -627,8 +674,9 @@ pub fn main(init: std.process.Init) anyerror!void {
     var banner: Banner = try .init(screenWidth, screenHeight);
     defer banner.deinit();
     var studio_mode: studio.Studio = .{
-        .enabled = launch_studio or slideshow_to_load == null,
+        .enabled = starts_in_studio,
         .dirty = slideshow_to_load == null,
+        .ui_font = G.studio_ui_font,
     };
     var property_prompt: studio_prompt.Prompt = .{};
     var pending_semantic_command: ?studio.SemanticCommand = null;
@@ -646,6 +694,8 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer studio_library_catalog_indices.deinit(gpa);
 
     var manual_fullscreen: bool = false;
+    var windowed_width = screenWidth;
+    var windowed_height = screenHeight;
     var window_close_seen = false;
 
     while (true) {
@@ -750,7 +800,10 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         // (re-) load slideshow
         if (G.slideshow_filp_to_load) |filp| {
-            studio_mode = .{ .enabled = launch_studio };
+            studio_mode = .{
+                .enabled = launch_studio,
+                .ui_font = G.studio_ui_font,
+            };
             studio_history.clear();
             // Component clipboard entries carry source-order definition
             // provenance. Never let them cross a document reload where the
@@ -818,8 +871,26 @@ pub fn main(init: std.process.Init) anyerror!void {
             screenHeight = rl.getScreenHeight();
         }
         const window_size: rl.Vector2 = .{ .x = @floatFromInt(screenWidth), .y = @floatFromInt(screenHeight) };
-        const slide_size_in_window = slideSizeInWindow(internal_render_size, window_size);
-        const slide_tl = slideAreaTL(internal_render_size, window_size);
+        const presentation_viewport: studio.Viewport = .{
+            .slide_top_left = slideAreaTL(internal_render_size, window_size),
+            .slide_size = slideSizeInWindow(internal_render_size, window_size),
+            .logical_size = internal_render_size,
+        };
+        // Export and presentation retain the original edge-to-edge viewport.
+        // Studio alone receives a docked frame whose permanent chrome is
+        // outside the fitted 16:9 slide canvas.
+        const studio_frame = studio_mode.layoutFrame(.{
+            .x = 0,
+            .y = 0,
+            .width = window_size.x,
+            .height = window_size.y,
+        });
+        const studio_viewport = if (studio_mode.capturesInput() and !export_controller.running)
+            studio_frame.viewport
+        else
+            presentation_viewport;
+        const slide_tl = studio_viewport.slide_top_left;
+        const slide_size_in_window = studio_viewport.slide_size;
 
         var empty_studio_items: [0]slides.SlideItem = .{};
         var studio_items: []slides.SlideItem = empty_studio_items[0..];
@@ -841,11 +912,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
         try collectStudioBounds(&studio_bounds, gpa, G.current_slide, studio_mode.active_morph_state, studio_items);
-        const studio_viewport: studio.Viewport = .{
-            .slide_top_left = slide_tl,
-            .slide_size = slide_size_in_window,
-            .logical_size = internal_render_size,
-        };
+        if (rl.isWindowResized()) studio_mode.cancelActiveInteraction(studio_items);
 
         studio_slide_summaries.clearRetainingCapacity();
         studio_library_entries.clearRetainingCapacity();
@@ -1399,6 +1466,8 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         if (!property_prompt.active and rl.isKeyPressed(.f)) {
             if (!manual_fullscreen) {
+                windowed_width = screenWidth;
+                windowed_height = screenHeight;
                 const monitor = rl.getCurrentMonitor();
                 rl.setWindowSize(rl.getMonitorWidth(monitor), rl.getMonitorHeight(monitor));
                 if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
@@ -1413,15 +1482,15 @@ pub fn main(init: std.process.Init) anyerror!void {
                 manual_fullscreen = true;
             } else {
                 // rl.toggleFullscreen();
-                screenWidth = windowWidth;
-                screenHeight = windowHeight;
+                screenWidth = windowed_width;
+                screenHeight = windowed_height;
                 if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                     rl.toggleFullscreen();
                 } else {
                     rl.toggleBorderlessWindowed();
                 }
                 // rl.toggleFullscreen();
-                rl.setWindowSize(windowWidth, windowHeight);
+                rl.setWindowSize(windowed_width, windowed_height);
                 manual_fullscreen = false;
             }
         }
@@ -1586,6 +1655,9 @@ const AppData = struct {
     slideshow_arena: std.heap.ArenaAllocator = undefined,
     slideshow_allocator: std.mem.Allocator = undefined,
     fonts: fonts.AvailableFonts = .{},
+    /// Dedicated embedded UI face. Presentation font directives never replace
+    /// this atlas, keeping Studio controls stable across decks.
+    studio_ui_font: rl.Font = undefined,
     editor_memory: []u8 = undefined,
     loaded_content: []u8 = undefined, // we will check for dirty editor against this
     source_len: usize = 0,
@@ -1612,6 +1684,15 @@ const AppData = struct {
         self.slideshow_allocator = self.slideshow_arena.allocator();
 
         self.fonts = try fonts.AvailableFonts.init(.{});
+        errdefer self.fonts.deinit();
+        self.studio_ui_font = try rl.loadFontFromMemory(
+            ".ttf",
+            studio_ui_font_data,
+            32,
+            fonts.default_fontchars[0..],
+        );
+        errdefer rl.unloadFont(self.studio_ui_font);
+        rl.setTextureFilter(self.studio_ui_font.texture, .bilinear);
         self.slideshow = try SlideShow.new(self.slideshow_allocator);
         self.slide_renderer = try renderer.SlideshowRenderer.new(self.slideshow_allocator, &self.fonts);
         self.playback.reset(rl.getTime());
@@ -1624,6 +1705,7 @@ const AppData = struct {
 
     fn deinit(self: *AppData) void {
         self.slide_renderer.deinit();
+        rl.unloadFont(self.studio_ui_font);
         self.fonts.deinit();
         self.allocator.free(self.editor_memory);
         self.allocator.free(self.loaded_content);

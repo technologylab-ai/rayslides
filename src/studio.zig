@@ -36,6 +36,10 @@ pub const UiTypography = struct {
 
 pub fn uiScale(viewport: Viewport) f32 {
     if (!viewport.valid()) return 1;
+    // Dock metrics are expressed in screen pixels by frameLayout. Scaling
+    // their children again from the fitted canvas would overflow the chrome
+    // on large displays.
+    if (viewport.chrome != null) return 1;
     const reference_width: f32 = 1280;
     const reference_height: f32 = 720;
     return std.math.clamp(
@@ -154,11 +158,54 @@ pub const LivePreview = struct {
     resized: bool,
 };
 
+pub const FrameMode = enum {
+    wide,
+    medium,
+    compact,
+    focus,
+};
+
+/// At widths where both docks would leave too little room for the slide, one
+/// dock at a time is reserved beside the canvas. `none` is useful on compact
+/// windows where the author wants the largest possible working surface.
+pub const DockPanel = enum {
+    none,
+    slides,
+    properties,
+};
+
+const empty_frame_rectangle: rl.Rectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+
+/// Screen-space Studio chrome. Unlike the first Studio prototype, every
+/// permanent control surface is outside the slide viewport.
+pub const ChromeLayout = struct {
+    content: rl.Rectangle,
+    toolbar: rl.Rectangle = empty_frame_rectangle,
+    left_dock: rl.Rectangle = empty_frame_rectangle,
+    right_dock: rl.Rectangle = empty_frame_rectangle,
+    status: rl.Rectangle = empty_frame_rectangle,
+    left_visible: bool = false,
+    right_visible: bool = false,
+    visible: bool = false,
+};
+
+/// The complete editor frame for one window size. Callers render the slide at
+/// `viewport`, then draw Studio overlays with that same viewport.
+pub const FrameLayout = struct {
+    mode: FrameMode,
+    chrome: ChromeLayout,
+    canvas_area: rl.Rectangle,
+    viewport: Viewport,
+};
+
 /// The already letterboxed region in which the slide is rendered.
 pub const Viewport = struct {
     slide_top_left: rl.Vector2,
     slide_size: rl.Vector2,
     logical_size: rl.Vector2 = default_logical_size,
+    /// Null preserves the legacy overlay layout for embedders that have not
+    /// adopted the docked frame API yet.
+    chrome: ?ChromeLayout = null,
 
     pub fn valid(self: Viewport) bool {
         return self.slide_size.x > 0 and self.slide_size.y > 0 and
@@ -173,6 +220,147 @@ pub const Viewport = struct {
             point.y <= self.slide_top_left.y + self.slide_size.y;
     }
 };
+
+fn insetRectangle(rect: rl.Rectangle, amount: f32) rl.Rectangle {
+    return .{
+        .x = rect.x + amount,
+        .y = rect.y + amount,
+        .width = @max(0, rect.width - amount * 2),
+        .height = @max(0, rect.height - amount * 2),
+    };
+}
+
+fn fitSlideViewport(rect: rl.Rectangle) Viewport {
+    if (rect.width <= 0 or rect.height <= 0) return .{
+        .slide_top_left = .{ .x = rect.x, .y = rect.y },
+        .slide_size = .zero(),
+    };
+    const aspect = default_logical_size.x / default_logical_size.y;
+    const width_from_height = rect.height * aspect;
+    const size: rl.Vector2 = if (width_from_height <= rect.width)
+        .{ .x = width_from_height, .y = rect.height }
+    else
+        .{ .x = rect.width, .y = rect.width / aspect };
+    return .{
+        .slide_top_left = .{
+            .x = rect.x + (rect.width - size.x) / 2,
+            .y = rect.y + (rect.height - size.y) / 2,
+        },
+        .slide_size = size,
+    };
+}
+
+/// Builds a responsive docked editor surface. Wide windows reserve both
+/// docks. Medium and compact windows reserve the requested dock only, so a
+/// dock never becomes a canvas-covering drawer. Focus Canvas uses the complete
+/// content rectangle and hides all permanent chrome.
+pub fn frameLayout(
+    content: rl.Rectangle,
+    studio_visible: bool,
+    focus_canvas: bool,
+    active_dock: DockPanel,
+) FrameLayout {
+    const safe_content: rl.Rectangle = .{
+        .x = content.x,
+        .y = content.y,
+        .width = @max(0, content.width),
+        .height = @max(0, content.height),
+    };
+    if (!studio_visible or focus_canvas) {
+        const canvas_area = insetRectangle(safe_content, if (studio_visible) 12 else 0);
+        var viewport = fitSlideViewport(canvas_area);
+        const chrome: ChromeLayout = .{ .content = safe_content };
+        viewport.chrome = chrome;
+        return .{
+            .mode = .focus,
+            .chrome = chrome,
+            .canvas_area = canvas_area,
+            .viewport = viewport,
+        };
+    }
+
+    const mode: FrameMode = if (safe_content.width >= 1480 and safe_content.height >= 700)
+        .wide
+    else if (safe_content.width >= 1100 and safe_content.height >= 620)
+        .medium
+    else
+        .compact;
+    const compact_shell = mode == .compact;
+    const gap: f32 = if (compact_shell) 8 else 10;
+    const edge: f32 = 12;
+    const toolbar_height: f32 = if (compact_shell) 64 else 70;
+    const status_height: f32 = if (compact_shell) 76 else 116;
+    const toolbar: rl.Rectangle = .{
+        .x = safe_content.x,
+        .y = safe_content.y,
+        .width = safe_content.width,
+        .height = @min(toolbar_height, safe_content.height),
+    };
+    const status_y = @max(toolbar.y + toolbar.height, safe_content.y + safe_content.height - status_height);
+    const status: rl.Rectangle = .{
+        .x = safe_content.x,
+        .y = status_y,
+        .width = safe_content.width,
+        .height = @max(0, safe_content.y + safe_content.height - status_y),
+    };
+    const body_y = toolbar.y + toolbar.height + gap;
+    const body_bottom = status.y - gap;
+    const body: rl.Rectangle = .{
+        .x = safe_content.x + edge,
+        .y = body_y,
+        .width = @max(0, safe_content.width - edge * 2),
+        .height = @max(0, body_bottom - body_y),
+    };
+
+    const left_visible = mode == .wide or (mode != .wide and active_dock == .slides);
+    const right_visible = mode == .wide or (mode != .wide and active_dock == .properties);
+    const left_width: f32 = if (mode == .wide)
+        std.math.clamp(safe_content.width * 0.16, 248, 304)
+    else
+        @min(@as(f32, 264), @max(@as(f32, 220), safe_content.width * 0.29));
+    const right_width: f32 = if (mode == .wide)
+        std.math.clamp(safe_content.width * 0.18, 304, 344)
+    else
+        @min(@as(f32, 304), @max(@as(f32, 272), safe_content.width * 0.32));
+    const left_dock: rl.Rectangle = if (left_visible) .{
+        .x = body.x,
+        .y = body.y,
+        .width = @min(left_width, body.width),
+        .height = body.height,
+    } else empty_frame_rectangle;
+    const right_dock: rl.Rectangle = if (right_visible) .{
+        .x = body.x + body.width - @min(right_width, body.width),
+        .y = body.y,
+        .width = @min(right_width, body.width),
+        .height = body.height,
+    } else empty_frame_rectangle;
+    const canvas_left = body.x + if (left_visible) left_dock.width + gap else 0;
+    const canvas_right = body.x + body.width - if (right_visible) right_dock.width + gap else 0;
+    const canvas_area: rl.Rectangle = .{
+        .x = canvas_left,
+        .y = body.y,
+        .width = @max(0, canvas_right - canvas_left),
+        .height = body.height,
+    };
+    const chrome: ChromeLayout = .{
+        .content = safe_content,
+        .toolbar = toolbar,
+        .left_dock = left_dock,
+        .right_dock = right_dock,
+        .status = status,
+        .left_visible = left_visible,
+        .right_visible = right_visible,
+        .visible = true,
+    };
+    var viewport = fitSlideViewport(canvas_area);
+    viewport.chrome = chrome;
+    return .{
+        .mode = mode,
+        .chrome = chrome,
+        .canvas_area = canvas_area,
+        .viewport = viewport,
+    };
+}
 
 pub fn logicalToScreen(viewport: Viewport, point: rl.Vector2) ?rl.Vector2 {
     if (!viewport.valid()) return null;
@@ -904,6 +1092,9 @@ pub const UiLayout = struct {
     scene_previous: rl.Rectangle,
     scene_label: rl.Rectangle,
     scene_next: rl.Rectangle,
+    slides_dock_toggle: rl.Rectangle = empty_ui_rectangle,
+    properties_dock_toggle: rl.Rectangle = empty_ui_rectangle,
+    focus_canvas: rl.Rectangle = empty_ui_rectangle,
     properties: rl.Rectangle,
     edit_text: rl.Rectangle,
     duplicate_item: rl.Rectangle,
@@ -922,6 +1113,31 @@ pub const UiLayout = struct {
     layer_buttons: [4]rl.Rectangle,
     lock_item: rl.Rectangle,
 };
+
+fn emptyUiLayout(scale: f32) UiLayout {
+    return .{
+        .scale = scale,
+        .toolbar = empty_ui_rectangle,
+        .tool_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 6,
+        .new_slide = empty_ui_rectangle,
+        .grid_toggle = empty_ui_rectangle,
+        .scene_previous = empty_ui_rectangle,
+        .scene_label = empty_ui_rectangle,
+        .scene_next = empty_ui_rectangle,
+        .properties = empty_ui_rectangle,
+        .edit_text = empty_ui_rectangle,
+        .duplicate_item = empty_ui_rectangle,
+        .delete_item = empty_ui_rectangle,
+        .promote = empty_ui_rectangle,
+        .foreground_swatches = [_]rl.Rectangle{empty_ui_rectangle} ** palette.len,
+        .background_swatches = [_]rl.Rectangle{empty_ui_rectangle} ** palette.len,
+        .clear_background = empty_ui_rectangle,
+        .align_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 6,
+        .distribute_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 2,
+        .layer_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 4,
+        .lock_item = empty_ui_rectangle,
+    };
+}
 
 pub const organizer_action_count = 6;
 pub const slide_card_height: f32 = 88;
@@ -960,6 +1176,11 @@ pub const SlidePreviewSlot = struct {
 pub fn workspaceLayout(viewport: Viewport) WorkspaceLayout {
     const margin: f32 = 12;
     const gap: f32 = 8;
+    if (viewport.chrome) |chrome| {
+        if (!chrome.visible or !chrome.left_visible or chrome.left_dock.width <= 0 or chrome.left_dock.height <= 0)
+            return emptyWorkspaceLayout();
+        return workspaceLayoutInSidebar(chrome.left_dock, gap);
+    }
     const toolbar = uiLayout(viewport).toolbar;
     const status = statusPanel(viewport);
     const available_height = @max(0, status.y - gap - (toolbar.y + toolbar.height + gap));
@@ -970,6 +1191,28 @@ pub fn workspaceLayout(viewport: Viewport) WorkspaceLayout {
         .width = @min(sidebar_width, @max(120, viewport.slide_size.x - margin * 2)),
         .height = available_height,
     };
+    return workspaceLayoutInSidebar(sidebar, gap);
+}
+
+fn emptyWorkspaceLayout() WorkspaceLayout {
+    return .{
+        .sidebar = empty_frame_rectangle,
+        .organizer = empty_frame_rectangle,
+        .organizer_actions = [_]rl.Rectangle{empty_frame_rectangle} ** organizer_action_count,
+        .slide_cards_clip = empty_frame_rectangle,
+        .slide_page_previous = empty_frame_rectangle,
+        .slide_page_next = empty_frame_rectangle,
+        .library = empty_frame_rectangle,
+        .library_use = empty_frame_rectangle,
+        .library_rename = empty_frame_rectangle,
+        .library_delete = empty_frame_rectangle,
+        .library_rows_clip = empty_frame_rectangle,
+        .library_page_previous = empty_frame_rectangle,
+        .library_page_next = empty_frame_rectangle,
+    };
+}
+
+fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32) WorkspaceLayout {
     const organizer_height = @min(@max(190, @floor(sidebar.height * 0.61)), @max(130, sidebar.height - 126));
     const organizer: rl.Rectangle = .{ .x = sidebar.x, .y = sidebar.y, .width = sidebar.width, .height = organizer_height };
 
@@ -1109,19 +1352,27 @@ fn rowsThatFit(height: f32, row_height: f32, gap: f32) usize {
 
 pub fn uiLayout(viewport: Viewport) UiLayout {
     const scale = uiScale(viewport);
+    if (viewport.chrome) |chrome| {
+        if (!chrome.visible) return emptyUiLayout(scale);
+    }
     const margin: f32 = 12 * scale;
-    const gap: f32 = 8 * scale;
-    const tool_size: f32 = 46 * scale;
-    const new_slide_width: f32 = 82 * scale;
-    const grid_width: f32 = 66 * scale;
-    const scene_width: f32 = 150 * scale;
+    const docked = if (viewport.chrome) |chrome| chrome.visible else false;
+    const compact_toolbar = if (viewport.chrome) |chrome| chrome.content.width < 1100 else false;
+    const gap: f32 = @as(f32, if (compact_toolbar) 5 else 8) * scale;
+    const tool_size: f32 = @as(f32, if (compact_toolbar) 40 else 46) * scale;
+    const new_slide_width: f32 = @as(f32, if (compact_toolbar) 70 else 82) * scale;
+    const grid_width: f32 = @as(f32, if (compact_toolbar) 58 else 66) * scale;
+    const scene_width: f32 = @as(f32, if (compact_toolbar) 112 else 150) * scale;
     const toolbar_width = margin * 2 + tool_size * 6 + gap * 5 + gap + new_slide_width + gap + grid_width + gap + scene_width;
-    const toolbar: rl.Rectangle = .{
-        .x = viewport.slide_top_left.x + margin,
-        .y = viewport.slide_top_left.y + margin,
-        .width = toolbar_width,
-        .height = tool_size + margin * 2,
-    };
+    const toolbar: rl.Rectangle = if (docked)
+        viewport.chrome.?.toolbar
+    else
+        .{
+            .x = viewport.slide_top_left.x + margin,
+            .y = viewport.slide_top_left.y + margin,
+            .width = toolbar_width,
+            .height = tool_size + margin * 2,
+        };
     var tool_buttons: [6]rl.Rectangle = undefined;
     for (&tool_buttons, 0..) |*button, index| button.* = .{
         .x = toolbar.x + margin + @as(f32, @floatFromInt(index)) * (tool_size + gap),
@@ -1160,16 +1411,55 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .height = tool_size,
     };
 
-    const property_width: f32 = 304 * scale;
-    var properties: rl.Rectangle = .{
+    const dock_button_gap: f32 = gap;
+    const focus_width: f32 = @as(f32, if (compact_toolbar) 64 else 76) * scale;
+    const properties_toggle_width: f32 = @as(f32, if (compact_toolbar) 86 else 104) * scale;
+    const slides_toggle_width: f32 = @as(f32, if (compact_toolbar) 68 else 82) * scale;
+    const focus_canvas: rl.Rectangle = if (docked) .{
+        .x = toolbar.x + toolbar.width - margin - focus_width,
+        .y = toolbar.y + (toolbar.height - tool_size) / 2,
+        .width = focus_width,
+        .height = tool_size,
+    } else empty_ui_rectangle;
+    const show_dock_toggles = docked and !(viewport.chrome.?.left_visible and viewport.chrome.?.right_visible);
+    const properties_dock_toggle: rl.Rectangle = if (show_dock_toggles) .{
+        .x = focus_canvas.x - dock_button_gap - properties_toggle_width,
+        .y = focus_canvas.y,
+        .width = properties_toggle_width,
+        .height = tool_size,
+    } else empty_ui_rectangle;
+    const slides_dock_toggle: rl.Rectangle = if (show_dock_toggles) .{
+        .x = properties_dock_toggle.x - dock_button_gap - slides_toggle_width,
+        .y = focus_canvas.y,
+        .width = slides_toggle_width,
+        .height = tool_size,
+    } else empty_ui_rectangle;
+
+    const property_width: f32 = if (docked and viewport.chrome.?.right_visible)
+        viewport.chrome.?.right_dock.width
+    else
+        304 * scale;
+    var properties: rl.Rectangle = if (docked) blk: {
+        if (viewport.chrome.?.right_visible) break :blk viewport.chrome.?.right_dock;
+        break :blk .{
+            .x = viewport.chrome.?.content.x + viewport.chrome.?.content.width,
+            .y = viewport.chrome.?.toolbar.y + viewport.chrome.?.toolbar.height,
+            .width = property_width,
+            .height = 0,
+        };
+    } else .{
         .x = viewport.slide_top_left.x + viewport.slide_size.x - property_width - margin,
         .y = viewport.slide_top_left.y + margin,
         .width = property_width,
         .height = 558 * scale,
     };
-    properties.height = @min(properties.height, @max(0, statusPanel(viewport).y - gap - properties.y));
+    if (!docked)
+        properties.height = @min(properties.height, @max(0, statusPanel(viewport).y - gap - properties.y));
     const compact_properties = properties.height < 520 * scale;
-    const minimal_properties = properties.height < 400 * scale;
+    // The compact align/distribute/layer stack ends just below 450 px. Below
+    // that height retain the primary geometry/color/type controls and lock,
+    // rather than allowing the last row to leak into the status dock.
+    const minimal_properties = properties.height < 456 * scale;
     const inset = 12 * scale;
     const inner_width = properties.width - inset * 2;
     const action_y = properties.y + @as(f32, if (compact_properties) 36 else 42) * scale;
@@ -1240,9 +1530,9 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         (inner_width - scalar_gap) / 2;
     const font_size: rl.Rectangle = .{
         .x = properties.x + inset,
-        .y = properties.y + @as(f32, if (compact_properties) 270 else 334) * scale,
+        .y = properties.y + @as(f32, if (minimal_properties) 264 else if (compact_properties) 270 else 334) * scale,
         .width = scalar_width,
-        .height = @as(f32, if (compact_properties) 34 else 36) * scale,
+        .height = @as(f32, if (minimal_properties) 32 else if (compact_properties) 34 else 36) * scale,
     };
     const opacity: rl.Rectangle = .{
         .x = font_size.x + scalar_width + scalar_gap,
@@ -1295,6 +1585,9 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .scene_previous = scene_previous,
         .scene_label = scene_label,
         .scene_next = scene_next,
+        .slides_dock_toggle = slides_dock_toggle,
+        .properties_dock_toggle = properties_dock_toggle,
+        .focus_canvas = focus_canvas,
         .properties = properties,
         .edit_text = edit_text,
         .duplicate_item = duplicate_item,
@@ -1316,6 +1609,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
 }
 
 fn statusPanel(viewport: Viewport) rl.Rectangle {
+    if (viewport.chrome) |chrome| return if (chrome.visible) chrome.status else empty_frame_rectangle;
     const scale = uiScale(viewport);
     const margin = 12 * scale;
     const panel_height: f32 = 116 * scale;
@@ -1331,6 +1625,7 @@ fn statusPanel(viewport: Viewport) rl.Rectangle {
 /// adapter; tests and other frontends can call `update` directly.
 pub const FrameInput = struct {
     toggle_pressed: bool = false,
+    toggle_focus_canvas_pressed: bool = false,
     cancel_pressed: bool = false,
     pointer_screen: rl.Vector2 = .{ .x = 0, .y = 0 },
     pointer_pressed: bool = false,
@@ -1402,6 +1697,7 @@ pub const FrameInput = struct {
             null;
         return .{
             .toggle_pressed = rl.isKeyPressed(.e),
+            .toggle_focus_canvas_pressed = rl.isKeyPressed(.tab),
             .cancel_pressed = rl.isKeyPressed(.escape),
             .pointer_screen = rl.getMousePosition(),
             .pointer_pressed = rl.isMouseButtonPressed(.left),
@@ -1522,6 +1818,15 @@ const SelectionGeometry = struct {
 
 pub const Studio = struct {
     enabled: bool = false,
+    /// Focus Canvas keeps editing/selection live while hiding all permanent
+    /// chrome. The next frame should be obtained through layoutFrame().
+    focus_canvas: bool = false,
+    /// Below the wide breakpoint only this dock is reserved beside the slide.
+    active_dock: DockPanel = .slides,
+    /// A dedicated, narrow UI face supplied by the integration layer. A null
+    /// font retains raylib's built-in text path for lightweight embedders and
+    /// unit tests.
+    ui_font: ?rl.Font = null,
     tool: Tool = .select,
     active_morph_state: ?usize = null,
     morph_state_count: usize = 0,
@@ -1561,6 +1866,64 @@ pub const Studio = struct {
 
     pub fn capturesInput(self: Studio) bool {
         return self.enabled;
+    }
+
+    pub fn layoutFrame(self: Studio, content: rl.Rectangle) FrameLayout {
+        return frameLayout(content, self.enabled, self.focus_canvas, self.active_dock);
+    }
+
+    pub fn setUiFont(self: *Studio, font: ?rl.Font) void {
+        self.ui_font = font;
+    }
+
+    fn measureUiText(self: Studio, text: [:0]const u8, font_size: i32) f32 {
+        if (self.ui_font) |font|
+            return rl.measureTextEx(font, text, @floatFromInt(font_size), 0).x;
+        return @floatFromInt(rl.measureText(text, font_size));
+    }
+
+    fn drawUiText(self: Studio, text: [:0]const u8, position: rl.Vector2, font_size: i32, color: rl.Color) void {
+        if (self.ui_font) |font| {
+            rl.drawTextEx(font, text, position, @floatFromInt(font_size), 0, color);
+        } else {
+            rl.drawText(text, @intFromFloat(position.x), @intFromFloat(position.y), font_size, color);
+        }
+    }
+
+    /// Copies a UTF-8 label into `buffer` and shortens it with an ellipsis
+    /// until the rendered text fits the available width. The final scissor in
+    /// callers remains a hard safety net for unusual font metrics.
+    fn fitUiText(self: Studio, buffer: []u8, value: []const u8, font_size: i32, max_width: f32) [:0]const u8 {
+        std.debug.assert(buffer.len >= 5);
+        if (max_width <= 0) {
+            buffer[0] = 0;
+            return buffer[0..0 :0];
+        }
+        if (value.len < buffer.len) {
+            @memcpy(buffer[0..value.len], value);
+            buffer[value.len] = 0;
+            const complete = buffer[0..value.len :0];
+            if (self.measureUiText(complete, font_size) <= max_width) return complete;
+        }
+
+        const ellipsis = "…";
+        var end = @min(value.len, buffer.len - ellipsis.len - 1);
+        if (end < value.len) {
+            while (end > 0 and value[end] & 0xc0 == 0x80) end -= 1;
+        }
+        while (true) {
+            @memcpy(buffer[0..end], value[0..end]);
+            @memcpy(buffer[end .. end + ellipsis.len], ellipsis);
+            buffer[end + ellipsis.len] = 0;
+            const candidate = buffer[0 .. end + ellipsis.len :0];
+            if (self.measureUiText(candidate, font_size) <= max_width) return candidate;
+            if (end == 0) {
+                buffer[0] = 0;
+                return buffer[0..0 :0];
+            }
+            end -= 1;
+            while (end > 0 and value[end] & 0xc0 == 0x80) end -= 1;
+        }
     }
 
     pub fn status(self: Studio) Status {
@@ -1678,6 +2041,7 @@ pub const Studio = struct {
         self.marquee.active = false;
         self.enabled = !self.enabled;
         if (!self.enabled) {
+            self.focus_canvas = false;
             self.tool = .select;
             self.active_morph_state = null;
             self.selected_identity = null;
@@ -1693,6 +2057,7 @@ pub const Studio = struct {
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.enabled = false;
+        self.focus_canvas = false;
         self.tool = .select;
         self.active_morph_state = null;
         self.selected_identity = null;
@@ -1935,6 +2300,13 @@ pub const Studio = struct {
             return null;
         }
         if (!self.enabled) return null;
+        if (input.toggle_focus_canvas_pressed) {
+            if (self.interaction != .idle) self.cancelInteraction(items);
+            self.marquee.active = false;
+            self.focus_canvas = !self.focus_canvas;
+            self.snap_guides = .{};
+            return null;
+        }
 
         self.validateSelection(items, resolved_bounds);
 
@@ -3009,6 +3381,18 @@ pub const Studio = struct {
         if (self.interaction != .idle) self.cancelInteraction(items);
         if (in_status) return true;
         if (in_toolbar) {
+            if (pointInRectangle(pointer, layout.slides_dock_toggle)) {
+                self.active_dock = if (self.active_dock == .slides) .none else .slides;
+                return true;
+            }
+            if (pointInRectangle(pointer, layout.properties_dock_toggle)) {
+                self.active_dock = if (self.active_dock == .properties) .none else .properties;
+                return true;
+            }
+            if (pointInRectangle(pointer, layout.focus_canvas)) {
+                self.focus_canvas = true;
+                return true;
+            }
             for (layout.tool_buttons, 0..) |button, index| {
                 if (pointInRectangle(pointer, button)) {
                     self.setTool(@enumFromInt(index), items);
@@ -4310,7 +4694,12 @@ pub const Studio = struct {
             rl.drawRectangleRec(badge, .{ .r = 111, .g = 42, .b = 57, .a = 240 });
             rl.drawRectangleLinesEx(badge, 1, .{ .r = 255, .g = 112, .b = 132, .a = 255 });
             const badge_font = scaledUiFont(uiScale(viewport), UiTypography.compact);
-            rl.drawText("LOCK", @intFromFloat(badge.x + 8 * uiScale(viewport)), @intFromFloat(badge.y + (badge.height - @as(f32, @floatFromInt(badge_font))) / 2), badge_font, .white);
+            self.drawUiText(
+                "LOCK",
+                .{ .x = badge.x + 8 * uiScale(viewport), .y = badge.y + (badge.height - @as(f32, @floatFromInt(badge_font))) / 2 },
+                badge_font,
+                .white,
+            );
         }
 
         if (self.interaction != .idle) {
@@ -4323,10 +4712,9 @@ pub const Studio = struct {
                 if (geometryToScreenRect(viewport, self.drag.source_after)) |source_rect| {
                     const shared_accent: rl.Color = .{ .r = 255, .g = 92, .b = 198, .a = 235 };
                     rl.drawRectangleLinesEx(source_rect, 2, shared_accent);
-                    rl.drawText(
+                    self.drawUiText(
                         "SHARED SOURCE",
-                        @intFromFloat(source_rect.x + 5),
-                        @intFromFloat(source_rect.y + 5),
+                        .{ .x = source_rect.x + 5, .y = source_rect.y + 5 },
                         scaledUiFont(uiScale(viewport), UiTypography.compact),
                         shared_accent,
                     );
@@ -4379,12 +4767,15 @@ pub const Studio = struct {
             }
         }
 
-        self.drawToolbar(viewport);
-        if (self.selected_identity != null) {
-            const selected_locked = if (self.selectedIndex(items)) |index| items[index].locked else false;
-            self.drawProperties(items, resolved_bounds, viewport, selected_locked);
+        const chrome_visible = if (viewport.chrome) |chrome| chrome.visible else true;
+        if (chrome_visible) {
+            self.drawToolbar(viewport);
+            if (self.selected_identity != null) {
+                const selected_locked = if (self.selectedIndex(items)) |index| items[index].locked else false;
+                self.drawProperties(items, resolved_bounds, viewport, selected_locked);
+            }
+            self.drawStatus(items, resolved_bounds, viewport);
         }
-        self.drawStatus(items, resolved_bounds, viewport);
     }
 
     fn drawLogicalGrid(self: Studio, viewport: Viewport) void {
@@ -4445,7 +4836,7 @@ pub const Studio = struct {
         }
     }
 
-    fn drawGeometryHud(_: Studio, viewport: Viewport, item_rect: rl.Rectangle, geometry: Geometry) void {
+    fn drawGeometryHud(self: Studio, viewport: Viewport, item_rect: rl.Rectangle, geometry: Geometry) void {
         var buffer: [128]u8 = undefined;
         const text = std.fmt.bufPrintZ(
             &buffer,
@@ -4455,13 +4846,18 @@ pub const Studio = struct {
         const scale = uiScale(viewport);
         const font_size = scaledUiFont(scale, UiTypography.body);
         const padding: f32 = 8 * scale;
-        const width: f32 = @floatFromInt(rl.measureText(text, font_size));
+        const width = self.measureUiText(text, font_size);
         const hud_width = width + padding * 2;
         const hud_height: f32 = 32 * scale;
         const rect = geometryHudRectangle(viewport, item_rect, hud_width, hud_height);
         rl.drawRectangleRec(rect, .{ .r = 12, .g = 16, .b = 28, .a = 238 });
         rl.drawRectangleLinesEx(rect, 1, .{ .r = 255, .g = 92, .b = 198, .a = 220 });
-        rl.drawText(text, @intFromFloat(rect.x + padding), @intFromFloat(rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2), font_size, .white);
+        self.drawUiText(
+            text,
+            .{ .x = rect.x + padding, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
+            font_size,
+            .white,
+        );
     }
 
     fn geometryHudRectangle(viewport: Viewport, item_rect: rl.Rectangle, hud_width: f32, hud_height: f32) rl.Rectangle {
@@ -4528,11 +4924,11 @@ pub const Studio = struct {
         const heading_font = scaledUiFont(font_scale, UiTypography.heading);
         const body_font = scaledUiFont(font_scale, UiTypography.body);
         const compact_font = scaledUiFont(font_scale, UiTypography.compact);
-        rl.drawText("SLIDES", @intFromFloat(layout.organizer.x + 12), @intFromFloat(layout.organizer.y + 9), heading_font, .white);
+        self.drawUiText("SLIDES", .{ .x = layout.organizer.x + 12, .y = layout.organizer.y + 9 }, heading_font, .white);
         const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down", "Tpl" };
-        for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(button, label);
-        drawCompactButton(layout.slide_page_previous, "Prev");
-        drawCompactButton(layout.slide_page_next, "Next");
+        for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(self, button, label);
+        drawCompactButton(self, layout.slide_page_previous, "Prev");
+        drawCompactButton(self, layout.slide_page_next, "Next");
 
         for (0..slideCardCapacity(layout)) |visible_slot| {
             const summary_index = self.organizer_first_visible + visible_slot;
@@ -4549,27 +4945,38 @@ pub const Studio = struct {
 
             const preview = slidePreviewRect(card);
             const text_x = preview.x + preview.width + 9;
+            const text_width = @max(0, card.x + card.width - text_x - 7);
+            if (text_width <= 0) continue;
+            rl.beginScissorMode(
+                @intFromFloat(@floor(text_x)),
+                @intFromFloat(@floor(card.y + 2)),
+                @intFromFloat(@ceil(text_width)),
+                @intFromFloat(@ceil(card.height - 4)),
+            );
             var line_buffer: [96]u8 = undefined;
             const slide_number = std.fmt.bufPrintZ(&line_buffer, "SLIDE {d}", .{summary.index + 1}) catch "SLIDE";
-            rl.drawText(slide_number, @intFromFloat(text_x), @intFromFloat(card.y + 7), compact_font, if (active) border else .white);
+            self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 7 }, compact_font, if (active) border else .white);
             var title_buffer: [96]u8 = undefined;
-            const title = textForDraw(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title);
-            rl.drawText(title, @intFromFloat(text_x), @intFromFloat(card.y + 28), body_font, .white);
+            const title = self.fitUiText(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title, body_font, text_width);
+            self.drawUiText(title, .{ .x = text_x, .y = card.y + 28 }, body_font, .white);
             var metadata_buffer: [96]u8 = undefined;
             const metadata = std.fmt.bufPrintZ(
                 &metadata_buffer,
                 "{d} items · {d} states",
                 .{ summary.item_count, summary.morph_count },
             ) catch "slide details";
-            rl.drawText(metadata, @intFromFloat(text_x), @intFromFloat(card.y + 57), compact_font, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+            var fitted_metadata_buffer: [96]u8 = undefined;
+            const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
+            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = card.y + 57 }, compact_font, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+            rl.endScissorMode();
         }
 
-        rl.drawText("LIBRARY", @intFromFloat(layout.library.x + 12), @intFromFloat(layout.library.y + 9), heading_font, .white);
-        drawCompactButton(layout.library_use, "Use");
-        drawCompactButton(layout.library_rename, "Ren");
-        drawCompactButton(layout.library_delete, "Del");
-        drawCompactButton(layout.library_page_previous, "Prev");
-        drawCompactButton(layout.library_page_next, "Next");
+        self.drawUiText("LIBRARY", .{ .x = layout.library.x + 12, .y = layout.library.y + 9 }, heading_font, .white);
+        drawCompactButton(self, layout.library_use, "Use");
+        drawCompactButton(self, layout.library_rename, "Ren");
+        drawCompactButton(self, layout.library_delete, "Del");
+        drawCompactButton(self, layout.library_page_previous, "Prev");
+        drawCompactButton(self, layout.library_page_next, "Next");
         for (0..libraryRowCapacity(layout)) |visible_slot| {
             const entry_index = self.library_first_visible + visible_slot;
             if (entry_index >= workspace.library.len) break;
@@ -4589,10 +4996,19 @@ pub const Studio = struct {
                 .{ .r = 43, .g = 123, .b = 151, .a = if (entry.available) 255 else 100 }
             else
                 .{ .r = 116, .g = 83, .b = 160, .a = if (entry.available) 255 else 100 });
+            self.drawUiText(badge, .{ .x = badge_rect.x + 6, .y = badge_rect.y + (badge_rect.height - @as(f32, @floatFromInt(compact_font))) / 2 }, compact_font, .white);
+            const text_x = row.x + 64;
+            const text_width = @max(0, row.x + row.width - text_x - 7);
+            if (text_width <= 0) continue;
+            rl.beginScissorMode(
+                @intFromFloat(@floor(text_x)),
+                @intFromFloat(@floor(row.y + 2)),
+                @intFromFloat(@ceil(text_width)),
+                @intFromFloat(@ceil(row.height - 4)),
+            );
             var name_buffer: [128]u8 = undefined;
-            const name = textForDraw(&name_buffer, entry.name);
-            rl.drawText(badge, @intFromFloat(badge_rect.x + 6), @intFromFloat(badge_rect.y + (badge_rect.height - @as(f32, @floatFromInt(compact_font))) / 2), compact_font, .white);
-            rl.drawText(name, @intFromFloat(row.x + 64), @intFromFloat(row.y + 6), body_font, if (entry.available)
+            const name = self.fitUiText(&name_buffer, entry.name, body_font, text_width);
+            self.drawUiText(name, .{ .x = text_x, .y = row.y + 6 }, body_font, if (entry.available)
                 .white
             else
                 .{ .r = 130, .g = 136, .b = 149, .a = 255 });
@@ -4601,10 +5017,11 @@ pub const Studio = struct {
                 "unused"
             else
                 std.fmt.bufPrintZ(&usage_buffer, "{d} use{s}", .{ entry.use_count, if (entry.use_count == 1) "" else "s" }) catch "used";
-            rl.drawText(usage, @intFromFloat(row.x + 64), @intFromFloat(row.y + 27), compact_font, if (entry.deletable)
+            self.drawUiText(usage, .{ .x = text_x, .y = row.y + 27 }, compact_font, if (entry.deletable)
                 .{ .r = 126, .g = 231, .b = 177, .a = 255 }
             else
                 .{ .r = 168, .g = 179, .b = 198, .a = 255 });
+            rl.endScissorMode();
         }
     }
 
@@ -4626,16 +5043,15 @@ pub const Studio = struct {
                 .{ .r = 115, .g = 128, .b = 150, .a = 200 });
             const label = toolLabel(tool);
             const font_size = body_font;
-            const width = rl.measureText(label, font_size);
-            rl.drawText(
+            const width = self.measureUiText(label, font_size);
+            self.drawUiText(
                 label,
-                @intFromFloat(button.x + (button.width - @as(f32, @floatFromInt(width))) / 2),
-                @intFromFloat(button.y + (button.height - @as(f32, @floatFromInt(font_size))) / 2),
+                .{ .x = button.x + (button.width - width) / 2, .y = button.y + (button.height - @as(f32, @floatFromInt(font_size))) / 2 },
                 font_size,
                 .white,
             );
         }
-        drawActionButton(layout.new_slide, "+ Slide");
+        drawActionButton(self, layout.new_slide, "+ Slide");
         rl.drawRectangleRec(layout.grid_toggle, if (self.grid_snapping)
             .{ .r = 43, .g = 123, .b = 151, .a = 255 }
         else
@@ -4645,22 +5061,24 @@ pub const Studio = struct {
         else
             .{ .r = 115, .g = 128, .b = 150, .a = 200 });
         const grid_label: [:0]const u8 = if (self.grid_snapping) "GRID ON" else "GRID";
-        const grid_label_width = rl.measureText(grid_label, compact_font);
-        rl.drawText(
+        const grid_label_width = self.measureUiText(grid_label, compact_font);
+        self.drawUiText(
             grid_label,
-            @intFromFloat(layout.grid_toggle.x + (layout.grid_toggle.width - @as(f32, @floatFromInt(grid_label_width))) / 2),
-            @intFromFloat(layout.grid_toggle.y + (layout.grid_toggle.height - @as(f32, @floatFromInt(compact_font))) / 2),
+            .{ .x = layout.grid_toggle.x + (layout.grid_toggle.width - grid_label_width) / 2, .y = layout.grid_toggle.y + (layout.grid_toggle.height - @as(f32, @floatFromInt(compact_font))) / 2 },
             compact_font,
             .white,
         );
-        drawActionButton(layout.scene_previous, "<");
+        drawActionButton(self, layout.scene_previous, "<");
         var scene_buffer: [32]u8 = undefined;
         const scene_label: [:0]const u8 = if (self.active_morph_state) |state|
             std.fmt.bufPrintZ(&scene_buffer, "STATE {d}/{d}", .{ state + 1, self.morph_state_count }) catch "MORPH"
         else
             "BASE";
-        drawActionButton(layout.scene_label, scene_label);
-        drawActionButton(layout.scene_next, ">");
+        drawActionButton(self, layout.scene_label, scene_label);
+        drawActionButton(self, layout.scene_next, ">");
+        drawToggleButton(self, layout.slides_dock_toggle, "Slides", self.active_dock == .slides);
+        drawToggleButton(self, layout.properties_dock_toggle, "Properties", self.active_dock == .properties);
+        drawActionButton(self, layout.focus_canvas, "Focus");
     }
 
     fn drawProperties(
@@ -4671,15 +5089,16 @@ pub const Studio = struct {
         selected_locked: bool,
     ) void {
         const layout = uiLayout(viewport);
+        if (layout.properties.width <= 0 or layout.properties.height <= 0) return;
         const heading_font = scaledUiFont(layout.scale, UiTypography.heading);
         const body_font = scaledUiFont(layout.scale, UiTypography.body);
         const secondary: rl.Color = .{ .r = 205, .g = 214, .b = 230, .a = 255 };
         drawStudioPanel(layout.properties);
-        rl.drawText("PROPERTIES", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + 11 * layout.scale), heading_font, .white);
-        drawActionButton(layout.edit_text, "Text");
-        drawActionButton(layout.duplicate_item, "Dup");
-        drawActionButton(layout.delete_item, "Del");
-        drawActionButton(layout.promote, "Reuse");
+        self.drawUiText("PROPERTIES", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + 11 * layout.scale }, heading_font, .white);
+        drawActionButton(self, layout.edit_text, "Text");
+        drawActionButton(self, layout.duplicate_item, "Dup");
+        drawActionButton(self, layout.delete_item, "Del");
+        drawActionButton(self, layout.promote, "Reuse");
 
         const selected_item: ?slides.SlideItem = if (self.selectionCount() == 1)
             if (self.selectedIndex(items)) |index| items[index] else null
@@ -4689,7 +5108,7 @@ pub const Studio = struct {
             itemGeometry(selected_item.?, resolved_bounds)
         else
             null;
-        rl.drawText("GEOMETRY", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 75 else 85) * layout.scale), body_font, secondary);
+        self.drawUiText("GEOMETRY", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + @as(f32, if (layout.compact_properties) 75 else 85) * layout.scale }, body_font, secondary);
         var geometry_buffers: [4][32]u8 = undefined;
         const geometry_fallbacks = [_][:0]const u8{ "X --", "Y --", "W --", "H --" };
         for (layout.geometry_fields, 0..) |button, index| {
@@ -4711,18 +5130,18 @@ pub const Studio = struct {
                 else
                     std.fmt.bufPrintZ(&geometry_buffers[index], "{s} {d:.1}", .{ prefix, value }) catch geometry_fallbacks[index];
             } else geometry_fallbacks[index];
-            drawActionButton(button, label);
+            drawActionButton(self, button, label);
         }
 
-        rl.drawText("FOREGROUND", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 135 else 193) * layout.scale), body_font, secondary);
-        drawCompactButton(layout.custom_foreground, "Custom");
+        self.drawUiText("FOREGROUND", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + @as(f32, if (layout.compact_properties) 135 else 193) * layout.scale }, body_font, secondary);
+        drawCompactButton(self, layout.custom_foreground, "Custom");
         drawSwatches(layout.foreground_swatches, if (selected_item) |item| item.color else null);
-        rl.drawText("BACKGROUND", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 193 else 255) * layout.scale), body_font, secondary);
-        drawCompactButton(layout.clear_background, "None");
-        drawCompactButton(layout.custom_background, "Custom");
+        self.drawUiText("BACKGROUND", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + @as(f32, if (layout.compact_properties) 193 else 255) * layout.scale }, body_font, secondary);
+        drawCompactButton(self, layout.clear_background, "None");
+        drawCompactButton(self, layout.custom_background, "Custom");
         drawSwatches(layout.background_swatches, if (selected_item) |item| item.background_color else null);
 
-        rl.drawText("TYPE & OPACITY", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 251 else 315) * layout.scale), body_font, secondary);
+        self.drawUiText("TYPE & OPACITY", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + @as(f32, if (layout.compact_properties) 251 else 315) * layout.scale }, body_font, secondary);
         var font_buffer: [32]u8 = undefined;
         const font_label: [:0]const u8 = if (selected_item) |item|
             if (item.kind == .textbox and item.fontSize != null)
@@ -4731,7 +5150,7 @@ pub const Studio = struct {
                 "Font --"
         else
             "Font --";
-        drawActionButton(layout.font_size, font_label);
+        drawActionButton(self, layout.font_size, font_label);
         var opacity_buffer: [32]u8 = undefined;
         const opacity_label: [:0]const u8 = if (selected_item) |item|
             if (layout.minimal_properties)
@@ -4739,31 +5158,31 @@ pub const Studio = struct {
             else
                 std.fmt.bufPrintZ(&opacity_buffer, "Opacity {d:.0}%", .{item.opacity * 100}) catch "Opacity"
         else if (layout.minimal_properties) "Op --" else "Opacity --";
-        drawActionButton(layout.opacity, opacity_label);
+        drawActionButton(self, layout.opacity, opacity_label);
 
         if (!layout.minimal_properties) {
-            rl.drawText(
+            self.drawUiText(
                 if (self.selectionCount() > 1) "ALIGN TO SELECTION" else "ALIGN TO SLIDE",
-                @intFromFloat(layout.properties.x + 12 * layout.scale),
-                @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 311 else 377) * layout.scale),
+                .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + @as(f32, if (layout.compact_properties) 311 else 377) * layout.scale },
                 body_font,
                 secondary,
             );
             const align_labels = [_][:0]const u8{ "L", "HC", "R", "T", "VC", "B" };
-            for (layout.align_buttons, align_labels) |button, label| drawCompactButton(button, label);
-            rl.drawText("DISTRIBUTE", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 369 else 437) * layout.scale), body_font, secondary);
+            for (layout.align_buttons, align_labels) |button, label| drawCompactButton(self, button, label);
+            self.drawUiText("DISTRIBUTE", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + @as(f32, if (layout.compact_properties) 369 else 437) * layout.scale }, body_font, secondary);
             const distribute_labels = [_][:0]const u8{ "H EQUAL GAP", "V EQUAL GAP" };
-            for (layout.distribute_buttons, distribute_labels) |button, label| drawCompactButton(button, label);
+            for (layout.distribute_buttons, distribute_labels) |button, label| drawCompactButton(self, button, label);
             if (!layout.compact_properties)
-                rl.drawText("LAYER", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + 499 * layout.scale), body_font, secondary);
+                self.drawUiText("LAYER", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + 499 * layout.scale }, body_font, secondary);
             const layer_labels = [_][:0]const u8{ "Back", "Down", "Up", "Front" };
-            for (layout.layer_buttons, layer_labels) |button, label| drawCompactButton(button, label);
+            for (layout.layer_buttons, layer_labels) |button, label| drawCompactButton(self, button, label);
         }
-        drawCompactButton(layout.lock_item, if (selected_locked) "Unlock" else "Lock");
+        drawCompactButton(self, layout.lock_item, if (selected_locked) "Unlock" else "Lock");
     }
 
     fn drawStatus(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
         const panel = statusPanel(viewport);
+        if (panel.width <= 0 or panel.height <= 0) return;
         const scale = uiScale(viewport);
         const heading_font = scaledUiFont(scale, UiTypography.status_heading);
         const body_font = scaledUiFont(scale, UiTypography.body);
@@ -4790,24 +5209,32 @@ pub const Studio = struct {
             ) catch "STUDIO · selected item";
         } else if (self.dirty) "STUDIO * · click an item to select it" else "STUDIO · click an item to select it";
 
-        rl.drawText(status_text, @intFromFloat(panel.x + 12 * scale), @intFromFloat(panel.y + 9 * scale), heading_font, .white);
-        rl.drawText(
-            if (self.grid_snapping)
-                "GRID ON · G toggle · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap"
-            else
-                "G grid · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap · [ ] morph scenes",
-            @intFromFloat(panel.x + 12 * scale),
-            @intFromFloat(panel.y + 39 * scale),
-            body_font,
-            .{ .r = 185, .g = 196, .b = 215, .a = 255 },
-        );
-        rl.drawText(
-            "Cmd/Ctrl-S save  ·  Shift-Cmd/Ctrl-S save copy  ·  Cmd/Ctrl-Z undo  ·  Shift-Cmd/Ctrl-Z redo",
-            @intFromFloat(panel.x + 12 * scale),
-            @intFromFloat(panel.y + 64 * scale),
-            body_font,
-            .{ .r = 185, .g = 196, .b = 215, .a = 255 },
-        );
+        self.drawUiText(status_text, .{ .x = panel.x + 12 * scale, .y = panel.y + 9 * scale }, heading_font, .white);
+        const compact_status = panel.height < 100 * scale;
+        if (compact_status and self.notice == .none) {
+            self.drawUiText(
+                if (self.grid_snapping) "GRID ON · G toggle · Tab Focus Canvas · Cmd/Ctrl-S save" else "G grid · Tab Focus Canvas · Cmd/Ctrl-S save",
+                .{ .x = panel.x + 12 * scale, .y = panel.y + 43 * scale },
+                body_font,
+                .{ .r = 185, .g = 196, .b = 215, .a = 255 },
+            );
+        } else {
+            self.drawUiText(
+                if (self.grid_snapping)
+                    "GRID ON · G toggle · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap"
+                else
+                    "G grid · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap · [ ] morph scenes",
+                .{ .x = panel.x + 12 * scale, .y = panel.y + 39 * scale },
+                body_font,
+                .{ .r = 185, .g = 196, .b = 215, .a = 255 },
+            );
+            self.drawUiText(
+                "Tab Focus Canvas  ·  Cmd/Ctrl-S save  ·  Shift-Cmd/Ctrl-S save copy  ·  Cmd/Ctrl-Z undo  ·  Shift-Cmd/Ctrl-Z redo",
+                .{ .x = panel.x + 12 * scale, .y = panel.y + 64 * scale },
+                body_font,
+                .{ .r = 185, .g = 196, .b = 215, .a = 255 },
+            );
+        }
         const notice_text: ?[:0]const u8 = switch (self.notice) {
             .none => null,
             .saved => "Saved to the original .sld",
@@ -4843,7 +5270,7 @@ pub const Studio = struct {
                 .saved, .copy_saved => .{ .r = 126, .g = 231, .b = 177, .a = 255 },
                 else => .{ .r = 255, .g = 145, .b = 132, .a = 255 },
             };
-            rl.drawText(message, @intFromFloat(panel.x + 12 * scale), @intFromFloat(panel.y + 89 * scale), body_font, notice_color);
+            self.drawUiText(message, .{ .x = panel.x + 12 * scale, .y = panel.y + @as(f32, if (compact_status) 43 else 89) * scale }, body_font, notice_color);
         }
     }
 };
@@ -4864,49 +5291,52 @@ fn drawStudioPanel(rect: rl.Rectangle) void {
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 80, .g = 215, .b = 255, .a = 180 });
 }
 
-fn drawActionButton(rect: rl.Rectangle, label: [:0]const u8) void {
+fn drawActionButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
     if (rect.width <= 0 or rect.height <= 0) return;
     rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 115, .g = 128, .b = 150, .a = 200 });
     const font_size: i32 = @max(UiTypography.body, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    const width = rl.measureText(label, font_size);
-    rl.drawText(
+    const width = studio.measureUiText(label, font_size);
+    studio.drawUiText(
         label,
-        @intFromFloat(rect.x + (rect.width - @as(f32, @floatFromInt(width))) / 2),
-        @intFromFloat(rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2),
+        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
         font_size,
         .white,
     );
 }
 
-fn drawCompactButton(rect: rl.Rectangle, label: [:0]const u8) void {
+fn drawCompactButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
     if (rect.width <= 0 or rect.height <= 0) return;
     rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 105, .g = 120, .b = 143, .a = 210 });
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    const width = rl.measureText(label, font_size);
-    rl.drawText(
+    const width = studio.measureUiText(label, font_size);
+    studio.drawUiText(
         label,
-        @intFromFloat(rect.x + (rect.width - @as(f32, @floatFromInt(width))) / 2),
-        @intFromFloat(rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2),
+        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
         font_size,
         .white,
     );
 }
 
-fn textForDraw(buffer: []u8, value: []const u8) [:0]const u8 {
-    std.debug.assert(buffer.len >= 5);
-    if (value.len < buffer.len) {
-        @memcpy(buffer[0..value.len], value);
-        buffer[value.len] = 0;
-        return buffer[0..value.len :0];
-    }
-    var end = buffer.len - 4;
-    while (end > 0 and value[end] & 0xc0 == 0x80) end -= 1;
-    @memcpy(buffer[0..end], value[0..end]);
-    @memcpy(buffer[end .. end + 3], "...");
-    buffer[end + 3] = 0;
-    return buffer[0 .. end + 3 :0];
+fn drawToggleButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8, active: bool) void {
+    if (rect.width <= 0 or rect.height <= 0) return;
+    rl.drawRectangleRec(rect, if (active)
+        .{ .r = 43, .g = 123, .b = 151, .a = 255 }
+    else
+        .{ .r = 31, .g = 38, .b = 55, .a = 245 });
+    rl.drawRectangleLinesEx(rect, if (active) 2 else 1, if (active)
+        .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+    else
+        .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+    const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
+    const width = studio.measureUiText(label, font_size);
+    studio.drawUiText(
+        label,
+        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
+        font_size,
+        .white,
+    );
 }
 
 fn drawSwatches(rects: [palette.len]rl.Rectangle, current: ?rl.Color) void {
@@ -8184,6 +8614,174 @@ test "property layout stays contained and typography remains legible" {
     const full_screen: Viewport = .{ .slide_top_left = .zero(), .slide_size = .{ .x = 2560, .y = 1440 } };
     try std.testing.expectApproxEqAbs(@as(f32, 2), uiScale(full_screen), 0.0001);
     try std.testing.expect(uiLayout(full_screen).edit_text.height > uiLayout(viewports[0]).edit_text.height);
+}
+
+test "docked frame keeps permanent chrome outside a sixteen by nine canvas" {
+    const cases = [_]struct {
+        size: rl.Vector2,
+        expected_mode: FrameMode,
+    }{
+        .{ .size = .{ .x = 1920, .y = 1080 }, .expected_mode = .wide },
+        .{ .size = .{ .x = 1600, .y = 900 }, .expected_mode = .wide },
+        .{ .size = .{ .x = 1280, .y = 720 }, .expected_mode = .medium },
+        .{ .size = .{ .x = 900, .y = 600 }, .expected_mode = .compact },
+        .{ .size = .{ .x = 900, .y = 506 }, .expected_mode = .compact },
+        .{ .size = .{ .x = 2560, .y = 1440 }, .expected_mode = .wide },
+    };
+    const requested_docks = [_]DockPanel{ .slides, .properties };
+    for (cases) |case| {
+        for (requested_docks) |requested_dock| {
+            const content: rl.Rectangle = .{ .x = 37, .y = 19, .width = case.size.x, .height = case.size.y };
+            const frame = frameLayout(content, true, false, requested_dock);
+            try std.testing.expectEqual(case.expected_mode, frame.mode);
+            try std.testing.expect(frame.chrome.visible);
+            try std.testing.expect(frame.viewport.valid());
+            try std.testing.expectApproxEqAbs(
+                @as(f32, 16.0 / 9.0),
+                frame.viewport.slide_size.x / frame.viewport.slide_size.y,
+                0.0001,
+            );
+            const logical_probe: rl.Vector2 = .{ .x = 713.5, .y = 402.25 };
+            const screen_probe = logicalToScreen(frame.viewport, logical_probe).?;
+            try expectVector(logical_probe, screenToLogical(frame.viewport, screen_probe).?);
+            const slide_rect: rl.Rectangle = .{
+                .x = frame.viewport.slide_top_left.x,
+                .y = frame.viewport.slide_top_left.y,
+                .width = frame.viewport.slide_size.x,
+                .height = frame.viewport.slide_size.y,
+            };
+            try expectRectangleContained(frame.canvas_area, slide_rect);
+            try std.testing.expect(!rectanglesOverlap(frame.chrome.toolbar, slide_rect));
+            try std.testing.expect(!rectanglesOverlap(frame.chrome.status, slide_rect));
+            if (frame.chrome.left_visible)
+                try std.testing.expect(!rectanglesOverlap(frame.chrome.left_dock, slide_rect));
+            if (frame.chrome.right_visible)
+                try std.testing.expect(!rectanglesOverlap(frame.chrome.right_dock, slide_rect));
+
+            const controls = uiLayout(frame.viewport);
+            try expectRectangleContained(frame.chrome.toolbar, controls.toolbar);
+            for (controls.tool_buttons) |button| try expectRectangleContained(frame.chrome.toolbar, button);
+            try expectRectangleContained(frame.chrome.toolbar, controls.new_slide);
+            try expectRectangleContained(frame.chrome.toolbar, controls.grid_toggle);
+            try expectRectangleContained(frame.chrome.toolbar, controls.scene_previous);
+            try expectRectangleContained(frame.chrome.toolbar, controls.scene_label);
+            try expectRectangleContained(frame.chrome.toolbar, controls.scene_next);
+            try expectRectangleContained(frame.chrome.toolbar, controls.slides_dock_toggle);
+            try expectRectangleContained(frame.chrome.toolbar, controls.properties_dock_toggle);
+            try expectRectangleContained(frame.chrome.toolbar, controls.focus_canvas);
+            try std.testing.expectEqual(@as(f32, 1), controls.scale);
+            if (frame.chrome.right_visible) {
+                try expectRectangleContained(frame.chrome.right_dock, controls.properties);
+                const property_controls = [_]rl.Rectangle{
+                    controls.edit_text,
+                    controls.duplicate_item,
+                    controls.delete_item,
+                    controls.promote,
+                    controls.custom_foreground,
+                    controls.custom_background,
+                    controls.clear_background,
+                    controls.font_size,
+                    controls.opacity,
+                    controls.lock_item,
+                };
+                for (property_controls) |control| try expectRectangleContained(controls.properties, control);
+                for (controls.geometry_fields) |control| try expectRectangleContained(controls.properties, control);
+                for (controls.foreground_swatches) |control| try expectRectangleContained(controls.properties, control);
+                for (controls.background_swatches) |control| try expectRectangleContained(controls.properties, control);
+                for (controls.align_buttons) |control| try expectRectangleContained(controls.properties, control);
+                for (controls.distribute_buttons) |control| try expectRectangleContained(controls.properties, control);
+                for (controls.layer_buttons) |control| try expectRectangleContained(controls.properties, control);
+            }
+            if (frame.chrome.left_visible)
+                try expectRectangleContained(frame.chrome.left_dock, workspaceLayout(frame.viewport).sidebar);
+        }
+    }
+
+    const compact = frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 600 }, true, false, .slides);
+    try std.testing.expect(compact.viewport.slide_size.x >= 600);
+    try std.testing.expect(compact.viewport.slide_size.y >= 330);
+    const minimum_compact = frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 506 }, true, false, .slides);
+    const minimum_workspace = workspaceLayout(minimum_compact.viewport);
+    try std.testing.expect(slideCardCapacity(minimum_workspace) >= 1);
+    try std.testing.expect(libraryRowCapacity(minimum_workspace) >= 1);
+}
+
+test "medium dock controls switch reserved space without overlaying the canvas" {
+    var items = [_]slides.SlideItem{testItem(501, .textbox, 100, 100, 200, 80)};
+    var studio: Studio = .{ .enabled = true, .active_dock = .slides };
+    const content: rl.Rectangle = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const slides_frame = studio.layoutFrame(content);
+    try std.testing.expect(slides_frame.chrome.left_visible);
+    try std.testing.expect(!slides_frame.chrome.right_visible);
+
+    const controls = uiLayout(slides_frame.viewport);
+    _ = studio.update(&items, &.{}, slides_frame.viewport, .{
+        .pointer_screen = rectangleCenter(controls.properties_dock_toggle),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(DockPanel.properties, studio.active_dock);
+    const properties_frame = studio.layoutFrame(content);
+    try std.testing.expect(!properties_frame.chrome.left_visible);
+    try std.testing.expect(properties_frame.chrome.right_visible);
+    try std.testing.expect(!rectanglesOverlap(
+        properties_frame.chrome.right_dock,
+        .{
+            .x = properties_frame.viewport.slide_top_left.x,
+            .y = properties_frame.viewport.slide_top_left.y,
+            .width = properties_frame.viewport.slide_size.x,
+            .height = properties_frame.viewport.slide_size.y,
+        },
+    ));
+
+    const property_controls = uiLayout(properties_frame.viewport);
+    _ = studio.update(&items, &.{}, properties_frame.viewport, .{
+        .pointer_screen = rectangleCenter(property_controls.properties_dock_toggle),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(DockPanel.none, studio.active_dock);
+    const canvas_frame = studio.layoutFrame(content);
+    try std.testing.expect(!canvas_frame.chrome.left_visible);
+    try std.testing.expect(!canvas_frame.chrome.right_visible);
+    try std.testing.expect(canvas_frame.canvas_area.width > properties_frame.canvas_area.width);
+    try std.testing.expect(canvas_frame.viewport.slide_size.x >= properties_frame.viewport.slide_size.x);
+}
+
+test "Focus Canvas hides chrome but preserves selection and restores with Tab" {
+    var items = [_]slides.SlideItem{testItem(502, .textbox, 100, 100, 200, 80)};
+    var studio: Studio = .{ .enabled = true, .selected_identity = 502, .active_dock = .properties };
+    const content: rl.Rectangle = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const normal = studio.layoutFrame(content);
+
+    _ = studio.update(&items, &.{}, normal.viewport, .{ .toggle_focus_canvas_pressed = true });
+    try std.testing.expect(studio.focus_canvas);
+    try std.testing.expectEqual(@as(?usize, 502), studio.selected_identity);
+    const focused = studio.layoutFrame(content);
+    try std.testing.expectEqual(FrameMode.focus, focused.mode);
+    try std.testing.expect(!focused.chrome.visible);
+    try std.testing.expectEqual(@as(f32, 0), uiLayout(focused.viewport).toolbar.width);
+    try std.testing.expectEqual(@as(f32, 0), statusPanel(focused.viewport).height);
+    try std.testing.expectEqual(@as(f32, 0), workspaceLayout(focused.viewport).sidebar.width);
+    try std.testing.expect(focused.viewport.slide_size.x > normal.viewport.slide_size.x);
+
+    _ = studio.update(&items, &.{}, focused.viewport, .{ .toggle_focus_canvas_pressed = true });
+    try std.testing.expect(!studio.focus_canvas);
+    try std.testing.expectEqual(@as(?usize, 502), studio.selected_identity);
+    try std.testing.expect(studio.layoutFrame(content).chrome.visible);
+}
+
+test "canvas selection does not move a responsive dock during pointer gesture" {
+    var items = [_]slides.SlideItem{testItem(503, .textbox, 100, 100, 200, 80)};
+    items[0].source = .{ .scope = .direct, .line_number = 2, .line_offset = 20, .patchable = true };
+    var studio: Studio = .{ .enabled = true, .active_dock = .slides };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const pointer = logicalToScreen(frame.viewport, .{ .x = 150, .y = 120 }).?;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = pointer,
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(Interaction.moving, studio.interaction);
+    try std.testing.expectEqual(DockPanel.slides, studio.active_dock);
 }
 
 test "single item rebind prefers unique IDs and falls back to every source layer" {

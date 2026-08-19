@@ -60,6 +60,14 @@ authoring surface backed by the ordinary `.sld` source: every completed action
 rewrites and reparses the document, so the GUI and text formats remain two
 views of the same file.
 
+Studio opens in a monitor-aware editing window (up to 1600×900) and fits the
+16:9 slide into the space left by its chrome, so permanent controls never cover
+slide content. Wide windows show the Slides/Library and Properties docks
+together; narrower windows reserve one dock at a time through the toolbar
+toggles. Press <kbd>Tab</kbd> for **Focus Canvas**, which hides all chrome while
+leaving selection, guides, and direct manipulation active. Studio uses an
+embedded, compact UI typeface independently of any fonts chosen by the deck.
+
 The top toolbar contains these one-shot canvas tools:
 
 | Tool | Shortcut | Action |
@@ -188,6 +196,7 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
 | <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |
 | <kbd>G</kbd> | Toggle grid display and grid snapping |
+| <kbd>Tab</kbd> | Toggle Focus Canvas without leaving Studio |
 | Hold <kbd>Shift</kbd> while resizing | Preserve the object's aspect ratio |
 | Hold <kbd>Cmd/Ctrl</kbd> while dragging | Temporarily bypass smart guides and grid snapping |
 | <kbd>Shift</kbd> + click | Add or remove an object from the current selection |
