@@ -93,6 +93,8 @@ const SourceRestore = struct {
     morph_scene: ?studio.MorphSceneCommand = null,
 };
 
+const HistoryDirection = enum { undo, redo };
+
 const StudioHistory = struct {
     allocator: std.mem.Allocator,
     undo_stack: std.ArrayList(SourceChange) = .empty,
@@ -161,26 +163,34 @@ const StudioHistory = struct {
         latest.after_morph_scene = .{ .active_state = after };
     }
 
-    fn undo(self: *StudioHistory) !?SourceRestore {
-        const entry = self.undo_stack.pop() orelse return null;
-        errdefer self.undo_stack.append(self.allocator, entry) catch {};
-        try self.redo_stack.append(self.allocator, entry);
-        return .{
-            .source = entry.before,
-            .slide = entry.before_slide,
-            .morph_scene = entry.before_morph_scene,
-        };
+    /// Reserve the destination stack and expose a borrowed restore snapshot
+    /// without moving the history cursor. The caller reparses this snapshot
+    /// first, then commits the infallible stack move only after success.
+    fn prepareRestore(self: *StudioHistory, direction: HistoryDirection) !?SourceRestore {
+        const source_stack = if (direction == .undo) &self.undo_stack else &self.redo_stack;
+        const destination_stack = if (direction == .undo) &self.redo_stack else &self.undo_stack;
+        if (source_stack.items.len == 0) return null;
+        try destination_stack.ensureUnusedCapacity(self.allocator, 1);
+        const entry = source_stack.items[source_stack.items.len - 1];
+        return if (direction == .undo)
+            .{
+                .source = entry.before,
+                .slide = entry.before_slide,
+                .morph_scene = entry.before_morph_scene,
+            }
+        else
+            .{
+                .source = entry.after,
+                .slide = entry.after_slide,
+                .morph_scene = entry.after_morph_scene,
+            };
     }
 
-    fn redo(self: *StudioHistory) !?SourceRestore {
-        const entry = self.redo_stack.pop() orelse return null;
-        errdefer self.redo_stack.append(self.allocator, entry) catch {};
-        try self.undo_stack.append(self.allocator, entry);
-        return .{
-            .source = entry.after,
-            .slide = entry.after_slide,
-            .morph_scene = entry.after_morph_scene,
-        };
+    fn commitRestore(self: *StudioHistory, direction: HistoryDirection) void {
+        const source_stack = if (direction == .undo) &self.undo_stack else &self.redo_stack;
+        const destination_stack = if (direction == .undo) &self.redo_stack else &self.undo_stack;
+        const entry = source_stack.pop() orelse return;
+        destination_stack.appendAssumeCapacity(entry);
     }
 };
 
@@ -275,14 +285,82 @@ test "Studio history restores structural edit slide positions" {
     history.setLatestAfterSlide(1);
     history.setLatestMorphScenes(0, 1);
 
-    const undo = (try history.undo()).?;
+    const undo = (try history.prepareRestore(.undo)).?;
     try std.testing.expectEqual(@as(i32, 0), undo.slide);
     try std.testing.expectEqualStrings("@slide\n@slide\n", undo.source);
     try std.testing.expectEqual(@as(?usize, 0), undo.morph_scene.?.active_state);
-    const redo = (try history.redo()).?;
+    try std.testing.expectEqual(@as(usize, 1), history.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), history.redo_stack.items.len);
+    history.commitRestore(.undo);
+
+    const redo = (try history.prepareRestore(.redo)).?;
     try std.testing.expectEqual(@as(i32, 1), redo.slide);
     try std.testing.expectEqualStrings("@slide\n@slide\n@slide\n", redo.source);
     try std.testing.expectEqual(@as(?usize, 1), redo.morph_scene.?.active_state);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 1), history.redo_stack.items.len);
+    history.commitRestore(.redo);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), history.redo_stack.items.len);
+}
+
+test "Studio structural history reparses duplicated slides in both directions" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@slide\n" ++
+        "@box id=hero x=20 y=30 text=Hero\n" ++
+        "@state(morph) name=detail\n" ++
+        "@set hero x=120\n" ++
+        "@slide\n" ++
+        "@box id=tail x=40 y=50 text=Tail\n";
+    var initial_arena = std.heap.ArenaAllocator.init(allocator);
+    defer initial_arena.deinit();
+    const initial_deck = try slides.SlideShow.new(initial_arena.allocator());
+    const initial_context = try parser.constructSlidesFromBuf(source, initial_deck, initial_arena.allocator());
+    defer initial_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), initial_context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), initial_deck.slides.items.len);
+
+    const patch = try source_editor.duplicateSlide(
+        allocator,
+        source,
+        initial_deck.slides.items[0].pos_in_editor,
+    );
+    var history = StudioHistory.init(allocator);
+    defer history.deinit();
+    const before = try allocator.dupe(u8, source);
+    errdefer allocator.free(before);
+    errdefer patch.deinit(allocator);
+    try history.record(before, patch.source, 0, 1);
+    history.setLatestMorphScenes(0, 0);
+
+    const undo = (try history.prepareRestore(.undo)).?;
+    var undo_arena = std.heap.ArenaAllocator.init(allocator);
+    defer undo_arena.deinit();
+    const undo_deck = try slides.SlideShow.new(undo_arena.allocator());
+    const undo_context = try parser.constructSlidesFromBuf(undo.source, undo_deck, undo_arena.allocator());
+    defer undo_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), undo_context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), undo_deck.slides.items.len);
+    try std.testing.expectEqual(@as(i32, 0), undo.slide);
+    try std.testing.expectEqual(@as(?usize, 0), undo.morph_scene.?.active_state);
+    history.commitRestore(.undo);
+
+    const redo = (try history.prepareRestore(.redo)).?;
+    var redo_arena = std.heap.ArenaAllocator.init(allocator);
+    defer redo_arena.deinit();
+    const redo_deck = try slides.SlideShow.new(redo_arena.allocator());
+    const redo_context = try parser.constructSlidesFromBuf(redo.source, redo_deck, redo_arena.allocator());
+    defer redo_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), redo_context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 3), redo_deck.slides.items.len);
+    try std.testing.expectEqual(@as(i32, 1), redo.slide);
+    try std.testing.expectEqual(@as(?usize, 0), redo.morph_scene.?.active_state);
+    try std.testing.expectEqualStrings(
+        redo_deck.slides.items[0].items.?.items[0].id.?,
+        redo_deck.slides.items[1].items.?.items[0].id.?,
+    );
+    history.commitRestore(.redo);
 }
 
 fn defaultCrowdHost(buffer: *[256]u8) []const u8 {
@@ -656,6 +734,14 @@ const FrameDiagnostics = struct {
     last_pre_render_ms: f64 = 0,
     slideshow_arena_bytes: usize = 0,
     pre_render_count: usize = 0,
+    last_studio_prepare_ms: f64 = 0,
+    studio_document_cache_builds: usize = 0,
+    studio_scene_cache_builds: usize = 0,
+    studio_composition_cache_builds: usize = 0,
+    studio_cache_rebuilt: bool = false,
+    studio_slide_count: usize = 0,
+    studio_item_count: usize = 0,
+    studio_render_fragment_count: usize = 0,
     last_slow_log_at: f64 = -10,
 
     fn observeFrame(self: *FrameDiagnostics, now: f64) void {
@@ -689,6 +775,27 @@ const FrameDiagnostics = struct {
         );
     }
 
+    fn recordStudioPrepare(
+        self: *FrameDiagnostics,
+        elapsed_seconds: f64,
+        document_cache_builds: usize,
+        scene_cache_builds: usize,
+        composition_cache_builds: usize,
+        cache_rebuilt: bool,
+        slide_count: usize,
+        item_count: usize,
+        render_fragment_count: usize,
+    ) void {
+        self.last_studio_prepare_ms = elapsed_seconds * 1000;
+        self.studio_document_cache_builds = document_cache_builds;
+        self.studio_scene_cache_builds = scene_cache_builds;
+        self.studio_composition_cache_builds = composition_cache_builds;
+        self.studio_cache_rebuilt = cache_rebuilt;
+        self.studio_slide_count = slide_count;
+        self.studio_item_count = item_count;
+        self.studio_render_fragment_count = render_fragment_count;
+    }
+
     fn draw(self: FrameDiagnostics, font: rl.Font, beast_mode: bool, placement: FrameDiagnosticsPlacement) void {
         if (!self.enabled) return;
         var frame_buffer: [192]u8 = undefined;
@@ -707,8 +814,21 @@ const FrameDiagnostics = struct {
         const mouse = rl.getMousePosition();
         const input_text = std.fmt.bufPrintZ(
             &input_buffer,
-            "MOUSE {d:.0}, {d:.0}   WINDOW {d} x {d}",
-            .{ mouse.x, mouse.y, rl.getScreenWidth(), rl.getScreenHeight() },
+            "STUDIO {d:.2} ms   CACHE {d}/{d}/{d}{s}   DECK {d}   ITEMS {d}/{d}   MOUSE {d:.0}, {d:.0}   WINDOW {d} x {d}",
+            .{
+                self.last_studio_prepare_ms,
+                self.studio_document_cache_builds,
+                self.studio_scene_cache_builds,
+                self.studio_composition_cache_builds,
+                if (self.studio_cache_rebuilt) "*" else "",
+                self.studio_slide_count,
+                self.studio_item_count,
+                self.studio_render_fragment_count,
+                mouse.x,
+                mouse.y,
+                rl.getScreenWidth(),
+                rl.getScreenHeight(),
+            },
         ) catch return;
         switch (placement) {
             .hidden => return,
@@ -744,8 +864,18 @@ const FrameDiagnostics = struct {
                 const compact_graph = if (roomy)
                     std.fmt.bufPrintZ(
                         &compact_graph_buffer,
-                        "REBUILD {d:.1} ms   ARENA {d:.1} KiB   BUILDS {d}   MOUSE {d:.0}, {d:.0}",
-                        .{ self.last_pre_render_ms, @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0, self.pre_render_count, mouse.x, mouse.y },
+                        "BUILD {d:.1} ms   PREP {d:.2} ms   CACHE {d}/{d}/{d}{s}   DECK {d}   ITEMS {d}/{d}",
+                        .{
+                            self.last_pre_render_ms,
+                            self.last_studio_prepare_ms,
+                            self.studio_document_cache_builds,
+                            self.studio_scene_cache_builds,
+                            self.studio_composition_cache_builds,
+                            if (self.studio_cache_rebuilt) "*" else "",
+                            self.studio_slide_count,
+                            self.studio_item_count,
+                            self.studio_render_fragment_count,
+                        },
                     ) catch return
                 else
                     std.fmt.bufPrintZ(
@@ -836,6 +966,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_command_palette = false;
     var diagnostics_command_tooltip = false;
     var diagnostics_precision_view = false;
+    var diagnostics_large_deck_count: ?usize = null;
     var diagnostics_select_buffer: [128]u8 = undefined;
     var diagnostics_select_id: ?[]const u8 = null;
 
@@ -868,6 +999,13 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else if (std.mem.eql(u8, arg, "--diagnostics-precision-view")) {
                 diagnostics_enabled = true;
                 diagnostics_precision_view = true;
+                launch_studio = true;
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-large-deck=")) {
+                const value = arg["--diagnostics-large-deck=".len..];
+                const count = std.fmt.parseInt(usize, value, 10) catch return error.InvalidDiagnosticSlideCount;
+                if (count == 0 or count > 200) return error.InvalidDiagnosticSlideCount;
+                diagnostics_enabled = true;
+                diagnostics_large_deck_count = count;
                 launch_studio = true;
             } else if (std.mem.startsWith(u8, arg, "--diagnostics-select=")) {
                 diagnostics_enabled = true;
@@ -925,6 +1063,8 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer G.deinit();
     if (slideshow_to_load) |path| {
         G.slideshow_filp_to_load = path;
+    } else if (diagnostics_large_deck_count) |slide_count| {
+        try initializeDiagnosticLargeSlideshow(slide_count);
     } else {
         try initializeUntitledSlideshow();
     }
@@ -960,14 +1100,11 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer studio_clipboard.deinit();
     var studio_bounds = std.ArrayList(studio.ResolvedBounds).empty;
     defer studio_bounds.deinit(gpa);
-    var studio_slide_summaries = std.ArrayList(studio.SlideSummary).empty;
-    defer studio_slide_summaries.deinit(gpa);
-    var studio_morph_summaries = std.ArrayList(studio.MorphStateSummary).empty;
-    defer studio_morph_summaries.deinit(gpa);
-    var studio_library_entries = std.ArrayList(studio.LibraryEntry).empty;
-    defer studio_library_entries.deinit(gpa);
-    var studio_library_catalog_indices = std.ArrayList(usize).empty;
-    defer studio_library_catalog_indices.deinit(gpa);
+    var studio_render_bounds = std.ArrayList(renderer.SlideshowRenderer.ItemRenderBounds).empty;
+    defer studio_render_bounds.deinit(gpa);
+    var studio_workspace_cache = StudioWorkspaceCache.init(gpa);
+    defer studio_workspace_cache.deinit();
+    var studio_composition_cache: StudioCompositionCache = .{};
 
     var manual_fullscreen: bool = false;
     var windowed_width = screenWidth;
@@ -1188,7 +1325,14 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_items = items.items;
             }
         }
-        try collectStudioBounds(&studio_bounds, gpa, G.current_slide, studio_mode.active_morph_state, studio_items);
+        const studio_prepare_started_at = rl.getTime();
+        const studio_render_fragment_count = try collectStudioBounds(
+            &studio_bounds,
+            &studio_render_bounds,
+            gpa,
+            G.current_slide,
+            studio_mode.active_morph_state,
+        );
         if (diagnostics_selection_pending) |item_id| {
             if (studio_mode.selectItemByIdOrSource(studio_items, item_id, .{})) {
                 studio_mode.active_dock = .properties;
@@ -1208,28 +1352,15 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
         if (rl.isWindowResized()) studio_mode.cancelActiveInteraction(studio_items);
 
-        studio_slide_summaries.clearRetainingCapacity();
-        studio_morph_summaries.clearRetainingCapacity();
-        studio_library_entries.clearRetainingCapacity();
-        studio_library_catalog_indices.clearRetainingCapacity();
         var frame_studio_catalog: ?studio_catalog.Catalog = null;
-        defer if (frame_studio_catalog) |catalog| catalog.deinit();
+        var workspace_cache_rebuilt = false;
         var studio_workspace: studio.Workspace = .{};
         if (studio_mode.capturesInput()) {
-            try collectStudioSlideSummaries(&studio_slide_summaries, gpa, G.slideshow);
-            if (current_slide) |slide| {
-                for (slide.morph_states.items, 0..) |state, state_index| {
-                    try studio_morph_summaries.append(gpa, .{
-                        .index = state_index,
-                        .label = state.spec.label orelse "",
-                        .duration = state.spec.duration,
-                        .after = state.spec.after,
-                        .easing = state.spec.easing,
-                        .source = state.source,
-                    });
-                }
-            }
-            frame_studio_catalog = try studio_catalog.discover(gpa, G.editor_memory[0..G.source_len]);
+            workspace_cache_rebuilt = try studio_workspace_cache.refreshDocument(
+                G.source_revision,
+                G.editor_memory[0..G.source_len],
+                G.slideshow,
+            );
             const item_insertion_offset = if (current_slide) |slide|
                 studioItemInsertionOffset(slide, studio_mode.active_morph_state) catch slide.pos_in_editor
             else
@@ -1238,30 +1369,32 @@ pub fn main(init: std.process.Init) anyerror!void {
                 source_editor.slideEndOffset(G.editor_memory[0..G.source_len], slide.pos_in_editor) catch item_insertion_offset
             else
                 item_insertion_offset;
-            try collectStudioLibraryEntries(
-                &studio_library_entries,
-                &studio_library_catalog_indices,
-                gpa,
-                frame_studio_catalog.?,
+            workspace_cache_rebuilt = (try studio_workspace_cache.refreshScene(
+                if (current_slide != null and G.current_slide >= 0) @intCast(G.current_slide) else null,
+                current_slide,
                 item_insertion_offset,
                 slide_insertion_offset,
-            );
+            )) or workspace_cache_rebuilt;
+            frame_studio_catalog = studio_workspace_cache.catalog;
             studio_workspace = .{
                 .visible = true,
-                .slides = studio_slide_summaries.items,
+                .slides = studio_workspace_cache.slide_summaries.items,
                 .current_slide = if (G.current_slide >= 0) @intCast(G.current_slide) else 0,
-                .library = studio_library_entries.items,
-                .morph_states = studio_morph_summaries.items,
+                .library = studio_workspace_cache.library_entries.items,
+                .morph_states = studio_workspace_cache.morph_summaries.items,
                 .new_deck = pristineUntitledDeck(),
                 .undo_available = studio_history.undo_stack.items.len > 0,
                 .redo_available = studio_history.redo_stack.items.len > 0,
                 .clipboard_item_count = studio_clipboard.items.items.len,
             };
         }
+        const composition_cache_builds_before = studio_composition_cache.rebuild_count;
         studio_mode.setCompositionContext(if (studio_mode.capturesInput() and current_slide != null)
-            studioCompositionContext(
+            studio_composition_cache.resolve(
+                G.source_revision,
                 gpa,
                 G.editor_memory[0..G.source_len],
+                G.current_slide,
                 current_slide.?,
                 studio_mode.active_morph_state,
                 studio_items,
@@ -1269,6 +1402,16 @@ pub fn main(init: std.process.Init) anyerror!void {
             )
         else
             null);
+        frame_diagnostics.recordStudioPrepare(
+            rl.getTime() - studio_prepare_started_at,
+            studio_workspace_cache.document_rebuild_count,
+            studio_workspace_cache.scene_rebuild_count,
+            studio_composition_cache.rebuild_count,
+            workspace_cache_rebuilt or studio_composition_cache.rebuild_count != composition_cache_builds_before,
+            G.slideshow.slides.items.len,
+            studio_items.len,
+            studio_render_fragment_count,
+        );
 
         var semantic_to_apply: ?studio.SemanticCommand = null;
         var semantic_text: ?[]const u8 = null;
@@ -1495,9 +1638,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                         property_prompt.begin(.reusable_name, name);
                     },
                     .rename_morph_state => |state_index| {
-                        if (state_index < studio_morph_summaries.items.len) {
+                        if (state_index < studio_workspace_cache.morph_summaries.items.len) {
                             var suggested_name: [96]u8 = undefined;
-                            const summary = studio_morph_summaries.items[state_index];
+                            const summary = studio_workspace_cache.morph_summaries.items[state_index];
                             const name = if (summary.label.len > 0)
                                 summary.label
                             else
@@ -1511,7 +1654,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                     .rename_library_entry => |library_index| {
                         if (studioLibraryEntry(
                             frame_studio_catalog,
-                            studio_library_catalog_indices.items,
+                            studio_workspace_cache.library_catalog_indices.items,
                             library_index,
                         )) |entry| {
                             pending_semantic_command = command;
@@ -1543,7 +1686,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                         if (add.library_entry_index) |library_index| {
                             if (studioLibraryName(
                                 frame_studio_catalog,
-                                studio_library_catalog_indices.items,
+                                studio_workspace_cache.library_catalog_indices.items,
                                 library_index,
                                 .element,
                             )) |name| {
@@ -1560,7 +1703,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                     .new_slide_from_template => |library_index| {
                         if (studioLibraryName(
                             frame_studio_catalog,
-                            studio_library_catalog_indices.items,
+                            studio_workspace_cache.library_catalog_indices.items,
                             library_index,
                             .slide,
                         )) |name| {
@@ -1798,7 +1941,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_items,
                 studio_bounds.items,
                 frame_studio_catalog,
-                studio_library_catalog_indices.items,
+                studio_workspace_cache.library_catalog_indices.items,
                 &studio_clipboard,
                 &selection_ids,
             )) |result| {
@@ -2196,6 +2339,9 @@ const AppData = struct {
     loaded_content: []u8 = undefined, // we will check for dirty editor against this
     source_len: usize = 0,
     loaded_len: usize = 0,
+    /// Monotonic in-memory document generation. Studio caches key off this
+    /// rather than rescanning up to 128 KiB of source every frame.
+    source_revision: usize = 0,
     last_window_size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     content_window_size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     slide_renderer: *renderer.SlideshowRenderer = undefined,
@@ -2268,6 +2414,13 @@ const AppData = struct {
         self.slide_renderer = try renderer.SlideshowRenderer.new(self.slideshow_allocator, &self.fonts);
     }
 
+    fn noteSourceMutation(self: *AppData) void {
+        self.source_revision +%= 1;
+        // Keep zero as the never-observed/default generation so an overflow
+        // cannot accidentally make a populated cache look pristine.
+        if (self.source_revision == 0) self.source_revision = 1;
+    }
+
     fn reinit(self: *AppData) !void {
         self.deinit();
         try self.init(self.allocator, self.io);
@@ -2319,6 +2472,7 @@ fn loadSlideshow(filp: []const u8) !void {
             G.loaded_content[input.len] = 0;
             G.source_len = input.len;
             G.loaded_len = input.len;
+            G.noteSourceMutation();
             G.slideshow_filp = blk: {
                 if (G.slideshow_filp) |existing| {
                     if (existing.ptr == filp.ptr) {
@@ -2405,7 +2559,98 @@ fn initializeUntitledSlideshow() !void {
     G.loaded_len = 0;
     G.slideshow_filp = null;
     G.hot_reload_last_stat = null;
+    G.noteSourceMutation();
     try reparseEditorSource();
+}
+
+fn appendDiagnosticDeckText(
+    output: []u8,
+    cursor: *usize,
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    if (cursor.* >= output.len) return error.DiagnosticDeckTooLarge;
+    const rendered = std.fmt.bufPrint(output[cursor.*..], format, args) catch return error.DiagnosticDeckTooLarge;
+    cursor.* += rendered.len;
+}
+
+fn diagnosticLargeDeckSource(output: []u8, slide_count: usize) ![]const u8 {
+    if (slide_count == 0 or slide_count > 200) return error.InvalidDiagnosticSlideCount;
+    var cursor: usize = 0;
+    const definition_count: usize = 24;
+    for (0..definition_count) |index| {
+        try appendDiagnosticDeckText(
+            output,
+            &cursor,
+            "@push perf_card_{d} w=220 h=76 fontsize=24 color=#dce8ffff bg=#17243cff text=Reusable {d}\n",
+            .{ index, index },
+        );
+    }
+    for (0..slide_count) |slide_index| {
+        try appendDiagnosticDeckText(output, &cursor, "@slide\n", .{});
+        try appendDiagnosticDeckText(
+            output,
+            &cursor,
+            "@box id=title_{d} x=80 y=64 w=1300 h=90 fontsize=52 color=#f6f8ffff text=Performance slide {d}\n",
+            .{ slide_index, slide_index + 1 },
+        );
+        for (0..5) |card_index| {
+            const definition_index = (slide_index + card_index) % definition_count;
+            try appendDiagnosticDeckText(
+                output,
+                &cursor,
+                "@pop perf_card_{d} id=card_{d}_{d} x={d} y={d}\n",
+                .{ definition_index, slide_index, card_index, 100 + card_index * 280, 250 + (card_index % 2) * 130 },
+            );
+        }
+        try appendDiagnosticDeckText(
+            output,
+            &cursor,
+            "@box id=footer_{d} x=80 y=940 fontsize=18 color=#8295b5ff text=Large-deck diagnostics · slide {d}\n",
+            .{ slide_index, slide_index + 1 },
+        );
+        if (slide_index % 8 == 0) {
+            try appendDiagnosticDeckText(
+                output,
+                &cursor,
+                "@state(morph) name=focus_{d} duration=0.35\n@set title_{d} x=140 color=#55d9ffff\n",
+                .{ slide_index, slide_index },
+            );
+        }
+    }
+    return output[0..cursor];
+}
+
+fn initializeDiagnosticLargeSlideshow(slide_count: usize) !void {
+    const source = try diagnosticLargeDeckSource(G.editor_memory[0 .. G.editor_memory.len - 1], slide_count);
+    G.editor_memory[source.len] = 0;
+    G.source_len = source.len;
+    G.loaded_len = 0;
+    G.slideshow_filp = null;
+    G.hot_reload_last_stat = null;
+    G.noteSourceMutation();
+    try reparseEditorSource();
+}
+
+test "large-deck diagnostics generate parser-clean reusable Studio stress data" {
+    const allocator = std.testing.allocator;
+    var source_buffer: [128 * 1024]u8 = undefined;
+    const source = try diagnosticLargeDeckSource(&source_buffer, 160);
+    try std.testing.expect(source.len < source_buffer.len);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const parser_context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer parser_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parser_context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 160), slideshow.slides.items.len);
+    try std.testing.expectEqual(@as(usize, 1), slideshow.slides.items[0].morph_states.items.len);
+    try std.testing.expectEqual(@as(usize, 0), slideshow.slides.items[1].morph_states.items.len);
+
+    const catalog = try studio_catalog.discover(allocator, source);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 24), catalog.entries.len);
 }
 
 fn pristineUntitledDeck() bool {
@@ -2672,6 +2917,7 @@ fn replaceEditorSource(source: []const u8) !void {
     if (old_len > source.len) @memset(G.editor_memory[source.len..old_len], 0);
     G.editor_memory[source.len] = 0;
     G.source_len = source.len;
+    G.noteSourceMutation();
 }
 
 fn studioItemByIdentity(items: []const slides.SlideItem, identity: usize) ?*const slides.SlideItem {
@@ -2886,8 +3132,16 @@ test "Studio composition capabilities expose exact component overrides and safe 
     try std.testing.expect(context.detach_target != null);
     try std.testing.expectEqual(studio.CompositionBlockReason.none, context.detach_block);
 
+    var capability_cache: StudioCompositionCache = .{};
+    const cached = capability_cache.resolve(7, allocator, source, 0, slide, null, items, studio_state).?;
+    try std.testing.expect(cached.local_overrides.contains(.x));
+    _ = capability_cache.resolve(7, allocator, source, 0, slide, null, items, studio_state);
+    try std.testing.expectEqual(@as(usize, 1), capability_cache.rebuild_count);
+
     studio_state.additional_selection_count = 1;
     try std.testing.expect(studioCompositionContext(allocator, source, slide, null, items, studio_state) == null);
+    try std.testing.expect(capability_cache.resolve(7, allocator, source, 0, slide, null, items, studio_state) == null);
+    try std.testing.expectEqual(@as(usize, 2), capability_cache.rebuild_count);
 }
 
 test "Studio composition capabilities authorize an exact reusable group detach" {
@@ -3529,6 +3783,45 @@ test "Studio group planner mixes existing and missing local overrides with a dir
     const untouched = reparsed.slides.items[1].items.?.items;
     try std.testing.expectApproxEqAbs(@as(f32, 10), untouched[0].position.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 40), untouched[1].position.x, 0.0001);
+
+    // Cross the planner -> one source patch -> history -> parser boundary in
+    // both directions. prepareRestore deliberately leaves the cursor fixed
+    // until the candidate source has reparsed successfully.
+    var history = StudioHistory.init(allocator);
+    defer history.deinit();
+    try history.record(
+        try allocator.dupe(u8, source),
+        try allocator.dupe(u8, patch.source),
+        0,
+        0,
+    );
+    const undo_restore = (try history.prepareRestore(.undo)).?;
+    var undo_arena = std.heap.ArenaAllocator.init(allocator);
+    defer undo_arena.deinit();
+    const undo_deck = try slides.SlideShow.new(undo_arena.allocator());
+    const undo_context = try parser.constructSlidesFromBuf(undo_restore.source, undo_deck, undo_arena.allocator());
+    defer undo_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), undo_context.parser_errors.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), undo_deck.slides.items[0].items.?.items[0].position.x, 0.0001);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), history.redo_stack.items.len);
+    history.commitRestore(.undo);
+
+    const redo_restore = (try history.prepareRestore(.redo)).?;
+    var redo_arena = std.heap.ArenaAllocator.init(allocator);
+    defer redo_arena.deinit();
+    const redo_deck = try slides.SlideShow.new(redo_arena.allocator());
+    const redo_context = try parser.constructSlidesFromBuf(redo_restore.source, redo_deck, redo_arena.allocator());
+    defer redo_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), redo_context.parser_errors.items.len);
+    const redone = redo_deck.slides.items[0].items.?.items;
+    for (redone, destinations) |item, destination| {
+        try std.testing.expectApproxEqAbs(destination.x, item.position.x, 0.0001);
+        try std.testing.expectApproxEqAbs(destination.y, item.position.y, 0.0001);
+    }
+    history.commitRestore(.redo);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), history.redo_stack.items.len);
 }
 
 test "Studio planner persists shared authored geometry while a local override stays masked" {
@@ -3971,6 +4264,160 @@ fn validReusableName(name: []const u8) bool {
     return true;
 }
 
+/// Retains source-borrowing Studio metadata for exactly one editor revision.
+/// The parser graph and editor buffer are immutable between revisions, so
+/// slide titles and catalog names remain valid without per-frame rescans or
+/// allocations. Scene-dependent slices rebuild only when their physical
+/// insertion offsets change.
+const StudioWorkspaceCache = struct {
+    allocator: std.mem.Allocator,
+    revision: ?usize = null,
+    catalog: ?studio_catalog.Catalog = null,
+    slide_summaries: std.ArrayList(studio.SlideSummary) = .empty,
+    morph_summaries: std.ArrayList(studio.MorphStateSummary) = .empty,
+    library_entries: std.ArrayList(studio.LibraryEntry) = .empty,
+    library_catalog_indices: std.ArrayList(usize) = .empty,
+    morph_slide_index: ?usize = null,
+    library_item_offset: ?usize = null,
+    library_slide_offset: ?usize = null,
+    document_rebuild_count: usize = 0,
+    scene_rebuild_count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) StudioWorkspaceCache {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *StudioWorkspaceCache) void {
+        if (self.catalog) |catalog| catalog.deinit();
+        self.catalog = null;
+        self.slide_summaries.deinit(self.allocator);
+        self.morph_summaries.deinit(self.allocator);
+        self.library_entries.deinit(self.allocator);
+        self.library_catalog_indices.deinit(self.allocator);
+    }
+
+    fn refreshDocument(
+        self: *StudioWorkspaceCache,
+        revision: usize,
+        source: []const u8,
+        slideshow: *const slides.SlideShow,
+    ) !bool {
+        if (self.revision != null and self.revision.? == revision) return false;
+
+        const catalog = try studio_catalog.discover(self.allocator, source);
+        errdefer catalog.deinit();
+        self.slide_summaries.clearRetainingCapacity();
+        try collectStudioSlideSummaries(&self.slide_summaries, self.allocator, slideshow);
+
+        if (self.catalog) |previous| previous.deinit();
+        self.catalog = catalog;
+        self.revision = revision;
+        self.morph_summaries.clearRetainingCapacity();
+        self.library_entries.clearRetainingCapacity();
+        self.library_catalog_indices.clearRetainingCapacity();
+        self.morph_slide_index = null;
+        self.library_item_offset = null;
+        self.library_slide_offset = null;
+        self.document_rebuild_count += 1;
+        return true;
+    }
+
+    fn refreshScene(
+        self: *StudioWorkspaceCache,
+        slide_index: ?usize,
+        slide: ?*const slides.Slide,
+        item_insertion_offset: usize,
+        slide_insertion_offset: usize,
+    ) !bool {
+        var rebuilt = false;
+        if (self.morph_slide_index != slide_index) {
+            self.morph_summaries.clearRetainingCapacity();
+            if (slide) |current| {
+                for (current.morph_states.items, 0..) |state, state_index| {
+                    try self.morph_summaries.append(self.allocator, .{
+                        .index = state_index,
+                        .label = state.spec.label orelse "",
+                        .duration = state.spec.duration,
+                        .after = state.spec.after,
+                        .easing = state.spec.easing,
+                        .source = state.source,
+                    });
+                }
+            }
+            self.morph_slide_index = slide_index;
+            rebuilt = true;
+        }
+
+        if (self.library_item_offset != item_insertion_offset or
+            self.library_slide_offset != slide_insertion_offset)
+        {
+            self.library_entries.clearRetainingCapacity();
+            self.library_catalog_indices.clearRetainingCapacity();
+            if (self.catalog) |catalog| try collectStudioLibraryEntries(
+                &self.library_entries,
+                &self.library_catalog_indices,
+                self.allocator,
+                catalog,
+                item_insertion_offset,
+                slide_insertion_offset,
+            );
+            self.library_item_offset = item_insertion_offset;
+            self.library_slide_offset = slide_insertion_offset;
+            rebuilt = true;
+        }
+        if (rebuilt) self.scene_rebuild_count += 1;
+        return rebuilt;
+    }
+};
+
+const StudioCompositionCache = struct {
+    const Key = struct {
+        revision: usize,
+        slide_index: i32,
+        morph_state: ?usize,
+        selection_count: usize,
+        selected_identity: ?usize,
+    };
+
+    key: ?Key = null,
+    value: ?studio.CompositionContext = null,
+    rebuild_count: usize = 0,
+
+    fn resolve(
+        self: *StudioCompositionCache,
+        revision: usize,
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        slide_index: i32,
+        slide: *const slides.Slide,
+        morph_state: ?usize,
+        items: []const slides.SlideItem,
+        studio_state: studio.Studio,
+    ) ?studio.CompositionContext {
+        const key: Key = .{
+            .revision = revision,
+            .slide_index = slide_index,
+            .morph_state = morph_state,
+            .selection_count = studio_state.selectionCount(),
+            .selected_identity = studio_state.selectedIdentityAt(0),
+        };
+        if (self.key) |cached| {
+            if (std.meta.eql(cached, key)) return self.value;
+        }
+        self.value = studioCompositionContext(
+            allocator,
+            source,
+            slide,
+            morph_state,
+            items,
+            studio_state,
+        );
+        self.key = key;
+        self.rebuild_count += 1;
+        return self.value;
+    }
+};
+
 fn studioSlideTitle(slide: *const slides.Slide) []const u8 {
     var title: []const u8 = "";
     var largest_font: i32 = std.math.minInt(i32);
@@ -4035,6 +4482,77 @@ fn collectStudioLibraryEntries(
         errdefer _ = output.pop();
         try catalog_indices.append(allocator, catalog_index);
     }
+}
+
+test "Studio workspace cache avoids unchanged large-deck rescans" {
+    const allocator = std.testing.allocator;
+    var source_builder = std.ArrayList(u8).empty;
+    defer source_builder.deinit(allocator);
+    const definition_count: usize = 48;
+    const slide_count: usize = 256;
+    for (0..definition_count) |index| {
+        var line_buffer: [160]u8 = undefined;
+        const line = try std.fmt.bufPrint(
+            &line_buffer,
+            "@push card_{d} x={d} y=20 w=180 h=60 text=Card {d}\n",
+            .{ index, index * 3, index },
+        );
+        try source_builder.appendSlice(allocator, line);
+    }
+    for (0..slide_count) |index| {
+        var line_buffer: [192]u8 = undefined;
+        const lines = try std.fmt.bufPrint(
+            &line_buffer,
+            "@slide\n@box id=title_{d} x=80 y=80 fontsize=48 text=Slide {d}\n",
+            .{ index, index },
+        );
+        try source_builder.appendSlice(allocator, lines);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const parser_context = try parser.constructSlidesFromBuf(source_builder.items, slideshow, arena.allocator());
+    defer parser_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parser_context.parser_errors.items.len);
+    try std.testing.expectEqual(slide_count, slideshow.slides.items.len);
+
+    var cache = StudioWorkspaceCache.init(allocator);
+    defer cache.deinit();
+    try std.testing.expect(try cache.refreshDocument(11, source_builder.items, slideshow));
+    try std.testing.expectEqual(slide_count, cache.slide_summaries.items.len);
+    try std.testing.expectEqual(definition_count, cache.catalog.?.entries.len);
+
+    const selected_index: usize = 200;
+    const selected = slideshow.slides.items[selected_index];
+    const item_offset = try source_editor.slideItemInsertionOffset(source_builder.items, selected.pos_in_editor);
+    const slide_offset = try source_editor.slideEndOffset(source_builder.items, selected.pos_in_editor);
+    try std.testing.expect(try cache.refreshScene(selected_index, selected, item_offset, slide_offset));
+    try std.testing.expectEqual(definition_count, cache.library_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.document_rebuild_count);
+    try std.testing.expectEqual(@as(usize, 1), cache.scene_rebuild_count);
+
+    // A steady Studio frame performs no catalog, slide-summary, morph, or
+    // library rebuild regardless of deck size.
+    try std.testing.expect(!try cache.refreshDocument(11, source_builder.items, slideshow));
+    try std.testing.expect(!try cache.refreshScene(selected_index, selected, item_offset, slide_offset));
+    try std.testing.expectEqual(@as(usize, 1), cache.document_rebuild_count);
+    try std.testing.expectEqual(@as(usize, 1), cache.scene_rebuild_count);
+
+    const next = slideshow.slides.items[selected_index + 1];
+    try std.testing.expect(try cache.refreshScene(
+        selected_index + 1,
+        next,
+        try source_editor.slideItemInsertionOffset(source_builder.items, next.pos_in_editor),
+        try source_editor.slideEndOffset(source_builder.items, next.pos_in_editor),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), cache.document_rebuild_count);
+    try std.testing.expectEqual(@as(usize, 2), cache.scene_rebuild_count);
+
+    // A new source generation invalidates every borrowed offset/name exactly
+    // once, even when the test deliberately reuses identical bytes.
+    try std.testing.expect(try cache.refreshDocument(12, source_builder.items, slideshow));
+    try std.testing.expectEqual(@as(usize, 2), cache.document_rebuild_count);
 }
 
 fn studioLibraryName(
@@ -5736,22 +6254,37 @@ fn applyStudioSemanticEdit(
     return .{};
 }
 
-fn undoStudioEdit(history: *StudioHistory, studio_mode: *studio.Studio) !bool {
-    const restore = try history.undo() orelse return false;
+fn restoreStudioHistory(
+    history: *StudioHistory,
+    studio_mode: *studio.Studio,
+    direction: HistoryDirection,
+) !bool {
+    const restore = try history.prepareRestore(direction) orelse return false;
+    const rollback_source = try G.allocator.dupe(u8, G.editor_memory[0..G.source_len]);
+    defer G.allocator.free(rollback_source);
+    const rollback_slide = G.current_slide;
+    const rollback_morph_state = studio_mode.active_morph_state;
+
     try replaceEditorSource(restore.source);
-    try reparseEditorSource();
+    reparseEditorSource() catch |restore_error| {
+        try replaceEditorSource(rollback_source);
+        try reparseEditorSource();
+        restoreStudioSlide(rollback_slide);
+        studio_mode.active_morph_state = rollback_morph_state;
+        return restore_error;
+    };
+    history.commitRestore(direction);
     restoreStudioSlide(restore.slide);
     restoreStudioMorphScene(studio_mode, restore.morph_scene);
     return true;
 }
 
+fn undoStudioEdit(history: *StudioHistory, studio_mode: *studio.Studio) !bool {
+    return restoreStudioHistory(history, studio_mode, .undo);
+}
+
 fn redoStudioEdit(history: *StudioHistory, studio_mode: *studio.Studio) !bool {
-    const restore = try history.redo() orelse return false;
-    try replaceEditorSource(restore.source);
-    try reparseEditorSource();
-    restoreStudioSlide(restore.slide);
-    restoreStudioMorphScene(studio_mode, restore.morph_scene);
-    return true;
+    return restoreStudioHistory(history, studio_mode, .redo);
 }
 
 fn restoreStudioMorphScene(studio_mode: *studio.Studio, requested: ?studio.MorphSceneCommand) void {
@@ -5783,20 +6316,28 @@ fn restoreStudioSlide(requested: i32) void {
 
 fn collectStudioBounds(
     output: *std.ArrayList(studio.ResolvedBounds),
+    render_bounds: *std.ArrayList(renderer.SlideshowRenderer.ItemRenderBounds),
     allocator: std.mem.Allocator,
     slide_number: i32,
     morph_state: ?usize,
-    items: []const slides.SlideItem,
-) !void {
+) !usize {
     output.clearRetainingCapacity();
-    for (items) |item| {
-        const bounds = G.slide_renderer.itemRenderBoundsForMorphState(slide_number, morph_state, item.identity) orelse continue;
+    const fragment_count = try G.slide_renderer.collectItemRenderBoundsForMorphState(
+        allocator,
+        render_bounds,
+        slide_number,
+        morph_state,
+    );
+    try output.ensureUnusedCapacity(allocator, render_bounds.items.len);
+    for (render_bounds.items) |entry| {
+        const bounds = entry.bounds;
         try output.append(allocator, .{
-            .identity = item.identity,
+            .identity = entry.owner_identity,
             .position = .{ .x = bounds.x, .y = bounds.y },
             .size = .{ .x = bounds.width, .y = bounds.height },
         });
     }
+    return fragment_count;
 }
 
 fn slideSizeInWindow(internal_render_size: rl.Vector2, window_size: rl.Vector2) rl.Vector2 {

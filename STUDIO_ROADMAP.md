@@ -161,11 +161,45 @@ seed the first state but cannot be renamed, deleted, or reordered.
 - [x] Keep presentation, screenshots, PDF export, thumbnails, and Focus Canvas
   independent from editor chrome and verify compact/default layouts visually.
 
+## Completed tranche: Large-deck performance and history confidence
+
+- [x] Cache slide summaries, reusable-library discovery, morph summaries, and
+  composition capabilities behind explicit source-revision and scene keys.
+- [x] Collect all active Studio item bounds in one renderer pass instead of
+  rescanning render fragments once per item.
+- [x] Extend the diagnostics HUD with Studio preparation time, cache rebuild
+  counters, deck size, and active item/render-fragment counts.
+- [x] Add a parser-backed `--diagnostics-large-deck=COUNT` stress deck and
+  validate a 160-slide document in the real macOS Studio window.
+- [x] Make Undo/Redo transactional: history cursors move only after the target
+  source reparses successfully, with the current source restored on failure.
+- [x] Exercise structural slide/morph history and mixed direct/local/shared
+  geometry batches through source patch, parse, Undo, and Redo boundaries.
+- [x] Show the selected slide and total deck size beside the slide-picker
+  paging controls so large decks retain a clear sense of position.
+
+ReleaseSafe live QA on the 160-slide stress deck holds Studio preparation at
+effectively 0.00 ms per steady frame, builds the complete render graph in
+about 6.7 ms on the test Mac, and remains synchronized to the 60 Hz display.
+
 ## Planned tranches
 
-### Performance and integration confidence
+### Large-project navigation and edit-time scaling
 
-- Performance work for large decks and richer integration-level history tests.
+- Add search/filter/jump surfaces for Slides, Objects, and Library without
+  hiding source-ownership barriers or changing document state.
+- Rebuild only provably affected render-graph regions after edits; retain the
+  current atomic full-deck fallback whenever dependencies are ambiguous.
+- Add automated performance and screenshot baselines for compact, default,
+  large, and synthetic-deck Studio configurations.
+
+### Release and resilience confidence
+
+- Extend application-boundary tests around document reload, Save As, recovery,
+  and source-edit failure injection, including allocation-failure history paths.
+- Add a repeatable macOS release QA checklist covering input focus, multiple
+  Spaces/monitors, resize/fullscreen transitions, and presentation/export
+  isolation from Studio chrome.
 
 ## Deliberate non-goals
 

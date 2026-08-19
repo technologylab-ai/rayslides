@@ -226,8 +226,11 @@ source.
 
 Press <kbd>F3</kbd>, or launch with `--diagnostics`, to show frame time, the
 one-second peak and slow-frame count, render-graph rebuild time, slideshow
-arena capacity, mouse coordinates, and window size. Slow frames are also
-rate-limited in the log while diagnostics are active. In Studio the HUD uses
+arena capacity, Studio preparation time, cache rebuild counts, deck size,
+active item/render-fragment counts, mouse coordinates, and window size. A `*`
+beside the cache counters marks a rebuild in the current frame. Slow frames
+are also rate-limited in the log while diagnostics are active. In Studio the
+HUD uses
 the free toolbar span between the authoring controls and Commands/Focus, so it
 does not cover slide content; narrow layouts hide it rather than crowding the
 controls.
@@ -242,6 +245,10 @@ for deterministic typography and containment QA across macOS Spaces.
 `--diagnostics-precision-view` enables rulers, both safe areas, measurements,
 and a 110% canvas view for deterministic precision-surface QA; pair it with
 `--diagnostics-select=ID` to measure a specific authored object.
+`--diagnostics-large-deck=COUNT` creates an in-memory, parser-backed Studio
+stress deck with reusable elements and morph states. `COUNT` accepts 1–200;
+the deck is intentionally untitled and does not touch a file unless you
+explicitly save it.
 
 Studio edits the `.sld` document rather than maintaining a separate opaque
 scene. It changes only the source owned by the selected object and preserves

@@ -1453,6 +1453,7 @@ pub const WorkspaceLayout = struct {
     organizer: rl.Rectangle,
     organizer_actions: [organizer_action_count]rl.Rectangle,
     slide_cards_clip: rl.Rectangle,
+    slide_page_status: rl.Rectangle,
     slide_page_previous: rl.Rectangle,
     slide_page_next: rl.Rectangle,
     library: rl.Rectangle,
@@ -1472,6 +1473,13 @@ pub const SlidePreviewSlot = struct {
     slide_index: usize,
     rect: rl.Rectangle,
 };
+
+fn currentSlideOrdinal(workspace: Workspace) usize {
+    for (workspace.slides, 0..) |summary, summary_index| {
+        if (summary.index == workspace.current_slide) return summary_index + 1;
+    }
+    return 0;
+}
 
 pub fn workspaceLayout(viewport: Viewport) WorkspaceLayout {
     const scale = if (viewport.chrome != null) uiScale(viewport) else 1;
@@ -1502,6 +1510,7 @@ fn emptyWorkspaceLayout() WorkspaceLayout {
         .organizer = empty_frame_rectangle,
         .organizer_actions = [_]rl.Rectangle{empty_frame_rectangle} ** organizer_action_count,
         .slide_cards_clip = empty_frame_rectangle,
+        .slide_page_status = empty_frame_rectangle,
         .slide_page_previous = empty_frame_rectangle,
         .slide_page_next = empty_frame_rectangle,
         .library = empty_frame_rectangle,
@@ -1534,6 +1543,12 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
         .x = organizer.x + organizer.width - 12 * scale - pager_width * 2 - action_gap,
         .y = pager_y,
         .width = pager_width,
+        .height = 22 * scale,
+    };
+    const slide_page_status: rl.Rectangle = .{
+        .x = organizer.x + 12 * scale,
+        .y = pager_y,
+        .width = @max(0, slide_page_previous.x - action_gap - (organizer.x + 12 * scale)),
         .height = 22 * scale,
     };
     const slide_page_next: rl.Rectangle = .{
@@ -1607,6 +1622,7 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
         .organizer = organizer,
         .organizer_actions = organizer_actions,
         .slide_cards_clip = slide_cards_clip,
+        .slide_page_status = slide_page_status,
         .slide_page_previous = slide_page_previous,
         .slide_page_next = slide_page_next,
         .library = library,
@@ -8228,6 +8244,30 @@ pub const Studio = struct {
         self.drawUiText("SLIDES", .{ .x = layout.organizer.x + 12 * font_scale, .y = layout.organizer.y + 9 * font_scale }, heading_font, .white);
         const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down", "Tpl" };
         for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(self, button, label);
+        var slide_progress_buffer: [64]u8 = undefined;
+        const current_summary = currentSlideOrdinal(workspace);
+        const slide_progress = std.fmt.bufPrintZ(
+            &slide_progress_buffer,
+            "{d} / {d}",
+            .{ current_summary, workspace.slides.len },
+        ) catch "slides";
+        var fitted_progress_buffer: [64]u8 = undefined;
+        const fitted_progress = self.fitUiText(
+            &fitted_progress_buffer,
+            slide_progress,
+            compact_font,
+            layout.slide_page_status.width,
+        );
+        self.drawUiText(
+            fitted_progress,
+            .{
+                .x = layout.slide_page_status.x,
+                .y = layout.slide_page_status.y +
+                    (layout.slide_page_status.height - @as(f32, @floatFromInt(compact_font))) / 2,
+            },
+            compact_font,
+            .{ .r = 185, .g = 196, .b = 215, .a = 255 },
+        );
         drawCompactButton(self, layout.slide_page_previous, "Prev");
         drawCompactButton(self, layout.slide_page_next, "Next");
 
@@ -12333,6 +12373,22 @@ test "workspace layout exposes bounded slide thumbnail slots" {
     try std.testing.expect(pointInRectangle(.{ .x = preview.x + preview.width, .y = preview.y + preview.height }, first));
     try std.testing.expect(first.y + first.height < second.y);
     try std.testing.expect(!pointInRectangle(rectangleCenter(layout.library), layout.organizer));
+    try std.testing.expect(layout.slide_page_status.x + layout.slide_page_status.width < layout.slide_page_previous.x);
+    try std.testing.expect(layout.slide_page_status.width >= 72 * layout.scale);
+
+    const progress_summaries = [_]SlideSummary{
+        .{ .index = 4 },
+        .{ .index = 11 },
+        .{ .index = 23 },
+    };
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        currentSlideOrdinal(.{ .visible = true, .slides = &progress_summaries, .current_slide = 11 }),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        currentSlideOrdinal(.{ .visible = true, .slides = &progress_summaries, .current_slide = 99 }),
+    );
 
     const short_viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = .{ .x = 900, .y = 360 } };
     const short_layout = workspaceLayout(short_viewport);

@@ -379,6 +379,60 @@ pub const SlideshowRenderer = struct {
         return self.itemRenderBoundsForMorphState(slide_number, null, owner_identity);
     }
 
+    pub const ItemRenderBounds = struct {
+        owner_identity: usize,
+        bounds: rl.Rectangle,
+    };
+
+    /// Collect every rendered owner in one linear pass. Studio previously
+    /// called itemRenderBoundsForMorphState once per SlideItem, rescanning all
+    /// fragments each time; text-heavy slides therefore paid quadratic work
+    /// on every frame. preRenderItem keeps an owner's fragments contiguous, so
+    /// the same unions can be emitted allocation-amortized in paint order.
+    pub fn collectItemRenderBoundsForMorphState(
+        self: *const SlideshowRenderer,
+        allocator: std.mem.Allocator,
+        output: *std.ArrayList(ItemRenderBounds),
+        slide_number: i32,
+        morph_state: ?usize,
+    ) !usize {
+        output.clearRetainingCapacity();
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return 0;
+        const slide = self.renderedSlides.items[@intCast(slide_number)];
+        const elements = if (morph_state) |state_index| blk: {
+            if (state_index >= slide.morph_scenes.items.len) return 0;
+            break :blk slide.morph_scenes.items[state_index].elements.items;
+        } else slide.elements.items;
+
+        for (elements) |element| {
+            if (element.kind == .background) continue;
+            const right = element.position.x + element.size.x;
+            const bottom = element.position.y + element.size.y;
+            if (output.items.len > 0 and output.items[output.items.len - 1].owner_identity == element.owner_identity) {
+                const previous = &output.items[output.items.len - 1].bounds;
+                const left = @min(previous.x, element.position.x);
+                const top = @min(previous.y, element.position.y);
+                previous.* = .{
+                    .x = left,
+                    .y = top,
+                    .width = @max(previous.x + previous.width, right) - left,
+                    .height = @max(previous.y + previous.height, bottom) - top,
+                };
+            } else {
+                try output.append(allocator, .{
+                    .owner_identity = element.owner_identity,
+                    .bounds = .{
+                        .x = element.position.x,
+                        .y = element.position.y,
+                        .width = element.size.x,
+                        .height = element.size.y,
+                    },
+                });
+            }
+        }
+        return elements.len;
+    }
+
     /// Logical bounds for an owner in either the base scene or one materialized
     /// semantic-morph snapshot. Studio uses the same scene for painting and
     /// hit-testing, so auto-sized images stay selectable while editing states.
@@ -2112,6 +2166,52 @@ test "repeated preRender releases slides morph scenes plans and owned text" {
     slideshow.slides.clearRetainingCapacity();
     try renderer.preRender(&slideshow, "");
     try std.testing.expectEqual(@as(usize, 0), renderer.renderedSlides.items.len);
+}
+
+test "Studio owner bounds are collected in one render-fragment pass" {
+    const allocator = std.testing.allocator;
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(allocator, &unused_fonts);
+    defer renderer.deinit();
+
+    const rendered_slide = try RenderedSlide.new(allocator);
+    var rendered_slide_owned = true;
+    errdefer if (rendered_slide_owned) renderer.destroyRenderedSlide(rendered_slide);
+    const owner_count: usize = 400;
+    const fragments_per_owner: usize = 3;
+    for (0..owner_count) |owner_index| {
+        for (0..fragments_per_owner) |fragment_index| {
+            try rendered_slide.elements.append(allocator, .{
+                .kind = .text,
+                .owner_identity = owner_index + 1,
+                .part_index = fragment_index,
+                .position = .{
+                    .x = @floatFromInt(owner_index * 2 + fragment_index),
+                    .y = @floatFromInt(owner_index + fragment_index * 4),
+                },
+                .size = .{ .x = 20, .y = 10 },
+            });
+        }
+    }
+    try renderer.renderedSlides.append(allocator, rendered_slide);
+    rendered_slide_owned = false;
+
+    var bounds = std.ArrayList(SlideshowRenderer.ItemRenderBounds).empty;
+    defer bounds.deinit(allocator);
+    const fragments_scanned = try renderer.collectItemRenderBoundsForMorphState(
+        allocator,
+        &bounds,
+        0,
+        null,
+    );
+    try std.testing.expectEqual(owner_count * fragments_per_owner, fragments_scanned);
+    try std.testing.expectEqual(owner_count, bounds.items.len);
+
+    for ([_]usize{ 0, owner_count / 2, owner_count - 1 }) |index| {
+        const legacy = renderer.itemRenderBoundsForMorphState(0, null, index + 1).?;
+        try std.testing.expectEqual(index + 1, bounds.items[index].owner_identity);
+        try std.testing.expectEqual(legacy, bounds.items[index].bounds);
+    }
 }
 
 test "inline font boundaries use the wider neighboring space in both directions" {
