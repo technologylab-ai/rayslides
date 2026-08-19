@@ -24,6 +24,7 @@ const studio_prompt = @import("studio_prompt.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const SlideShow = slides.SlideShow;
 const studio_ui_font_data = @embedFile("assets/Calibri Regular.ttf");
+const presenter_ui_font_data = @embedFile("assets/Calibri Light.ttf");
 const pristine_untitled_source = "@slide\n";
 const cli_help =
     \\Rayslides {s}
@@ -49,6 +50,7 @@ const cli_help =
     \\  --diagnostics-command-palette    Open Studio with Commands visible
     \\  --diagnostics-command-tooltip    Show deterministic command hover help
     \\  --diagnostics-precision-view     Show rulers, guides, and precision tools
+    \\  --diagnostics-presenter-pairing  Show the Presenter pairing overlay
     \\  --diagnostics-large-deck=N       Generate an N-slide stress deck (1-200)
     \\  --diagnostics-incremental-edit=N Edit slide N after the initial render
     \\  --diagnostics-window=WIDTHxHEIGHT
@@ -599,9 +601,36 @@ fn publishPresenterState(
     }) catch |err| log.err("Presenter state update failed: {any}", .{err});
 }
 
-fn drawCenteredPresenterText(text: [:0]const u8, y: i32, font_size: i32, color: rl.Color, width: i32) void {
-    const text_width = rl.measureText(text, font_size);
-    rl.drawText(text, @divFloor(width - text_width, 2), y, font_size, color);
+fn presenterOverlayScale(screen_width: i32, screen_height: i32) f32 {
+    const width_scale = @as(f32, @floatFromInt(@max(screen_width, 1))) / 1280.0;
+    const height_scale = @as(f32, @floatFromInt(@max(screen_height, 1))) / 720.0;
+    return std.math.clamp(@min(width_scale, height_scale), 1.0, 3.0);
+}
+
+fn presenterOverlayPx(base: i32, scale: f32) i32 {
+    return @intFromFloat(@round(@as(f32, @floatFromInt(base)) * scale));
+}
+
+fn drawCenteredPresenterText(
+    font: rl.Font,
+    text: [:0]const u8,
+    y: i32,
+    font_size: f32,
+    color: rl.Color,
+    width: i32,
+) void {
+    const measured = rl.measureTextEx(font, text, font_size, 0);
+    rl.drawTextEx(
+        font,
+        text,
+        .{
+            .x = (@as(f32, @floatFromInt(width)) - measured.x) / 2,
+            .y = @floatFromInt(y),
+        },
+        font_size,
+        0,
+        color,
+    );
 }
 
 fn drawPresenterPairingOverlay(
@@ -611,23 +640,31 @@ fn drawPresenterPairingOverlay(
     screen_width: i32,
     screen_height: i32,
 ) void {
+    const scale = presenterOverlayScale(screen_width, screen_height);
+    const font = G.presenter_ui_font;
     rl.drawRectangleRec(.{
         .x = 0,
         .y = 0,
         .width = @floatFromInt(screen_width),
         .height = @floatFromInt(screen_height),
     }, .{ .r = 7, .g = 11, .b = 24, .a = 255 });
-    drawCenteredPresenterText("PAIR PRESENTER PHONE", 24, 28, .{ .r = 97, .g = 218, .b = 251, .a = 255 }, screen_width);
-    drawCenteredPresenterText("Scan this private code before enabling screen mirroring", 60, 18, .{ .r = 185, .g = 202, .b = 220, .a = 255 }, screen_width);
+    drawCenteredPresenterText(font, "PAIR PRESENTER PHONE", presenterOverlayPx(18, scale), 36 * scale, .{ .r = 97, .g = 218, .b = 251, .a = 255 }, screen_width);
+    drawCenteredPresenterText(font, "Scan this private code before enabling screen mirroring", presenterOverlayPx(58, scale), 24 * scale, .{ .r = 185, .g = 202, .b = 220, .a = 255 }, screen_width);
 
-    const qr_target = @max(@as(i32, 120), @min(@as(i32, 340), @min(screen_width - 80, screen_height - 190)));
+    const qr_target = @max(
+        presenterOverlayPx(120, scale),
+        @min(
+            presenterOverlayPx(380, scale),
+            @min(screen_width - presenterOverlayPx(80, scale), screen_height - presenterOverlayPx(210, scale)),
+        ),
+    );
     if (code.ensure(runtime.pairing_url.slice())) {
         const matrix_size = code.size();
         const quiet_modules: i32 = 4;
         const cell = @max(@as(i32, 1), @divFloor(qr_target, matrix_size + quiet_modules * 2));
         const rendered_side = (matrix_size + quiet_modules * 2) * cell;
         const left = @divFloor(screen_width - rendered_side, 2);
-        const top: i32 = 88;
+        const top = presenterOverlayPx(92, scale);
         rl.drawRectangleRec(.{
             .x = @floatFromInt(left),
             .y = @floatFromInt(top),
@@ -650,20 +687,28 @@ fn drawPresenterPairingOverlay(
 
         var address_buffer: [320:0]u8 = @splat(0);
         const address = std.fmt.bufPrintZ(&address_buffer, "Local address: {s}", .{runtime.base_url.slice()}) catch "Local address is too long";
-        const address_y = @min(screen_height - 74, top + rendered_side + 12);
-        drawCenteredPresenterText(address, address_y, 18, .{ .r = 223, .g = 233, .b = 244, .a = 255 }, screen_width);
+        const address_y = @min(screen_height - presenterOverlayPx(82, scale), top + rendered_side + presenterOverlayPx(14, scale));
+        drawCenteredPresenterText(font, address, address_y, 22 * scale, .{ .r = 223, .g = 233, .b = 244, .a = 255 }, screen_width);
     } else {
-        drawCenteredPresenterText("The pairing address is too long to encode as a QR code.", 160, 20, .{ .r = 255, .g = 155, .b = 174, .a = 255 }, screen_width);
+        drawCenteredPresenterText(font, "The pairing address is too long to encode as a QR code.", presenterOverlayPx(160, scale), 24 * scale, .{ .r = 255, .g = 155, .b = 174, .a = 255 }, screen_width);
     }
 
     drawCenteredPresenterText(
+        font,
         if (connected) "PHONE CONNECTED" else "WAITING FOR PHONE",
-        screen_height - 48,
-        18,
+        screen_height - presenterOverlayPx(82, scale),
+        24 * scale,
         if (connected) .{ .r = 130, .g = 230, .b = 174, .a = 255 } else .{ .r = 255, .g = 181, .b = 71, .a = 255 },
         screen_width,
     );
-    drawCenteredPresenterText("P: hide setup   •   Shift-P: unpair and stop", screen_height - 25, 15, .{ .r = 139, .g = 158, .b = 179, .a = 255 }, screen_width);
+    drawCenteredPresenterText(font, "P: hide setup   •   Shift-P: unpair and stop", screen_height - presenterOverlayPx(30, scale), 18 * scale, .{ .r = 139, .g = 158, .b = 179, .a = 255 }, screen_width);
+}
+
+test "presenter pairing overlay scales for projector resolutions" {
+    try std.testing.expectApproxEqAbs(@as(f32, 1), presenterOverlayScale(1280, 720), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), presenterOverlayScale(1920, 1080), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), presenterOverlayScale(3840, 2160), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), presenterOverlayScale(900, 506), 0.001);
 }
 
 const ExportController = struct {
@@ -1765,6 +1810,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_command_palette = false;
     var diagnostics_command_tooltip = false;
     var diagnostics_precision_view = false;
+    var diagnostics_presenter_pairing = false;
     var diagnostics_large_deck_count: ?usize = null;
     var diagnostics_incremental_edit_slide: ?usize = null;
     var diagnostics_window_size: ?WindowDimensions = null;
@@ -1833,6 +1879,9 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-precision-view")) {
                 diagnostics_enabled = true;
                 diagnostics_precision_view = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-presenter-pairing")) {
+                diagnostics_presenter_pairing = true;
                 launch_studio = true;
             } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-large-deck=")) {
                 const value = arg["--diagnostics-large-deck=".len..];
@@ -1978,6 +2027,11 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer presenter_preview.deinit();
     var presenter_qr: qrcode.Code = .{};
     var presenter_pairing_visible = false;
+    if (diagnostics_presenter_pairing) {
+        if (!ensurePresenterCompanionRunning(&presenter_runtime, presenter_options))
+            return error.DiagnosticPresenterPairingFailed;
+        presenter_pairing_visible = true;
+    }
 
     rl.setTargetFPS(60);
     var beast_mode: bool = false;
@@ -3598,6 +3652,9 @@ const AppData = struct {
     /// Dedicated embedded UI face. Presentation font directives never replace
     /// this atlas, keeping Studio controls stable across decks.
     studio_ui_font: rl.Font = undefined,
+    /// Projector-facing setup text scales independently from slide fonts and
+    /// remains Calibri Light even when the deck replaces its presentation face.
+    presenter_ui_font: rl.Font = undefined,
     editor_memory: []u8 = undefined,
     loaded_content: []u8 = undefined, // we will check for dirty editor against this
     source_len: usize = 0,
@@ -3649,6 +3706,14 @@ const AppData = struct {
         );
         errdefer rl.unloadFont(self.studio_ui_font);
         rl.setTextureFilter(self.studio_ui_font.texture, .bilinear);
+        self.presenter_ui_font = try rl.loadFontFromMemory(
+            ".ttf",
+            presenter_ui_font_data,
+            64,
+            fonts.default_fontchars[0..],
+        );
+        errdefer rl.unloadFont(self.presenter_ui_font);
+        rl.setTextureFilter(self.presenter_ui_font.texture, .bilinear);
         self.slideshow = try SlideShow.new(self.slideshow_allocator);
         // The parser graph is arena-backed and replaced after every Studio
         // source edit. The renderer deliberately lives on the long-lived GPA
@@ -3667,6 +3732,7 @@ const AppData = struct {
         if (self.parser_context) |context| context.deinit();
         self.parser_context = null;
         self.slide_renderer.deinit();
+        rl.unloadFont(self.presenter_ui_font);
         rl.unloadFont(self.studio_ui_font);
         self.fonts.deinit();
         self.allocator.free(self.editor_memory);
