@@ -104,13 +104,29 @@ reported as blocked rather than guessed away.
   needed, and refuse existing destinations instead of silently overwriting or
   inventing a filename.
 
+## Completed tranche: Morph and transition timeline
+
+- [x] Present the authored BASE scene and every cumulative semantic morph state
+  as responsive cards in reserved Studio chrome, never over the slide canvas.
+- [x] Show each state's optional source label, automatic delay, duration, and
+  easing, with the active scene synchronized across canvas and Objects.
+- [x] Add, visually duplicate, rename, delete, and reorder complete state
+  blocks through guarded source transactions and one-entry undo/redo.
+- [x] Preserve exact state bodies, comments, BOM/line endings, and EOF layout;
+  reject dynamic/global source ownership or invalid cumulative dependencies
+  atomically instead of guessing.
+- [x] Restore the selected BASE/state scene with timeline undo/redo and keep it
+  visible while scrolling long timelines.
+- [x] Verify compact, default, and large layouts headlessly and exercise a
+  real four-state morph deck in the macOS Studio window.
+
+The **Dup** operation inserts an empty following state with the selected
+cumulative snapshot and copies its timing/easing. It does not replay mutations
+or duplicate state-born IDs. Labels are deliberately omitted from the copy
+until the author names it. BASE remains the immutable authored root: it can
+seed the first state but cannot be renamed, deleted, or reordered.
+
 ## Planned tranches
-
-### Morph and transition timeline
-
-- Present base plus semantic morph states as an explicit timeline.
-- Add, duplicate, rename, reorder, and preview states visually.
-- Make state inheritance, local overrides, and transition ownership visible.
 
 ### Precision and polish
 

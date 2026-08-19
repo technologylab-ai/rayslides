@@ -83,11 +83,14 @@ const SourceChange = struct {
     after: []u8,
     before_slide: i32,
     after_slide: i32,
+    before_morph_scene: ?studio.MorphSceneCommand = null,
+    after_morph_scene: ?studio.MorphSceneCommand = null,
 };
 
 const SourceRestore = struct {
     source: []const u8,
     slide: i32,
+    morph_scene: ?studio.MorphSceneCommand = null,
 };
 
 const StudioHistory = struct {
@@ -147,18 +150,37 @@ const StudioHistory = struct {
         self.undo_stack.items[self.undo_stack.items.len - 1].after_slide = @intCast(slide);
     }
 
+    fn setLatestMorphScenes(
+        self: *StudioHistory,
+        before: ?usize,
+        after: ?usize,
+    ) void {
+        if (self.undo_stack.items.len == 0) return;
+        const latest = &self.undo_stack.items[self.undo_stack.items.len - 1];
+        latest.before_morph_scene = .{ .active_state = before };
+        latest.after_morph_scene = .{ .active_state = after };
+    }
+
     fn undo(self: *StudioHistory) !?SourceRestore {
         const entry = self.undo_stack.pop() orelse return null;
         errdefer self.undo_stack.append(self.allocator, entry) catch {};
         try self.redo_stack.append(self.allocator, entry);
-        return .{ .source = entry.before, .slide = entry.before_slide };
+        return .{
+            .source = entry.before,
+            .slide = entry.before_slide,
+            .morph_scene = entry.before_morph_scene,
+        };
     }
 
     fn redo(self: *StudioHistory) !?SourceRestore {
         const entry = self.redo_stack.pop() orelse return null;
         errdefer self.redo_stack.append(self.allocator, entry) catch {};
         try self.undo_stack.append(self.allocator, entry);
-        return .{ .source = entry.after, .slide = entry.after_slide };
+        return .{
+            .source = entry.after,
+            .slide = entry.after_slide,
+            .morph_scene = entry.after_morph_scene,
+        };
     }
 };
 
@@ -251,13 +273,16 @@ test "Studio history restores structural edit slide positions" {
     errdefer allocator.free(after);
     try history.record(before, after, 0, 0);
     history.setLatestAfterSlide(1);
+    history.setLatestMorphScenes(0, 1);
 
     const undo = (try history.undo()).?;
     try std.testing.expectEqual(@as(i32, 0), undo.slide);
     try std.testing.expectEqualStrings("@slide\n@slide\n", undo.source);
+    try std.testing.expectEqual(@as(?usize, 0), undo.morph_scene.?.active_state);
     const redo = (try history.redo()).?;
     try std.testing.expectEqual(@as(i32, 1), redo.slide);
     try std.testing.expectEqualStrings("@slide\n@slide\n@slide\n", redo.source);
+    try std.testing.expectEqual(@as(?usize, 1), redo.morph_scene.?.active_state);
 }
 
 fn defaultCrowdHost(buffer: *[256]u8) []const u8 {
@@ -828,6 +853,8 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer studio_bounds.deinit(gpa);
     var studio_slide_summaries = std.ArrayList(studio.SlideSummary).empty;
     defer studio_slide_summaries.deinit(gpa);
+    var studio_morph_summaries = std.ArrayList(studio.MorphStateSummary).empty;
+    defer studio_morph_summaries.deinit(gpa);
     var studio_library_entries = std.ArrayList(studio.LibraryEntry).empty;
     defer studio_library_entries.deinit(gpa);
     var studio_library_catalog_indices = std.ArrayList(usize).empty;
@@ -1064,6 +1091,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (rl.isWindowResized()) studio_mode.cancelActiveInteraction(studio_items);
 
         studio_slide_summaries.clearRetainingCapacity();
+        studio_morph_summaries.clearRetainingCapacity();
         studio_library_entries.clearRetainingCapacity();
         studio_library_catalog_indices.clearRetainingCapacity();
         var frame_studio_catalog: ?studio_catalog.Catalog = null;
@@ -1071,6 +1099,18 @@ pub fn main(init: std.process.Init) anyerror!void {
         var studio_workspace: studio.Workspace = .{};
         if (studio_mode.capturesInput()) {
             try collectStudioSlideSummaries(&studio_slide_summaries, gpa, G.slideshow);
+            if (current_slide) |slide| {
+                for (slide.morph_states.items, 0..) |state, state_index| {
+                    try studio_morph_summaries.append(gpa, .{
+                        .index = state_index,
+                        .label = state.spec.label orelse "",
+                        .duration = state.spec.duration,
+                        .after = state.spec.after,
+                        .easing = state.spec.easing,
+                        .source = state.source,
+                    });
+                }
+            }
             frame_studio_catalog = try studio_catalog.discover(gpa, G.editor_memory[0..G.source_len]);
             const item_insertion_offset = if (current_slide) |slide|
                 studioItemInsertionOffset(slide, studio_mode.active_morph_state) catch slide.pos_in_editor
@@ -1093,6 +1133,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .slides = studio_slide_summaries.items,
                 .current_slide = if (G.current_slide >= 0) @intCast(G.current_slide) else 0,
                 .library = studio_library_entries.items,
+                .morph_states = studio_morph_summaries.items,
                 .new_deck = pristineUntitledDeck(),
             };
         }
@@ -1293,6 +1334,20 @@ pub fn main(init: std.process.Init) anyerror!void {
                         const name = std.fmt.bufPrint(&suggested_name, "slide_template_{d}", .{slide_index + 1}) catch "slide_template";
                         pending_semantic_command = command;
                         property_prompt.begin(.reusable_name, name);
+                    },
+                    .rename_morph_state => |state_index| {
+                        if (state_index < studio_morph_summaries.items.len) {
+                            var suggested_name: [96]u8 = undefined;
+                            const summary = studio_morph_summaries.items[state_index];
+                            const name = if (summary.label.len > 0)
+                                summary.label
+                            else
+                                std.fmt.bufPrint(&suggested_name, "state_{d}", .{state_index + 1}) catch "state";
+                            pending_semantic_command = command;
+                            property_prompt.begin(.reusable_name, name);
+                        } else {
+                            studio_mode.setNotice(.edit_failed);
+                        }
                     },
                     .rename_library_entry => |library_index| {
                         if (studioLibraryEntry(
@@ -1578,6 +1633,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                         G.current_slide = @intCast(slide_index);
                         studio_mode.active_morph_state = null;
                     }
+                    if (result.morph_scene) |scene| {
+                        studio_mode.active_morph_state = scene.active_state;
+                    }
                     studio_mode.markSourceChanged();
                     var id_views: [studio.max_selection_items][]const u8 = undefined;
                     if (selection_ids.values.items.len > 0) {
@@ -1662,6 +1720,12 @@ pub fn main(init: std.process.Init) anyerror!void {
                         error.UnsupportedGroupPromotion,
                         error.UnsupportedGroupInstance,
                         => .structural_source_locked,
+                        error.InvalidMorphStateOffset,
+                        error.NoAdjacentMorphState,
+                        => .morph_structure_locked,
+                        error.InvalidMorphState,
+                        error.StudioSourcePatchInvalid,
+                        => if (semanticCommandIsMorphTimeline(command)) .morph_structure_locked else .edit_failed,
                         error.StudioClipboardEmpty => .clipboard_empty,
                         error.LockedLayerBarrier,
                         error.StudioItemLocked,
@@ -1712,9 +1776,9 @@ pub fn main(init: std.process.Init) anyerror!void {
             // selection before reparsing so undo/redo can never retarget it.
             studio_mode.clearSelection(studio_items);
             const changed = if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift))
-                redoStudioEdit(&studio_history)
+                redoStudioEdit(&studio_history, &studio_mode)
             else
-                undoStudioEdit(&studio_history);
+                undoStudioEdit(&studio_history, &studio_mode);
             if (changed) |did_change| {
                 if (did_change) {
                     studio_mode.markSourceChanged();
@@ -1951,6 +2015,11 @@ const AppData = struct {
     last_window_size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     content_window_size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     slide_renderer: *renderer.SlideshowRenderer = undefined,
+    /// Owns parser-side storage borrowed by the live slide graph, including
+    /// expanded `@let` directive lines. Keep it alive until the graph is
+    /// replaced; destroying it immediately leaves item IDs/text as dangling
+    /// slices even though the rendered slide itself still exists.
+    parser_context: ?*parser.ParserContext = null,
     slideshow_filp_buffer: [std.fs.max_path_bytes]u8 = undefined,
     slideshow_filp_to_load_buffer: [std.fs.max_path_bytes]u8 = undefined,
     slideshow_filp: ?[]const u8 = null,
@@ -1968,6 +2037,7 @@ const AppData = struct {
 
         self.slideshow_arena = std.heap.ArenaAllocator.init(gpa);
         self.slideshow_allocator = self.slideshow_arena.allocator();
+        self.parser_context = null;
 
         self.fonts = try fonts.AvailableFonts.init(.{});
         errdefer self.fonts.deinit();
@@ -1990,6 +2060,8 @@ const AppData = struct {
     }
 
     fn deinit(self: *AppData) void {
+        if (self.parser_context) |context| context.deinit();
+        self.parser_context = null;
         self.slide_renderer.deinit();
         rl.unloadFont(self.studio_ui_font);
         self.fonts.deinit();
@@ -2002,6 +2074,8 @@ const AppData = struct {
     /// Studio history deliberately survive so a visual edit can be reparsed
     /// without turning into a file reload.
     fn resetSlideshowGraph(self: *AppData) !void {
+        if (self.parser_context) |context| context.deinit();
+        self.parser_context = null;
         self.slide_renderer.deinit();
         self.slideshow_arena.deinit();
         self.slideshow_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -2071,8 +2145,10 @@ fn loadSlideshow(filp: []const u8) !void {
             };
             std.log.debug("filp is now {s}", .{G.slideshow_filp.?});
             if (parser.constructSlidesFromBuf(G.editor_memory[0..input.len], G.slideshow, G.slideshow_allocator)) |pcontext| {
-                defer pcontext.deinit();
-                // ed_anim.parser_context = pcontext;
+                // SlideItem fields borrow parser-owned slices (notably from
+                // expanded @let lines), so the context is part of the live
+                // slideshow graph rather than a parse-time temporary.
+                G.parser_context = pcontext;
                 // now reload fonts
                 if (pcontext.custom_fonts_present) {
                     std.log.debug("reloading fonts", .{});
@@ -2124,8 +2200,11 @@ fn reparseEditorSource() !void {
         G.slideshow,
         G.slideshow_allocator,
     );
-    defer context.deinit();
-    if (context.parser_errors.items.len != 0) return error.StudioSourcePatchInvalid;
+    if (context.parser_errors.items.len != 0) {
+        context.deinit();
+        return error.StudioSourcePatchInvalid;
+    }
+    G.parser_context = context;
 
     if (G.slideshow.slides.items.len == 0) {
         G.current_slide = 0;
@@ -2740,6 +2819,18 @@ fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticComman
     if (target.edit_scope != .shared_template) return false;
     const item = studioItemByIdentity(items, target.item_identity) orelse return false;
     return item.instance_source != null;
+}
+
+fn semanticCommandIsMorphTimeline(command: studio.SemanticCommand) bool {
+    return switch (command) {
+        .add_morph_state,
+        .duplicate_morph_state,
+        .rename_morph_state,
+        .delete_morph_state,
+        .move_morph_state,
+        => true,
+        else => false,
+    };
 }
 
 fn layerCommandSelects(command: studio.LayerCommand, identity: usize) bool {
@@ -4623,6 +4714,7 @@ test "Studio visibility planner supports component instances and rejects locked 
 const StudioSemanticEditResult = struct {
     source_changed: bool = true,
     slide_index: ?usize = null,
+    morph_scene: ?studio.MorphSceneCommand = null,
     /// Non-structural property edits preserve item identity/order. Leaving the
     /// source-bound selection in Studio lets it rebind on the next frame,
     /// including id-less literal items, so inspector workflows can edit
@@ -5305,6 +5397,90 @@ fn applyStudioSemanticEdit(
                 instance_id,
             ));
         },
+        .add_morph_state => |scene| {
+            const after_offset: ?usize = if (scene.active_state) |state_index| blk: {
+                if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+                break :blk slide.morph_states.items[state_index].source.line_offset;
+            } else null;
+            try recordStudioPatch(history, try source_editor.insertMorphStateAfter(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+                after_offset,
+            ));
+            const next_state: ?usize = if (scene.active_state) |state_index| state_index + 1 else 0;
+            history.setLatestMorphScenes(morph_state, next_state);
+            return .{ .morph_scene = .{ .active_state = next_state } };
+        },
+        .duplicate_morph_state => |state_index| {
+            if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            try recordStudioPatch(history, try source_editor.duplicateMorphState(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+                slide.morph_states.items[state_index].source.line_offset,
+            ));
+            history.setLatestMorphScenes(morph_state, state_index + 1);
+            return .{ .morph_scene = .{ .active_state = state_index + 1 } };
+        },
+        .rename_morph_state => |state_index| {
+            if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            const label = prompted_text orelse return error.StudioPromptMissing;
+            if (!validReusableName(label)) return error.InvalidReusableName;
+            if (slide.morph_states.items[state_index].spec.label) |existing| {
+                if (std.mem.eql(u8, existing, label)) return .{
+                    .source_changed = false,
+                    .morph_scene = .{ .active_state = state_index },
+                };
+            }
+            try recordStudioPatch(history, try source_editor.renameMorphState(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+                slide.morph_states.items[state_index].source.line_offset,
+                label,
+            ));
+            history.setLatestMorphScenes(morph_state, state_index);
+            return .{ .morph_scene = .{ .active_state = state_index } };
+        },
+        .delete_morph_state => |state_index| {
+            const state_count = slide.morph_states.items.len;
+            if (state_index >= state_count) return error.InvalidMorphState;
+            try recordStudioPatch(history, try source_editor.deleteMorphState(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+                slide.morph_states.items[state_index].source.line_offset,
+            ));
+            const next_state: ?usize = if (state_count == 1)
+                null
+            else if (state_index + 1 < state_count)
+                state_index
+            else
+                state_index - 1;
+            history.setLatestMorphScenes(morph_state, next_state);
+            return .{ .morph_scene = .{ .active_state = next_state } };
+        },
+        .move_morph_state => |move| {
+            if (move.state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            const direction: source_editor.MorphStateMoveDirection = switch (move.direction) {
+                .earlier => .earlier,
+                .later => .later,
+            };
+            try recordStudioPatch(history, try source_editor.moveMorphState(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+                slide.morph_states.items[move.state_index].source.line_offset,
+                direction,
+            ));
+            const next_state: usize = switch (move.direction) {
+                .earlier => move.state_index - 1,
+                .later => move.state_index + 1,
+            };
+            history.setLatestMorphScenes(morph_state, next_state);
+            return .{ .morph_scene = .{ .active_state = next_state } };
+        },
         .new_slide => {
             try recordStudioPatch(history, try source_editor.insertBlankSlideAfter(
                 G.allocator,
@@ -5375,20 +5551,39 @@ fn applyStudioSemanticEdit(
     return .{};
 }
 
-fn undoStudioEdit(history: *StudioHistory) !bool {
+fn undoStudioEdit(history: *StudioHistory, studio_mode: *studio.Studio) !bool {
     const restore = try history.undo() orelse return false;
     try replaceEditorSource(restore.source);
     try reparseEditorSource();
     restoreStudioSlide(restore.slide);
+    restoreStudioMorphScene(studio_mode, restore.morph_scene);
     return true;
 }
 
-fn redoStudioEdit(history: *StudioHistory) !bool {
+fn redoStudioEdit(history: *StudioHistory, studio_mode: *studio.Studio) !bool {
     const restore = try history.redo() orelse return false;
     try replaceEditorSource(restore.source);
     try reparseEditorSource();
     restoreStudioSlide(restore.slide);
+    restoreStudioMorphScene(studio_mode, restore.morph_scene);
     return true;
+}
+
+fn restoreStudioMorphScene(studio_mode: *studio.Studio, requested: ?studio.MorphSceneCommand) void {
+    const scene = requested orelse return;
+    const slide_index = std.math.cast(usize, G.current_slide) orelse {
+        studio_mode.active_morph_state = null;
+        return;
+    };
+    if (slide_index >= G.slideshow.slides.items.len) {
+        studio_mode.active_morph_state = null;
+        return;
+    }
+    const state_count = G.slideshow.slides.items[slide_index].morph_states.items.len;
+    studio_mode.active_morph_state = if (scene.active_state) |state_index|
+        if (state_index < state_count) state_index else null
+    else
+        null;
 }
 
 fn restoreStudioSlide(requested: i32) void {

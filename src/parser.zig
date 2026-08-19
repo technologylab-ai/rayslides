@@ -469,6 +469,9 @@ fn processReusableGroupLine(line: []const u8, context: *ParserContext) !void {
     builder.parsing_item_context.source_patchable = true;
 }
 
+/// Builds `slideshow` and returns its parser-side owner. The resulting slide
+/// graph borrows slices from this context's input and expanded `@let` lines;
+/// callers must keep the context alive until the slideshow graph is destroyed.
 pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, allocator: std.mem.Allocator) !*ParserContext {
     var context: *ParserContext = try ParserContext.new(allocator);
     context.slideshow = slideshow;
@@ -1275,6 +1278,21 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.morph = spec;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "label")) {
+                    if (attr_it.next()) |label| {
+                        if (!std.mem.eql(u8, item_context.directive, "@state")) {
+                            reportErrorInContext(ParserError.Syntax, context, "label= is only valid on @state(morph)");
+                            continue;
+                        }
+                        if (!isMorphStateLabel(label)) {
+                            reportErrorInContext(ParserError.Syntax, context, "morph state label must start with a letter or underscore and contain only letters, digits, _ or -");
+                            continue;
+                        }
+                        var spec = item_context.morph orelse animation.MorphSpec{};
+                        spec.label = label;
+                        item_context.morph = spec;
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "transition")) {
                     if (attr_it.next()) |effectstr| {
                         var transition = item_context.transition orelse animation.Transition{};
@@ -1328,6 +1346,14 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
         item_context.morph = animation.MorphSpec{};
     }
     return item_context;
+}
+
+fn isMorphStateLabel(label: []const u8) bool {
+    if (label.len == 0 or !(std.ascii.isAlphabetic(label[0]) or label[0] == '_')) return false;
+    for (label[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) return false;
+    }
+    return true;
 }
 
 // - @push       -- merge: parser context, current item context --> pushed item
@@ -2206,7 +2232,7 @@ test "semantic morph states are cumulative reversible snapshots" {
         \\@slide
         \\@box id=hero img=assets/example.png x=1200 y=200 w=500 h=300 opacity=0.8
         \\@pop title y=90 text=Persistent title
-        \\@state(morph) duration=0.75 ease=spring after=0.5
+        \\@state(morph) label=focus duration=0.75 ease=spring after=0.5
         \\@set hero x=0 y=0 w=1920 h=1080 opacity=1
         \\@hide title shadow_x=9
         \\@box id=caption x=100 y=900 w=1500 h=100 text=Born in state one
@@ -2230,6 +2256,7 @@ test "semantic morph states are cumulative reversible snapshots" {
     try std.testing.expectApproxEqAbs(@as(f32, 100), slide.items.?.items[1].position.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 90), slide.items.?.items[1].position.y, 0.0001);
     const state_one = slide.morph_states.items[0];
+    try std.testing.expectEqualStrings("focus", state_one.spec.label.?);
     try std.testing.expectEqual(animation.Easing.spring, state_one.spec.easing);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), state_one.spec.duration, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), state_one.spec.after.?, 0.0001);
@@ -2244,6 +2271,7 @@ test "semantic morph states are cumulative reversible snapshots" {
     try std.testing.expectEqual(@as(?usize, 0), state_one.items.items[2].creation_morph_state);
 
     const state_two = slide.morph_states.items[1];
+    try std.testing.expect(state_two.spec.label == null);
     try std.testing.expectEqual(animation.Easing.linear, state_two.spec.easing);
     try std.testing.expectEqual(@as(usize, 3), state_two.items.items.len);
     try std.testing.expectApproxEqAbs(@as(f32, 200), state_two.items.items[0].position.x, 0.0001);

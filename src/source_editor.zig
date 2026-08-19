@@ -250,6 +250,7 @@ pub const PatchError = error{
     GroupNameCollision,
     NoLocalPropertyOverride,
     NoAdjacentSlide,
+    NoAdjacentMorphState,
     NoLayerChange,
     NotPromotableDirective,
     OverlappingSourceEdits,
@@ -287,6 +288,11 @@ pub const SlideMoveDirection = enum {
     /// Put the selected slide immediately before its preceding slide.
     earlier,
     /// Put the selected slide immediately after its following slide.
+    later,
+};
+
+pub const MorphStateMoveDirection = enum {
+    earlier,
     later,
 };
 
@@ -1720,6 +1726,143 @@ pub fn morphStateEndOffset(source: []const u8, state_directive_offset: usize) Pa
         cursor = line.full_end;
     }
     return source.len;
+}
+
+/// Exact physical source block owned by one semantic morph state. The range
+/// starts at its `@state` directive and ends before the next state or rendered
+/// slide anchor. `slide_offset` is required so stale state offsets cannot
+/// escape into another logical slide.
+pub fn morphStateRange(
+    source: []const u8,
+    slide_offset: usize,
+    state_directive_offset: usize,
+) PatchError!LogicalSlideRange {
+    const slide = try logicalSlideRange(source, slide_offset);
+    if (state_directive_offset < slide.start or state_directive_offset >= slide.end) {
+        return error.InvalidMorphStateOffset;
+    }
+    const state = directiveLine(source, state_directive_offset) catch
+        return error.InvalidMorphStateOffset;
+    if (!isMorphStateDirective(directiveName(source[state.start..state.content_end]))) {
+        return error.InvalidMorphStateOffset;
+    }
+    const end = try morphStateEndOffset(source, state_directive_offset);
+    if (end > slide.end) return error.InvalidMorphStateOffset;
+    return .{
+        .start = state.start,
+        .end = end,
+        .anchor_offset = state.start,
+        .explicit_anchor = true,
+    };
+}
+
+/// Insert a new cumulative state after the selected state, or immediately
+/// after the base scene when `after_state_offset` is null.
+pub fn insertMorphStateAfter(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    after_state_offset: ?usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const insertion_offset = if (after_state_offset) |state_offset|
+        (try morphStateRange(source, slide_offset, state_offset)).end
+    else
+        try slideItemInsertionOffset(source, slide_offset);
+    return insertDirectiveAt(allocator, source, insertion_offset, "@state(morph)");
+}
+
+/// Create a visual copy of a state without replaying its mutations. Because
+/// morph snapshots are cumulative, an empty following state starts with the
+/// exact selected appearance. Timing/easing attributes are copied, while the
+/// author-facing label is intentionally omitted so the two cards remain
+/// distinguishable until renamed.
+pub fn duplicateMorphState(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    state_directive_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const range = try morphStateRange(source, slide_offset, state_directive_offset);
+    try validateMorphStateBlock(source, range);
+    const line = try directiveLine(source, state_directive_offset);
+    const directive = try duplicateMorphDirective(allocator, source[line.start..line.content_end]);
+    defer allocator.free(directive);
+    return insertDirectiveAt(allocator, source, range.end, directive);
+}
+
+/// Delete one complete state block. The caller reparses the resulting deck as
+/// part of the source transaction; dependencies from later states therefore
+/// fail atomically rather than leaving a partially valid timeline.
+pub fn deleteMorphState(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    state_directive_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const range = try morphStateRange(source, slide_offset, state_directive_offset);
+    try validateMorphStateBlock(source, range);
+    return replaceRange(allocator, source, range.start, range.end, "");
+}
+
+/// Move one complete state block across its adjacent state. State bodies stay
+/// byte-identical; cumulative semantics are deliberately recomputed by the
+/// parser after the atomic swap.
+pub fn moveMorphState(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    state_directive_offset: usize,
+    direction: MorphStateMoveDirection,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const slide = try logicalSlideRange(source, slide_offset);
+    const selected = try morphStateRange(source, slide_offset, state_directive_offset);
+    try validateMorphStateBlock(source, selected);
+
+    const left: LogicalSlideRange, const right: LogicalSlideRange = switch (direction) {
+        .earlier => blk: {
+            const previous_offset = previousMorphStateOffset(source, slide, selected.start) orelse
+                return error.NoAdjacentMorphState;
+            const previous = try morphStateRange(source, slide_offset, previous_offset);
+            if (previous.end != selected.start) return error.InvalidMorphStateOffset;
+            try validateMorphStateBlock(source, previous);
+            break :blk .{ previous, selected };
+        },
+        .later => blk: {
+            if (selected.end >= slide.end) return error.NoAdjacentMorphState;
+            const next_line = directiveLine(source, selected.end) catch
+                return error.NoAdjacentMorphState;
+            if (!isMorphStateDirective(directiveName(source[next_line.start..next_line.content_end]))) {
+                return error.NoAdjacentMorphState;
+            }
+            const next = try morphStateRange(source, slide_offset, selected.end);
+            try validateMorphStateBlock(source, next);
+            break :blk .{ selected, next };
+        },
+    };
+
+    var replacement = std.ArrayList(u8).empty;
+    defer replacement.deinit(allocator);
+    try appendSwappedSlideRanges(allocator, &replacement, source, left, right);
+    return replaceRange(allocator, source, left.start, right.end, replacement.items);
+}
+
+/// Set or replace the optional author-facing state label. Labels are static
+/// source identifiers used only by Studio; item mutation targets remain IDs.
+pub fn renameMorphState(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    state_directive_offset: usize,
+    label: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (!isReusableName(label)) return error.InvalidReusableName;
+    _ = try morphStateRange(source, slide_offset, state_directive_offset);
+    const line = try directiveLine(source, state_directive_offset);
+    if (hasPotentialLetExpansion(source[line.start..line.content_end])) {
+        return error.InvalidMorphStateOffset;
+    }
+    const patches = [_]LiteralAttributePatch{.{ .key = "label", .value = label }};
+    return patchLiteralAttributes(allocator, source, state_directive_offset, &patches);
 }
 
 /// Promote one direct `@box` item to a reusable component in place.
@@ -4057,6 +4200,76 @@ fn isMorphMutationDirective(name: []const u8) bool {
         std.mem.eql(u8, name, "@hide");
 }
 
+fn validateMorphStateBlock(source: []const u8, range: LogicalSlideRange) PatchError!void {
+    var cursor = range.start;
+    var first = true;
+    while (cursor < range.end) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            if (hasPotentialLetExpansion(text)) return error.InvalidMorphStateOffset;
+            const name = directiveName(text);
+            if (first) {
+                if (!isMorphStateDirective(name)) return error.InvalidMorphStateOffset;
+            } else if (!(isMorphMutationDirective(name) or
+                std.mem.eql(u8, name, "@box") or
+                std.mem.eql(u8, name, "@bg") or
+                std.mem.eql(u8, name, "@pop")))
+            {
+                // Moving or deleting definitions/defaults with a state would
+                // alter source-global parser context. Keep those directives a
+                // hard structural boundary rather than guessing ownership.
+                return error.InvalidMorphStateOffset;
+            }
+        }
+        first = false;
+        cursor = line.full_end;
+    }
+}
+
+fn previousMorphStateOffset(
+    source: []const u8,
+    slide: LogicalSlideRange,
+    before: usize,
+) ?usize {
+    var previous: ?usize = null;
+    var cursor = slide.start;
+    while (cursor < before) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isMorphStateDirective(name)) previous = cursor;
+        }
+        cursor = line.full_end;
+    }
+    return previous;
+}
+
+fn duplicateMorphDirective(
+    allocator: std.mem.Allocator,
+    directive: []const u8,
+) (std.mem.Allocator.Error || PatchError)![]u8 {
+    if (hasPotentialLetExpansion(directive)) return error.InvalidMorphStateOffset;
+    if (!isMorphStateDirective(directiveName(directive))) return error.InvalidMorphStateOffset;
+
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, "@state(morph)");
+    var tokens = std.mem.tokenizeAny(u8, directive, " \t");
+    _ = tokens.next();
+    while (tokens.next()) |token| {
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals];
+        if (std.mem.eql(u8, key, "label")) continue;
+        if (!(std.mem.eql(u8, key, "after") or
+            std.mem.eql(u8, key, "duration") or
+            std.mem.eql(u8, key, "ease"))) continue;
+        try output.append(allocator, ' ');
+        try output.appendSlice(allocator, token);
+    }
+    return output.toOwnedSlice(allocator);
+}
+
 fn isSlideBoundaryDirective(name: []const u8) bool {
     return isRenderedSlideAnchor(name) or
         std.mem.eql(u8, name, "@pushslide");
@@ -6056,6 +6269,162 @@ test "bare morph state is a base and state insertion boundary" {
     );
     defer inserted.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, inserted.source, "@box id=top text=Still base\n@state") != null);
+}
+
+test "morph timeline add duplicate rename and delete preserve cumulative snapshots" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=hero x=10 y=20 text=Base\r\n" ++
+        "@state(morph) label=focus after=0.2 duration=0.8 ease=spring\r\n" ++
+        "@set hero x=100\r\n" ++
+        "@state label=detail duration=0.4 ease=linear\r\n" ++
+        "@set hero y=200";
+    const first = std.mem.indexOf(u8, source, "@state(morph)").?;
+
+    const duplicated = try duplicateMorphState(std.testing.allocator, source, 3, first);
+    defer duplicated.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        duplicated.source,
+        "@set hero x=100\r\n@state(morph) after=0.2 duration=0.8 ease=spring\r\n@state label=detail",
+    ) != null);
+
+    const duplicate_offset = std.mem.indexOfPos(
+        u8,
+        duplicated.source,
+        first + 1,
+        "@state(morph) after=0.2",
+    ).?;
+    const renamed = try renameMorphState(
+        std.testing.allocator,
+        duplicated.source,
+        3,
+        duplicate_offset,
+        "focus_copy",
+    );
+    defer renamed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, renamed.source, "label=focus_copy") != null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(renamed.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 3), deck.slides.items[0].morph_states.items.len);
+    const state_one = deck.slides.items[0].morph_states.items[0];
+    const state_copy = deck.slides.items[0].morph_states.items[1];
+    try std.testing.expectEqualStrings("focus_copy", state_copy.spec.label.?);
+    try std.testing.expectApproxEqAbs(
+        state_one.items.items[0].position.x,
+        state_copy.items.items[0].position.x,
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(
+        state_one.items.items[0].position.y,
+        state_copy.items.items[0].position.y,
+        0.0001,
+    );
+
+    const deleted = try deleteMorphState(std.testing.allocator, renamed.source, 3, duplicate_offset);
+    defer deleted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(source, deleted.source);
+
+    const added = try insertMorphStateAfter(std.testing.allocator, source, 3, null);
+    defer added.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        added.source,
+        "@box id=hero x=10 y=20 text=Base\r\n@state(morph)\r\n@state(morph) label=focus",
+    ) != null);
+}
+
+test "morph timeline reorder swaps exact state blocks and handles EOF" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\r\n" ++
+        "@box id=hero x=10 y=20 text=Base\r\n" ++
+        "@state(morph) label=x-change duration=0.8\r\n" ++
+        "@set hero x=100\r\n" ++
+        "# first tail\r\n" ++
+        "@state(morph) label=y-change duration=0.3\r\n" ++
+        "@set hero y=200";
+    const first = std.mem.indexOf(u8, source, "@state(morph)").?;
+    const second = std.mem.lastIndexOf(u8, source, "@state(morph)").?;
+    const expected =
+        "@slide\r\n" ++
+        "@box id=hero x=10 y=20 text=Base\r\n" ++
+        "@state(morph) label=y-change duration=0.3\r\n" ++
+        "@set hero y=200\r\n" ++
+        "@state(morph) label=x-change duration=0.8\r\n" ++
+        "@set hero x=100\r\n" ++
+        "# first tail";
+
+    const earlier = try moveMorphState(std.testing.allocator, source, 0, second, .earlier);
+    defer earlier.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, earlier.source);
+    const later = try moveMorphState(std.testing.allocator, source, 0, first, .later);
+    defer later.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, later.source);
+    try std.testing.expectError(
+        error.NoAdjacentMorphState,
+        moveMorphState(std.testing.allocator, source, 0, first, .earlier),
+    );
+    try std.testing.expectError(
+        error.NoAdjacentMorphState,
+        moveMorphState(std.testing.allocator, source, 0, second, .later),
+    );
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(earlier.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const states = deck.slides.items[0].morph_states.items;
+    try std.testing.expectEqualStrings("y-change", states[0].spec.label.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), states[0].items.items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), states[0].items.items[0].position.y, 0.0001);
+    try std.testing.expectEqualStrings("x-change", states[1].spec.label.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), states[1].items.items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), states[1].items.items[0].position.y, 0.0001);
+}
+
+test "morph timeline structural edits reject dynamic and global state content" {
+    const dynamic =
+        "@slide\n" ++
+        "@box id=hero text=Base\n" ++
+        "@state(morph)\n" ++
+        "@set hero $movement$\n" ++
+        "@state(morph)\n";
+    const first = std.mem.indexOf(u8, dynamic, "@state").?;
+    try std.testing.expectError(
+        error.InvalidMorphStateOffset,
+        deleteMorphState(std.testing.allocator, dynamic, 0, first),
+    );
+    try std.testing.expectError(
+        error.InvalidMorphStateOffset,
+        moveMorphState(std.testing.allocator, dynamic, 0, first, .later),
+    );
+
+    const global =
+        "@slide\n" ++
+        "@box id=hero text=Base\n" ++
+        "@state(morph)\n" ++
+        "@color=#ffffffff\n" ++
+        "@state(morph)\n";
+    try std.testing.expectError(
+        error.InvalidMorphStateOffset,
+        deleteMorphState(
+            std.testing.allocator,
+            global,
+            0,
+            std.mem.indexOf(u8, global, "@state").?,
+        ),
+    );
 }
 
 test "unambiguous implicit slide supports base item and new slide boundaries" {

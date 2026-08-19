@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const rl = @import("raylib");
+const animation = @import("animation.zig");
 const slides = @import("slides.zig");
 const studio_new_deck = @import("studio_new_deck.zig");
 
@@ -860,6 +861,8 @@ pub const Notice = enum {
     group_reusable_needs_source_support,
     override_reset_unsupported,
     detach_instance_unsupported,
+    morph_state_required,
+    morph_structure_locked,
 };
 
 /// The active canvas tool. Creation tools are deliberately one-shot: after a
@@ -1111,6 +1114,27 @@ pub const MorphSceneCommand = struct {
     active_state: ?usize,
 };
 
+pub const MorphStateMoveDirection = enum {
+    earlier,
+    later,
+};
+
+pub const MorphStateMoveCommand = struct {
+    state_index: usize,
+    direction: MorphStateMoveDirection,
+};
+
+/// Borrowed, renderer-independent metadata for one explicit timeline card.
+/// The base scene is implicit and is drawn by Studio before this slice.
+pub const MorphStateSummary = struct {
+    index: usize,
+    label: []const u8 = "",
+    duration: f32 = 0.6,
+    after: ?f32 = null,
+    easing: animation.Easing = .smooth,
+    source: slides.SourceRef = .{},
+};
+
 pub const AddReusableCommand = struct {
     position: rl.Vector2,
     suggested_size: rl.Vector2,
@@ -1167,6 +1191,9 @@ pub const Workspace = struct {
     slides: []const SlideSummary = &.{},
     current_slide: usize = 0,
     library: []const LibraryEntry = &.{},
+    /// Explicit semantic states for the current slide. Base is always scene
+    /// zero and therefore is not repeated in this slice.
+    morph_states: []const MorphStateSummary = &.{},
 };
 
 /// Source-level intentions emitted by the visual controls. Unlike
@@ -1203,6 +1230,11 @@ pub const SemanticCommand = union(enum) {
     promote_to_reusable: CommandTarget,
     promote_items_to_group: ItemBatchCommand,
     select_morph_scene: MorphSceneCommand,
+    add_morph_state: MorphSceneCommand,
+    duplicate_morph_state: usize,
+    rename_morph_state: usize,
+    delete_morph_state: usize,
+    move_morph_state: MorphStateMoveCommand,
     new_slide: void,
     select_slide: usize,
     duplicate_slide: usize,
@@ -2178,6 +2210,75 @@ fn statusPanel(viewport: Viewport) rl.Rectangle {
     };
 }
 
+pub const morph_timeline_action_count: usize = 6;
+pub const MorphTimelineLayout = struct {
+    panel: rl.Rectangle,
+    cards_clip: rl.Rectangle,
+    actions: [morph_timeline_action_count]rl.Rectangle,
+    card_width: f32,
+    card_gap: f32,
+    compact: bool,
+};
+
+/// Bottom chrome timeline. It lives inside the reserved status shell, never
+/// over the slide canvas, so scene authoring remains unobscured.
+pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
+    const panel = statusPanel(viewport);
+    if (panel.width <= 0 or panel.height <= 0) return .{
+        .panel = empty_frame_rectangle,
+        .cards_clip = empty_frame_rectangle,
+        .actions = [_]rl.Rectangle{empty_frame_rectangle} ** morph_timeline_action_count,
+        .card_width = 0,
+        .card_gap = 0,
+        .compact = true,
+    };
+    const compact = panel.height < 100;
+    const padding: f32 = if (compact) 6 else 8;
+    const gap: f32 = 5;
+    const action_width: f32 = if (compact) 43 else 52;
+    const action_height: f32 = if (compact) 34 else 32;
+    const card_height: f32 = if (compact) 34 else 68;
+    const actions_width = action_width * morph_timeline_action_count + gap * (morph_timeline_action_count - 1);
+    var actions: [morph_timeline_action_count]rl.Rectangle = undefined;
+    const actions_x = panel.x + panel.width - padding - actions_width;
+    for (&actions, 0..) |*button, index| button.* = .{
+        .x = actions_x + @as(f32, @floatFromInt(index)) * (action_width + gap),
+        .y = panel.y + padding,
+        .width = action_width,
+        .height = action_height,
+    };
+    return .{
+        .panel = panel,
+        .cards_clip = .{
+            .x = panel.x + padding,
+            .y = panel.y + padding,
+            .width = @max(0, actions_x - gap - (panel.x + padding)),
+            .height = card_height,
+        },
+        .actions = actions,
+        .card_width = if (compact) 112 else 154,
+        .card_gap = 6,
+        .compact = compact,
+    };
+}
+
+pub fn morphTimelineCardCapacity(layout: MorphTimelineLayout) usize {
+    if (layout.cards_clip.width <= 0 or layout.card_width <= 0) return 0;
+    return @intFromFloat(@max(@as(f32, 0), @floor(
+        (layout.cards_clip.width + layout.card_gap) / (layout.card_width + layout.card_gap),
+    )));
+}
+
+pub fn morphTimelineCardRect(layout: MorphTimelineLayout, visible_slot: usize) ?rl.Rectangle {
+    if (visible_slot >= morphTimelineCardCapacity(layout)) return null;
+    return .{
+        .x = layout.cards_clip.x + @as(f32, @floatFromInt(visible_slot)) * (layout.card_width + layout.card_gap),
+        .y = layout.cards_clip.y,
+        .width = layout.card_width,
+        .height = layout.cards_clip.height,
+    };
+}
+
 /// A testable input snapshot. `updateFromRaylib` is the convenient runtime
 /// adapter; tests and other frontends can call `update` directly.
 pub const FrameInput = struct {
@@ -2498,6 +2599,7 @@ pub const Studio = struct {
     organizer_first_visible: usize = 0,
     library_first_visible: usize = 0,
     objects_first_visible: usize = 0,
+    morph_first_visible: usize = 0,
     last_objects_primary: ?usize = null,
     selected_library_index: ?usize = null,
     library_cleanup_preview_count: usize = 0,
@@ -3329,6 +3431,28 @@ pub const Studio = struct {
         self.tool = .select;
     }
 
+    fn selectMorphScene(self: *Studio, items: []slides.SlideItem, state: ?usize) void {
+        self.setActiveMorphState(items, state);
+        self.pending_semantic_command = .{ .select_morph_scene = .{ .active_state = self.active_morph_state } };
+    }
+
+    fn normalizeMorphTimeline(self: *Studio, viewport: Viewport, workspace: Workspace) void {
+        const scene_count = workspace.morph_states.len + 1;
+        const capacity = morphTimelineCardCapacity(morphTimelineLayout(viewport));
+        if (capacity == 0 or scene_count <= capacity) {
+            self.morph_first_visible = 0;
+            return;
+        }
+        const max_first = scene_count - capacity;
+        self.morph_first_visible = @min(self.morph_first_visible, max_first);
+        const active_scene = if (self.active_morph_state) |state| state + 1 else 0;
+        if (active_scene < self.morph_first_visible) {
+            self.morph_first_visible = active_scene;
+        } else if (active_scene >= self.morph_first_visible + capacity) {
+            self.morph_first_visible = @min(active_scene - capacity + 1, max_first);
+        }
+    }
+
     /// Cycles base -> state 1 ... state N -> base and emits the scene choice
     /// for the integration layer to switch both item slice and renderer state.
     pub fn cycleMorphState(self: *Studio, items: []slides.SlideItem, delta: i8) void {
@@ -3338,12 +3462,7 @@ pub const Studio = struct {
         const movement: isize = @intCast(delta);
         const next_scene = @mod(current + movement, scene_count);
         const next_state: ?usize = if (next_scene == 0) null else @intCast(next_scene - 1);
-        self.clearSelection(items);
-        self.active_morph_state = next_state;
-        self.snap_guides = .{};
-        self.selected_library_index = null;
-        self.tool = .select;
-        self.pending_semantic_command = .{ .select_morph_scene = .{ .active_state = next_state } };
+        self.selectMorphScene(items, next_state);
     }
 
     pub fn cancelActiveInteraction(self: *Studio, items: []slides.SlideItem) void {
@@ -3696,6 +3815,7 @@ pub const Studio = struct {
 
         if (workspace.visible) {
             self.normalizeWorkspace(viewport, workspace);
+            self.normalizeMorphTimeline(viewport, workspace);
             if (self.handleWorkspaceKeyboard(items, workspace, input)) return null;
             self.handleWorkspaceScroll(viewport, workspace, input);
         }
@@ -4787,6 +4907,16 @@ pub const Studio = struct {
 
     fn handleWorkspaceScroll(self: *Studio, viewport: Viewport, workspace: Workspace, input: FrameInput) void {
         if (input.workspace_scroll == 0) return;
+        const timeline = morphTimelineLayout(viewport);
+        if (pointInRectangle(input.pointer_screen, timeline.panel)) {
+            self.morph_first_visible = scrollFirstVisible(
+                self.morph_first_visible,
+                workspace.morph_states.len + 1,
+                morphTimelineCardCapacity(timeline),
+                if (input.workspace_scroll > 0) -1 else 1,
+            );
+            return;
+        }
         const layout = workspaceLayout(viewport);
         if (layout.sidebar.height < workspace_min_height) return;
         if (pointInRectangle(input.pointer_screen, layout.organizer)) {
@@ -4813,6 +4943,7 @@ pub const Studio = struct {
         workspace: Workspace,
         pointer: rl.Vector2,
     ) bool {
+        if (self.handleMorphTimelineClick(items, viewport, workspace, pointer)) return true;
         const layout = workspaceLayout(viewport);
         if (layout.sidebar.height < workspace_min_height) return false;
         const in_organizer = pointInRectangle(pointer, layout.organizer);
@@ -4946,6 +5077,85 @@ pub const Studio = struct {
         return true;
     }
 
+    fn handleMorphTimelineClick(
+        self: *Studio,
+        items: []slides.SlideItem,
+        viewport: Viewport,
+        workspace: Workspace,
+        pointer: rl.Vector2,
+    ) bool {
+        const layout = morphTimelineLayout(viewport);
+        if (!pointInRectangle(pointer, layout.panel)) return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+
+        for (0..morphTimelineCardCapacity(layout)) |visible_slot| {
+            const card = morphTimelineCardRect(layout, visible_slot) orelse continue;
+            if (!pointInRectangle(pointer, card)) continue;
+            const scene_index = self.morph_first_visible + visible_slot;
+            if (scene_index > workspace.morph_states.len) return true;
+            self.selectMorphScene(items, if (scene_index == 0) null else scene_index - 1);
+            self.notice = .none;
+            return true;
+        }
+
+        for (layout.actions, 0..) |button, action| {
+            if (!pointInRectangle(pointer, button)) continue;
+            self.clearSelection(items);
+            self.tool = .select;
+            self.notice = .none;
+            switch (action) {
+                // Add inserts after the selected scene. Base therefore creates
+                // the first state; selecting a state inserts immediately after
+                // it and preserves the visible cumulative snapshot.
+                0 => self.pending_semantic_command = .{ .add_morph_state = .{
+                    .active_state = self.active_morph_state,
+                } },
+                1 => if (self.active_morph_state) |state_index| {
+                    self.pending_semantic_command = .{ .duplicate_morph_state = state_index };
+                } else {
+                    self.pending_semantic_command = .{ .add_morph_state = .{ .active_state = null } };
+                },
+                2 => if (self.active_morph_state) |state_index| {
+                    self.pending_semantic_command = .{ .rename_morph_state = state_index };
+                } else {
+                    self.notice = .morph_state_required;
+                },
+                3 => if (self.active_morph_state) |state_index| {
+                    self.pending_semantic_command = .{ .delete_morph_state = state_index };
+                } else {
+                    self.notice = .morph_state_required;
+                },
+                4 => if (self.active_morph_state) |state_index| {
+                    if (state_index == 0) {
+                        self.notice = .morph_state_required;
+                    } else {
+                        self.pending_semantic_command = .{ .move_morph_state = .{
+                            .state_index = state_index,
+                            .direction = .earlier,
+                        } };
+                    }
+                } else {
+                    self.notice = .morph_state_required;
+                },
+                5 => if (self.active_morph_state) |state_index| {
+                    if (state_index + 1 >= workspace.morph_states.len) {
+                        self.notice = .morph_state_required;
+                    } else {
+                        self.pending_semantic_command = .{ .move_morph_state = .{
+                            .state_index = state_index,
+                            .direction = .later,
+                        } };
+                    }
+                } else {
+                    self.notice = .morph_state_required;
+                },
+                else => unreachable,
+            }
+            return true;
+        }
+        return true;
+    }
+
     fn handleNewDeckChooser(
         self: *Studio,
         items: []slides.SlideItem,
@@ -5049,6 +5259,7 @@ pub const Studio = struct {
         self.clearSelection(items);
         self.tool = .select;
         self.active_morph_state = null;
+        self.morph_first_visible = 0;
         self.notice = .none;
     }
 
@@ -6710,6 +6921,7 @@ pub const Studio = struct {
 
     pub fn drawWorkspaceOverlay(self: Studio, viewport: Viewport, workspace: Workspace) void {
         if (!self.enabled or !workspace.visible) return;
+        self.drawMorphTimeline(viewport, workspace);
         const layout = workspaceLayout(viewport);
         if (layout.sidebar.height < workspace_min_height) return;
         // Sidebar rows have fixed logical heights, so they scale more
@@ -6833,6 +7045,131 @@ pub const Studio = struct {
             rl.endScissorMode();
         }
         if (workspace.new_deck) self.drawNewDeckChooser(viewport);
+    }
+
+    fn drawMorphTimeline(self: Studio, viewport: Viewport, workspace: Workspace) void {
+        const layout = morphTimelineLayout(viewport);
+        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        const active_scene = if (self.active_morph_state) |state| state + 1 else 0;
+        const body_font: i32 = if (layout.compact) UiTypography.compact else UiTypography.body;
+        const meta_font: i32 = UiTypography.compact;
+
+        // Repaint the complete card band plus the text baseline immediately
+        // below it. drawStatus() runs first; without the extra baseline clear,
+        // the lower halves of its shortcut text peek out beneath the cards.
+        // The notice row starts lower (or directly after compact cards) and
+        // remains available for source/edit feedback.
+        const repaint_height = layout.cards_clip.height + @as(f32, if (layout.compact) 8 else 18);
+        rl.drawRectangleRec(.{
+            .x = layout.panel.x + 1,
+            .y = layout.panel.y + 1,
+            .width = layout.panel.width - 2,
+            .height = @min(layout.panel.height - 2, repaint_height),
+        }, .{ .r = 10, .g = 14, .b = 24, .a = 255 });
+
+        rl.beginScissorMode(
+            @intFromFloat(@floor(layout.cards_clip.x)),
+            @intFromFloat(@floor(layout.cards_clip.y)),
+            @intFromFloat(@ceil(layout.cards_clip.width)),
+            @intFromFloat(@ceil(layout.cards_clip.height)),
+        );
+        for (0..morphTimelineCardCapacity(layout)) |visible_slot| {
+            const scene_index = self.morph_first_visible + visible_slot;
+            if (scene_index > workspace.morph_states.len) break;
+            const card = morphTimelineCardRect(layout, visible_slot) orelse break;
+            const active = scene_index == active_scene;
+            const base = scene_index == 0;
+            const fill: rl.Color = if (active)
+                .{ .r = 31, .g = 83, .b = 104, .a = 255 }
+            else if (base)
+                .{ .r = 34, .g = 39, .b = 55, .a = 255 }
+            else
+                .{ .r = 38, .g = 31, .b = 57, .a = 255 };
+            const border: rl.Color = if (active)
+                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            else if (base)
+                .{ .r = 130, .g = 145, .b = 170, .a = 230 }
+            else
+                .{ .r = 190, .g = 133, .b = 255, .a = 220 };
+            rl.drawRectangleRec(card, fill);
+            rl.drawRectangleLinesEx(card, if (active) 3 else 1, border);
+
+            var title_buffer: [96]u8 = undefined;
+            const title_source: []const u8 = if (base)
+                "BASE"
+            else if (workspace.morph_states[scene_index - 1].label.len > 0)
+                workspace.morph_states[scene_index - 1].label
+            else
+                std.fmt.bufPrint(&title_buffer, "STATE {d}", .{scene_index}) catch "STATE";
+            var fitted_title_buffer: [96]u8 = undefined;
+            const fitted_title = self.fitUiText(
+                &fitted_title_buffer,
+                title_source,
+                body_font,
+                card.width - 18,
+            );
+            self.drawUiText(fitted_title, .{
+                .x = card.x + 9,
+                .y = card.y + @as(f32, if (layout.compact) 9 else 8),
+            }, body_font, .white);
+
+            if (!layout.compact) {
+                var metadata_buffer: [96]u8 = undefined;
+                const metadata: []const u8 = if (base)
+                    "AUTHORED ROOT"
+                else state: {
+                    const summary = workspace.morph_states[scene_index - 1];
+                    const easing = switch (summary.easing) {
+                        .linear => "linear",
+                        .smooth => "smooth",
+                        .spring => "spring",
+                    };
+                    break :state if (summary.after) |delay|
+                        std.fmt.bufPrint(&metadata_buffer, "+{d:.1}s · {d:.1}s {s}", .{ delay, summary.duration, easing }) catch easing
+                    else
+                        std.fmt.bufPrint(&metadata_buffer, "{d:.1}s · {s}", .{ summary.duration, easing }) catch easing;
+                };
+                var fitted_metadata_buffer: [96]u8 = undefined;
+                const fitted_metadata = self.fitUiText(
+                    &fitted_metadata_buffer,
+                    metadata,
+                    meta_font,
+                    card.width - 18,
+                );
+                self.drawUiText(fitted_metadata, .{ .x = card.x + 9, .y = card.y + 38 }, meta_font, .{
+                    .r = 190,
+                    .g = 202,
+                    .b = 222,
+                    .a = 255,
+                });
+            }
+
+            if (scene_index > 0 and visible_slot > 0) {
+                const line_y = card.y + card.height / 2;
+                rl.drawLineEx(
+                    .{ .x = card.x - layout.card_gap + 1, .y = line_y },
+                    .{ .x = card.x - 2, .y = line_y },
+                    2,
+                    .{ .r = 190, .g = 133, .b = 255, .a = 210 },
+                );
+            }
+        }
+        rl.endScissorMode();
+
+        const labels = [_][:0]const u8{ "+", "Dup", "Name", "Del", "<", ">" };
+        for (layout.actions, labels, 0..) |button, label, action| {
+            const enabled = switch (action) {
+                0, 1 => true,
+                2, 3 => self.active_morph_state != null,
+                4 => if (self.active_morph_state) |state| state > 0 else false,
+                5 => if (self.active_morph_state) |state| state + 1 < workspace.morph_states.len else false,
+                else => false,
+            };
+            if (enabled)
+                drawCompactButton(self, button, label)
+            else
+                drawDisabledBadge(self, button, label);
+        }
     }
 
     fn drawNewDeckChooser(self: Studio, viewport: Viewport) void {
@@ -7744,6 +8081,8 @@ pub const Studio = struct {
             .group_reusable_needs_source_support => "Group reusable needs explicit component-group source-format support",
             .override_reset_unsupported => "That local property cannot be reset safely; no source change was made",
             .detach_instance_unsupported => "This reusable instance cannot be detached safely here",
+            .morph_state_required => "Select a state card first; BASE cannot be renamed, deleted, or reordered",
+            .morph_structure_locked => "That state move would break cumulative source ownership; no change was made",
         };
         if (notice_text) |message| {
             const notice_color: rl.Color = switch (self.notice) {
@@ -12391,6 +12730,137 @@ test "single item rebind prefers unique IDs and falls back to every source layer
     ambiguous[1].source = direct_source;
     try std.testing.expect(!studio.selectItemByIdOrSource(&ambiguous, null, direct_source));
     try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
+}
+
+test "Studio morph timeline selects scenes and emits structural intentions" {
+    var studio: Studio = .{ .enabled = true };
+    studio.setMorphStateCount(3);
+    const states = [_]MorphStateSummary{
+        .{ .index = 0, .label = "focus", .duration = 0.8, .easing = .spring },
+        .{ .index = 1, .label = "detail", .duration = 0.4, .after = 1.2, .easing = .linear },
+        .{ .index = 2, .duration = 0.6, .easing = .smooth },
+    };
+    const workspace: Workspace = .{ .visible = true, .morph_states = &states };
+    const viewport = frameLayout(.{
+        .x = 0,
+        .y = 0,
+        .width = 1600,
+        .height = 900,
+    }, true, false, .slides).viewport;
+    const layout = morphTimelineLayout(viewport);
+
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(morphTimelineCardRect(layout, 1).?),
+    });
+    try std.testing.expectEqual(@as(?usize, 0), studio.active_morph_state);
+    switch (studio.takeSemanticCommand().?) {
+        .select_morph_scene => |command| try std.testing.expectEqual(@as(?usize, 0), command.active_state),
+        else => return error.TestUnexpectedResult,
+    }
+
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.actions[0]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .add_morph_state => |command| try std.testing.expectEqual(@as(?usize, 0), command.active_state),
+        else => return error.TestUnexpectedResult,
+    }
+
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.actions[1]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_morph_state => |state_index| try std.testing.expectEqual(@as(usize, 0), state_index),
+        else => return error.TestUnexpectedResult,
+    }
+
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.actions[2]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .rename_morph_state => |state_index| try std.testing.expectEqual(@as(usize, 0), state_index),
+        else => return error.TestUnexpectedResult,
+    }
+
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.actions[5]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .move_morph_state => |command| {
+            try std.testing.expectEqual(@as(usize, 0), command.state_index);
+            try std.testing.expectEqual(MorphStateMoveDirection.later, command.direction);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Base remains an explicit card, but destructive/name/order actions are
+    // disabled because it is the authored root rather than a state block.
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(morphTimelineCardRect(layout, 0).?),
+    });
+    _ = studio.takeSemanticCommand();
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.actions[3]),
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.morph_state_required, studio.notice);
+}
+
+test "Studio morph timeline is contained and keeps the active card visible" {
+    const sizes = [_]rl.Vector2{
+        .{ .x = 900, .y = 506 },
+        .{ .x = 1280, .y = 720 },
+        .{ .x = 2560, .y = 1440 },
+    };
+    for (sizes) |size| {
+        const viewport = frameLayout(.{
+            .x = 0,
+            .y = 0,
+            .width = size.x,
+            .height = size.y,
+        }, true, false, .slides).viewport;
+        const layout = morphTimelineLayout(viewport);
+        try std.testing.expect(morphTimelineCardCapacity(layout) >= 3);
+        try expectRectangleContained(layout.panel, layout.cards_clip);
+        for (layout.actions) |button| try expectRectangleContained(layout.panel, button);
+        for (0..morphTimelineCardCapacity(layout)) |slot| {
+            try expectRectangleContained(layout.cards_clip, morphTimelineCardRect(layout, slot).?);
+        }
+    }
+
+    var summaries: [12]MorphStateSummary = undefined;
+    for (&summaries, 0..) |*summary, index| summary.* = .{ .index = index };
+    const workspace: Workspace = .{ .visible = true, .morph_states = &summaries };
+    const viewport = frameLayout(.{
+        .x = 0,
+        .y = 0,
+        .width = 900,
+        .height = 506,
+    }, true, false, .slides).viewport;
+    var studio: Studio = .{
+        .enabled = true,
+        .active_morph_state = 11,
+        .morph_state_count = 12,
+    };
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{});
+    const capacity = morphTimelineCardCapacity(morphTimelineLayout(viewport));
+    try std.testing.expect(studio.morph_first_visible > 0);
+    try std.testing.expect(12 >= studio.morph_first_visible);
+    try std.testing.expect(12 < studio.morph_first_visible + capacity);
+
+    const before_scroll = studio.morph_first_visible;
+    _ = studio.updateWithWorkspace(&.{}, &.{}, viewport, workspace, .{
+        .workspace_scroll = 1,
+        .pointer_screen = rectangleCenter(morphTimelineLayout(viewport).panel),
+    });
+    try std.testing.expect(studio.morph_first_visible < before_scroll);
 }
 
 fn rectangleCenter(rect: rl.Rectangle) rl.Vector2 {

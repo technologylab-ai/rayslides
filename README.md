@@ -276,7 +276,16 @@ The `*` beside `STUDIO` means the in-memory document differs from the original
 file. Automatic file reload is paused while those unsaved changes exist.
 Transitions are paused in Studio and ordinary reveal items are shown. The scene
 control in the toolbar switches between the base scene and each semantic morph
-state. Editing an inherited, named item creates or updates a state-local `@set`;
+state. The bottom timeline makes that cumulative structure explicit: BASE is
+the authored root, followed by cards showing each state's label, automatic
+delay, duration, and easing. Click a card to preview/edit it. The adjacent
+controls add a state after the current scene, duplicate the current visual
+snapshot, name, delete, or move a state earlier/later. Every structural action
+is one source transaction and one Undo entry; unsafe dynamic/global ownership
+or broken dependencies are refused without changing the document. BASE can
+create the first state, but cannot itself be renamed, deleted, or reordered.
+
+Editing an inherited, named item creates or updates a state-local `@set`;
 deleting it creates `@hide`. Items born in the active state are edited at their
 own directive. Background creation and reusable promotion remain base-scene
 operations because they change structural layout rather than one morph state.
@@ -608,7 +617,7 @@ slide. Give objects stable `id=` values, start a new state with
 @box id=hero img=assets/diagram.png x=1250 y=180 w=520 h=320
 @box id=title x=120 y=180 w=1000 h=120 fontsize=72 shadow=#00000080 text=One object, many states
 
-@state(morph) duration=0.8 ease=spring
+@state(morph) label=takeover duration=0.8 ease=spring
 @set hero x=0 y=0 w=1920 h=1080
 @set title x=80 y=55 fontsize=48 color=#f7a41dff shadow_offset=7
 ```
@@ -618,7 +627,9 @@ Everything before the first state is the slide's initial state. Each
 cumulative patch over the previous state. Unspecified objects and properties
 carry forward. The default duration is 0.6 seconds and the default easing is
 `smooth`; the available easing modes are `linear`, `smooth`, and `spring`.
-Bare `@state` is accepted as shorthand for `@state(morph)`.
+Bare `@state` is accepted as shorthand for `@state(morph)`. An optional
+`label=NAME` uses the same identifier spelling as reusable names and appears in
+Studio's timeline; it is author-facing metadata, not an item mutation target.
 
 Use the state directives to manipulate objects:
 
