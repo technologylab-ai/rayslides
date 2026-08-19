@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "scenario": "compact-properties",
+  "capture": { "width": 900, "height": 506 },
+  "deck": { "slides": 24, "active_items": 7, "render_fragments": 13 },
+  "render": {
+    "events": 1, "last_mode": "full", "last_rebuilt": 24, "total_slides": 24,
+    "full_count": 1, "partial_count": 0, "unchanged_count": 0,
+    "last_full_ms": 0.928, "last_partial_ms": 0.000, "last_unchanged_ms": 0.000
+  },
+  "studio": { "prepare_ms": 0.003, "document_cache_builds": 1, "scene_cache_builds": 1, "composition_cache_builds": 1 },
+  "frame": { "latest_ms": 17.125, "sampled_peak_ms": 21.283, "sampled_slow_frames": 0 },
+  "parser_arena_bytes": 597174
+}

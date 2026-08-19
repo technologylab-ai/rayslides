@@ -36,6 +36,10 @@ pub const ItemSpec = struct {
 };
 
 pub const MorphSpec = struct {
+    /// Optional author-facing label for Studio's state timeline. Labels are
+    /// source identifiers rather than runtime targets; morph mutations still
+    /// address stable item `id=` values.
+    label: ?[]const u8 = null,
     /// null means that the next presentation action starts this state.
     after: ?f32 = null,
     duration: f32 = 0.6,

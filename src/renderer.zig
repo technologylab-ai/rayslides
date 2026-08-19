@@ -1,6 +1,7 @@
 const std = @import("std");
 const TextureCache = @import("texturecache.zig");
 const slides = @import("slides.zig");
+const parser = @import("parser.zig");
 const animation = @import("animation.zig");
 const crowdplay = @import("crowdplay.zig");
 const markdownlineparser = @import("markdownlineparser.zig");
@@ -51,11 +52,24 @@ const RenderElement = struct {
     opacity: f32 = 1.0,
     owner_identity: usize = 0,
     part_index: usize = 0,
+    is_item_background: bool = false,
 };
 
 const RenderedScene = struct {
     elements: std.ArrayList(RenderElement),
     plan: MorphPlan,
+    owned_text: std.ArrayList([:0]const u8),
+    /// Arrays backing CrowdSpec.choices. The strings themselves are tracked
+    /// by owned_text so all RenderElement slices remain valid after the
+    /// parser arena is replaced.
+    owned_crowd_choices: std.ArrayList([]const []const u8),
+
+    fn deinit(self: *RenderedScene, allocator: std.mem.Allocator) void {
+        self.elements.deinit(allocator);
+        self.plan.draws.deinit(allocator);
+        freeOwnedCrowdChoices(allocator, &self.owned_crowd_choices);
+        freeOwnedText(allocator, &self.owned_text);
+    }
 };
 
 const MorphDrawKind = enum {
@@ -78,7 +92,13 @@ const RenderedSlide = struct {
     elements: std.ArrayList(RenderElement) = undefined,
     morph_scenes: std.ArrayList(RenderedScene) = undefined,
     steps: std.ArrayList(animation.Step) = undefined,
+    /// Every heap-backed string referenced by base-scene RenderElements.
+    /// Individual strings may be shared by several elements (bullet glyphs),
+    /// so ownership lives here rather than on RenderElement itself.
+    owned_text: std.ArrayList([:0]const u8) = undefined,
+    owned_crowd_choices: std.ArrayList([]const []const u8) = undefined,
     transition: animation.Transition = .{},
+    input_fingerprint: u64 = 0,
 
     fn new(allocator: std.mem.Allocator) !*RenderedSlide {
         var self: *RenderedSlide = try allocator.create(RenderedSlide);
@@ -86,9 +106,172 @@ const RenderedSlide = struct {
         self.elements = std.ArrayList(RenderElement).empty;
         self.morph_scenes = std.ArrayList(RenderedScene).empty;
         self.steps = std.ArrayList(animation.Step).empty;
+        self.owned_text = std.ArrayList([:0]const u8).empty;
+        self.owned_crowd_choices = std.ArrayList([]const []const u8).empty;
         return self;
     }
+
+    fn deinit(self: *RenderedSlide, allocator: std.mem.Allocator) void {
+        self.elements.deinit(allocator);
+        for (self.morph_scenes.items) |*scene| scene.deinit(allocator);
+        self.morph_scenes.deinit(allocator);
+        self.steps.deinit(allocator);
+        freeOwnedCrowdChoices(allocator, &self.owned_crowd_choices);
+        freeOwnedText(allocator, &self.owned_text);
+    }
 };
+
+fn freeOwnedText(allocator: std.mem.Allocator, owned_text: *std.ArrayList([:0]const u8)) void {
+    for (owned_text.items) |text| allocator.free(text);
+    owned_text.deinit(allocator);
+}
+
+fn freeOwnedCrowdChoices(allocator: std.mem.Allocator, owned_choices: *std.ArrayList([]const []const u8)) void {
+    for (owned_choices.items) |choices| allocator.free(choices);
+    owned_choices.deinit(allocator);
+}
+
+const RenderFingerprinter = struct {
+    value: u64 = 0x72736c696465735f,
+
+    fn addBytes(self: *RenderFingerprinter, bytes: []const u8) void {
+        self.value = std.hash.Wyhash.hash(self.value, bytes);
+    }
+
+    fn addScalar(self: *RenderFingerprinter, value: anytype) void {
+        var copy = value;
+        self.addBytes(std.mem.asBytes(&copy));
+    }
+
+    fn addBool(self: *RenderFingerprinter, value: bool) void {
+        self.addScalar(@as(u8, @intFromBool(value)));
+    }
+
+    fn addString(self: *RenderFingerprinter, value: []const u8) void {
+        self.addScalar(value.len);
+        self.addBytes(value);
+    }
+
+    fn addOptionalString(self: *RenderFingerprinter, value: ?[]const u8) void {
+        self.addBool(value != null);
+        if (value) |text| self.addString(text);
+    }
+
+    fn addF32(self: *RenderFingerprinter, value: f32) void {
+        self.addScalar(@as(u32, @bitCast(value)));
+    }
+
+    fn addOptionalF32(self: *RenderFingerprinter, value: ?f32) void {
+        self.addBool(value != null);
+        if (value) |number| self.addF32(number);
+    }
+
+    fn addOptionalI32(self: *RenderFingerprinter, value: ?i32) void {
+        self.addBool(value != null);
+        if (value) |number| self.addScalar(number);
+    }
+
+    fn addVector(self: *RenderFingerprinter, value: rl.Vector2) void {
+        self.addF32(value.x);
+        self.addF32(value.y);
+    }
+
+    fn addColor(self: *RenderFingerprinter, value: rl.Color) void {
+        self.addScalar(value.r);
+        self.addScalar(value.g);
+        self.addScalar(value.b);
+        self.addScalar(value.a);
+    }
+
+    fn addOptionalColor(self: *RenderFingerprinter, value: ?rl.Color) void {
+        self.addBool(value != null);
+        if (value) |color| self.addColor(color);
+    }
+
+    fn addItemAnimation(self: *RenderFingerprinter, value: ?animation.ItemSpec) void {
+        self.addBool(value != null);
+        if (value) |spec| {
+            self.addScalar(@as(u8, @intFromEnum(spec.effect)));
+            self.addScalar(@as(u8, @intFromEnum(spec.by)));
+            self.addOptionalF32(spec.after);
+            self.addF32(spec.duration);
+        }
+    }
+
+    fn addMorphSpec(self: *RenderFingerprinter, spec: animation.MorphSpec) void {
+        self.addOptionalF32(spec.after);
+        self.addF32(spec.duration);
+        self.addScalar(@as(u8, @intFromEnum(spec.easing)));
+    }
+
+    fn addTextShadow(self: *RenderFingerprinter, value: ?slides.TextShadow) void {
+        self.addBool(value != null);
+        if (value) |shadow| {
+            self.addBool(shadow.enabled);
+            self.addColor(shadow.color);
+            self.addVector(shadow.offset);
+        }
+    }
+
+    fn addCrowd(self: *RenderFingerprinter, value: ?slides.CrowdSpec) void {
+        self.addBool(value != null);
+        if (value) |crowd| {
+            self.addScalar(@as(u8, @intFromEnum(crowd.kind)));
+            self.addString(crowd.id);
+            self.addString(crowd.prompt);
+            self.addScalar(crowd.choices.len);
+            for (crowd.choices) |choice| self.addString(choice);
+            self.addBool(crowd.initially_open);
+        }
+    }
+
+    fn addItem(self: *RenderFingerprinter, item: slides.SlideItem) void {
+        self.addScalar(item.identity);
+        self.addScalar(@as(u8, @intFromEnum(item.kind)));
+        self.addOptionalString(item.text);
+        self.addOptionalI32(item.fontSize);
+        self.addOptionalF32(item.line_height_factor);
+        self.addOptionalColor(item.color);
+        self.addOptionalColor(item.background_color);
+        self.addOptionalString(item.img_path);
+        self.addVector(item.position);
+        self.addVector(item.size);
+        self.addOptionalI32(item.underline_width);
+        self.addOptionalColor(item.bullet_color);
+        self.addOptionalString(item.bullet_symbol);
+        self.addOptionalF32(item.scale);
+        self.addOptionalF32(item.ratio);
+        self.addItemAnimation(item.animation);
+        self.addTextShadow(item.text_shadow);
+        self.addCrowd(item.crowd);
+        self.addF32(item.opacity);
+        self.addBool(item.visible);
+    }
+};
+
+/// Hashes only data consumed while constructing RenderedSlide. Source offsets,
+/// parser ownership, reusable provenance, and other authoring metadata are
+/// intentionally excluded: moving bytes before a slide must not invalidate an
+/// otherwise identical render graph.
+fn renderInputFingerprint(slide: *const slides.Slide, slideshow_filp: []const u8) u64 {
+    var hash = RenderFingerprinter{};
+    hash.addString(slideshow_filp);
+    hash.addScalar(@as(u8, @intFromEnum(slide.transition.effect)));
+    hash.addF32(slide.transition.duration);
+    if (slide.items) |items| {
+        hash.addScalar(items.items.len);
+        for (items.items) |item| hash.addItem(item);
+    } else {
+        hash.addScalar(@as(usize, 0));
+    }
+    hash.addScalar(slide.morph_states.items.len);
+    for (slide.morph_states.items) |state| {
+        hash.addMorphSpec(state.spec);
+        hash.addScalar(state.items.items.len);
+        for (state.items.items) |item| hash.addItem(item);
+    }
+    return hash.value;
+}
 
 pub const RevealState = struct {
     visible_through: usize = 0,
@@ -103,6 +286,21 @@ pub const TransitionState = struct {
     progress: f32 = 1.0,
     direction: i8 = 1,
 };
+
+/// One transient Studio gesture. The renderer applies it at draw time, so the
+/// object follows the pointer without reparsing the document on every frame.
+pub const ItemGeometryPreview = struct {
+    owner_identity: usize,
+    before_position: rl.Vector2,
+    before_size: rl.Vector2,
+    after_position: rl.Vector2,
+    after_size: rl.Vector2,
+    resized: bool,
+};
+
+/// Multi-selection is deliberately bounded in Studio so live preview state
+/// remains allocation-free inside the render loop.
+pub const max_item_geometry_previews = 64;
 
 const RenderTransform = struct {
     offset: rl.Vector2 = .{ .x = 0, .y = 0 },
@@ -170,6 +368,8 @@ pub const SlideshowRenderer = struct {
     texture_cache: TextureCache,
     fonts: *my_fonts.AvailableFonts,
     qr_code: qrcode.Code = .{},
+    item_geometry_previews: [max_item_geometry_previews]ItemGeometryPreview = undefined,
+    item_geometry_preview_count: usize = 0,
 
     pub fn new(allocator: std.mem.Allocator, fonts: *my_fonts.AvailableFonts) !*SlideshowRenderer {
         var self: *SlideshowRenderer = try allocator.create(SlideshowRenderer);
@@ -184,59 +384,237 @@ pub const SlideshowRenderer = struct {
     }
 
     pub fn deinit(self: *SlideshowRenderer) void {
-        self.texture_cache.deinit(self.allocator);
+        self.deinitRenderedSlides(&self.renderedSlides);
+        self.md_parser.deinit();
+        self.texture_cache.deinit();
+        self.allocator.destroy(self);
     }
 
+    fn destroyRenderedSlide(self: *SlideshowRenderer, rendered_slide: *RenderedSlide) void {
+        rendered_slide.deinit(self.allocator);
+        self.allocator.destroy(rendered_slide);
+    }
+
+    fn deinitRenderedSlides(self: *SlideshowRenderer, rendered_slides: *std.ArrayList(*RenderedSlide)) void {
+        for (rendered_slides.items) |rendered_slide| self.destroyRenderedSlide(rendered_slide);
+        rendered_slides.deinit(self.allocator);
+        rendered_slides.* = std.ArrayList(*RenderedSlide).empty;
+    }
+
+    fn ownRenderedText(self: *SlideshowRenderer, render_slide: *RenderedSlide, text: []const u8) ![:0]const u8 {
+        const owned = try self.allocator.dupeZ(u8, text);
+        errdefer self.allocator.free(owned);
+        try render_slide.owned_text.append(self.allocator, owned);
+        return owned;
+    }
+
+    fn ownCrowdSpec(self: *SlideshowRenderer, render_slide: *RenderedSlide, crowd: slides.CrowdSpec) !slides.CrowdSpec {
+        const owned_id = try self.ownRenderedText(render_slide, crowd.id);
+        const owned_prompt = try self.ownRenderedText(render_slide, crowd.prompt);
+        if (crowd.choices.len == 0) return .{
+            .kind = crowd.kind,
+            .id = owned_id,
+            .prompt = owned_prompt,
+            .initially_open = crowd.initially_open,
+        };
+
+        const owned_choices = try self.allocator.alloc([]const u8, crowd.choices.len);
+        errdefer self.allocator.free(owned_choices);
+        for (crowd.choices, 0..) |choice, index| {
+            owned_choices[index] = try self.ownRenderedText(render_slide, choice);
+        }
+        try render_slide.owned_crowd_choices.append(self.allocator, owned_choices);
+        return .{
+            .kind = crowd.kind,
+            .id = owned_id,
+            .prompt = owned_prompt,
+            .choices = owned_choices,
+            .initially_open = crowd.initially_open,
+        };
+    }
+
+    fn buildRenderedSlide(
+        self: *SlideshowRenderer,
+        slide: *const slides.Slide,
+        slide_index: usize,
+        slideshow_filp: []const u8,
+        fingerprint: u64,
+    ) !*RenderedSlide {
+        const slide_number = slide_index + 1;
+
+        if (slide.items == null or slide.items.?.items.len == 0) {
+            log.warn("Slide {d} has NO ITEMS!", .{slide_number});
+        }
+
+        const render_slide = try RenderedSlide.new(self.allocator);
+        errdefer self.destroyRenderedSlide(render_slide);
+        render_slide.transition = slide.transition;
+        render_slide.input_fingerprint = fingerprint;
+
+        if (slide.items) |items| {
+            for (items.items) |item| try self.preRenderItem(render_slide, item, slide_number, slideshow_filp);
+        }
+        for (slide.morph_states.items, 0..) |state, state_index| {
+            const state_render = try RenderedSlide.new(self.allocator);
+            var state_render_owned = true;
+            errdefer if (state_render_owned) self.destroyRenderedSlide(state_render);
+            for (state.items.items) |state_item| {
+                var static_item = state_item;
+                // Reveal steps belong to the base timeline and must not be
+                // duplicated while materializing later state snapshots.
+                static_item.animation = null;
+                try self.preRenderItem(state_render, static_item, slide_number, slideshow_filp);
+            }
+            const source_elements = if (state_index == 0)
+                render_slide.elements.items
+            else
+                render_slide.morph_scenes.items[state_index - 1].elements.items;
+            var plan = try buildMorphPlan(self.allocator, source_elements, state_render.elements.items);
+            var plan_owned = true;
+            errdefer if (plan_owned) plan.draws.deinit(self.allocator);
+            try render_slide.morph_scenes.ensureUnusedCapacity(self.allocator, 1);
+            render_slide.morph_scenes.appendAssumeCapacity(.{
+                .elements = state_render.elements,
+                .plan = plan,
+                .owned_text = state_render.owned_text,
+                .owned_crowd_choices = state_render.owned_crowd_choices,
+            });
+            plan_owned = false;
+            state_render.elements = std.ArrayList(RenderElement).empty;
+            state_render.owned_text = std.ArrayList([:0]const u8).empty;
+            state_render.owned_crowd_choices = std.ArrayList([]const []const u8).empty;
+            state_render_owned = false;
+            self.destroyRenderedSlide(state_render);
+            try render_slide.steps.append(self.allocator, animation.Step.fromMorph(state.spec, state_index));
+        }
+        return render_slide;
+    }
+
+    pub const RebuildMode = enum { full, partial, unchanged };
+
+    pub const RebuildResult = struct {
+        mode: RebuildMode,
+        rebuilt_slide_count: usize,
+        total_slide_count: usize,
+    };
+
+    /// Compatibility entry point for callers that explicitly require a full
+    /// graph replacement.
     pub fn preRender(self: *SlideshowRenderer, slideshow: *const slides.SlideShow, slideshow_filp: []const u8) !void {
-        log.debug("ENTER preRender", .{});
+        _ = try self.preRenderFull(slideshow, slideshow_filp);
+    }
+
+    fn preRenderFull(self: *SlideshowRenderer, slideshow: *const slides.SlideShow, slideshow_filp: []const u8) !RebuildResult {
+        log.debug("ENTER full preRender", .{});
         if (slideshow.slides.items.len == 0) {
             log.warn("NO SLIDED!!!", .{});
-            return;
         }
 
-        self.renderedSlides.shrinkRetainingCapacity(0);
+        // Build beside the live render graph. A failed image/text/morph build
+        // leaves the currently displayed deck intact; success swaps ownership
+        // and tears the previous graph down in one place.
+        var rebuilt = std.ArrayList(*RenderedSlide).empty;
+        errdefer self.deinitRenderedSlides(&rebuilt);
 
-        for (slideshow.slides.items, 0..) |slide, i| {
-            const slide_number = i + 1;
-
-            if (slide.items == null or slide.items.?.items.len == 0) {
-                log.warn("Slide {d} has NO ITEMS!", .{slide_number});
-            }
-
-            // add a renderedSlide
-            const renderSlide = try RenderedSlide.new(self.allocator);
-            renderSlide.transition = slide.transition;
-
-            if (slide.items) |items| {
-                for (items.items) |item| try self.preRenderItem(renderSlide, item, slide_number, slideshow_filp);
-            }
-            for (slide.morph_states.items, 0..) |state, state_index| {
-                const state_render = try RenderedSlide.new(self.allocator);
-                for (state.items.items) |state_item| {
-                    var static_item = state_item;
-                    // Reveal steps belong to the base timeline and must not be
-                    // duplicated while materializing later state snapshots.
-                    static_item.animation = null;
-                    try self.preRenderItem(state_render, static_item, slide_number, slideshow_filp);
-                }
-                const source_elements = if (state_index == 0)
-                    renderSlide.elements.items
-                else
-                    renderSlide.morph_scenes.items[state_index - 1].elements.items;
-                const plan = try buildMorphPlan(self.allocator, source_elements, state_render.elements.items);
-                try renderSlide.morph_scenes.append(self.allocator, .{ .elements = state_render.elements, .plan = plan });
-                try renderSlide.steps.append(self.allocator, animation.Step.fromMorph(state.spec, state_index));
-            }
-
-            // now add the slide
-            try self.renderedSlides.append(self.allocator, renderSlide);
+        for (slideshow.slides.items, 0..) |slide, index| {
+            const fingerprint = renderInputFingerprint(slide, slideshow_filp);
+            const render_slide = try self.buildRenderedSlide(slide, index, slideshow_filp, fingerprint);
+            rebuilt.append(self.allocator, render_slide) catch |err| {
+                self.destroyRenderedSlide(render_slide);
+                return err;
+            };
         }
-        log.debug("LEAVE preRender with {d} slides", .{self.renderedSlides.items.len});
+        var previous = self.renderedSlides;
+        self.renderedSlides = rebuilt;
+        self.deinitRenderedSlides(&previous);
+        log.debug("LEAVE full preRender with {d} slides", .{self.renderedSlides.items.len});
+        return .{
+            .mode = .full,
+            .rebuilt_slide_count = self.renderedSlides.items.len,
+            .total_slide_count = self.renderedSlides.items.len,
+        };
+    }
+
+    /// Rebuilds only positions whose fully parsed, renderer-facing semantics
+    /// changed. Slide-count changes deliberately take the full, transactional
+    /// path. Every partial replacement is built beside the live graph and no
+    /// old slide is retired until all replacements succeeded.
+    pub fn preRenderChanged(self: *SlideshowRenderer, slideshow: *const slides.SlideShow, slideshow_filp: []const u8) !RebuildResult {
+        const slide_count = slideshow.slides.items.len;
+        if (self.renderedSlides.items.len != slide_count) return self.preRenderFull(slideshow, slideshow_filp);
+
+        var replacements = try self.allocator.alloc(?*RenderedSlide, slide_count);
+        defer self.allocator.free(replacements);
+        @memset(replacements, null);
+        errdefer for (replacements) |replacement| {
+            if (replacement) |rendered_slide| self.destroyRenderedSlide(rendered_slide);
+        };
+
+        var changed_count: usize = 0;
+        for (slideshow.slides.items, 0..) |slide, index| {
+            const fingerprint = renderInputFingerprint(slide, slideshow_filp);
+            if (self.renderedSlides.items[index].input_fingerprint == fingerprint) continue;
+            replacements[index] = try self.buildRenderedSlide(slide, index, slideshow_filp, fingerprint);
+            changed_count += 1;
+        }
+        if (changed_count == 0) return .{
+            .mode = .unchanged,
+            .rebuilt_slide_count = 0,
+            .total_slide_count = slide_count,
+        };
+
+        for (replacements, 0..) |*replacement, index| {
+            if (replacement.*) |new_slide| {
+                const old_slide = self.renderedSlides.items[index];
+                self.renderedSlides.items[index] = new_slide;
+                replacement.* = null;
+                self.destroyRenderedSlide(old_slide);
+            }
+        }
+        return .{
+            .mode = .partial,
+            .rebuilt_slide_count = changed_count,
+            .total_slide_count = slide_count,
+        };
     }
 
     pub fn stepCount(self: *const SlideshowRenderer, slide_number: i32) usize {
         if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return 0;
         return self.renderedSlides.items[@intCast(slide_number)].steps.items.len;
+    }
+
+    /// Number of ordinary reveal steps before semantic morph states begin.
+    /// Studio shows this stable base scene so every build item is selectable
+    /// without accidentally editing an interpolated or later morph snapshot.
+    pub fn baseRevealStepCount(self: *const SlideshowRenderer, slide_number: i32) usize {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return 0;
+        var count: usize = 0;
+        for (self.renderedSlides.items[@intCast(slide_number)].steps.items) |step| {
+            if (step.kind == .morph) break;
+            count += 1;
+        }
+        return count;
+    }
+
+    pub fn setItemGeometryPreview(self: *SlideshowRenderer, preview: ?ItemGeometryPreview) void {
+        if (preview) |value| {
+            self.item_geometry_previews[0] = value;
+            self.item_geometry_preview_count = 1;
+        } else {
+            self.item_geometry_preview_count = 0;
+        }
+    }
+
+    pub fn setItemGeometryPreviews(self: *SlideshowRenderer, previews: []const ItemGeometryPreview) void {
+        if (previews.len > max_item_geometry_previews) {
+            // Never truncate a group preview: that would make the rendered
+            // gesture disagree with the atomic source command. Studio enforces
+            // the same fixed capacity before a selection can reach this API.
+            self.item_geometry_preview_count = 0;
+            return;
+        }
+        @memcpy(self.item_geometry_previews[0..previews.len], previews);
+        self.item_geometry_preview_count = previews.len;
     }
 
     pub fn stepAt(self: *const SlideshowRenderer, slide_number: i32, step_index: usize) ?animation.Step {
@@ -249,6 +627,108 @@ pub const SlideshowRenderer = struct {
     pub fn transitionForSlide(self: *const SlideshowRenderer, slide_number: i32) animation.Transition {
         if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return .{};
         return self.renderedSlides.items[@intCast(slide_number)].transition;
+    }
+
+    /// Returns the union of the logical render fragments owned by one base
+    /// SlideItem. Studio uses this for objects whose authored size is
+    /// intentionally implicit, most notably auto-dimensioned images.
+    pub fn itemRenderBounds(self: *const SlideshowRenderer, slide_number: i32, owner_identity: usize) ?rl.Rectangle {
+        return self.itemRenderBoundsForMorphState(slide_number, null, owner_identity);
+    }
+
+    pub const ItemRenderBounds = struct {
+        owner_identity: usize,
+        bounds: rl.Rectangle,
+    };
+
+    /// Collect every rendered owner in one linear pass. Studio previously
+    /// called itemRenderBoundsForMorphState once per SlideItem, rescanning all
+    /// fragments each time; text-heavy slides therefore paid quadratic work
+    /// on every frame. preRenderItem keeps an owner's fragments contiguous, so
+    /// the same unions can be emitted allocation-amortized in paint order.
+    pub fn collectItemRenderBoundsForMorphState(
+        self: *const SlideshowRenderer,
+        allocator: std.mem.Allocator,
+        output: *std.ArrayList(ItemRenderBounds),
+        slide_number: i32,
+        morph_state: ?usize,
+    ) !usize {
+        output.clearRetainingCapacity();
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return 0;
+        const slide = self.renderedSlides.items[@intCast(slide_number)];
+        const elements = if (morph_state) |state_index| blk: {
+            if (state_index >= slide.morph_scenes.items.len) return 0;
+            break :blk slide.morph_scenes.items[state_index].elements.items;
+        } else slide.elements.items;
+
+        for (elements) |element| {
+            if (element.kind == .background) continue;
+            const right = element.position.x + element.size.x;
+            const bottom = element.position.y + element.size.y;
+            if (output.items.len > 0 and output.items[output.items.len - 1].owner_identity == element.owner_identity) {
+                const previous = &output.items[output.items.len - 1].bounds;
+                const left = @min(previous.x, element.position.x);
+                const top = @min(previous.y, element.position.y);
+                previous.* = .{
+                    .x = left,
+                    .y = top,
+                    .width = @max(previous.x + previous.width, right) - left,
+                    .height = @max(previous.y + previous.height, bottom) - top,
+                };
+            } else {
+                try output.append(allocator, .{
+                    .owner_identity = element.owner_identity,
+                    .bounds = .{
+                        .x = element.position.x,
+                        .y = element.position.y,
+                        .width = element.size.x,
+                        .height = element.size.y,
+                    },
+                });
+            }
+        }
+        return elements.len;
+    }
+
+    /// Logical bounds for an owner in either the base scene or one materialized
+    /// semantic-morph snapshot. Studio uses the same scene for painting and
+    /// hit-testing, so auto-sized images stay selectable while editing states.
+    pub fn itemRenderBoundsForMorphState(
+        self: *const SlideshowRenderer,
+        slide_number: i32,
+        morph_state: ?usize,
+        owner_identity: usize,
+    ) ?rl.Rectangle {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return null;
+        const slide = self.renderedSlides.items[@intCast(slide_number)];
+        const elements = if (morph_state) |state_index| blk: {
+            if (state_index >= slide.morph_scenes.items.len) return null;
+            break :blk slide.morph_scenes.items[state_index].elements.items;
+        } else slide.elements.items;
+        var result: ?rl.Rectangle = null;
+        for (elements) |element| {
+            if (element.owner_identity != owner_identity or element.kind == .background) continue;
+            const right = element.position.x + element.size.x;
+            const bottom = element.position.y + element.size.y;
+            if (result) |bounds| {
+                const left = @min(bounds.x, element.position.x);
+                const top = @min(bounds.y, element.position.y);
+                result = .{
+                    .x = left,
+                    .y = top,
+                    .width = @max(bounds.x + bounds.width, right) - left,
+                    .height = @max(bounds.y + bounds.height, bottom) - top,
+                };
+            } else {
+                result = .{
+                    .x = element.position.x,
+                    .y = element.position.y,
+                    .width = element.size.x,
+                    .height = element.size.y,
+                };
+            }
+        }
+        return result;
     }
 
     fn appendStep(self: *SlideshowRenderer, renderSlide: *RenderedSlide, spec: animation.ItemSpec) !usize {
@@ -275,15 +755,36 @@ pub const SlideshowRenderer = struct {
         // clicks while hidden in the base state.
         if (!rendered_item.visible) rendered_item.animation = null;
         const first_element = renderSlide.elements.items.len;
+        const has_item_background = itemBackgroundElement(rendered_item) != null;
+        if (itemBackgroundElement(rendered_item)) |background| {
+            // An item-owned fill is the first part of its owner group, so the
+            // item's actual content always remains above it.
+            try renderSlide.elements.append(self.allocator, background);
+        }
         switch (rendered_item.kind) {
             .background => try self.createBg(renderSlide, rendered_item, slideshow_filp),
             .textbox => try self.preRenderTextBlock(renderSlide, rendered_item, slide_number),
             .img => try self.createImg(renderSlide, rendered_item, slideshow_filp),
             .crowd => try self.createCrowd(renderSlide, rendered_item),
         }
-        for (renderSlide.elements.items[first_element..], 0..) |*element, part_index| {
+        if (has_item_background and renderSlide.elements.items.len > first_element + 1) {
+            resolveItemBackgroundGeometry(
+                &renderSlide.elements.items[first_element],
+                renderSlide.elements.items[first_element + 1 ..],
+            );
+        }
+        if (has_item_background and renderSlide.elements.items.len > first_element + 1) {
+            // Enter with the first content fragment. This is the shared item
+            // step for by-item animations and the first line/bullet step for
+            // progressive text.
+            renderSlide.elements.items[first_element].reveal_step = renderSlide.elements.items[first_element + 1].reveal_step;
+        }
+        for (renderSlide.elements.items[first_element..], 0..) |*element, emitted_index| {
             element.owner_identity = rendered_item.identity;
-            element.part_index = part_index;
+            // Backgrounds have their own semantic role. Foreground part
+            // indexes stay stable when a state adds or removes `bg=`, which
+            // lets the morph planner keep unchanged content above the fill.
+            element.part_index = emitted_index - @intFromBool(has_item_background and emitted_index > 0);
             element.opacity = if (rendered_item.visible) rendered_item.opacity else 0.0;
         }
     }
@@ -308,11 +809,12 @@ pub const SlideshowRenderer = struct {
     }
 
     fn createCrowd(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem) !void {
+        const owned_crowd = if (item.crowd) |crowd| try self.ownCrowdSpec(renderSlide, crowd) else null;
         try renderSlide.elements.append(self.allocator, .{
             .kind = .crowd,
             .position = item.position,
             .size = item.size,
-            .crowd = item.crowd,
+            .crowd = owned_crowd,
             .reveal_step = try self.wholeItemStep(renderSlide, item),
         });
     }
@@ -372,7 +874,7 @@ pub const SlideshowRenderer = struct {
         // not sure I want to allocate here, though
         var bulletSymbol: [:0]const u8 = undefined;
         if (item.bullet_symbol) |bs| {
-            bulletSymbol = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{bs}, 0);
+            bulletSymbol = try self.ownRenderedText(renderSlide, bs);
         } else {
             // no bullet symbol - error
             log.err("No bullet symbol for text {?s}", .{item.text});
@@ -401,6 +903,7 @@ pub const SlideshowRenderer = struct {
 
             // slide number
             const new_t = try replaceSlideNumber(self.allocator, t, slide_number);
+            defer self.allocator.free(new_t);
 
             // split into lines
             var it = std.mem.splitScalar(u8, new_t, '\n');
@@ -608,7 +1111,7 @@ pub const SlideshowRenderer = struct {
 
                 var attempted_span_size: rl.Vector2 = undefined;
                 var available_width: f32 = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
-                var render_text_c = try self.styledTextblockSize_toCstring(span.text.?, display_font_size, font_used, &attempted_span_size);
+                var render_text_c = try self.styledTextblockSize_toCstring(renderSlide, span.text.?, display_font_size, font_used, &attempted_span_size);
                 const whole_span_width = boundaryWidth(attempted_span_size.x, boundary_spacing, 0, span.text.?.len, span.text.?.len);
                 log.debug("available_width: {d}, attempted_span_size: {d:3.0}", .{ available_width, whole_span_width });
                 if (whole_span_width < available_width) {
@@ -682,7 +1185,7 @@ pub const SlideshowRenderer = struct {
                         log.debug("current idx of spc {d}", .{currentIdxOfSpace});
                         // try if we fit. if we don't -> render up until last idx
                         var render_text = span.text.?[lastConsumedIdx..currentIdxOfSpace];
-                        render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                        render_text_c = try self.styledTextblockSize_toCstring(renderSlide, render_text, display_font_size, font_used, &attempted_span_size);
                         const candidate_width = boundaryWidth(attempted_span_size.x, boundary_spacing, lastConsumedIdx, currentIdxOfSpace, span.text.?.len);
                         log.debug("   current available_width: {d}, attempted_span_size: {d:3.0}", .{ available_width, candidate_width });
                         if (candidate_width > available_width and wordCount > 1) {
@@ -698,7 +1201,7 @@ pub const SlideshowRenderer = struct {
                                 available_width = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
                                 const end_of_string_pos = if (lastIdxOfSpace > span.text.?.len) span.text.?.len else lastIdxOfSpace;
                                 render_text = span.text.?[lastConsumedIdx..end_of_string_pos];
-                                render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                                render_text_c = try self.styledTextblockSize_toCstring(renderSlide, render_text, display_font_size, font_used, &attempted_span_size);
                                 const rendered_slice_start = lastConsumedIdx;
                                 const rendered_width = boundaryWidth(attempted_span_size.x, boundary_spacing, rendered_slice_start, end_of_string_pos, span.text.?.len);
                                 lastConsumedIdx = lastIdxOfSpace;
@@ -732,7 +1235,7 @@ pub const SlideshowRenderer = struct {
                             if (lastIdxOfSpace >= currentIdxOfSpace) {
                                 available_width = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
                                 render_text = span.text.?[lastConsumedIdx..currentIdxOfSpace];
-                                render_text_c = try self.styledTextblockSize_toCstring(render_text, display_font_size, font_used, &attempted_span_size);
+                                render_text_c = try self.styledTextblockSize_toCstring(renderSlide, render_text, display_font_size, font_used, &attempted_span_size);
                                 const rendered_slice_start = lastConsumedIdx;
                                 const rendered_width = boundaryWidth(attempted_span_size.x, boundary_spacing, rendered_slice_start, currentIdxOfSpace, span.text.?.len);
                                 lastConsumedIdx = lastIdxOfSpace;
@@ -817,12 +1320,8 @@ pub const SlideshowRenderer = struct {
         return false;
     }
 
-    fn toCString(self: *SlideshowRenderer, text: []const u8) ![:0]const u8 {
-        return try self.allocator.dupeZ(u8, text);
-    }
-
-    fn styledTextblockSize_toCstring(self: *SlideshowRenderer, text: []const u8, fontsize: f32, font: rl.Font, size_out: *rl.Vector2) ![:0]const u8 {
-        const ctext = try self.toCString(text);
+    fn styledTextblockSize_toCstring(self: *SlideshowRenderer, render_slide: *RenderedSlide, text: []const u8, fontsize: f32, font: rl.Font, size_out: *rl.Vector2) ![:0]const u8 {
+        const ctext = try self.ownRenderedText(render_slide, text);
         log.debug("cstring: of {s} = `{s}`", .{ text, ctext });
         if (ctext[0] == 0) {
             size_out.x = 0;
@@ -921,6 +1420,32 @@ pub const SlideshowRenderer = struct {
             }
         }
         try self.renderOneSlide(slide_number, reveal, transforms.incoming, pos, size, internal_render_size, crowd_snapshot, crowd_url);
+    }
+
+    /// Paint the final stable scene of one slide into a small Studio card.
+    /// Thumbnail rendering deliberately ignores a live canvas geometry preview
+    /// (item identities restart on every slide) and audience-only Crowdplay
+    /// state, then restores the preview for the main canvas.
+    pub fn renderStudioThumbnail(
+        self: *SlideshowRenderer,
+        slide_number: i32,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+    ) !void {
+        const preview_count = self.item_geometry_preview_count;
+        self.item_geometry_preview_count = 0;
+        defer self.item_geometry_preview_count = preview_count;
+        try self.renderOneSlide(
+            slide_number,
+            .{ .visible_through = self.stepCount(slide_number) },
+            .{},
+            pos,
+            size,
+            internal_render_size,
+            null,
+            "",
+        );
     }
 
     fn renderOneSlide(
@@ -1194,24 +1719,32 @@ pub const SlideshowRenderer = struct {
         crowd_snapshot: ?crowdplay.Snapshot,
         crowd_url: []const u8,
     ) void {
+        var previewed = if (geometryPreviewFor(
+            self.item_geometry_previews[0..self.item_geometry_preview_count],
+            element.owner_identity,
+        )) |preview|
+            elementWithGeometryPreview(element.*, preview)
+        else
+            element.*;
+        const displayed = &previewed;
         var transform = base_transform;
-        transform.opacity *= element.opacity;
+        transform.opacity *= displayed.opacity;
         if (transform.opacity <= 0) return;
-        switch (element.kind) {
+        switch (displayed.kind) {
             .background => {
-                if (element.texture) |texture| {
+                if (displayed.texture) |texture| {
                     renderImg(.{ .x = 0.0, .y = 0.0 }, internal_render_size, texture, .white, .blank, pos, size, internal_render_size, transform);
-                } else if (element.color) |color| {
+                } else if (displayed.color) |color| {
                     renderBgColor(color, pos, size, transform);
                 }
             },
-            .text => self.renderText(element, pos, size, internal_render_size, transform),
+            .text => self.renderText(displayed, pos, size, internal_render_size, transform),
             .image => {
-                if (element.texture) |texture| {
-                    renderImg(element.position, element.size, texture, .white, .blank, pos, size, internal_render_size, transform);
+                if (displayed.texture) |texture| {
+                    renderImg(displayed.position, displayed.size, texture, .white, .blank, pos, size, internal_render_size, transform);
                 }
             },
-            .crowd => self.renderCrowd(element, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),
+            .crowd => self.renderCrowd(displayed, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),
         }
     }
 
@@ -1295,6 +1828,98 @@ pub const SlideshowRenderer = struct {
     }
 };
 
+fn itemBackgroundElement(item: slides.SlideItem) ?RenderElement {
+    if (item.kind == .background) return null;
+    const color = item.background_color orelse return null;
+    return .{
+        .kind = .text,
+        .position = item.position,
+        .size = item.size,
+        .fontSize = null,
+        .underline_width = null,
+        .line_height_factor = null,
+        .text = null,
+        .color = color,
+        .is_item_background = true,
+    };
+}
+
+/// Fill omitted dimensions from the content fragments produced for the same
+/// owner. This keeps `bg=` useful for naturally-sized images without turning
+/// an omitted image width or height into an explicit source value.
+fn resolveItemBackgroundGeometry(background: *RenderElement, content: []const RenderElement) void {
+    if (background.size.x > 0 and background.size.y > 0) return;
+
+    var bounds: ?rl.Rectangle = null;
+    for (content) |element| {
+        if (element.kind == .background) continue;
+        const right = element.position.x + element.size.x;
+        const bottom = element.position.y + element.size.y;
+        if (bounds) |current| {
+            const left = @min(current.x, element.position.x);
+            const top = @min(current.y, element.position.y);
+            bounds = .{
+                .x = left,
+                .y = top,
+                .width = @max(current.x + current.width, right) - left,
+                .height = @max(current.y + current.height, bottom) - top,
+            };
+        } else {
+            bounds = .{
+                .x = element.position.x,
+                .y = element.position.y,
+                .width = element.size.x,
+                .height = element.size.y,
+            };
+        }
+    }
+    const resolved = bounds orelse return;
+    if (background.size.x <= 0) {
+        background.position.x = resolved.x;
+        background.size.x = resolved.width;
+    }
+    if (background.size.y <= 0) {
+        background.position.y = resolved.y;
+        background.size.y = resolved.height;
+    }
+}
+
+fn elementWithGeometryPreview(element: RenderElement, preview: ItemGeometryPreview) RenderElement {
+    if (element.kind == .background or element.owner_identity != preview.owner_identity) return element;
+
+    var result = element;
+    const move = rl.Vector2{
+        .x = preview.after_position.x - preview.before_position.x,
+        .y = preview.after_position.y - preview.before_position.y,
+    };
+    result.position.x += move.x;
+    result.position.y += move.y;
+    if (!preview.resized) return result;
+
+    // Images, Crowdplay panels, and color-only rectangles can be resized
+    // faithfully without rebuilding layout. Text keeps its glyph metrics and
+    // reflows once the completed gesture is reparsed.
+    const scalable = element.kind == .image or element.kind == .crowd or
+        (element.kind == .text and element.text == null);
+    if (!scalable or preview.before_size.x <= 0 or preview.before_size.y <= 0) return result;
+
+    const scale_x = preview.after_size.x / preview.before_size.x;
+    const scale_y = preview.after_size.y / preview.before_size.y;
+    result.position = .{
+        .x = preview.after_position.x + (element.position.x - preview.before_position.x) * scale_x,
+        .y = preview.after_position.y + (element.position.y - preview.before_position.y) * scale_y,
+    };
+    result.size = .{ .x = element.size.x * scale_x, .y = element.size.y * scale_y };
+    return result;
+}
+
+fn geometryPreviewFor(previews: []const ItemGeometryPreview, identity: usize) ?ItemGeometryPreview {
+    for (previews) |preview| {
+        if (preview.owner_identity == identity) return preview;
+    }
+    return null;
+}
+
 fn stableMorphState(slide: *const RenderedSlide, visible_through: usize) ?usize {
     var state_index: ?usize = null;
     const step_count = @min(visible_through, slide.steps.items.len);
@@ -1338,19 +1963,85 @@ fn indexOwnerGroups(groups: *std.AutoHashMap(usize, ElementGroup), elements: []c
     }
 }
 
-fn groupsCompatible(source: []const RenderElement, source_group: ElementGroup, target: []const RenderElement, target_group: ElementGroup) bool {
-    if (source_group.len == 0 or source_group.len != target_group.len) return false;
+fn groupBackgroundIndex(elements: []const RenderElement, group: ElementGroup) ?usize {
+    if (group.len == 0) return null;
+    const index = group.first;
+    return if (elements[index].is_item_background) index else null;
+}
+
+fn groupForeground(group: ElementGroup, background_index: ?usize) ElementGroup {
+    const skip: usize = @intFromBool(background_index != null);
+    return .{ .first = group.first + skip, .len = group.len - skip };
+}
+
+fn foregroundGroupsCompatible(source: []const RenderElement, source_group: ElementGroup, target: []const RenderElement, target_group: ElementGroup) bool {
+    if (source_group.len != target_group.len) return false;
     for (0..source_group.len) |offset| {
         const source_element = &source[source_group.first + offset];
         const target_element = &target[target_group.first + offset];
-        if (source_element.part_index != target_element.part_index or
+        if (source_element.is_item_background or target_element.is_item_background or
+            source_element.part_index != target_element.part_index or
             !elementPayloadCompatible(source_element, target_element)) return false;
     }
     return true;
 }
 
+fn appendOwnerMorphDraws(
+    plan: *MorphPlan,
+    allocator: std.mem.Allocator,
+    source: []const RenderElement,
+    source_group: ElementGroup,
+    target: []const RenderElement,
+    target_group: ElementGroup,
+) !void {
+    const source_background = groupBackgroundIndex(source, source_group);
+    const target_background = groupBackgroundIndex(target, target_group);
+
+    // Paint both background layers before any foreground fragment. Adding,
+    // removing, or recoloring `bg=` can therefore never cover text that is
+    // cross-fading within the same semantic owner.
+    if (source_background) |source_index| {
+        if (target_background) |target_index| {
+            if (elementPayloadCompatible(&source[source_index], &target[target_index])) {
+                try plan.draws.append(allocator, .{
+                    .kind = .interpolate,
+                    .source_index = source_index,
+                    .target_index = target_index,
+                });
+            } else {
+                try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_index });
+                try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_index });
+            }
+        } else {
+            try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_index });
+        }
+    } else if (target_background) |target_index| {
+        try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_index });
+    }
+
+    const source_foreground = groupForeground(source_group, source_background);
+    const target_foreground = groupForeground(target_group, target_background);
+    if (foregroundGroupsCompatible(source, source_foreground, target, target_foreground)) {
+        for (0..target_foreground.len) |offset| {
+            try plan.draws.append(allocator, .{
+                .kind = .interpolate,
+                .source_index = source_foreground.first + offset,
+                .target_index = target_foreground.first + offset,
+            });
+        }
+    } else {
+        for (0..source_foreground.len) |offset| {
+            try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_foreground.first + offset });
+        }
+        for (0..target_foreground.len) |offset| {
+            try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_foreground.first + offset });
+        }
+    }
+}
+
 fn buildMorphPlan(allocator: std.mem.Allocator, source: []const RenderElement, target: []const RenderElement) !MorphPlan {
     var plan = MorphPlan{ .draws = std.ArrayList(MorphDraw).empty };
+    errdefer plan.draws.deinit(allocator);
     var source_groups = std.AutoHashMap(usize, ElementGroup).init(allocator);
     defer source_groups.deinit();
     var target_groups = std.AutoHashMap(usize, ElementGroup).init(allocator);
@@ -1366,22 +2057,7 @@ fn buildMorphPlan(allocator: std.mem.Allocator, source: []const RenderElement, t
         const owner_identity = target[target_first].owner_identity;
         const target_group = target_groups.get(owner_identity).?;
         if (source_groups.get(owner_identity)) |source_group| {
-            if (groupsCompatible(source, source_group, target, target_group)) {
-                for (0..target_group.len) |offset| {
-                    try plan.draws.append(allocator, .{
-                        .kind = .interpolate,
-                        .source_index = source_group.first + offset,
-                        .target_index = target_group.first + offset,
-                    });
-                }
-            } else {
-                for (0..source_group.len) |offset| {
-                    try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_group.first + offset });
-                }
-                for (0..target_group.len) |offset| {
-                    try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_group.first + offset });
-                }
-            }
+            try appendOwnerMorphDraws(&plan, allocator, source, source_group, target, target_group);
         } else {
             for (0..target_group.len) |offset| {
                 try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_group.first + offset });
@@ -1699,6 +2375,347 @@ test "slide number replacement excludes unused formatter bytes" {
     try std.testing.expectEqualStrings("page 6 of 6", rendered);
 }
 
+test "repeated preRender releases slides morph scenes plans and owned text" {
+    const allocator = std.testing.allocator;
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(allocator, &unused_fonts);
+    defer renderer.deinit();
+
+    var slideshow: slides.SlideShow = .{ .slides = std.ArrayList(*slides.Slide).empty };
+    defer slideshow.slides.deinit(allocator);
+    var slide: slides.Slide = .{ .allocator = allocator };
+    slide.items = std.ArrayList(slides.SlideItem).empty;
+    slide.morph_states = std.ArrayList(slides.MorphState).empty;
+    defer {
+        slide.items.?.deinit(allocator);
+        for (slide.morph_states.items) |*morph_state| morph_state.items.deinit(allocator);
+        slide.morph_states.deinit(allocator);
+    }
+
+    try slide.items.?.append(allocator, .{
+        .identity = 1,
+        .kind = .background,
+        .color = .black,
+    });
+    var state: slides.MorphState = .{};
+    state.items = std.ArrayList(slides.SlideItem).empty;
+    try state.items.append(allocator, .{
+        .identity = 1,
+        .kind = .background,
+        .color = .white,
+    });
+    try slide.morph_states.append(allocator, state);
+    try slideshow.slides.append(allocator, &slide);
+
+    for (0..8) |_| {
+        try renderer.preRender(&slideshow, "");
+        try std.testing.expectEqual(@as(usize, 1), renderer.renderedSlides.items.len);
+        const rendered_slide = renderer.renderedSlides.items[0];
+        try std.testing.expectEqual(@as(usize, 1), rendered_slide.morph_scenes.items.len);
+        try std.testing.expectEqual(@as(usize, 1), rendered_slide.steps.items.len);
+        _ = try renderer.ownRenderedText(rendered_slide, "owned base text");
+        const scene_text = try allocator.dupeZ(u8, "owned morph text");
+        errdefer allocator.free(scene_text);
+        try rendered_slide.morph_scenes.items[0].owned_text.append(allocator, scene_text);
+    }
+
+    // An empty successful rebuild is still a rebuild: it must retire the
+    // previous graph rather than leave stale slides alive.
+    slideshow.slides.clearRetainingCapacity();
+    try renderer.preRender(&slideshow, "");
+    try std.testing.expectEqual(@as(usize, 0), renderer.renderedSlides.items.len);
+}
+
+test "preRenderChanged preserves unchanged slides and replaces only semantic changes" {
+    const allocator = std.testing.allocator;
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(allocator, &unused_fonts);
+    defer renderer.deinit();
+
+    var slideshow: slides.SlideShow = .{ .slides = std.ArrayList(*slides.Slide).empty };
+    defer slideshow.slides.deinit(allocator);
+    var slide_a: slides.Slide = .{ .allocator = allocator };
+    slide_a.items = std.ArrayList(slides.SlideItem).empty;
+    slide_a.morph_states = std.ArrayList(slides.MorphState).empty;
+    defer {
+        slide_a.items.?.deinit(allocator);
+        for (slide_a.morph_states.items) |*state| state.items.deinit(allocator);
+        slide_a.morph_states.deinit(allocator);
+    }
+    var slide_b: slides.Slide = .{ .allocator = allocator };
+    slide_b.items = std.ArrayList(slides.SlideItem).empty;
+    slide_b.morph_states = std.ArrayList(slides.MorphState).empty;
+    defer {
+        slide_b.items.?.deinit(allocator);
+        for (slide_b.morph_states.items) |*state| state.items.deinit(allocator);
+        slide_b.morph_states.deinit(allocator);
+    }
+    try slide_a.items.?.append(allocator, .{
+        .identity = 1,
+        .kind = .background,
+        .color = .black,
+        .source = .{ .scope = .direct, .line_offset = 10, .patchable = true },
+    });
+    try slide_b.items.?.append(allocator, .{
+        .identity = 1,
+        .kind = .background,
+        .color = .white,
+        .source = .{ .scope = .direct, .line_offset = 20, .patchable = true },
+    });
+    try slideshow.slides.append(allocator, &slide_a);
+    try slideshow.slides.append(allocator, &slide_b);
+
+    const initial = try renderer.preRenderChanged(&slideshow, "deck.sld");
+    try std.testing.expectEqual(SlideshowRenderer.RebuildMode.full, initial.mode);
+    try std.testing.expectEqual(@as(usize, 2), initial.rebuilt_slide_count);
+    const first_a = @intFromPtr(renderer.renderedSlides.items[0]);
+    const first_b = @intFromPtr(renderer.renderedSlides.items[1]);
+
+    // Parser/source ownership can move when earlier bytes are edited without
+    // changing anything consumed by the renderer.
+    slide_a.items.?.items[0].source.line_offset = 10_000;
+    const unchanged = try renderer.preRenderChanged(&slideshow, "deck.sld");
+    try std.testing.expectEqual(SlideshowRenderer.RebuildMode.unchanged, unchanged.mode);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.rebuilt_slide_count);
+    try std.testing.expectEqual(first_a, @intFromPtr(renderer.renderedSlides.items[0]));
+    try std.testing.expectEqual(first_b, @intFromPtr(renderer.renderedSlides.items[1]));
+
+    slide_a.items.?.items[0].color = .red;
+    const one_changed = try renderer.preRenderChanged(&slideshow, "deck.sld");
+    try std.testing.expectEqual(SlideshowRenderer.RebuildMode.partial, one_changed.mode);
+    try std.testing.expectEqual(@as(usize, 1), one_changed.rebuilt_slide_count);
+    try std.testing.expect(first_a != @intFromPtr(renderer.renderedSlides.items[0]));
+    try std.testing.expectEqual(first_b, @intFromPtr(renderer.renderedSlides.items[1]));
+    try std.testing.expectEqual(rl.Color.red, renderer.renderedSlides.items[0].elements.items[0].color.?);
+
+    const second_a = @intFromPtr(renderer.renderedSlides.items[0]);
+    var morph_state: slides.MorphState = .{ .spec = .{ .duration = 0.9, .easing = .linear } };
+    morph_state.items = std.ArrayList(slides.SlideItem).empty;
+    try morph_state.items.append(allocator, .{
+        .identity = 1,
+        .kind = .background,
+        .color = .blue,
+    });
+    try slide_b.morph_states.append(allocator, morph_state);
+    const morph_changed = try renderer.preRenderChanged(&slideshow, "deck.sld");
+    try std.testing.expectEqual(SlideshowRenderer.RebuildMode.partial, morph_changed.mode);
+    try std.testing.expectEqual(@as(usize, 1), morph_changed.rebuilt_slide_count);
+    try std.testing.expectEqual(second_a, @intFromPtr(renderer.renderedSlides.items[0]));
+    try std.testing.expectEqual(@as(usize, 1), renderer.renderedSlides.items[1].morph_scenes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), renderer.renderedSlides.items[1].steps.items.len);
+
+    var slide_c: slides.Slide = .{ .allocator = allocator };
+    slide_c.items = std.ArrayList(slides.SlideItem).empty;
+    slide_c.morph_states = std.ArrayList(slides.MorphState).empty;
+    defer {
+        slide_c.items.?.deinit(allocator);
+        slide_c.morph_states.deinit(allocator);
+    }
+    try slide_c.items.?.append(allocator, .{ .identity = 1, .kind = .background, .color = .green });
+    try slideshow.slides.append(allocator, &slide_c);
+    const structural = try renderer.preRenderChanged(&slideshow, "deck.sld");
+    try std.testing.expectEqual(SlideshowRenderer.RebuildMode.full, structural.mode);
+    try std.testing.expectEqual(@as(usize, 3), structural.rebuilt_slide_count);
+}
+
+test "rendered Crowd data survives parser arena replacement" {
+    const allocator = std.testing.allocator;
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(allocator, &unused_fonts);
+    defer renderer.deinit();
+
+    var parser_arena = std.heap.ArenaAllocator.init(allocator);
+    var parser_arena_live = true;
+    defer if (parser_arena_live) parser_arena.deinit();
+    const parser_allocator = parser_arena.allocator();
+    const slideshow = try slides.SlideShow.new(parser_allocator);
+    const slide = try slides.Slide.new(parser_allocator);
+    const choices = try parser_allocator.alloc([]const u8, 2);
+    choices[0] = try parser_allocator.dupe(u8, "Cyan");
+    choices[1] = try parser_allocator.dupe(u8, "Magenta");
+    try slide.items.?.append(parser_allocator, .{
+        .identity = 1,
+        .kind = .crowd,
+        .position = .{ .x = 100, .y = 80 },
+        .size = .{ .x = 1720, .y = 920 },
+        .crowd = .{
+            .kind = .poll,
+            .id = try parser_allocator.dupe(u8, "palette"),
+            .prompt = try parser_allocator.dupe(u8, "Pick a color"),
+            .choices = choices,
+        },
+    });
+    var morph_state: slides.MorphState = .{};
+    morph_state.items = std.ArrayList(slides.SlideItem).empty;
+    try morph_state.items.append(parser_allocator, .{
+        .identity = 1,
+        .kind = .crowd,
+        .position = .{ .x = 120, .y = 90 },
+        .size = .{ .x = 1700, .y = 900 },
+        .crowd = .{
+            .kind = .join,
+            .id = try parser_allocator.dupe(u8, "joined"),
+            .prompt = try parser_allocator.dupe(u8, "You are in"),
+        },
+    });
+    try slide.morph_states.append(parser_allocator, morph_state);
+    try slideshow.slides.append(parser_allocator, slide);
+
+    _ = try renderer.preRenderChanged(slideshow, "deck.sld");
+    parser_arena.deinit();
+    parser_arena_live = false;
+
+    const base_crowd = renderer.renderedSlides.items[0].elements.items[0].crowd.?;
+    try std.testing.expectEqualStrings("palette", base_crowd.id);
+    try std.testing.expectEqualStrings("Pick a color", base_crowd.prompt);
+    try std.testing.expectEqual(@as(usize, 2), base_crowd.choices.len);
+    try std.testing.expectEqualStrings("Cyan", base_crowd.choices[0]);
+    try std.testing.expectEqualStrings("Magenta", base_crowd.choices[1]);
+
+    const state_crowd = renderer.renderedSlides.items[0].morph_scenes.items[0].elements.items[0].crowd.?;
+    try std.testing.expectEqualStrings("joined", state_crowd.id);
+    try std.testing.expectEqualStrings("You are in", state_crowd.prompt);
+}
+
+test "shared source changes rebuild exactly the parsed dependent slides" {
+    const allocator = std.testing.allocator;
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(allocator, &unused_fonts);
+    defer renderer.deinit();
+
+    const original =
+        "@push card x=10 y=20 w=300 h=80 color=#112233ff\n" ++
+        "@slide\n" ++
+        "@pop card id=first\n" ++
+        "@slide\n" ++
+        "@box id=unrelated x=40 y=50 w=100 h=70 color=#abcdef12\n" ++
+        "@slide\n" ++
+        "@pop card id=second\n";
+    const changed =
+        "@push card x=10 y=20 w=300 h=80 color=#ee3366ff\n" ++
+        "@slide\n" ++
+        "@pop card id=first\n" ++
+        "@slide\n" ++
+        "@box id=unrelated x=40 y=50 w=100 h=70 color=#abcdef12\n" ++
+        "@slide\n" ++
+        "@pop card id=second\n";
+
+    var first_arena = std.heap.ArenaAllocator.init(allocator);
+    const first_slideshow = try slides.SlideShow.new(first_arena.allocator());
+    const first_context = try parser.constructSlidesFromBuf(original, first_slideshow, first_arena.allocator());
+    try std.testing.expectEqual(@as(usize, 0), first_context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 3), first_slideshow.slides.items.len);
+    const initial = try renderer.preRenderChanged(first_slideshow, "deck.sld");
+    try std.testing.expectEqual(SlideshowRenderer.RebuildMode.full, initial.mode);
+    const unrelated_pointer = @intFromPtr(renderer.renderedSlides.items[1]);
+    first_context.deinit();
+    first_arena.deinit();
+
+    var second_arena = std.heap.ArenaAllocator.init(allocator);
+    defer second_arena.deinit();
+    const second_slideshow = try slides.SlideShow.new(second_arena.allocator());
+    const second_context = try parser.constructSlidesFromBuf(changed, second_slideshow, second_arena.allocator());
+    defer second_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second_context.parser_errors.items.len);
+    const selective = try renderer.preRenderChanged(second_slideshow, "deck.sld");
+    try std.testing.expectEqual(SlideshowRenderer.RebuildMode.partial, selective.mode);
+    try std.testing.expectEqual(@as(usize, 2), selective.rebuilt_slide_count);
+    try std.testing.expectEqual(unrelated_pointer, @intFromPtr(renderer.renderedSlides.items[1]));
+    try std.testing.expectEqual(@as(u8, 0xee), renderer.renderedSlides.items[0].elements.items[0].color.?.r);
+    try std.testing.expectEqual(@as(u8, 0xee), renderer.renderedSlides.items[2].elements.items[0].color.?.r);
+}
+
+test "failed selective rebuild leaves every live slide untouched" {
+    const backing_allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(backing_allocator, .{});
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(failing.allocator(), &unused_fonts);
+    defer renderer.deinit();
+
+    var slideshow: slides.SlideShow = .{ .slides = std.ArrayList(*slides.Slide).empty };
+    defer slideshow.slides.deinit(backing_allocator);
+    var slide_a: slides.Slide = .{ .allocator = backing_allocator };
+    slide_a.items = std.ArrayList(slides.SlideItem).empty;
+    slide_a.morph_states = std.ArrayList(slides.MorphState).empty;
+    defer {
+        slide_a.items.?.deinit(backing_allocator);
+        slide_a.morph_states.deinit(backing_allocator);
+    }
+    var slide_b: slides.Slide = .{ .allocator = backing_allocator };
+    slide_b.items = std.ArrayList(slides.SlideItem).empty;
+    slide_b.morph_states = std.ArrayList(slides.MorphState).empty;
+    defer {
+        slide_b.items.?.deinit(backing_allocator);
+        slide_b.morph_states.deinit(backing_allocator);
+    }
+    try slide_a.items.?.append(backing_allocator, .{ .identity = 1, .kind = .background, .color = .black });
+    try slide_b.items.?.append(backing_allocator, .{ .identity = 1, .kind = .background, .color = .white });
+    try slideshow.slides.append(backing_allocator, &slide_a);
+    try slideshow.slides.append(backing_allocator, &slide_b);
+    _ = try renderer.preRenderChanged(&slideshow, "deck.sld");
+    const first_pointer = @intFromPtr(renderer.renderedSlides.items[0]);
+    const second_pointer = @intFromPtr(renderer.renderedSlides.items[1]);
+
+    slide_a.items.?.items[0].color = .red;
+    slide_b.items.?.items[0].color = .blue;
+    // replacements allocation + the first slide's struct/elements succeed;
+    // constructing the second replacement then fails. No index may have
+    // swapped yet.
+    failing.fail_index = failing.alloc_index + 3;
+    try std.testing.expectError(error.OutOfMemory, renderer.preRenderChanged(&slideshow, "deck.sld"));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(first_pointer, @intFromPtr(renderer.renderedSlides.items[0]));
+    try std.testing.expectEqual(second_pointer, @intFromPtr(renderer.renderedSlides.items[1]));
+    try std.testing.expectEqual(rl.Color.black, renderer.renderedSlides.items[0].elements.items[0].color.?);
+    try std.testing.expectEqual(rl.Color.white, renderer.renderedSlides.items[1].elements.items[0].color.?);
+}
+
+test "Studio owner bounds are collected in one render-fragment pass" {
+    const allocator = std.testing.allocator;
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(allocator, &unused_fonts);
+    defer renderer.deinit();
+
+    const rendered_slide = try RenderedSlide.new(allocator);
+    var rendered_slide_owned = true;
+    errdefer if (rendered_slide_owned) renderer.destroyRenderedSlide(rendered_slide);
+    const owner_count: usize = 400;
+    const fragments_per_owner: usize = 3;
+    for (0..owner_count) |owner_index| {
+        for (0..fragments_per_owner) |fragment_index| {
+            try rendered_slide.elements.append(allocator, .{
+                .kind = .text,
+                .owner_identity = owner_index + 1,
+                .part_index = fragment_index,
+                .position = .{
+                    .x = @floatFromInt(owner_index * 2 + fragment_index),
+                    .y = @floatFromInt(owner_index + fragment_index * 4),
+                },
+                .size = .{ .x = 20, .y = 10 },
+            });
+        }
+    }
+    try renderer.renderedSlides.append(allocator, rendered_slide);
+    rendered_slide_owned = false;
+
+    var bounds = std.ArrayList(SlideshowRenderer.ItemRenderBounds).empty;
+    defer bounds.deinit(allocator);
+    const fragments_scanned = try renderer.collectItemRenderBoundsForMorphState(
+        allocator,
+        &bounds,
+        0,
+        null,
+    );
+    try std.testing.expectEqual(owner_count * fragments_per_owner, fragments_scanned);
+    try std.testing.expectEqual(owner_count, bounds.items.len);
+
+    for ([_]usize{ 0, owner_count / 2, owner_count - 1 }) |index| {
+        const legacy = renderer.itemRenderBoundsForMorphState(0, null, index + 1).?;
+        try std.testing.expectEqual(index + 1, bounds.items[index].owner_identity);
+        try std.testing.expectEqual(legacy, bounds.items[index].bounds);
+    }
+}
+
 test "inline font boundaries use the wider neighboring space in both directions" {
     const before_chunky = inlineBoundarySpacing("Add ", 4, null, 10);
     try std.testing.expectApproxEqAbs(@as(f32, 0), before_chunky.leading, 0.0001);
@@ -1815,6 +2832,50 @@ test "semantic morph plan keeps a changed foreground above its background" {
     try std.testing.expectEqual(@as(?usize, 1), plan.draws.items[2].target_index);
 }
 
+test "item background morphs below changed or unchanged foreground content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const old_text: [:0]const u8 = "old";
+    const new_text: [:0]const u8 = "new";
+    const source = [_]RenderElement{
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .is_item_background = true, .color = .black },
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .text = old_text },
+    };
+    const changed = [_]RenderElement{
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .is_item_background = true, .color = .white },
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .text = new_text },
+    };
+
+    const changed_plan = try buildMorphPlan(allocator, &source, &changed);
+    try std.testing.expectEqual(@as(usize, 3), changed_plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, changed_plan.draws.items[0].kind);
+    try std.testing.expectEqual(@as(?usize, 0), changed_plan.draws.items[0].target_index);
+    try std.testing.expectEqual(MorphDrawKind.source_fade, changed_plan.draws.items[1].kind);
+    try std.testing.expectEqual(@as(?usize, 1), changed_plan.draws.items[1].source_index);
+    try std.testing.expectEqual(MorphDrawKind.target_fade, changed_plan.draws.items[2].kind);
+    try std.testing.expectEqual(@as(?usize, 1), changed_plan.draws.items[2].target_index);
+
+    const without_background = [_]RenderElement{
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .text = old_text },
+    };
+    const added_plan = try buildMorphPlan(allocator, &without_background, &source);
+    try std.testing.expectEqual(@as(usize, 2), added_plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.target_fade, added_plan.draws.items[0].kind);
+    try std.testing.expectEqual(@as(?usize, 0), added_plan.draws.items[0].target_index);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, added_plan.draws.items[1].kind);
+    try std.testing.expectEqual(@as(?usize, 0), added_plan.draws.items[1].source_index);
+    try std.testing.expectEqual(@as(?usize, 1), added_plan.draws.items[1].target_index);
+
+    const removed_plan = try buildMorphPlan(allocator, &source, &without_background);
+    try std.testing.expectEqual(@as(usize, 2), removed_plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.source_fade, removed_plan.draws.items[0].kind);
+    try std.testing.expectEqual(@as(?usize, 0), removed_plan.draws.items[0].source_index);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, removed_plan.draws.items[1].kind);
+    try std.testing.expectEqual(@as(?usize, 1), removed_plan.draws.items[1].source_index);
+    try std.testing.expectEqual(@as(?usize, 0), removed_plan.draws.items[1].target_index);
+}
+
 test "stable semantic state follows morph steps in the shared timeline" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1828,6 +2889,127 @@ test "stable semantic state follows morph steps in the shared timeline" {
     try std.testing.expectEqual(@as(?usize, 0), stableMorphState(slide, 2));
     try std.testing.expectEqual(@as(?usize, 1), stableMorphState(slide, 3));
     try std.testing.expectEqual(@as(?usize, 1), stableMorphState(slide, 99));
+}
+
+test "Studio geometry preview moves all fragments and resizes visual surfaces" {
+    const move: ItemGeometryPreview = .{
+        .owner_identity = 7,
+        .before_position = .{ .x = 100, .y = 200 },
+        .before_size = .{ .x = 400, .y = 300 },
+        .after_position = .{ .x = 130, .y = 180 },
+        .after_size = .{ .x = 400, .y = 300 },
+        .resized = false,
+    };
+    const text: RenderElement = .{
+        .kind = .text,
+        .owner_identity = 7,
+        .position = .{ .x = 120, .y = 230 },
+        .size = .{ .x = 80, .y = 30 },
+        .text = "hello",
+    };
+    const moved = elementWithGeometryPreview(text, move);
+    try std.testing.expectApproxEqAbs(@as(f32, 150), moved.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 210), moved.position.y, 0.0001);
+
+    var resize = move;
+    resize.after_position = move.before_position;
+    resize.after_size = .{ .x = 800, .y = 150 };
+    resize.resized = true;
+    const image: RenderElement = .{
+        .kind = .image,
+        .owner_identity = 7,
+        .position = .{ .x = 150, .y = 250 },
+        .size = .{ .x = 200, .y = 100 },
+    };
+    const resized = elementWithGeometryPreview(image, resize);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), resized.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 225), resized.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), resized.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), resized.size.y, 0.0001);
+
+    const text_resize = elementWithGeometryPreview(text, resize);
+    try std.testing.expectEqual(text.position, text_resize.position);
+    try std.testing.expectEqual(text.size, text_resize.size);
+}
+
+test "Studio geometry preview batches resolve by item identity" {
+    const previews = [_]ItemGeometryPreview{
+        .{
+            .owner_identity = 7,
+            .before_position = .{ .x = 0, .y = 0 },
+            .before_size = .{ .x = 10, .y = 10 },
+            .after_position = .{ .x = 20, .y = 30 },
+            .after_size = .{ .x = 10, .y = 10 },
+            .resized = false,
+        },
+        .{
+            .owner_identity = 9,
+            .before_position = .{ .x = 100, .y = 100 },
+            .before_size = .{ .x = 20, .y = 20 },
+            .after_position = .{ .x = 80, .y = 90 },
+            .after_size = .{ .x = 20, .y = 20 },
+            .resized = false,
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 7), geometryPreviewFor(&previews, 7).?.owner_identity);
+    try std.testing.expectEqual(@as(usize, 9), geometryPreviewFor(&previews, 9).?.owner_identity);
+    try std.testing.expect(geometryPreviewFor(&previews, 8) == null);
+}
+
+test "item-owned background is a bounded color part behind its content" {
+    const item = slides.SlideItem{
+        .kind = .textbox,
+        .position = .{ .x = 120, .y = 240 },
+        .size = .{ .x = 640, .y = 180 },
+        .background_color = .{ .r = 12, .g = 34, .b = 56, .a = 200 },
+    };
+    const background = itemBackgroundElement(item).?;
+    try std.testing.expectEqual(RenderElementKind.text, background.kind);
+    try std.testing.expect(background.text == null);
+    try std.testing.expectEqual(item.position, background.position);
+    try std.testing.expectEqual(item.size, background.size);
+    try std.testing.expectEqual(@as(u8, 12), background.color.?.r);
+    try std.testing.expectEqual(@as(u8, 200), background.color.?.a);
+
+    var without = item;
+    without.background_color = null;
+    try std.testing.expect(itemBackgroundElement(without) == null);
+    var slide_background = item;
+    slide_background.kind = .background;
+    try std.testing.expect(itemBackgroundElement(slide_background) == null);
+}
+
+test "item-owned background resolves omitted image dimensions from content" {
+    var background: RenderElement = .{
+        .kind = .text,
+        .position = .{ .x = 120, .y = 240 },
+        .size = .zero(),
+        .color = .black,
+    };
+    const content = [_]RenderElement{.{
+        .kind = .image,
+        .position = .{ .x = 120, .y = 240 },
+        .size = .{ .x = 640, .y = 360 },
+    }};
+
+    resolveItemBackgroundGeometry(&background, &content);
+    try std.testing.expectEqual(content[0].position, background.position);
+    try std.testing.expectEqual(content[0].size, background.size);
+
+    // An explicitly authored dimension remains authoritative while the other
+    // dimension can still follow the resolved image aspect.
+    background = .{
+        .kind = .text,
+        .position = .{ .x = 50, .y = 240 },
+        .size = .{ .x = 500, .y = 0 },
+        .color = .black,
+    };
+    resolveItemBackgroundGeometry(&background, &content);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), background.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), background.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 240), background.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 360), background.size.y, 0.0001);
 }
 
 pub fn slidePosToRenderPos(pos: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) rl.Vector2 {

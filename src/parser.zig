@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const slides = @import("slides.zig");
 const fonts = @import("fonts.zig");
 const animation = @import("animation.zig");
@@ -55,6 +56,29 @@ pub const ParserErrorContext = struct {
     }
 };
 
+const ReusableGroupDefinition = struct {
+    members: std.ArrayList(slides.SlideItem),
+    /// Ordinary `@pop` changes the parser's inherited item context for the
+    /// item after it. Preserve that observable tail only when the definition
+    /// actually contains a `@pop`; box-only groups leave the caller's context
+    /// untouched.
+    post_context: ?slides.ItemContext = null,
+};
+
+const ReusableGroupBuilder = struct {
+    name: []const u8,
+    start_line_number: usize,
+    start_line_offset: usize,
+    members: std.ArrayList(slides.SlideItem) = .empty,
+    parsing_item_context: slides.ItemContext = .{},
+    pending_animation: ?animation.ItemSpec = null,
+    pending_animation_source: slides.SourceRef = .{},
+    local_context: slides.ItemContext,
+    post_context: ?slides.ItemContext = null,
+    nested_depth: usize = 0,
+    valid: bool = true,
+};
+
 pub const ParserContext = struct {
     allocator: std.mem.Allocator,
     input: [:0]const u8 = undefined,
@@ -72,11 +96,17 @@ pub const ParserContext = struct {
     slideshow: *slides.SlideShow = undefined,
     push_contexts: std.StringHashMap(slides.ItemContext),
     push_slides: std.StringHashMap(*slides.Slide),
+    reusable_groups: std.StringHashMap(ReusableGroupDefinition),
+    active_group: ?ReusableGroupBuilder = null,
 
     current_context: slides.ItemContext = slides.ItemContext{},
     current_slide: *slides.Slide,
     pending_animation: ?animation.ItemSpec = null,
     active_morph_state: ?usize = null,
+    /// True while parsing the authored base scene of a successfully cloned
+    /// @popslide instance. During this window @set/@show/@hide may override
+    /// inherited template items without changing their shared definition.
+    template_instance_base_open: bool = false,
 
     allErrorsCstrArray: ?[][*]const u8 = null,
 
@@ -99,6 +129,7 @@ pub const ParserContext = struct {
             .let_substituted_lines = std.ArrayList([]const u8).empty,
             .push_contexts = std.StringHashMap(slides.ItemContext).init(a),
             .push_slides = std.StringHashMap(*slides.Slide).init(a),
+            .reusable_groups = std.StringHashMap(ReusableGroupDefinition).init(a),
             .current_slide = try slides.Slide.new(a),
             .parser_errors = std.ArrayList(ParserErrorContext).empty,
             .allErrorsCstrArray = null,
@@ -119,6 +150,10 @@ pub const ParserContext = struct {
         self.parser_errors.deinit(self.allocator);
         self.push_contexts.deinit();
         self.push_slides.deinit();
+        var group_it = self.reusable_groups.valueIterator();
+        while (group_it.next()) |group| group.members.deinit(self.allocator);
+        self.reusable_groups.deinit();
+        if (self.active_group) |*group| group.members.deinit(self.allocator);
         var it = self.let_substitutions.iterator();
         while (it.next()) |kv| {
             self.allocator.free(kv.key_ptr.*);
@@ -132,6 +167,7 @@ pub const ParserContext = struct {
     }
 
     fn logAllErrors(self: *ParserContext) void {
+        if (builtin.is_test) return;
         for (self.parser_errors.items) |err| {
             if (err.message) |msg| {
                 log.err("line {d}: {} ({s})", .{ err.line_number, err.parser_error, msg });
@@ -181,6 +217,261 @@ fn reportErrorInParsingContext(err: anyerror, pctx: *const slides.ItemContext, c
     };
 }
 
+fn isReusableName(name: []const u8) bool {
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) return false;
+    }
+    return true;
+}
+
+fn directiveWord(line: []const u8) []const u8 {
+    var words = std.mem.tokenizeAny(u8, line, " \t");
+    return words.next() orelse "";
+}
+
+fn beginReusableGroup(line: []const u8, context: *ParserContext) !void {
+    var words = std.mem.tokenizeAny(u8, line, " \t");
+    _ = words.next();
+    const name = words.next() orelse "";
+    var valid = true;
+    if (!isReusableName(name)) {
+        reportErrorInContext(ParserError.Syntax, context, "@pushgroup requires a literal reusable name");
+        valid = false;
+    }
+    if (words.next() != null) {
+        reportErrorInContext(ParserError.Syntax, context, "@pushgroup accepts only its literal name");
+        valid = false;
+    }
+    if (context.pending_animation != null) {
+        reportErrorInContext(ParserError.Syntax, context, "@anim must be followed by an item before @pushgroup");
+        context.pending_animation = null;
+    }
+    context.active_group = .{
+        .name = name,
+        .start_line_number = context.parsed_line_number,
+        .start_line_offset = context.parsed_line_offset,
+        .local_context = context.current_context,
+        .valid = valid,
+    };
+}
+
+fn appendReusableGroupBodyLine(item_context: *slides.ItemContext, line: []const u8, context: *ParserContext) !void {
+    var body_line = line;
+    if ((line.len == 1 and line[0] == '_') or line[0] == '`') body_line = " ";
+    item_context.text = if (item_context.text) |text|
+        try std.fmt.allocPrint(context.allocator, "{s}\n{s}", .{ text, body_line })
+    else
+        try std.fmt.allocPrint(context.allocator, "{s}", .{body_line});
+}
+
+fn reusableGroupHasMember(builder: *const ReusableGroupBuilder, id: []const u8) bool {
+    for (builder.members.items) |item| {
+        if (item.id) |member_id| if (std.mem.eql(u8, member_id, id)) return true;
+    }
+    return false;
+}
+
+fn buildReusableGroupMember(
+    item_context: *slides.ItemContext,
+    builder: *ReusableGroupBuilder,
+    context: *ParserContext,
+) !?slides.SlideItem {
+    const member_id = item_context.id orelse {
+        reportErrorInParsingContext(ParserError.Syntax, item_context, context, "every reusable-group member requires an explicit id=");
+        builder.valid = false;
+        return null;
+    };
+    if (!isReusableName(member_id)) {
+        reportErrorInParsingContext(ParserError.Syntax, item_context, context, "reusable-group member id= must be a literal reusable-name segment");
+        builder.valid = false;
+        return null;
+    }
+    if (reusableGroupHasMember(builder, member_id)) {
+        const message = try std.fmt.allocPrint(context.allocator, "duplicate reusable-group member id `{s}`", .{member_id});
+        reportErrorInParsingContext(ParserError.Syntax, item_context, context, message);
+        builder.valid = false;
+        return null;
+    }
+
+    if (builder.pending_animation) |pending| {
+        if (item_context.animation == null) item_context.animation = pending;
+        builder.pending_animation = null;
+    }
+
+    if (std.mem.eql(u8, item_context.directive, "@pop")) {
+        const component_name = item_context.context_name orelse {
+            builder.valid = false;
+            return null;
+        };
+        const component = context.push_contexts.get(component_name) orelse {
+            const message = try std.fmt.allocPrint(context.allocator, "cannot use @pop `{s}` in reusable group: was not pushed", .{component_name});
+            reportErrorInParsingContext(ParserError.Syntax, item_context, context, message);
+            builder.valid = false;
+            return null;
+        };
+        builder.local_context = component;
+        builder.local_context.text = null;
+        builder.local_context.img_path = null;
+        builder.post_context = builder.local_context;
+        item_context.applyOtherIfNull(component);
+    }
+
+    mergeParserAndItemContext(item_context, &builder.local_context);
+    var item = slides.SlideItem{};
+    item.applyContext(item_context.*);
+    item.source = .{
+        .scope = .direct,
+        .line_number = item_context.line_number,
+        .line_offset = item_context.line_offset,
+        .patchable = item_context.source_patchable,
+    };
+    item.applySlideDefaultsIfNecessary(context.current_slide);
+    item.applySlideShowDefaultsIfNecessary(context.slideshow);
+    item.kind = if (item.img_path != null) .img else .textbox;
+    item.sanityCheck() catch |err| {
+        reportErrorInParsingContext(err, item_context, context, "reusable-group member sanity check failed");
+        builder.valid = false;
+        return null;
+    };
+    return item;
+}
+
+fn commitReusableGroupParsingContext(builder: *ReusableGroupBuilder, context: *ParserContext) !void {
+    const item_context = &builder.parsing_item_context;
+    if (item_context.directive.len == 0) return;
+    defer builder.parsing_item_context = .{};
+
+    if (std.mem.eql(u8, item_context.directive, "@anim")) {
+        if (item_context.text != null) {
+            reportErrorInParsingContext(ParserError.Syntax, item_context, context, "@anim cannot own body text in a reusable group");
+            builder.valid = false;
+        }
+        if (builder.pending_animation != null) {
+            reportErrorInParsingContext(ParserError.Syntax, item_context, context, "@anim must be followed by one reusable-group member");
+            builder.valid = false;
+        }
+        builder.pending_animation = item_context.animation orelse animation.ItemSpec{};
+        builder.pending_animation_source = .{
+            .line_number = item_context.line_number,
+            .line_offset = item_context.line_offset,
+        };
+        return;
+    }
+
+    if (!std.mem.eql(u8, item_context.directive, "@box") and
+        !std.mem.eql(u8, item_context.directive, "@pop"))
+    {
+        builder.valid = false;
+        return;
+    }
+    if (try buildReusableGroupMember(item_context, builder, context)) |item| {
+        try builder.members.append(context.allocator, item);
+    }
+}
+
+fn installReusableGroup(context: *ParserContext, builder: *ReusableGroupBuilder) !void {
+    if (builder.pending_animation != null) {
+        const source = slides.ItemContext{
+            .line_number = builder.pending_animation_source.line_number,
+            .line_offset = builder.pending_animation_source.line_offset,
+        };
+        reportErrorInParsingContext(ParserError.Syntax, &source, context, "dangling @anim at end of reusable group");
+        builder.valid = false;
+    }
+    if (!builder.valid) {
+        builder.members.deinit(context.allocator);
+        return;
+    }
+    const definition = ReusableGroupDefinition{
+        .members = builder.members,
+        .post_context = builder.post_context,
+    };
+    if (context.reusable_groups.getPtr(builder.name)) |old| {
+        old.members.deinit(context.allocator);
+        old.* = definition;
+    } else {
+        try context.reusable_groups.put(builder.name, definition);
+    }
+}
+
+fn processReusableGroupLine(line: []const u8, context: *ParserContext) !void {
+    var builder = &context.active_group.?;
+    if (line.len == 0 or std.mem.startsWith(u8, line, "#")) return;
+    if (std.mem.indexOfScalar(u8, line, '$') != null) {
+        reportErrorInContext(ParserError.Syntax, context, "dynamic `$` expansion is forbidden in reusable-group definitions");
+        builder.valid = false;
+        return;
+    }
+
+    if (builder.nested_depth > 0) {
+        if (std.mem.startsWith(u8, line, "@")) {
+            const nested_directive = directiveWord(line);
+            if (std.mem.eql(u8, nested_directive, "@pushgroup")) {
+                builder.nested_depth += 1;
+            } else if (std.mem.eql(u8, nested_directive, "@endgroup")) {
+                builder.nested_depth -= 1;
+            }
+        }
+        return;
+    }
+
+    if (!std.mem.startsWith(u8, line, "@")) {
+        if (!std.mem.eql(u8, builder.parsing_item_context.directive, "@box") and
+            !std.mem.eql(u8, builder.parsing_item_context.directive, "@pop"))
+        {
+            reportErrorInContext(ParserError.Syntax, context, "reusable-group body text must belong to a literal @box or @pop member");
+            builder.valid = false;
+            return;
+        }
+        try appendReusableGroupBodyLine(&builder.parsing_item_context, line, context);
+        return;
+    }
+
+    const directive = directiveWord(line);
+    if (std.mem.eql(u8, directive, "@endgroup")) {
+        try commitReusableGroupParsingContext(builder, context);
+        if (std.mem.trim(u8, line[directive.len..], " \t").len != 0) {
+            reportErrorInContext(ParserError.Syntax, context, "@endgroup accepts no attributes");
+            builder.valid = false;
+        }
+        try installReusableGroup(context, builder);
+        context.active_group = null;
+        return;
+    }
+
+    try commitReusableGroupParsingContext(builder, context);
+    if (std.mem.eql(u8, directive, "@pushgroup")) {
+        reportErrorInContext(ParserError.Syntax, context, "reusable-group definitions cannot nest");
+        builder.valid = false;
+        builder.nested_depth = 1;
+        return;
+    }
+    if (!std.mem.eql(u8, directive, "@box") and
+        !std.mem.eql(u8, directive, "@pop") and
+        !std.mem.eql(u8, directive, "@anim") and
+        !(std.mem.startsWith(u8, directive, "@anim(") and std.mem.endsWith(u8, directive, ")")))
+    {
+        reportErrorInContext(ParserError.Syntax, context, "only literal @box/@pop members and their @anim are allowed in a reusable group");
+        builder.valid = false;
+        return;
+    }
+
+    const error_count = context.parser_errors.items.len;
+    builder.parsing_item_context = parseItemAttributes(line, context) catch |err| {
+        if (context.parser_errors.items.len == error_count) reportErrorInContext(err, context, null);
+        builder.valid = false;
+        return;
+    };
+    if (context.parser_errors.items.len != error_count) builder.valid = false;
+    builder.parsing_item_context.line_number = context.parsed_line_number;
+    builder.parsing_item_context.line_offset = context.parsed_line_offset;
+    builder.parsing_item_context.source_patchable = true;
+}
+
+/// Builds `slideshow` and returns its parser-side owner. The resulting slide
+/// graph borrows slices from this context's input and expanded `@let` lines;
+/// callers must keep the context alive until the slideshow graph is destroyed.
 pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, allocator: std.mem.Allocator) !*ParserContext {
     var context: *ParserContext = try ParserContext.new(allocator);
     context.slideshow = slideshow;
@@ -190,6 +481,7 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
     // log.info("input is: {s}", .{context.input});
 
     const start: usize = if (std.mem.startsWith(u8, context.input, "\xEF\xBB\xBF")) 3 else 0;
+    context.parsed_line_offset = start;
     // All slices retained by SlideItem and template contexts must point into
     // parser-owned storage rather than the caller's transient editor buffer.
     var it = std.mem.splitScalar(u8, context.input[start..], '\n');
@@ -227,6 +519,32 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
                     },
                 );
                 return error.Overflow;
+            }
+
+            // Reusable-group definitions are parsed in a deliberately small,
+            // transactional sub-language before @let/global handling. This
+            // keeps forbidden directives and substitutions from mutating the
+            // live slide or inherited item context while a block is open.
+            if (context.active_group != null) {
+                processReusableGroupLine(line_unprocessed, context) catch |err| {
+                    reportErrorInContext(err, context, "could not parse reusable-group definition");
+                    if (context.active_group) |*group| group.valid = false;
+                };
+                continue;
+            }
+
+            const raw_directive = directiveWord(line_unprocessed);
+            if (std.mem.eql(u8, raw_directive, "@pushgroup")) {
+                commitParsingContext(&parsing_item_context, context) catch |err| {
+                    reportErrorInContext(err, context, null);
+                };
+                parsing_item_context = .{};
+                try beginReusableGroup(line_unprocessed, context);
+                continue;
+            }
+            if (std.mem.eql(u8, raw_directive, "@endgroup")) {
+                reportErrorInContext(ParserError.Syntax, context, "@endgroup without an open @pushgroup");
+                continue;
             }
 
             // try to handle let substitutions
@@ -350,6 +668,10 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
                 };
                 parsing_item_context.line_number = context.parsed_line_number;
                 parsing_item_context.line_offset = context.parsed_line_offset;
+                // Expanded @let lines do not have a safe one-to-one mapping
+                // back to their physical tokens. Keep them selectable in
+                // Studio, but explicitly read-only until such a mapping exists.
+                parsing_item_context.source_patchable = line.ptr == line_unprocessed.ptr;
             } else {
                 // add text lines to current parsing context
                 var text: []const u8 = "";
@@ -372,6 +694,15 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
                 parsing_item_context.text = text;
             }
         }
+    }
+    if (context.active_group) |*group| {
+        const source = slides.ItemContext{
+            .line_number = group.start_line_number,
+            .line_offset = group.start_line_offset,
+        };
+        reportErrorInParsingContext(ParserError.Syntax, &source, context, "unclosed @pushgroup definition");
+        group.members.deinit(context.allocator);
+        context.active_group = null;
     }
     // commit last slide
     commitParsingContext(&parsing_item_context, context) catch |err| {
@@ -566,6 +897,7 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
         std.mem.eql(u8, item_context.directive, "@pop") or
         std.mem.eql(u8, item_context.directive, "@pushslide") or
         std.mem.eql(u8, item_context.directive, "@popslide") or
+        std.mem.eql(u8, item_context.directive, "@popgroup") or
         std.mem.eql(u8, item_context.directive, "@set") or
         std.mem.eql(u8, item_context.directive, "@show") or
         std.mem.eql(u8, item_context.directive, "@hide"))
@@ -600,9 +932,25 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
     var text_words = std.ArrayList([]const u8).empty;
     defer text_words.deinit(context.allocator);
     var after_text_directive = false;
+    var group_instance_id_seen = false;
 
     while (word_it.next()) |word| {
         if (!after_text_directive) {
+            if (std.mem.eql(u8, item_context.directive, "@popgroup")) {
+                const equals_index = std.mem.indexOfScalar(u8, word, '=') orelse {
+                    reportErrorInContext(ParserError.Syntax, context, "@popgroup accepts only id=INSTANCE");
+                    return ParserError.Syntax;
+                };
+                if (!std.mem.eql(u8, word[0..equals_index], "id") or
+                    equals_index + 1 == word.len or
+                    std.mem.indexOfScalar(u8, word[equals_index + 1 ..], '=') != null or
+                    group_instance_id_seen)
+                {
+                    reportErrorInContext(ParserError.Syntax, context, "@popgroup requires exactly one id=INSTANCE attribute");
+                    return ParserError.Syntax;
+                }
+                group_instance_id_seen = true;
+            }
             // `text=` owns the complete remainder of the directive. Split at
             // only its first equals sign so inline examples such as
             // `id=hero_image` are preserved instead of being truncated to
@@ -702,6 +1050,21 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.color = color;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "bg")) {
+                    if (attr_it.next()) |colorstr| {
+                        item_context.has_background_color = true;
+                        if (std.mem.eql(u8, colorstr, "none")) {
+                            item_context.background_color = null;
+                        } else {
+                            const color = parseColorLiteral(colorstr, context) catch |err| {
+                                reportErrorInContext(err, context, "cannot parse bg=");
+                                item_context.has_background_color = false;
+                                continue;
+                            };
+                            item_context.background_color = color;
+                        }
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "opacity")) {
                     if (attr_it.next()) |opacitystr| {
                         const opacity = std.fmt.parseFloat(f32, opacitystr) catch |err| {
@@ -723,6 +1086,17 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                             item_context.visible = false;
                         } else {
                             reportErrorInContext(ParserError.Syntax, context, "visible= must be true or false");
+                        }
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "locked")) {
+                    if (attr_it.next()) |locked_str| {
+                        if (std.mem.eql(u8, locked_str, "true")) {
+                            item_context.locked = true;
+                        } else if (std.mem.eql(u8, locked_str, "false")) {
+                            item_context.locked = false;
+                        } else {
+                            reportErrorInContext(ParserError.Syntax, context, "locked= must be true or false");
                         }
                     }
                 }
@@ -904,6 +1278,21 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.morph = spec;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "label")) {
+                    if (attr_it.next()) |label| {
+                        if (!std.mem.eql(u8, item_context.directive, "@state")) {
+                            reportErrorInContext(ParserError.Syntax, context, "label= is only valid on @state(morph)");
+                            continue;
+                        }
+                        if (!isMorphStateLabel(label)) {
+                            reportErrorInContext(ParserError.Syntax, context, "morph state label must start with a letter or underscore and contain only letters, digits, _ or -");
+                            continue;
+                        }
+                        var spec = item_context.morph orelse animation.MorphSpec{};
+                        spec.label = label;
+                        item_context.morph = spec;
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "transition")) {
                     if (attr_it.next()) |effectstr| {
                         var transition = item_context.transition orelse animation.Transition{};
@@ -959,6 +1348,14 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
     return item_context;
 }
 
+fn isMorphStateLabel(label: []const u8) bool {
+    if (label.len == 0 or !(std.ascii.isAlphabetic(label[0]) or label[0] == '_')) return false;
+    for (label[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) return false;
+    }
+    return true;
+}
+
 // - @push       -- merge: parser context, current item context --> pushed item
 // - @pushslide  -- pushed slide just from parser context, clear current item context just as with @page
 // - @pop        -- merge: current item context with parser context --> current item context
@@ -983,6 +1380,10 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     if (parsing_item_context.text == null) parsing_item_context.text = item_context.text;
     if (parsing_item_context.fontSize == null) parsing_item_context.fontSize = item_context.fontSize;
     if (parsing_item_context.color == null) parsing_item_context.color = item_context.color;
+    if (!parsing_item_context.has_background_color and item_context.has_background_color) {
+        parsing_item_context.background_color = item_context.background_color;
+        parsing_item_context.has_background_color = true;
+    }
     if (parsing_item_context.position) |own_position| {
         if (item_context.position) |inherited_position| {
             var merged = own_position;
@@ -1056,6 +1457,21 @@ fn validateCurrentMorphIds(context: *ParserContext, parsing_item_context: *const
     try validateMorphIds(final_state.items.items, context, parsing_item_context);
 }
 
+/// Rebuilds the renderer-facing crowd prompt/choices when @set changes the
+/// item's body text. SlideItem.text alone is not used to draw crowd panels.
+fn prepareCrowdTextMutation(
+    parsing_item_context: *slides.ItemContext,
+    item: *const slides.SlideItem,
+    context: *ParserContext,
+) !void {
+    if (parsing_item_context.text == null or item.kind != .crowd) return;
+    var crowd = item.crowd orelse return;
+    crowd.prompt = "";
+    crowd.choices = &.{};
+    parsing_item_context.crowd = crowd;
+    try finalizeCrowdSpec(parsing_item_context, context);
+}
+
 fn commitMorphMutation(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
     const state_index = context.active_morph_state orelse {
         reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@set/@show/@hide require a preceding @state(morph)");
@@ -1077,9 +1493,142 @@ fn commitMorphMutation(parsing_item_context: *slides.ItemContext, context: *Pars
         return;
     };
     var item = &items.items[item_index];
+    try prepareCrowdTextMutation(parsing_item_context, item, context);
     if (std.mem.eql(u8, parsing_item_context.directive, "@show")) parsing_item_context.visible = true;
     if (std.mem.eql(u8, parsing_item_context.directive, "@hide")) parsing_item_context.visible = false;
     item.applyPatch(parsing_item_context.*);
+    item.state_source = .{
+        .scope = .morph_item,
+        .line_number = parsing_item_context.line_number,
+        .line_offset = parsing_item_context.line_offset,
+        .patchable = parsing_item_context.source_patchable,
+    };
+    item.state_source_state = state_index;
+}
+
+fn commitSlideInstanceMutation(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
+    const target = parsing_item_context.context_name orelse return;
+    if (parsing_item_context.id != null) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "slide-template IDs are immutable; @set/@show/@hide cannot contain id=");
+        parsing_item_context.id = null;
+    }
+    if (parsing_item_context.animation != null) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "slide-template base overrides are not animations; anim= is not valid here");
+        parsing_item_context.animation = null;
+    }
+
+    const items = &context.current_slide.items.?;
+    var found: ?usize = null;
+    var ambiguous = false;
+    for (items.items, 0..) |item, index| {
+        const id = item.id orelse continue;
+        if (!std.mem.eql(u8, id, target)) continue;
+        if (found != null) {
+            ambiguous = true;
+            break;
+        }
+        found = index;
+    }
+    if (ambiguous or found == null) {
+        const message = try std.fmt.allocPrint(context.allocator, "slide-template instance target `{s}` is missing or ambiguous", .{target});
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, message);
+        return;
+    }
+
+    var item = &items.items[found.?];
+    if (item.source.scope != .slide_template) {
+        const message = try std.fmt.allocPrint(context.allocator, "slide-template instance target `{s}` is not inherited from the template", .{target});
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, message);
+        return;
+    }
+    try prepareCrowdTextMutation(parsing_item_context, item, context);
+    if (std.mem.eql(u8, parsing_item_context.directive, "@show")) parsing_item_context.visible = true;
+    if (std.mem.eql(u8, parsing_item_context.directive, "@hide")) parsing_item_context.visible = false;
+    item.applyPatch(parsing_item_context.*);
+    item.instance_source = .{
+        .scope = .slide_instance_override,
+        .line_number = parsing_item_context.line_number,
+        .line_offset = parsing_item_context.line_offset,
+        .patchable = parsing_item_context.source_patchable,
+    };
+}
+
+fn currentSlideHasExactId(context: *ParserContext, id: []const u8) bool {
+    for (context.current_slide.currentItems(context.active_morph_state).items) |item| {
+        if (item.id) |existing_id| {
+            if (std.mem.eql(u8, existing_id, id)) return true;
+        }
+    }
+    return false;
+}
+
+fn commitReusableGroupInstance(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
+    if (context.pending_animation != null) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@anim cannot target @popgroup; animations belong to its literal members");
+        context.pending_animation = null;
+        return;
+    }
+    if (context.active_morph_state != null) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup must be instantiated before the first @state(morph)");
+        return;
+    }
+
+    const group_name = parsing_item_context.context_name orelse return;
+    if (!isReusableName(group_name)) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup name must be a literal reusable-name segment");
+        return;
+    }
+    const instance_id = parsing_item_context.id orelse {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup requires id=INSTANCE");
+        return;
+    };
+    if (!isReusableName(instance_id)) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup id= must be a literal reusable-name segment");
+        return;
+    }
+    if (parsing_item_context.text != null) {
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@popgroup cannot own body text");
+        return;
+    }
+
+    const definition = context.reusable_groups.get(group_name) orelse {
+        const message = try std.fmt.allocPrint(context.allocator, "cannot @popgroup `{s}`: definition is missing or not complete", .{group_name});
+        reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, message);
+        return;
+    };
+
+    var clones = std.ArrayList(slides.SlideItem).empty;
+    defer clones.deinit(context.allocator);
+    try clones.ensureTotalCapacity(context.allocator, definition.members.items.len);
+    for (definition.members.items) |prototype| {
+        const member_id = prototype.id.?;
+        const effective_id = try std.fmt.allocPrint(context.allocator, "{s}.{s}", .{ instance_id, member_id });
+        if (currentSlideHasExactId(context, effective_id)) {
+            const message = try std.fmt.allocPrint(context.allocator, "reusable-group instance id `{s}` collides with an item on the current slide", .{effective_id});
+            reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, message);
+            return;
+        }
+
+        var clone = prototype;
+        clone.id = effective_id;
+        clone.identity = context.current_slide.next_item_identity + clones.items.len;
+        clone.creation_morph_state = null;
+        clone.source = .{
+            .scope = .group_instance_member,
+            .line_number = parsing_item_context.line_number,
+            .line_offset = parsing_item_context.line_offset,
+            .patchable = parsing_item_context.source_patchable,
+        };
+        clone.group_member_source = prototype.source;
+        clone.instance_source = null;
+        clone.state_source = null;
+        clone.state_source_state = null;
+        clones.appendAssumeCapacity(clone);
+    }
+
+    try context.current_slide.items.?.appendSlice(context.allocator, clones.items);
+    context.current_slide.next_item_identity += clones.items.len;
+    if (definition.post_context) |post_context| context.current_context = post_context;
 }
 
 fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *ParserContext) !void {
@@ -1103,8 +1652,15 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         }
         context.active_morph_state = try context.current_slide.beginMorphState(
             parsing_item_context.morph orelse animation.MorphSpec{},
+            .{
+                .scope = .morph_item,
+                .line_number = parsing_item_context.line_number,
+                .line_offset = parsing_item_context.line_offset,
+                .patchable = parsing_item_context.source_patchable,
+            },
             context.active_morph_state,
         );
+        context.template_instance_base_open = false;
         context.current_context = .{};
         return;
     }
@@ -1113,7 +1669,23 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         std.mem.eql(u8, parsing_item_context.directive, "@show") or
         std.mem.eql(u8, parsing_item_context.directive, "@hide"))
     {
-        try commitMorphMutation(parsing_item_context, context);
+        if (context.pending_animation != null) {
+            reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@anim must be followed by an item before @set/@show/@hide");
+            context.pending_animation = null;
+            return;
+        }
+        if (context.active_morph_state != null) {
+            try commitMorphMutation(parsing_item_context, context);
+        } else if (context.template_instance_base_open) {
+            try commitSlideInstanceMutation(parsing_item_context, context);
+        } else {
+            reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, "@set/@show/@hide require a @popslide base scene or a preceding @state(morph)");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, parsing_item_context.directive, "@popgroup")) {
+        try commitReusableGroupInstance(parsing_item_context, context);
         return;
     }
 
@@ -1147,6 +1719,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
     }
 
     if (std.mem.eql(u8, parsing_item_context.directive, "@pushslide")) {
+        context.template_instance_base_open = false;
         context.current_slide.applyContext(parsing_item_context);
         if (context.current_slide.morph_states.items.len > 0) {
             try validateCurrentMorphIds(context, parsing_item_context);
@@ -1157,6 +1730,18 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                 "slide templates cannot contain morph states; add @state(morph) after @popslide",
             );
         } else if (parsing_item_context.context_name) |context_name| {
+            for (context.current_slide.items.?.items) |*item| {
+                // A template may itself be captured from a customized
+                // @popslide instance. In that case the latest base override
+                // is the source that actually authored the captured value.
+                // Promote it to shared-template provenance for the new
+                // definition instead of leaking an instance-local owner into
+                // every future clone of the nested template.
+                if (item.instance_source) |instance_source| item.source = instance_source;
+                item.source.scope = .slide_template;
+                item.instance_source = null;
+                item.captureSharedTemplateValues();
+            }
             try context.push_slides.put(context_name, context.current_slide);
         }
         context.current_slide = try slides.Slide.new(context.allocator);
@@ -1183,6 +1768,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
     }
 
     if (std.mem.eql(u8, parsing_item_context.directive, "@popslide")) {
+        context.template_instance_base_open = false;
         // emit the current slide (if present) into the slideshow
         // then create a new slide (NOT deiniting the current one) with the **parsing** context's overrides
         // and make it the current slide
@@ -1213,6 +1799,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                     context.current_slide.pos_in_editor = parsing_item_context.line_offset;
                     context.current_slide.line_in_editor = parsing_item_context.line_number;
                     if (parsing_item_context.transition) |transition| context.current_slide.transition = transition;
+                    context.template_instance_base_open = true;
                 }
             } else {
                 const errmsg = try std.fmt.allocPrint(context.allocator, "cannot @popslide `{s}` : was not pushed!", .{context_name});
@@ -1226,6 +1813,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
     }
 
     if (std.mem.eql(u8, parsing_item_context.directive, "@slide")) {
+        context.template_instance_base_open = false;
         // emit the current slide (if present) into the slideshow
         // then create a new slide (NOT deiniting the current one) with the **parsing** context's overrides
         // and make it the current slide
@@ -1298,6 +1886,18 @@ fn commitItemToSlide(parsing_item_context: *slides.ItemContext, parser_context: 
         parsing_item_context.id = parsing_item_context.context_name;
     }
     slide_item.applyContext(parsing_item_context.*);
+    slide_item.source = .{
+        .scope = if (parser_context.active_morph_state != null)
+            .morph_item
+        else if (std.mem.eql(u8, parsing_item_context.directive, "@pop"))
+            .component_instance
+        else
+            .direct,
+        .line_number = parsing_item_context.line_number,
+        .line_offset = parsing_item_context.line_offset,
+        .patchable = parsing_item_context.source_patchable,
+    };
+    slide_item.creation_morph_state = parser_context.active_morph_state;
     if (parser_context.active_morph_state != null and slide_item.animation != null) {
         reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, parser_context, "items born inside morph states animate as part of the state; anim= is not valid here");
         slide_item.animation = null;
@@ -1632,7 +2232,7 @@ test "semantic morph states are cumulative reversible snapshots" {
         \\@slide
         \\@box id=hero img=assets/example.png x=1200 y=200 w=500 h=300 opacity=0.8
         \\@pop title y=90 text=Persistent title
-        \\@state(morph) duration=0.75 ease=spring after=0.5
+        \\@state(morph) label=focus duration=0.75 ease=spring after=0.5
         \\@set hero x=0 y=0 w=1920 h=1080 opacity=1
         \\@hide title shadow_x=9
         \\@box id=caption x=100 y=900 w=1500 h=100 text=Born in state one
@@ -1652,9 +2252,11 @@ test "semantic morph states are cumulative reversible snapshots" {
     try std.testing.expectEqual(@as(usize, 2), slide.morph_states.items.len);
 
     const base_hero = slide.items.?.items[0];
+    try std.testing.expectEqual(@as(?usize, null), base_hero.creation_morph_state);
     try std.testing.expectApproxEqAbs(@as(f32, 100), slide.items.?.items[1].position.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 90), slide.items.?.items[1].position.y, 0.0001);
     const state_one = slide.morph_states.items[0];
+    try std.testing.expectEqualStrings("focus", state_one.spec.label.?);
     try std.testing.expectEqual(animation.Easing.spring, state_one.spec.easing);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), state_one.spec.duration, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), state_one.spec.after.?, 0.0001);
@@ -1666,8 +2268,10 @@ test "semantic morph states are cumulative reversible snapshots" {
     try std.testing.expectEqual(@as(u8, 1), state_one.items.items[1].text_shadow.?.color.r);
     try std.testing.expectApproxEqAbs(@as(f32, 9), state_one.items.items[1].text_shadow.?.offset.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 3), state_one.items.items[1].text_shadow.?.offset.y, 0.0001);
+    try std.testing.expectEqual(@as(?usize, 0), state_one.items.items[2].creation_morph_state);
 
     const state_two = slide.morph_states.items[1];
+    try std.testing.expect(state_two.spec.label == null);
     try std.testing.expectEqual(animation.Easing.linear, state_two.spec.easing);
     try std.testing.expectEqual(@as(usize, 3), state_two.items.items.len);
     try std.testing.expectApproxEqAbs(@as(f32, 200), state_two.items.items[0].position.x, 0.0001);
@@ -1678,6 +2282,89 @@ test "semantic morph states are cumulative reversible snapshots" {
     try std.testing.expectApproxEqAbs(@as(f32, 40), state_two.items.items[1].position.y, 0.0001);
     try std.testing.expectEqual(@as(u8, 1), state_two.items.items[1].color.?.r);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), state_two.items.items[2].opacity, 0.0001);
+    try std.testing.expectEqual(@as(?usize, 0), state_two.items.items[2].creation_morph_state);
+}
+
+test "semantic morph snapshots retain creation and effective state sources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@box id=hero x=10 y=20 w=100 h=80 text=Hero
+        \\@box id=steady x=30 y=40 w=120 h=90 text=Steady
+        \\@state(morph)
+        \\@set hero x=100
+        \\@hide steady
+        \\@state(morph)
+        \\@show hero y=200
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = slideshow.slides.items[0];
+    const base_hero = &slide.items.?.items[0];
+    const base_steady = &slide.items.?.items[1];
+    try std.testing.expect(base_hero.state_source == null);
+    try std.testing.expect(base_steady.state_source == null);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box id=hero").?, base_hero.source.line_offset);
+    try std.testing.expectEqual(base_hero.source.line_offset, base_hero.effectiveSource().line_offset);
+
+    const state_one = slide.morph_states.items[0].items.items;
+    try std.testing.expectEqual(@as(usize, 4), slide.morph_states.items[0].source.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@state(morph)").?, slide.morph_states.items[0].source.line_offset);
+    try std.testing.expect(slide.morph_states.items[0].source.patchable);
+    try std.testing.expectEqual(base_hero.source.line_offset, state_one[0].source.line_offset);
+    try std.testing.expectEqual(base_steady.source.line_offset, state_one[1].source.line_offset);
+    try std.testing.expectEqual(slides.SourceScope.morph_item, state_one[0].state_source.?.scope);
+    try std.testing.expectEqual(@as(?usize, 0), state_one[0].state_source_state);
+    try std.testing.expectEqual(@as(?usize, 0), state_one[1].state_source_state);
+    try std.testing.expect(state_one[0].state_source.?.patchable);
+    try std.testing.expectEqual(@as(usize, 5), state_one[0].state_source.?.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero").?, state_one[0].effectiveSource().line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@hide steady").?, state_one[1].effectiveSource().line_offset);
+
+    const state_two = slide.morph_states.items[1].items.items;
+    try std.testing.expectEqual(@as(usize, 7), slide.morph_states.items[1].source.line_number);
+    try std.testing.expectEqual(base_hero.source.line_offset, state_two[0].source.line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@show hero").?, state_two[0].effectiveSource().line_offset);
+    try std.testing.expectEqual(@as(?usize, 1), state_two[0].state_source_state);
+    // An item not touched in a later state keeps the directive that still
+    // determines its effective state.
+    try std.testing.expectEqual(state_one[1].effectiveSource().line_offset, state_two[1].effectiveSource().line_offset);
+    try std.testing.expectEqual(@as(?usize, 0), state_two[1].state_source_state);
+}
+
+test "let-expanded semantic morph sources are read only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        "@let move=x=100 y=200\n" ++
+        "@slide\n" ++
+        "@box id=hero x=10 y=20 w=100 h=80 text=Hero\n" ++
+        "@state(morph)\n" ++
+        "@set hero $move$\n";
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = slideshow.slides.items[0].morph_states.items[0].items.items[0];
+    try std.testing.expect(item.state_source != null);
+    try std.testing.expectEqual(slides.SourceScope.morph_item, item.state_source.?.scope);
+    try std.testing.expectEqual(@as(?usize, 0), item.state_source_state);
+    try std.testing.expect(!item.effectiveSource().patchable);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero").?, item.effectiveSource().line_offset);
+    // Only the @set line is expanded. The literal @state directive remains a
+    // safe insertion anchor for a later local Studio override.
+    try std.testing.expect(slideshow.slides.items[0].morph_states.items[0].source.patchable);
 }
 
 test "semantic morph mutations report unknown and ambiguous targets" {
@@ -1742,6 +2429,80 @@ test "item templates merge sparse geometry and reject template ids" {
     try std.testing.expectApproxEqAbs(@as(f32, 200), item.size.y, 0.0001);
 }
 
+test "logical items retain directive source scope line and offset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push title x=100 y=80 w=900 h=120
+        \\@box id=template_box text=From template
+        \\@pushslide content
+        \\@popslide content
+        \\@box id=direct text=Direct
+        \\@pop title text=Component
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), slideshow.slides.items.len);
+
+    const direct = slideshow.slides.items[0].items.?.items[1];
+    try std.testing.expectEqual(slides.SourceScope.direct, direct.source.scope);
+    try std.testing.expect(direct.source.patchable);
+    try std.testing.expectEqual(@as(usize, 5), direct.source.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box id=direct").?, direct.source.line_offset);
+
+    const component = slideshow.slides.items[0].items.?.items[2];
+    try std.testing.expectEqual(slides.SourceScope.component_instance, component.source.scope);
+    try std.testing.expect(component.source.patchable);
+    try std.testing.expectEqual(@as(usize, 6), component.source.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@pop title text=Component").?, component.source.line_offset);
+
+    const template_item = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SourceScope.slide_template, template_item.source.scope);
+    try std.testing.expect(template_item.source.patchable);
+    try std.testing.expectEqual(@as(usize, 2), template_item.source.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box id=template_box").?, template_item.source.line_offset);
+}
+
+test "BOM-aware provenance starts at the physical directive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input = "\xEF\xBB\xBF@slide\n@box x=10 y=20 w=100 h=50 text=BOM\n";
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expect(item.source.patchable);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box").?, item.source.line_offset);
+}
+
+test "let-expanded item directives are explicitly read-only provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        "@let body=text=Hello\n" ++
+        "@slide\n" ++
+        "@box x=10 y=20 w=100 h=50 $body$\n";
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SourceScope.direct, item.source.scope);
+    try std.testing.expect(!item.source.patchable);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box").?, item.source.line_offset);
+}
+
 test "morph states are rejected inside reusable slide templates" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1762,4 +2523,683 @@ test "morph states are rejected inside reusable slide templates" {
     // and the unsupported morphing template is reported separately.
     try std.testing.expectEqual(@as(usize, 2), context.parser_errors.items.len);
     try std.testing.expect(context.push_slides.get("invalid") == null);
+}
+
+test "slide template instances support local base set show and hide overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=100 h=80 text=Hero
+        \\@box id=caption x=30 y=40 w=120 h=90 visible=false text=Caption
+        \\@box id=badge x=50 y=60 w=140 h=100 text=Badge
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set hero x=300 text=Local hero
+        \\@show caption y=400
+        \\@hide badge
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), slideshow.slides.items.len);
+
+    const template = context.push_slides.get("layout").?;
+    try std.testing.expectApproxEqAbs(@as(f32, 10), template.items.?.items[0].position.x, 0.0001);
+    try std.testing.expectEqualStrings("Hero", template.items.?.items[0].text.?);
+    try std.testing.expect(!template.items.?.items[1].visible);
+    try std.testing.expect(template.items.?.items[0].instance_source == null);
+
+    const instance = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 300), instance[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), instance[0].position.y, 0.0001);
+    try std.testing.expectEqualStrings("Local hero", instance[0].text.?);
+    try std.testing.expect(instance[1].visible);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), instance[1].position.y, 0.0001);
+    try std.testing.expect(!instance[2].visible);
+
+    for (instance) |item| try std.testing.expectEqual(slides.SourceScope.slide_template, item.source.scope);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, instance[0].instance_source.?.scope);
+    try std.testing.expectEqual(@as(usize, 6), instance[0].instance_source.?.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero").?, instance[0].effectiveBaseSource().line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@show caption").?, instance[1].effectiveBaseSource().line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@hide badge").?, instance[2].effectiveSource().line_offset);
+    try std.testing.expect(instance[0].effectiveBaseSource().patchable);
+}
+
+test "morph states inherit instance base overrides and layer state overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=100 h=80 text=Hero
+        \\@box id=caption x=30 y=40 w=120 h=90 text=Caption
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set hero x=100
+        \\@hide caption
+        \\@state(morph)
+        \\@set hero y=200
+        \\@state(morph)
+        \\@show caption x=300
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = slideshow.slides.items[0];
+    try std.testing.expectEqual(@as(usize, 2), slide.morph_states.items.len);
+    const base = slide.items.?.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 100), base[0].position.x, 0.0001);
+    try std.testing.expect(!base[1].visible);
+
+    const first = slide.morph_states.items[0].items.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 100), first[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), first[0].position.y, 0.0001);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero x=100").?, first[0].effectiveBaseSource().line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero y=200").?, first[0].effectiveSource().line_offset);
+    try std.testing.expect(!first[1].visible);
+    try std.testing.expect(first[1].state_source == null);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@hide caption").?, first[1].effectiveSource().line_offset);
+
+    const second = slide.morph_states.items[1].items.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 100), second[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), second[0].position.y, 0.0001);
+    try std.testing.expectEqual(@as(?usize, 0), second[0].state_source_state);
+    try std.testing.expect(second[1].visible);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), second[1].position.x, 0.0001);
+    try std.testing.expectEqual(@as(?usize, 1), second[1].state_source_state);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@show caption").?, second[1].effectiveSource().line_offset);
+}
+
+test "base mutations require a live slide-template instance and inherited target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=inherited x=10 y=20 w=100 h=80 text=Inherited
+        \\@pushslide layout
+        \\@popslide layout
+        \\@box id=local x=1 y=2 w=3 h=4 text=Decoration
+        \\@set inherited x=50
+        \\@set local x=60
+        \\@slide
+        \\@box id=direct x=5 y=6 w=7 h=8 text=Direct
+        \\@set direct x=70
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+    const instance = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 50), instance[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), instance[1].position.x, 0.0001);
+    try std.testing.expect(instance[1].instance_source == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), slideshow.slides.items[1].items.?.items[0].position.x, 0.0001);
+}
+
+test "instance base mutations reject missing and duplicate ids" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=same x=0 y=0 w=100 h=100 text=One
+        \\@box id=same x=100 y=0 w=100 h=100 text=Two
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set same x=200
+        \\@hide missing
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 0), items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), items[1].position.x, 0.0001);
+    try std.testing.expect(items[0].instance_source == null);
+    try std.testing.expect(items[1].instance_source == null);
+}
+
+test "let-expanded instance override provenance is read only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        "@let move=x=100 y=200\n" ++
+        "@box id=hero x=10 y=20 w=100 h=80 text=Hero\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@set hero $move$\n";
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 100), item.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), item.position.y, 0.0001);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, item.source.scope);
+    try std.testing.expect(item.source.patchable);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, item.instance_source.?.scope);
+    try std.testing.expect(!item.effectiveBaseSource().patchable);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero").?, item.effectiveBaseSource().line_offset);
+}
+
+test "pending item animation rejects an instance mutation and does not leak" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=100 h=80 text=Hero
+        \\@pushslide layout
+        \\@popslide layout
+        \\@anim fade
+        \\@set hero x=200
+        \\@box id=decoration x=1 y=2 w=3 h=4 text=Decoration
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 10), items[0].position.x, 0.0001);
+    try std.testing.expect(items[0].instance_source == null);
+    try std.testing.expect(items[1].animation == null);
+}
+
+test "nested slide templates promote captured instance overrides to shared provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=100 h=80 text=Original
+        \\@pushslide first
+        \\@popslide first
+        \\@set hero x=100 text=Captured
+        \\@pushslide second
+        \\@popslide second
+        \\@set hero x=200
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const captured = context.push_slides.get("second").?.items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 100), captured.position.x, 0.0001);
+    try std.testing.expectEqualStrings("Captured", captured.text.?);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, captured.source.scope);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero x=100").?, captured.source.line_offset);
+    try std.testing.expect(captured.instance_source == null);
+
+    // Capturing `second` closes the in-progress first instance, leaving the
+    // parser's historical empty boundary slide before the rendered clone.
+    const rendered = slideshow.slides.items[1].items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 200), rendered.position.x, 0.0001);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero x=100").?, rendered.source.line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@set hero x=200").?, rendered.instance_source.?.line_offset);
+}
+
+test "crowd text mutations rebuild the renderer-facing prompt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@crowd join id=audience
+        \\Shared invitation
+        \\@pushslide room
+        \\@popslide room
+        \\@set audience
+        \\Local invitation
+        \\@state(morph)
+        \\@set audience
+        \\Morph invitation
+        \\@popslide room
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqualStrings("Shared invitation", context.push_slides.get("room").?.items.?.items[0].crowd.?.prompt);
+    try std.testing.expectEqualStrings("Local invitation", slideshow.slides.items[0].items.?.items[0].crowd.?.prompt);
+    try std.testing.expectEqualStrings("Morph invitation", slideshow.slides.items[0].morph_states.items[0].items.items[0].crowd.?.prompt);
+    try std.testing.expectEqualStrings("Shared invitation", slideshow.slides.items[1].items.?.items[0].crowd.?.prompt);
+}
+
+test "item backgrounds inherit and support local and morph set or clear mutations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=300 h=100 color=#112233ff bg=#203040ff text=Hero
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set hero bg=#50607080
+        \\@state(morph)
+        \\@set hero bg=none
+        \\@popslide layout
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const template_item = context.push_slides.get("layout").?.items.?.items[0];
+    try std.testing.expectEqual(@as(u8, 0x20), template_item.background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x40), template_item.background_color.?.b);
+    try std.testing.expectEqual(@as(u8, 0x20), template_item.sharedTemplateValues().?.background_color.?.r);
+
+    const instance = slideshow.slides.items[0];
+    try std.testing.expectEqual(@as(u8, 0x50), instance.items.?.items[0].background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x80), instance.items.?.items[0].background_color.?.a);
+    try std.testing.expect(instance.morph_states.items[0].items.items[0].background_color == null);
+    // Neither local mutation changes the captured template layer.
+    try std.testing.expectEqual(
+        @as(u8, 0x20),
+        instance.morph_states.items[0].items.items[0].sharedTemplateValues().?.background_color.?.r,
+    );
+}
+
+test "slide-template text and image property layers preserve shared font size and opacity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=caption x=10 y=20 w=500 h=120 fontsize=40 color=#112233ff bg=#203040ff opacity=0.9 text=Shared
+        \\@box id=photo img=assets/example.png x=600 y=20 w=320 h=200 fontsize=30 color=#213243ff bg=#304050ff opacity=0.8
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set caption fontsize=50 color=#405060ff bg=none opacity=0.7
+        \\@set photo fontsize=35 color=#506070ff bg=#607080ff opacity=0.6
+        \\@state(morph)
+        \\@set caption fontsize=60 color=#708090ff bg=#8090a0ff opacity=0.5
+        \\@set photo fontsize=45 color=#90a0b0ff bg=none opacity=0.4
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const template_items = context.push_slides.get("layout").?.items.?.items;
+    try std.testing.expectEqual(@as(?i32, 40), template_items[0].fontSize);
+    try std.testing.expectEqual(@as(?i32, 40), template_items[0].sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), template_items[0].sharedTemplateValues().?.opacity, 0.0001);
+    try std.testing.expectEqual(@as(?i32, 30), template_items[1].fontSize);
+    try std.testing.expectEqual(@as(?i32, 30), template_items[1].sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), template_items[1].sharedTemplateValues().?.opacity, 0.0001);
+
+    const instance = slideshow.slides.items[0];
+    const local_caption = instance.items.?.items[0];
+    const local_photo = instance.items.?.items[1];
+    try std.testing.expectEqual(@as(?i32, 50), local_caption.fontSize);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), local_caption.opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x40), local_caption.color.?.r);
+    try std.testing.expect(local_caption.background_color == null);
+    try std.testing.expectEqual(@as(?i32, 40), local_caption.sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), local_caption.sharedTemplateValues().?.opacity, 0.0001);
+    try std.testing.expectEqual(@as(?i32, 35), local_photo.fontSize);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), local_photo.opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x50), local_photo.color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x60), local_photo.background_color.?.r);
+    try std.testing.expectEqual(@as(?i32, 30), local_photo.sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), local_photo.sharedTemplateValues().?.opacity, 0.0001);
+
+    const morphed = instance.morph_states.items[0].items.items;
+    try std.testing.expectEqual(@as(?i32, 60), morphed[0].fontSize);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), morphed[0].opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x70), morphed[0].color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x80), morphed[0].background_color.?.r);
+    try std.testing.expectEqual(@as(?i32, 40), morphed[0].sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), morphed[0].sharedTemplateValues().?.opacity, 0.0001);
+    try std.testing.expectEqual(@as(?i32, 45), morphed[1].fontSize);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), morphed[1].opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x90), morphed[1].color.?.r);
+    try std.testing.expect(morphed[1].background_color == null);
+    try std.testing.expectEqual(@as(?i32, 30), morphed[1].sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), morphed[1].sharedTemplateValues().?.opacity, 0.0001);
+}
+
+test "nested slide templates refresh and preserve their shared authored value layer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=300 h=100 fontsize=36 color=#112233ff bg=#203040ff opacity=0.8 text=Original
+        \\@pushslide first
+        \\@popslide first
+        \\@set hero x=100 fontsize=44 color=#405060ff bg=none opacity=0.6 text=Captured
+        \\@hide hero
+        \\@pushslide second
+        \\@popslide second
+        \\@set hero y=200 fontsize=52 color=#708090ff bg=#90a0b0ff text=Local
+        \\@show hero
+        \\@state(morph)
+        \\@set hero x=300 fontsize=60 color=#a0b0c0ff bg=none opacity=0.2 text=Morph
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const first = context.push_slides.get("first").?.items.?.items[0];
+    const first_values = first.sharedTemplateValues().?;
+    try std.testing.expectApproxEqAbs(@as(f32, 10), first_values.position.x, 0.0001);
+    try std.testing.expectEqualStrings("Original", first_values.text.?);
+    try std.testing.expectEqual(@as(?i32, 36), first_values.font_size);
+    try std.testing.expectEqual(@as(u8, 0x11), first_values.color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x20), first_values.background_color.?.r);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), first_values.opacity, 0.0001);
+    try std.testing.expect(first_values.visible);
+
+    const second = context.push_slides.get("second").?.items.?.items[0];
+    const captured_values = second.sharedTemplateValues().?;
+    try std.testing.expectApproxEqAbs(@as(f32, 100), captured_values.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), captured_values.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), captured_values.size.x, 0.0001);
+    try std.testing.expectEqualStrings("Captured", captured_values.text.?);
+    try std.testing.expectEqual(@as(?i32, 44), captured_values.font_size);
+    try std.testing.expectEqual(@as(u8, 0x40), captured_values.color.?.r);
+    try std.testing.expect(captured_values.background_color == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), captured_values.opacity, 0.0001);
+    try std.testing.expect(!captured_values.visible);
+    try std.testing.expectEqual(
+        std.mem.indexOf(u8, input, "@hide hero").?,
+        second.source.line_offset,
+    );
+
+    // Later instance and morph patches change only effective values. Both
+    // cumulative layers retain the nested template's captured authored data.
+    const rendered = slideshow.slides.items[1];
+    const local = rendered.items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 100), local.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), local.position.y, 0.0001);
+    try std.testing.expectEqualStrings("Local", local.text.?);
+    try std.testing.expectEqual(@as(?i32, 52), local.fontSize);
+    try std.testing.expect(local.visible);
+    try std.testing.expectEqual(@as(u8, 0x90), local.background_color.?.r);
+    try std.testing.expectEqualStrings("Captured", local.sharedTemplateValues().?.text.?);
+    try std.testing.expectEqual(@as(?i32, 44), local.sharedTemplateValues().?.font_size);
+    try std.testing.expect(!local.sharedTemplateValues().?.visible);
+
+    const morphed = rendered.morph_states.items[0].items.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 300), morphed.position.x, 0.0001);
+    try std.testing.expectEqualStrings("Morph", morphed.text.?);
+    try std.testing.expectEqual(@as(?i32, 60), morphed.fontSize);
+    try std.testing.expectEqual(@as(u8, 0xa0), morphed.color.?.r);
+    try std.testing.expect(morphed.background_color == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), morphed.opacity, 0.0001);
+    try std.testing.expectEqualStrings("Captured", morphed.sharedTemplateValues().?.text.?);
+    try std.testing.expectEqual(@as(?i32, 44), morphed.sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), morphed.sharedTemplateValues().?.position.x, 0.0001);
+    try std.testing.expect(morphed.sharedTemplateValues().?.background_color == null);
+}
+
+test "component item background can explicitly clear an inherited fill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push card x=10 y=20 w=300 h=100 bg=#102030ff
+        \\@slide
+        \\@pop card text=Filled
+        \\@pop card bg=none text=Clear
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(u8, 0x10), items[0].background_color.?.r);
+    try std.testing.expect(items[1].background_color == null);
+}
+
+test "editor locks inherit and can be overridden locally and in morph states" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=300 h=100 locked=true text=Hero
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set hero locked=false
+        \\@state(morph)
+        \\@set hero locked=true
+        \\@popslide layout
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const shared = context.push_slides.get("layout").?.items.?.items[0];
+    try std.testing.expect(shared.locked);
+    try std.testing.expect(shared.sharedTemplateValues().?.locked);
+
+    const customized = slideshow.slides.items[0];
+    try std.testing.expect(!customized.items.?.items[0].locked);
+    try std.testing.expect(customized.items.?.items[0].sharedTemplateValues().?.locked);
+    try std.testing.expect(customized.morph_states.items[0].items.items[0].locked);
+    try std.testing.expect(customized.morph_states.items[0].items.items[0].sharedTemplateValues().?.locked);
+
+    const ordinary = slideshow.slides.items[1].items.?.items[0];
+    try std.testing.expect(ordinary.locked);
+    try std.testing.expect(ordinary.instance_source == null);
+}
+
+test "invalid editor lock values are rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const context = try constructSlidesFromBuf(
+        "@slide\n@box id=hero w=100 h=100 locked=maybe text=Hero\n",
+        slideshow,
+        allocator,
+    );
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
+    try std.testing.expect(!slideshow.slides.items[0].items.?.items[0].locked);
+}
+
+test "reusable groups emit ordered fresh members and remain morph targets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push badge x=700 y=80 w=220 h=70 color=#ffeeaaff
+        \\@slide
+        \\@pushgroup feature-card
+        \\@anim fade duration=0.4
+        \\@box id=title x=120 y=140 w=500 h=100 fontsize=48 text=Reusable title
+        \\@pop badge id=tag text=New
+        \\@endgroup
+        \\@popgroup feature-card id=primary
+        \\@box id=after text=Inherited after group
+        \\@popgroup feature-card id=secondary
+        \\@state(morph) duration=0.7
+        \\@set primary.title x=300 text=Moved title
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const slide = slideshow.slides.items[0];
+    const items = slide.items.?.items;
+    try std.testing.expectEqual(@as(usize, 5), items.len);
+    try std.testing.expectEqualStrings("primary.title", items[0].id.?);
+    try std.testing.expectEqualStrings("primary.tag", items[1].id.?);
+    try std.testing.expectEqualStrings("after", items[2].id.?);
+    try std.testing.expectEqualStrings("secondary.title", items[3].id.?);
+    try std.testing.expectEqualStrings("secondary.tag", items[4].id.?);
+    try std.testing.expectEqualStrings("Reusable title", items[0].text.?);
+    try std.testing.expectEqualStrings("New", items[1].text.?);
+    try std.testing.expectEqual(animation.Effect.fade, items[0].animation.?.effect);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), items[0].animation.?.duration, 0.0001);
+    try std.testing.expectEqual(slides.SourceScope.group_instance_member, items[0].source.scope);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@popgroup feature-card").?, items[0].source.line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@box id=title").?, items[0].group_member_source.?.line_offset);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@pop badge id=tag").?, items[1].group_member_source.?.line_offset);
+    try std.testing.expect(items[0].identity != items[1].identity);
+    try std.testing.expect(items[0].identity != items[3].identity);
+    try std.testing.expect(items[1].identity != items[4].identity);
+    // The definition's final @pop context is reproduced by the call, just as
+    // the literal promoted sequence would affect the item that follows it.
+    try std.testing.expectApproxEqAbs(@as(f32, 700), items[2].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 80), items[2].position.y, 0.0001);
+
+    const morphed = slide.morph_states.items[0].items.items;
+    try std.testing.expectEqualStrings("primary.title", morphed[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), morphed[0].position.x, 0.0001);
+    try std.testing.expectEqualStrings("Moved title", morphed[0].text.?);
+    try std.testing.expectEqual(slides.SourceScope.morph_item, morphed[0].state_source.?.scope);
+}
+
+test "reusable groups require complete prior definitions and later definitions shadow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@popgroup card id=too-early
+        \\@pushgroup card
+        \\@box id=body x=1 y=2 w=3 h=4 text=First
+        \\@endgroup
+        \\@popgroup card id=one
+        \\@pushgroup card
+        \\@box id=body x=10 y=20 w=30 h=40 text=Second
+        \\@endgroup
+        \\@popgroup card id=two
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("one.body", items[0].id.?);
+    try std.testing.expectEqualStrings("First", items[0].text.?);
+    try std.testing.expectEqualStrings("two.body", items[1].id.?);
+    try std.testing.expectEqualStrings("Second", items[1].text.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), items[1].position.x, 0.0001);
+}
+
+test "reusable group id collisions reject an entire instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@pushgroup pair
+        \\@box id=left x=10 y=20 w=30 h=40 text=Left
+        \\@box id=right x=50 y=20 w=30 h=40 text=Right
+        \\@endgroup
+        \\@box id=dupe.right x=0 y=0 w=1 h=1 text=Existing
+        \\@popgroup pair id=dupe
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("dupe.right", items[0].id.?);
+}
+
+test "malformed reusable groups emit nothing and do not poison slide context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push inherited x=900 y=800 w=70 h=60
+        \\@slide
+        \\@pushgroup broken
+        \\@pop inherited id=inside text=Would leak context
+        \\@pushgroup nested
+        \\@box id=nested-item x=1 y=2 w=3 h=4 text=Nested
+        \\@endgroup
+        \\@box id=still-inside x=not-a-number y=2 w=3 h=4 text=Still inside outer block
+        \\@bg color=#101010ff
+        \\@endgroup
+        \\@popgroup broken id=nope
+        \\@box id=healthy x=11 y=22 w=33 h=44 text=Healthy
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expect(context.parser_errors.items.len >= 2);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("healthy", items[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 11), items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 22), items[0].position.y, 0.0001);
+}
+
+test "reusable group syntax rejects dynamic names missing ids dangling anim and unclosed blocks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@slide
+        \\@pushgroup bad$name
+        \\@anim fade
+        \\@box x=1 y=2 w=3 h=4 text=Missing id
+        \\@pushgroup nested
+        \\@box id=member x=1 y=2 w=3 h=4 text=Nested
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expect(context.parser_errors.items.len >= 3);
+    try std.testing.expectEqual(@as(usize, 0), slideshow.slides.items[0].items.?.items.len);
+    try std.testing.expectEqual(@as(usize, 0), context.reusable_groups.count());
 }

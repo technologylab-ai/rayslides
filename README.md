@@ -6,7 +6,47 @@ This port is minimalistic, and I wrote it to be able to edit, present, and PDF-e
 
 Due to the new [raylib](https://github.com/raysan5/raylib) dep, builds should work on all 3 major platforms now.
 
-![screenshot](rayslides.jpg)
+![Rayslides Studio editing a polished slide with inline typography, color, geometry, and layout controls](docs/images/rayslides-studio-properties.jpg)
+
+![Rayslides Studio showing the source-aware Objects and layers inspector](docs/images/rayslides-studio-objects.jpg)
+
+## Build and run
+
+Rayslides remains a command-line application on macOS, Linux, and Windows. The
+ordinary build installs the executable at `zig-out/bin/rayslides`:
+
+```sh
+zig build -Doptimize=ReleaseSafe
+zig-out/bin/rayslides talk.sld
+```
+
+During development, the equivalent run step is:
+
+```sh
+zig build run -- talk.sld
+```
+
+Run `rayslides --help` for the complete option list or `rayslides --version`
+for the version. A positional `.sld` path works before or after options; use
+`--` before a filename that itself begins with a hyphen.
+
+On macOS, an additional build step creates a self-contained application bundle
+without replacing or changing the CLI executable:
+
+```sh
+zig build -Doptimize=ReleaseSafe macos-app
+open zig-out/Rayslides.app
+```
+
+The bundle is written to `zig-out/Rayslides.app`. It uses the Studio showcase's
+light-sculpture artwork as its icon and registers Rayslides `.sld` documents,
+so decks can be opened with Finder, **Open With → Rayslides**, or by dropping a
+`.sld` onto the live window. It has only the local ad-hoc seal required for a
+structurally valid Apple Silicon app—no signing identity, certificate,
+Developer ID, account, or notarization. After copying it to another Mac, macOS
+may require one right-click **Open** before ordinary double-click launches are
+allowed. See the [macOS app notes](docs/MACOS_APP.md) for file opening and
+recovery locations.
 
 Missing but maybe coming soon:
 
@@ -15,8 +55,6 @@ Missing but maybe coming soon:
 Missing but probably not coming soon:
 
 - PPTX Export
-- Editor
-- Inspector Gadget
 
 ## Presentation and Slide Navigation
 
@@ -49,8 +87,368 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>O</kbd> | Open or lock the active Crowdplay poll |
 | <kbd>V</kbd> | Reveal or hide Crowdplay results |
 | <kbd>R</kbd> | Reset votes in the active Crowdplay poll |
+| <kbd>E</kbd> | Enter or leave Studio visual editing mode |
+| <kbd>F3</kbd> | Toggle frame/rebuild diagnostics |
 
 **Beast Mode**: removes the 60 FPS limit
+
+## Studio visual editing
+
+The current direction and upcoming implementation tranches are tracked in the
+[Studio roadmap](STUDIO_ROADMAP.md).
+
+Run rayslides without a slide file to open the **Create your first deck**
+chooser in Studio. Choose Blank, Midnight, Editorial, or Aurora with a click
+or keys <kbd>1</kbd>–<kbd>4</kbd>. Blank starts with one clean slide; the three
+designed starters create two immediately useful slides plus source-native
+`@pushslide` layouts, a reusable `@pushgroup` footer, stable item IDs, and live
+`$slide_number` fields. Nothing is hidden in a project format: the result is
+ordinary readable `.sld` source and one Undo returns to the pristine chooser.
+
+Press <kbd>Cmd/Ctrl-S</kbd> on an untitled deck to choose its path. Rayslides
+adds `.sld` when needed and refuses to overwrite an existing file. After the
+deck has a name, the same shortcut atomically saves it and
+<kbd>Shift-Cmd/Ctrl-S</kbd> writes a unique `*.edited.sld` copy. Pass `--studio`
+with a slide file to open that deck directly in Studio, or press <kbd>E</kbd>
+while presenting an existing deck. Studio is a visual authoring surface backed
+by the ordinary `.sld` source: every completed action rewrites and reparses the
+document, so the GUI and text formats remain two views of the same file.
+
+Studio opens in a monitor-aware editing window (up to 1600×900) and fits the
+16:9 slide into the space left by its chrome, so permanent controls never cover
+slide content. Wide windows show the Slides/Library and Properties docks
+together; narrower windows reserve one dock at a time through the toolbar
+toggles. Press <kbd>Tab</kbd> for **Focus Canvas**, which hides all chrome while
+leaving selection, guides, and direct manipulation active. Studio uses an
+embedded, compact UI typeface independently of any fonts chosen by the deck.
+When the window is enlarged beyond the 1600×900 reference surface, the whole
+authoring shell scales coherently up to 2×—type, docks, timeline cards, object
+rows, buttons, and hit targets—rather than enlarging labels inside fixed
+panels. Retina framebuffer density is left to the platform so it is not counted
+twice; the scaling follows the usable logical window size.
+
+Click **Commands** or press <kbd>Cmd/Ctrl-K</kbd> to open Studio's contextual
+command palette. Search by action, category, description, keyword, or shortcut;
+use <kbd>Up</kbd>/<kbd>Down</kbd> and <kbd>Enter</kbd> to run an action. Commands
+that are unsafe in the current slide, scene, selection, history, or clipboard
+remain visible with the reason they are unavailable, so shortcut memorization
+is optional rather than required. Studio also provides delayed hover help for
+its tools, docks, Properties, layer controls, slide organizer, Library, and
+morph timeline. The tooltips and pointer shapes disappear during gestures and
+text entry, keeping the canvas calm while actively editing.
+
+Press <kbd>Cmd/Ctrl-F</kbd> to search the panel under the pointer (or the active
+dock): Slides, Library, or Objects. Search filters immediately without changing
+the `.sld`, history, or dirty state. Use <kbd>Up</kbd>/<kbd>Down</kbd>,
+<kbd>Home</kbd>/<kbd>End</kbd>, or the wheel to choose a result, then
+<kbd>Enter</kbd> to jump to its slide, reusable definition, or object. While a
+Find field is active, <kbd>Tab</kbd>/<kbd>Shift-Tab</kbd> cycles among all three
+panels; each panel remembers its own query. <kbd>Esc</kbd> returns keyboard focus
+to Studio while keeping the useful filter visible, and the pink × clears it.
+Object filtering always retains full-slide Background rows because they are
+real paint-order barriers, not cosmetic list entries. The command palette also
+offers **Find a slide**, **Find a library entry**, and **Find an object**.
+
+Studio's precision view is entirely editor-side: use **Commands** to toggle
+calibrated rulers, 5% action-safe and 10% title-safe guides, or live dimensions
+and edge distances for the current selection. <kbd>Cmd/Ctrl</kbd>-wheel zooms
+around the pointer, plain wheel or trackpad input pans, and Space-drag or a
+middle-button drag moves the canvas directly. <kbd>Cmd/Ctrl</kbd>-<kbd>0</kbd>
+fits and recenters the complete slide. The view is constrained so the slide
+cannot be lost offscreen, while presentation, screenshots, PDF export, source,
+history, and saved files remain unaffected.
+
+The right inspector opens on **Objects**, a front-to-back paint-order list for
+the active base or morph scene. It includes hidden, fully transparent, and
+locked objects so they remain recoverable when canvas hit-testing cannot reach
+them. Click a row to select it, Shift-click for an ordered multi-selection,
+use **Vis/Hid** and **L/U** for visibility and locking, and use the layer
+buttons for atomic paint-order changes. Full-slide background rows remain
+visible as read-only paint barriers. Switch to **Properties** in the same dock
+for exact values and styling. Opacity accepts the inclusive range `0`–`1` or
+`0%`–`100%`; visibility remains a separate source property.
+
+Properties are edited inline without covering the canvas. Click a field, or
+press <kbd>Enter</kbd> on a single selected text object while Properties is
+visible. <kbd>Enter</kbd> commits, <kbd>Tab</kbd> and
+<kbd>Shift-Tab</kbd> commit and traverse, <kbd>Shift-Enter</kbd> inserts a text
+line, and <kbd>Esc</kbd> cancels the draft. Invalid values remain focused with
+a field-local explanation; neither source nor history changes until validation
+succeeds. Long and multiline values scroll with the caret. Multi-selection
+shows truthful common/Mixed values but property mutation remains deliberately
+single-object and atomic.
+
+The top toolbar contains these one-shot canvas tools:
+
+| Tool | Shortcut | Action |
+| ---- | -------- | ------ |
+| Select | <kbd>V</kbd> | Select, move, and resize an existing object |
+| Text | <kbd>T</kbd> | Click, then enter text for a new text box |
+| Bullets | <kbd>B</kbd> | Click, then enter one bullet per line |
+| Image | <kbd>I</kbd> | Click, then enter a path relative to the slide file |
+| Rectangle | <kbd>R</kbd> | Click to add a colored shape |
+| Library | <kbd>U</kbd> | Click, then name an existing reusable `@push` element |
+
+Click an object and drag it to move it, or drag the cyan handle at its
+bottom-right corner to resize it. The arrow keys nudge the selection by one
+logical pixel; hold <kbd>Shift</kbd> to nudge by ten. Moves and resizes snap to
+the slide and nearby object edges and centers, with magenta guides and a live
+`x/y/w/h` readout. Hold <kbd>Cmd/Ctrl</kbd> during a drag to bypass snapping,
+or press <kbd>G</kbd> to toggle the visible 20-pixel grid. Holding
+<kbd>Shift</kbd> while resizing preserves the displayed aspect ratio, including
+for auto-sized images. The property panel edits text, exact `x/y/w/h` values,
+font size, opacity, foreground and item-background colors, duplicates or
+deletes the object, promotes it for reuse, and aligns it to any slide edge or
+center. Numeric width and height fields change only the chosen dimension, so
+the other dimension of an auto-sized image remains automatic. Custom colors
+accept `#RRGGBB` or `#RRGGBBAA`; opacity accepts `0`–`1` or `0%`–`100%`.
+Fully transparent objects remain recoverable through the Objects inspector.
+Shift-click toggles objects into an ordered
+multi-selection, and <kbd>Cmd/Ctrl-A</kbd> selects every editable object in the
+current scene. Drag an empty part of the canvas to marquee-select everything
+the rectangle overlaps; hold <kbd>Shift</kbd> to toggle the marquee hits against
+the selection that existed when the drag began. A group can be dragged or
+nudged as one unit; the same alignment buttons align its members to the
+selection bounds, while **H Gap** and **V Gap** distribute three or more
+objects with equal spacing. Group moves, layer changes, duplication, and
+deletion are each written atomically as one undoable source edit. Resize, text,
+color, and promotion remain single-object operations; Studio refuses them for
+a group instead of silently changing only its primary item. Batch duplicate or
+delete is likewise refused as a whole when any selected object's source
+ownership cannot be handled safely.
+The **Layer** controls move one or several selected objects backward, forward,
+to the back, or to the front while preserving the group's internal paint
+order. A layer change is also one atomic source edit.
+<kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new slide immediately after the
+current one. <kbd>Esc</kbd> cancels an active drag or tool, then leaves Studio.
+
+<kbd>Cmd/Ctrl-C</kbd> copies selected authored objects to Studio's internal
+clipboard; <kbd>Cmd/Ctrl-V</kbd> pastes fresh objects into the current base or
+morph scene. Every pasted object receives a unique `id=`, is offset by 20
+logical pixels on each successive paste, and the entire paste is one undoable
+edit. Auto-sized images retain automatic sizing. The safe clipboard scope is
+deliberately source-aware: copy accepts literal direct `@box` items and direct
+`@pop` component instances in the base scene. A copied `@pop` remembers the
+exact `@push` definition it resolved to, and paste is refused if the destination
+would bind it to a shadowing definition. Component instances are base-scene
+only, while ordinary boxes may be pasted into a morph scene. Generated items,
+inherited slide-template objects, backgrounds, and Crowdplay panels are refused
+without changing the source. Clipboard snippets remain source-faithful rather
+than materializing inherited defaults, so pasting onto a slide with different
+font or color defaults may intentionally adopt that destination's appearance.
+
+**Lock** writes `locked=true` on selected objects. Locked objects remain in the
+rendered deck but are excluded from normal clicking, select-all, snapping,
+geometry, properties, and layer mutations. Click the visible **LOCK** badge to
+select one for read-only copying; click it again, use **Unlock**, or press
+<kbd>Cmd/Ctrl-L</kbd> to write `locked=false`. Locks follow the same ownership
+rules as other properties, including instance-local and morph-state `@set`
+overrides; hold <kbd>Alt</kbd> for an intentional shared-template lock change.
+A locked object is also a layer barrier, so a batch move that would cross it is
+refused atomically.
+
+The Studio sidebar is a deck organizer and source-aware library. Its slide
+cards contain live rendered thumbnails and can select, add, duplicate, delete,
+or move complete slides while preserving their base content, morph states,
+comments, and line endings. The library lists the effective `@push` elements
+and `@pushslide` templates available at the current source position. Click an
+entry to select it, then choose **Use**: reusable elements become a one-shot
+canvas placement tool at their authored size, while slide templates create the
+next slide. **Ren** changes that definition and its source-order-resolved uses;
+**Del** removes only unused element definitions. Slide-template deletion and
+deleting elements with live uses are deliberately refused. Later or shadowed
+definitions are absent because they would not resolve at that insertion point.
+
+The organizer's **Tpl** action promotes an eligible direct slide into a named
+`@pushslide` definition while leaving an equivalent `@popslide` instance in
+its original deck position. Promotion is intentionally conservative: Studio
+refuses template-backed slides or source whose global/default context cannot
+be moved without changing semantics.
+
+New text/bullet/image creation and reusable-name actions open a small modal
+editor; editing an existing object's ordinary properties uses the inline
+inspector described above.
+<kbd>Enter</kbd> commits, <kbd>Shift-Enter</kbd> inserts a line in text fields,
+<kbd>Cmd/Ctrl-V</kbd> pastes, and <kbd>Esc</kbd> cancels without touching the
+source.
+
+### Rendering diagnostics
+
+Press <kbd>F3</kbd>, or launch with `--diagnostics`, to show frame time, the
+one-second peak and slow-frame count, render-graph rebuild time and mode, the
+number of slides rebuilt, full/partial/unchanged rebuild counters, slideshow
+arena capacity, Studio preparation time, cache rebuild counts, deck size,
+active item/render-fragment counts, mouse coordinates, and window size. A `*`
+beside the cache counters marks a rebuild in the current frame. Slow frames
+are also rate-limited in the log while diagnostics are active. In Studio the
+HUD uses
+the free toolbar span between the authoring controls and Commands/Focus, so it
+does not cover slide content; narrow layouts hide it rather than crowding the
+controls.
+`--diagnostics-select=ID` opens Studio with the unique authored `id=` selected
+in Properties; this is a non-mutating QA aid. Normal playback uses synchronized
+presentation plus a 60 Hz fallback; Beast Mode intentionally disables both
+limits.
+`--diagnostics-command-palette` opens Studio with the command palette visible,
+which makes compact/default/large screenshot regression checks deterministic.
+`--diagnostics-command-tooltip` similarly holds the Commands hover card open
+for deterministic typography and containment QA across macOS Spaces.
+`--diagnostics-precision-view` enables rulers, both safe areas, measurements,
+and a 110% canvas view for deterministic precision-surface QA; pair it with
+`--diagnostics-select=ID` to measure a specific authored object.
+`--diagnostics-large-deck=COUNT` creates an in-memory, parser-backed Studio
+stress deck with reusable elements and morph states. `COUNT` accepts 1–200;
+the deck is intentionally untitled and does not touch a file unless you
+explicitly save it.
+`--diagnostics-incremental-edit=N` performs one real, undoable Properties-style
+source edit on the one-based slide `N` after the first complete frame. Pair it
+with the large-deck flag to verify that the next HUD event is a selective
+`partial 1/COUNT` rebuild without synthesizing keyboard or pointer input.
+`--diagnostics-find-slide=QUERY` opens the real slide-picker Find field with a
+deterministic query, and `--diagnostics-window=WIDTHxHEIGHT` requests an exact
+Studio client size (minimum 900×506). Together they make compact/default/large
+navigation screenshots reproducible without synthesizing global key input.
+`--no-startup-banner` suppresses the four-second launch banner for unattended
+captures, kiosk launches, and other cases that need the first frame to contain
+only the deck and Studio chrome.
+
+The repository includes an opt-in visual and performance baseline harness for
+compact Properties, the default command palette, large precision mode, and a
+real one-slide incremental rebuild in a synthetic 160-slide deck. On this Mac,
+the following command moves each short-lived window to Aerospace workspace 12,
+verifies that exact process window is both on workspace 12 and floating, then
+releases an in-app capture gate:
+
+```sh
+zig build -Doptimize=ReleaseSafe studio-baselines -- --workspace 12
+```
+
+Use `studio-baselines-update` with the same arguments only after deliberately
+reviewing a visual or performance change. Actual captures, amplified failure
+diffs, reports, and logs are written below `zig-out/studio-baselines`; approved
+PNG and JSON references live in `tests/studio_baselines`. The harness requires
+Python Pillow. See [the baseline notes](tests/studio_baselines/README.md) for
+tolerances and individual-scenario commands.
+
+For release work, `zig build release-confidence` runs the headless resilience
+gate. The repeatable [macOS release checklist](docs/MACOS_RELEASE_QA.md) adds
+verified Aerospace placement, focus, multi-monitor/resize/fullscreen, reload,
+Save As/recovery, and presentation/export checks.
+
+Studio edits the `.sld` document rather than maintaining a separate opaque
+scene. It changes only the source owned by the selected object and preserves
+unrelated spacing, comments, text, and line endings. Objects instantiated with
+`@pop` are edited at that instance. Named objects inherited from `@pushslide`
+are also edited locally by default: Studio creates or updates an `@set` beside
+the current `@popslide`, and Delete adds `@hide`. Hold <kbd>Alt</kbd> while
+moving, resizing, nudging, or changing a property to edit the shared template
+definition instead. This also works from an already-customized instance:
+Studio retains the shared authored value layer and applies the gesture delta
+there without baking the local coordinates into every slide. The current slide
+keeps any properties it overrides. <kbd>Alt</kbd>-Delete removes the shared item
+and its source-resolved local and morph mutations together; ambiguous or
+generated dependency layouts are refused atomically. Template items use an
+amber outline and the status bar states whether an operation is local or
+shared. An inherited object without a unique `id=` cannot receive a local
+override; add an ID or use <kbd>Alt</kbd> for an intentional shared edit. A
+generated shared directive produced through `@let` remains read-only, but an
+identified inherited item can still receive a later literal local override.
+Background swatches write an item-owned `bg=` fill, so a local template
+override stays behind its own text, image, or panel without creating a
+z-order-sensitive sibling rectangle. Use the **None** background control to
+write `bg=none` and clear an inherited or directly authored fill.
+
+**Reuse** (or <kbd>P</kbd>) promotes a direct box to a named `@push` definition
+and leaves an equivalent `@pop` instance in place. The Library tool creates
+more instances later in the document. Reusable definitions are source-order
+scoped, so a library item can only be placed after its definition.
+
+| Studio shortcut | Description |
+| --------------- | ----------- |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> | Open the searchable contextual command palette |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>F</kbd> | Find and jump within Slides, Library, or Objects |
+| <kbd>1</kbd>–<kbd>4</kbd> on the new-deck chooser | Create Blank, Midnight, Editorial, or Aurora |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, then atomically save changes to its `.sld` file |
+| <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, or save an `*.edited.sld` copy of a named deck |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Undo the last visual edit |
+| <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
+| <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |
+| <kbd>G</kbd> | Toggle grid display and grid snapping |
+| <kbd>Cmd/Ctrl</kbd> + mouse wheel | Zoom the canvas around the pointer |
+| Mouse wheel / trackpad scroll | Pan the canvas |
+| Space + drag / middle-button drag | Pan the canvas directly |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>+</kbd> / <kbd>-</kbd> | Zoom in / out around the canvas center |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>0</kbd> | Fit and recenter the complete slide |
+| <kbd>Tab</kbd> | Toggle Focus Canvas without leaving Studio |
+| Hold <kbd>Shift</kbd> while resizing | Preserve the object's aspect ratio |
+| Hold <kbd>Cmd/Ctrl</kbd> while dragging | Temporarily bypass smart guides and grid snapping |
+| <kbd>Shift</kbd> + click | Add or remove an object from the current selection |
+| Drag empty canvas | Marquee-select every overlapping object |
+| <kbd>Shift</kbd> + drag empty canvas | Toggle marquee hits against the starting selection |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>A</kbd> | Select every editable object in the current scene |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>C</kbd> | Copy selected direct boxes or direct component instances |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>V</kbd> | Paste clipboard objects, offset by another 20 pixels |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>[</kbd> / <kbd>]</kbd> | Move the selection one layer down / up |
+| <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>[</kbd> / <kbd>]</kbd> | Move the selection to the back / front |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>L</kbd> | Lock or unlock the selected objects |
+| <kbd>Backspace</kbd> | Atomically delete the selected object or selection |
+| Hold <kbd>Alt</kbd> while editing a template item | Edit its shared definition instead of this instance |
+| <kbd>Enter</kbd> | Edit the selected object's text |
+| <kbd>P</kbd> | Promote the selected object for reuse |
+| <kbd>Enter</kbd> | Use the selected library entry when no canvas object is selected |
+| <kbd>F2</kbd> | Rename the selected library definition and its resolved uses |
+| <kbd>Shift</kbd> + <kbd>Delete</kbd> | Delete the selected library definition when it is unused |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>N</kbd> | Insert a new slide after this slide |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd> | Promote the current slide to a reusable slide template |
+| <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Select the previous or next slide in Studio |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>D</kbd> | Atomically duplicate the selected object(s), or the current slide when none are selected |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>Backspace</kbd> | Delete the current slide (except the only slide) |
+| <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>Up/Down</kbd> | Move the current slide when no object is selected; otherwise nudge the shared template item by ten |
+
+The `*` beside `STUDIO` means the in-memory document differs from the original
+file. Automatic file reload is paused while those unsaved changes exist.
+Transitions are paused in Studio and ordinary reveal items are shown. The scene
+control in the toolbar switches between the base scene and each semantic morph
+state. The bottom timeline makes that cumulative structure explicit: BASE is
+the authored root, followed by cards showing each state's label, automatic
+delay, duration, and easing. Click a card to preview/edit it. The adjacent
+controls add a state after the current scene, duplicate the current visual
+snapshot, name, delete, or move a state earlier/later. Every structural action
+is one source transaction and one Undo entry; unsafe dynamic/global ownership
+or broken dependencies are refused without changing the document. BASE can
+create the first state, but cannot itself be renamed, deleted, or reordered.
+
+Editing an inherited, named item creates or updates a state-local `@set`;
+deleting it creates `@hide`. Items born in the active state are edited at their
+own directive. Background creation and reusable promotion remain base-scene
+operations because they change structural layout rather than one morph state.
+Structural edits are also undoable. Layer changes support literal direct boxes,
+direct component instances, and objects born in the active morph state, but do
+not reorder inherited slide-template content. Items separated by a mutation,
+definition, global default, or another source-ownership boundary cannot cross
+it. Full-slide `@bg` items are pinned layer boundaries, so **Back** cannot hide
+ordinary content underneath the slide background. If a layout cannot be moved,
+copied, or duplicated unambiguously, Studio refuses the whole operation and
+leaves the source intact.
+
+Object duplication is also source-aware: it copies each complete item body and
+owned reveal animation, assigns fresh stable `id=` values, offsets the clones
+by 20 logical pixels, and leaves auto-image sizing untouched. A mixed batch of
+direct boxes and direct `@pop` component instances is committed as one edit.
+Inherited morph items, local slide-template clones, generated directives, and
+crowd panels are conservatively refused when they cannot be duplicated without
+changing their ownership semantics. Hold <kbd>Alt</kbd> with **Dup** or
+<kbd>Cmd/Ctrl-D</kbd> to duplicate an uncustomized item in the shared slide
+template.
+
+If the original file changes externally, Studio refuses to overwrite it and
+asks you to use Save Copy. Quitting with unsaved work also writes a unique
+`*.edited.sld` recovery copy before closing; if that copy cannot be written,
+the quit is cancelled. A named deck first recovers beside its source. The
+macOS app falls back—and stores untitled recovery copies—in
+`~/Library/Application Support/Rayslides/Recovery`; it does not use Documents
+or request Documents-folder access. Direct CLI launches retain the traditional
+behavior of recovering an untitled deck into their current working directory.
 
 # Slideshow Text Format
 
@@ -189,6 +587,90 @@ Internal render buffer resolution is 1920x1080. So always use coordinates in thi
 
 More documentation to follow.
 
+## Reusable groups
+
+`@push`/`@pop` represents one reusable item. A reusable composition of several
+objects uses an explicit block so its ownership and member IDs remain clear:
+
+```text
+@pushgroup feature
+@box id=title x=120 y=120 w=760 h=100 fontsize=64 text=Fast by design
+@box id=art img=assets/feature.png x=1040 y=120 w=680 h=680
+@endgroup
+
+@slide
+@popgroup feature id=intro
+
+@state(morph)
+@set intro.title y=420
+```
+
+Every member and every `@popgroup` use must have an explicit literal `id=`.
+Emitted IDs are qualified as `INSTANCE.MEMBER`, so two uses remain independent
+and morph mutations can target one exact member. Definitions become visible
+only after `@endgroup`; later definitions with the same name shadow earlier
+ones in normal source order. The initial format deliberately keeps absolute
+member coordinates and refuses nested, generated, background, Crowdplay, or
+malformed group bodies rather than guessing at ownership.
+
+In Studio, select two or more contiguous authored objects and choose **Reuse**
+to promote them in one undoable source transaction. The Library labels the
+result as **GROUP** and can place additional absolute-position instances;
+Properties identifies inherited group members and **Detach** expands the whole
+instance into ordinary local boxes. Group rename, unused deletion, placement,
+promotion, and detach all retain exact source-order definition provenance and
+refuse ambiguous structures atomically. Library **Clean** previews how many
+unreachable element, group, and direct slide-template definitions are safe to
+remove; **Apply** then follows their exact source-order dependencies to a fixed
+point and removes them in one undoable edit. Ambiguous parser-context ownership
+is reported as blocked and left untouched. See [the Studio roadmap](STUDIO_ROADMAP.md)
+for the next authoring tranches.
+
+## Slide-template instance overrides
+
+Items in a reusable `@pushslide` template can be changed on one slide without
+copying or detaching the template. Give the template item a stable `id=`, then
+put `@set`, `@show`, or `@hide` after the corresponding `@popslide` and before
+its first morph state:
+
+```text
+@box id=title x=100 y=70 w=1700 h=100 fontsize=52 text=Shared title
+@box id=page_number x=1780 y=1010 w=80 h=40 text=$slide_number
+@pushslide content
+
+@popslide content
+@set title x=180 color=#f7a41dff text=Local title for this slide
+@hide page_number
+
+@state(morph)
+@set title y=500
+```
+
+The shared template remains unchanged. The base-scene override affects only
+that `@popslide` instance, and subsequent morph states inherit it before
+applying their own mutations. Targets must uniquely identify inherited
+template items; ordinary direct slides still require an `@state(morph)` before
+using these mutation directives. Studio writes this syntax automatically for
+local geometry, text, colors, backgrounds, locking, and deletion. Holding
+<kbd>Alt</kbd> explicitly edits the shared template item instead, including from
+a customized instance: Studio keeps the shared authored value layer separate
+from effective local values. Shared deletion removes source-resolved local and
+morph mutations together; ambiguous or generated dependencies are refused
+atomically.
+
+The Properties inspector marks locally authored fields with **L** and offers
+an **R** reset when the exact source layer can be removed safely. Reset deletes
+all contributions for that property in the current instance or morph state,
+so the shared or previous-state value truly resurfaces. A source-safe single
+`@pop` component can also be **Detached** into a fully materialized direct
+`@box`; the operation preserves its effective appearance, animation, comments,
+selection, and one-step undo history. Ambiguous persistent component context is
+left shared and explained instead of being rewritten.
+
+For nested reusable elements, give `@pop` an explicit `id=` when local slide
+overrides refer to it. That ID remains stable if the reusable definition is
+renamed; relying on the component name as its implicit ID does not.
+
 ## Animations and slide states
 
 Animations add reveal states to one logical slide; they do not duplicate the
@@ -272,7 +754,7 @@ slide. Give objects stable `id=` values, start a new state with
 @box id=hero img=assets/diagram.png x=1250 y=180 w=520 h=320
 @box id=title x=120 y=180 w=1000 h=120 fontsize=72 shadow=#00000080 text=One object, many states
 
-@state(morph) duration=0.8 ease=spring
+@state(morph) label=takeover duration=0.8 ease=spring
 @set hero x=0 y=0 w=1920 h=1080
 @set title x=80 y=55 fontsize=48 color=#f7a41dff shadow_offset=7
 ```
@@ -282,7 +764,9 @@ Everything before the first state is the slide's initial state. Each
 cumulative patch over the previous state. Unspecified objects and properties
 carry forward. The default duration is 0.6 seconds and the default easing is
 `smooth`; the available easing modes are `linear`, `smooth`, and `spring`.
-Bare `@state` is accepted as shorthand for `@state(morph)`.
+Bare `@state` is accepted as shorthand for `@state(morph)`. An optional
+`label=NAME` uses the same identifier spelling as reusable names and appears in
+Studio's timeline; it is author-facing metadata, not an item mutation target.
 
 Use the state directives to manipulate objects:
 
@@ -312,9 +796,12 @@ backward pauses automatic progression and reverses the same interpolation.
 Changing direction during a morph continues from the current frame.
 
 Morphable properties include position and size (`x`, `y`, `w`, `h`),
-`fontsize`, `color`, `bullet_color`, `line_height`, `underline_width`, image
-`scale` and `ratio`, text-shadow properties, and `opacity` from `0` to `1`.
-Text content and an existing image object's `img=` path may also change.
+`fontsize`, foreground `color`, item background `bg`, `bullet_color`,
+`line_height`, `underline_width`, image `scale` and `ratio`, text-shadow
+properties, and `opacity` from `0` to `1`. Use `bg=#rrggbbaa` for a bounded
+fill behind that item and `bg=none` to clear it; this is distinct from the
+slide-wide `@bg` directive. Text content and an existing image object's `img=`
+path may also change.
 Rayslides interpolates geometry, font size, colors, opacity, and shadows when
 the rendered content is compatible. Changed text, changed images, wrapping
 changes, new objects, and removed objects use a cross-fade instead, avoiding

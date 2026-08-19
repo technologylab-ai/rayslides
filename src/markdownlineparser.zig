@@ -54,12 +54,28 @@ pub const MdLineParser = struct {
 
     pub fn init(self: *MdLineParser, allocator: std.mem.Allocator) void {
         if (self.result_spans) |*spans| {
-            spans.shrinkRetainingCapacity(0);
+            self.freeSpanText(spans.items);
+            spans.clearRetainingCapacity();
         } else {
             self.result_spans = std.ArrayList(MdTextSpan).empty;
         }
         self.allocator = allocator;
         self.currentSpan = .{};
+    }
+
+    pub fn deinit(self: *MdLineParser) void {
+        if (self.result_spans) |*spans| {
+            self.freeSpanText(spans.items);
+            spans.deinit(self.allocator);
+        }
+        self.result_spans = null;
+        self.currentSpan = .{};
+    }
+
+    fn freeSpanText(self: *MdLineParser, spans: []const MdTextSpan) void {
+        for (spans) |span| {
+            if (span.text) |text| self.allocator.free(text);
+        }
     }
 
     fn makeCstr(self: *MdLineParser, t: []const u8) ![]const u8 {
@@ -316,7 +332,9 @@ pub const MdLineParser = struct {
         }
 
         const span = line[self.currentSpan.startpos..self.currentSpan.endpos];
-        self.currentSpan.text = try self.makeCstr(span);
+        const owned_text = try self.makeCstr(span);
+        errdefer self.allocator.free(owned_text);
+        self.currentSpan.text = owned_text;
         if (self.result_spans) |*spans| {
             try spans.append(self.allocator, self.currentSpan);
         } else {
@@ -355,10 +373,11 @@ pub const MdLineParser = struct {
                 zig = "zig";
             }
 
+            var colored_buffer: [64]u8 = undefined;
             var colored: []const u8 = "";
 
             if (span.styleflags & StyleFlags.colored > 0) {
-                colored = std.fmt.allocPrint(self.allocator, "color: {?}", .{span.color_override}) catch "color";
+                colored = std.fmt.bufPrint(&colored_buffer, "color: {?}", .{span.color_override}) catch "color";
             }
 
             log.debug("[{}:{}] `{?s}` : {s} {s} {s} {s} {s} {s}", .{ span.startpos, span.endpos, span.text, bold, italic, underline, zig, line_bulleted, colored });
@@ -378,4 +397,17 @@ fn peekBack(line: []const u8, pos: usize, howmany: usize) ?u8 {
         return null;
     }
     return line[pos - howmany];
+}
+
+test "markdown parser releases span text across repeated parses" {
+    var parser: MdLineParser = .{};
+    parser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    for (0..8) |_| {
+        try parser.parseLine("plain **bold** <#112233ff>color</>");
+        try std.testing.expect(parser.result_spans.?.items.len >= 3);
+        parser.logSpans();
+        parser.init(std.testing.allocator);
+    }
 }
