@@ -2382,6 +2382,68 @@ test "item backgrounds inherit and support local and morph set or clear mutation
     );
 }
 
+test "slide-template text and image property layers preserve shared font size and opacity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=caption x=10 y=20 w=500 h=120 fontsize=40 color=#112233ff bg=#203040ff opacity=0.9 text=Shared
+        \\@box id=photo img=assets/example.png x=600 y=20 w=320 h=200 fontsize=30 color=#213243ff bg=#304050ff opacity=0.8
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set caption fontsize=50 color=#405060ff bg=none opacity=0.7
+        \\@set photo fontsize=35 color=#506070ff bg=#607080ff opacity=0.6
+        \\@state(morph)
+        \\@set caption fontsize=60 color=#708090ff bg=#8090a0ff opacity=0.5
+        \\@set photo fontsize=45 color=#90a0b0ff bg=none opacity=0.4
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const template_items = context.push_slides.get("layout").?.items.?.items;
+    try std.testing.expectEqual(@as(?i32, 40), template_items[0].fontSize);
+    try std.testing.expectEqual(@as(?i32, 40), template_items[0].sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), template_items[0].sharedTemplateValues().?.opacity, 0.0001);
+    try std.testing.expectEqual(@as(?i32, 30), template_items[1].fontSize);
+    try std.testing.expectEqual(@as(?i32, 30), template_items[1].sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), template_items[1].sharedTemplateValues().?.opacity, 0.0001);
+
+    const instance = slideshow.slides.items[0];
+    const local_caption = instance.items.?.items[0];
+    const local_photo = instance.items.?.items[1];
+    try std.testing.expectEqual(@as(?i32, 50), local_caption.fontSize);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), local_caption.opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x40), local_caption.color.?.r);
+    try std.testing.expect(local_caption.background_color == null);
+    try std.testing.expectEqual(@as(?i32, 40), local_caption.sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), local_caption.sharedTemplateValues().?.opacity, 0.0001);
+    try std.testing.expectEqual(@as(?i32, 35), local_photo.fontSize);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), local_photo.opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x50), local_photo.color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x60), local_photo.background_color.?.r);
+    try std.testing.expectEqual(@as(?i32, 30), local_photo.sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), local_photo.sharedTemplateValues().?.opacity, 0.0001);
+
+    const morphed = instance.morph_states.items[0].items.items;
+    try std.testing.expectEqual(@as(?i32, 60), morphed[0].fontSize);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), morphed[0].opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x70), morphed[0].color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x80), morphed[0].background_color.?.r);
+    try std.testing.expectEqual(@as(?i32, 40), morphed[0].sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), morphed[0].sharedTemplateValues().?.opacity, 0.0001);
+    try std.testing.expectEqual(@as(?i32, 45), morphed[1].fontSize);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), morphed[1].opacity, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0x90), morphed[1].color.?.r);
+    try std.testing.expect(morphed[1].background_color == null);
+    try std.testing.expectEqual(@as(?i32, 30), morphed[1].sharedTemplateValues().?.font_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), morphed[1].sharedTemplateValues().?.opacity, 0.0001);
+}
+
 test "nested slide templates refresh and preserve their shared authored value layer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2389,17 +2451,17 @@ test "nested slide templates refresh and preserve their shared authored value la
     const slideshow = try slides.SlideShow.new(allocator);
 
     const input =
-        \\@box id=hero x=10 y=20 w=300 h=100 color=#112233ff bg=#203040ff opacity=0.8 text=Original
+        \\@box id=hero x=10 y=20 w=300 h=100 fontsize=36 color=#112233ff bg=#203040ff opacity=0.8 text=Original
         \\@pushslide first
         \\@popslide first
-        \\@set hero x=100 color=#405060ff bg=none opacity=0.6 text=Captured
+        \\@set hero x=100 fontsize=44 color=#405060ff bg=none opacity=0.6 text=Captured
         \\@hide hero
         \\@pushslide second
         \\@popslide second
-        \\@set hero y=200 color=#708090ff bg=#90a0b0ff text=Local
+        \\@set hero y=200 fontsize=52 color=#708090ff bg=#90a0b0ff text=Local
         \\@show hero
         \\@state(morph)
-        \\@set hero x=300 color=#a0b0c0ff bg=none opacity=0.2 text=Morph
+        \\@set hero x=300 fontsize=60 color=#a0b0c0ff bg=none opacity=0.2 text=Morph
     ;
 
     const context = try constructSlidesFromBuf(input, slideshow, allocator);
@@ -2411,6 +2473,7 @@ test "nested slide templates refresh and preserve their shared authored value la
     const first_values = first.sharedTemplateValues().?;
     try std.testing.expectApproxEqAbs(@as(f32, 10), first_values.position.x, 0.0001);
     try std.testing.expectEqualStrings("Original", first_values.text.?);
+    try std.testing.expectEqual(@as(?i32, 36), first_values.font_size);
     try std.testing.expectEqual(@as(u8, 0x11), first_values.color.?.r);
     try std.testing.expectEqual(@as(u8, 0x20), first_values.background_color.?.r);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), first_values.opacity, 0.0001);
@@ -2422,6 +2485,7 @@ test "nested slide templates refresh and preserve their shared authored value la
     try std.testing.expectApproxEqAbs(@as(f32, 20), captured_values.position.y, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 300), captured_values.size.x, 0.0001);
     try std.testing.expectEqualStrings("Captured", captured_values.text.?);
+    try std.testing.expectEqual(@as(?i32, 44), captured_values.font_size);
     try std.testing.expectEqual(@as(u8, 0x40), captured_values.color.?.r);
     try std.testing.expect(captured_values.background_color == null);
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), captured_values.opacity, 0.0001);
@@ -2438,18 +2502,22 @@ test "nested slide templates refresh and preserve their shared authored value la
     try std.testing.expectApproxEqAbs(@as(f32, 100), local.position.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 200), local.position.y, 0.0001);
     try std.testing.expectEqualStrings("Local", local.text.?);
+    try std.testing.expectEqual(@as(?i32, 52), local.fontSize);
     try std.testing.expect(local.visible);
     try std.testing.expectEqual(@as(u8, 0x90), local.background_color.?.r);
     try std.testing.expectEqualStrings("Captured", local.sharedTemplateValues().?.text.?);
+    try std.testing.expectEqual(@as(?i32, 44), local.sharedTemplateValues().?.font_size);
     try std.testing.expect(!local.sharedTemplateValues().?.visible);
 
     const morphed = rendered.morph_states.items[0].items.items[0];
     try std.testing.expectApproxEqAbs(@as(f32, 300), morphed.position.x, 0.0001);
     try std.testing.expectEqualStrings("Morph", morphed.text.?);
+    try std.testing.expectEqual(@as(?i32, 60), morphed.fontSize);
     try std.testing.expectEqual(@as(u8, 0xa0), morphed.color.?.r);
     try std.testing.expect(morphed.background_color == null);
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), morphed.opacity, 0.0001);
     try std.testing.expectEqualStrings("Captured", morphed.sharedTemplateValues().?.text.?);
+    try std.testing.expectEqual(@as(?i32, 44), morphed.sharedTemplateValues().?.font_size);
     try std.testing.expectApproxEqAbs(@as(f32, 100), morphed.sharedTemplateValues().?.position.x, 0.0001);
     try std.testing.expect(morphed.sharedTemplateValues().?.background_color == null);
 }

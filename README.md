@@ -54,10 +54,11 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 ## Studio visual editing
 
 Run rayslides without a slide file to begin with a blank, untitled slide in
-Studio, or press <kbd>E</kbd> while presenting an existing deck. Studio is a
-visual authoring surface backed by the ordinary `.sld` source: every completed
-action rewrites and reparses the document, so the GUI and text formats remain
-two views of the same file.
+Studio, pass `--studio` with a slide file to open that deck directly in Studio,
+or press <kbd>E</kbd> while presenting an existing deck. Studio is a visual
+authoring surface backed by the ordinary `.sld` source: every completed action
+rewrites and reparses the document, so the GUI and text formats remain two
+views of the same file.
 
 The top toolbar contains these one-shot canvas tools:
 
@@ -77,9 +78,14 @@ the slide and nearby object edges and centers, with magenta guides and a live
 `x/y/w/h` readout. Hold <kbd>Cmd/Ctrl</kbd> during a drag to bypass snapping,
 or press <kbd>G</kbd> to toggle the visible 20-pixel grid. Holding
 <kbd>Shift</kbd> while resizing preserves the displayed aspect ratio, including
-for auto-sized images. The property panel edits text, duplicates or deletes
-the object, promotes it for reuse, applies palette colors, and aligns it to any
-slide edge or center. Shift-click toggles objects into an ordered
+for auto-sized images. The property panel edits text, exact `x/y/w/h` values,
+font size, opacity, foreground and item-background colors, duplicates or
+deletes the object, promotes it for reuse, and aligns it to any slide edge or
+center. Numeric width and height fields change only the chosen dimension, so
+the other dimension of an auto-sized image remains automatic. Custom colors
+accept `#RRGGBB` or `#RRGGBBAA`; opacity accepts `0.01`–`1` or `1%`–`100%`.
+Zero opacity is intentionally refused until transparent objects can be
+reselected through a layers view. Shift-click toggles objects into an ordered
 multi-selection, and <kbd>Cmd/Ctrl-A</kbd> selects every editable object in the
 current scene. Drag an empty part of the canvas to marquee-select everything
 the rectangle overlaps; hold <kbd>Shift</kbd> to toggle the marquee hits against

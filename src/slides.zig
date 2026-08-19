@@ -199,6 +199,7 @@ pub const SourceRef = struct {
 /// without accidentally baking an instance-local value into every clone.
 pub const TemplateItemValues = struct {
     text: ?[]const u8 = null,
+    font_size: ?i32 = null,
     color: ?rl.Color = null,
     background_color: ?rl.Color = null,
     position: rl.Vector2 = .zero(),
@@ -301,6 +302,7 @@ pub const SlideItem = struct {
     pub fn captureSharedTemplateValues(self: *SlideItem) void {
         self.shared_template_values = .{
             .text = self.text,
+            .font_size = self.fontSize,
             .color = self.color,
             .background_color = self.background_color,
             .position = self.position,
@@ -626,6 +628,7 @@ test "slide cloning preserves morph source provenance" {
         .instance_source = .{ .scope = .slide_instance_override, .line_number = 3, .line_offset = 21, .patchable = true },
         .shared_template_values = .{
             .text = "shared",
+            .font_size = 42,
             .position = .{ .x = 10, .y = 20 },
             .size = .{ .x = 300, .y = 80 },
             .background_color = .{ .r = 1, .g = 2, .b = 3, .a = 4 },
@@ -656,6 +659,7 @@ test "slide cloning preserves morph source provenance" {
     try std.testing.expectEqual(@as(?usize, 0), clone.morph_states.items[0].items.items[0].creation_morph_state);
     const cloned_values = clone.morph_states.items[0].items.items[0].shared_template_values.?;
     try std.testing.expectEqualStrings("shared", cloned_values.text.?);
+    try std.testing.expectEqual(@as(?i32, 42), cloned_values.font_size);
     try std.testing.expectApproxEqAbs(@as(f32, 10), cloned_values.position.x, 0.0001);
     try std.testing.expectEqual(@as(u8, 4), cloned_values.background_color.?.a);
 }

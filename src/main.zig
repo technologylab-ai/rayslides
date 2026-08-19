@@ -562,6 +562,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var crowd_options = CrowdOptions{};
     var crowd_host_buffer: [256]u8 = undefined;
     crowd_options.host = defaultCrowdHost(&crowd_host_buffer);
+    var launch_studio = false;
 
     // get args
     const slideshow_to_load: ?[]const u8 = blk: {
@@ -577,6 +578,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                 crowd_options.port = std.fmt.parseInt(u16, arg["--crowd-port=".len..], 10) catch std.process.fatal("Invalid --crowd-port value", .{});
             } else if (std.mem.eql(u8, arg, "--no-crowd")) {
                 crowd_options.enabled = false;
+            } else if (std.mem.eql(u8, arg, "--studio")) {
+                launch_studio = true;
             } else if (slideshow_arg == null) {
                 slideshow_arg = arg;
             } else {
@@ -624,7 +627,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var banner: Banner = try .init(screenWidth, screenHeight);
     defer banner.deinit();
     var studio_mode: studio.Studio = .{
-        .enabled = slideshow_to_load == null,
+        .enabled = launch_studio or slideshow_to_load == null,
         .dirty = slideshow_to_load == null,
     };
     var property_prompt: studio_prompt.Prompt = .{};
@@ -747,7 +750,7 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         // (re-) load slideshow
         if (G.slideshow_filp_to_load) |filp| {
-            studio_mode = .{};
+            studio_mode = .{ .enabled = launch_studio };
             studio_history.clear();
             // Component clipboard entries carry source-order definition
             // provenance. Never let them cross a document reload where the
@@ -935,6 +938,91 @@ pub fn main(init: std.process.Init) anyerror!void {
                             if (target.edit_scope == .shared_template) .shared_text else .text,
                             initial_text,
                         );
+                    },
+                    .edit_numeric_geometry => |request| prompt: {
+                        const item = studioItemByIdentity(studio_items, request.target.item_identity) orelse {
+                            studio_mode.setNotice(.edit_failed);
+                            break :prompt;
+                        };
+                        const geometry = if (request.target.edit_scope == .shared_template)
+                            if (item.sharedTemplateValues()) |shared|
+                                studio.Geometry{ .position = shared.position, .size = shared.size }
+                            else
+                                studio.itemGeometry(item.*, studio_bounds.items)
+                        else
+                            studio.itemGeometry(item.*, studio_bounds.items);
+                        const value = switch (request.field) {
+                            .x => geometry.position.x,
+                            .y => geometry.position.y,
+                            .width => geometry.size.x,
+                            .height => geometry.size.y,
+                        };
+                        var initial_buffer: [64]u8 = undefined;
+                        const initial = formatStudioFloat(&initial_buffer, value) catch "0";
+                        pending_semantic_command = command;
+                        property_prompt.begin(
+                            switch (request.field) {
+                                .x, .y => .coordinate,
+                                .width, .height => .dimension,
+                            },
+                            initial,
+                        );
+                    },
+                    .set_custom_foreground => |target| prompt: {
+                        const item = studioItemByIdentity(studio_items, target.item_identity) orelse {
+                            studio_mode.setNotice(.edit_failed);
+                            break :prompt;
+                        };
+                        const color = if (target.edit_scope == .shared_template)
+                            if (item.sharedTemplateValues()) |shared| shared.color else null
+                        else
+                            item.color;
+                        var initial_buffer: [9]u8 = undefined;
+                        pending_semantic_command = command;
+                        property_prompt.begin(.color, if (color) |value| colorLiteral(&initial_buffer, value) else "#ffffffff");
+                    },
+                    .set_custom_background => |target| prompt: {
+                        const item = studioItemByIdentity(studio_items, target.item_identity) orelse {
+                            studio_mode.setNotice(.edit_failed);
+                            break :prompt;
+                        };
+                        const color = if (target.edit_scope == .shared_template)
+                            if (item.sharedTemplateValues()) |shared| shared.background_color else null
+                        else
+                            item.background_color;
+                        var initial_buffer: [9]u8 = undefined;
+                        pending_semantic_command = command;
+                        property_prompt.begin(.color, if (color) |value| colorLiteral(&initial_buffer, value) else "#ffffffff");
+                    },
+                    .set_font_size => |target| prompt: {
+                        const item = studioItemByIdentity(studio_items, target.item_identity) orelse {
+                            studio_mode.setNotice(.edit_failed);
+                            break :prompt;
+                        };
+                        const font_size = if (target.edit_scope == .shared_template)
+                            if (item.sharedTemplateValues()) |shared| shared.font_size else null
+                        else
+                            item.fontSize;
+                        var initial_buffer: [32]u8 = undefined;
+                        const initial = if (font_size) |value|
+                            std.fmt.bufPrint(&initial_buffer, "{d}", .{value}) catch ""
+                        else
+                            "";
+                        pending_semantic_command = command;
+                        property_prompt.begin(.font_size, initial);
+                    },
+                    .set_opacity => |target| prompt: {
+                        const item = studioItemByIdentity(studio_items, target.item_identity) orelse {
+                            studio_mode.setNotice(.edit_failed);
+                            break :prompt;
+                        };
+                        const opacity = if (target.edit_scope == .shared_template)
+                            if (item.sharedTemplateValues()) |shared| shared.opacity else item.opacity
+                        else
+                            item.opacity;
+                        var initial_buffer: [64]u8 = undefined;
+                        pending_semantic_command = command;
+                        property_prompt.begin(.opacity, formatStudioFloat(&initial_buffer, opacity) catch "1");
                     },
                     .promote_to_reusable => |target| {
                         var suggested_name: [96]u8 = undefined;
@@ -1176,41 +1264,60 @@ pub fn main(init: std.process.Init) anyerror!void {
                     // Reparse invalidates every runtime identity. Rebind stable
                     // IDs when available and always clear the complete old
                     // group, including additional-selection state, when not.
-                    studio_mode.selectItemsByIds(
-                        currentStudioSceneItems(&studio_mode),
-                        id_views[0..selection_ids.values.items.len],
-                    );
+                    if (!result.preserve_selection) {
+                        studio_mode.selectItemsByIds(
+                            currentStudioSceneItems(&studio_mode),
+                            id_views[0..selection_ids.values.items.len],
+                        );
+                    }
                 }
                 studio_mode.setNotice(if (customized_shared_property) .shared_template_customized else .none);
             } else |err| {
-                semantic_source_changed = true;
-                studio_mode.setNotice(switch (err) {
-                    error.AmbiguousSlideTemplateLayout,
-                    error.AmbiguousSlideTemplateDependency,
-                    error.UnsafeSlideGlobalDirective,
-                    error.UnsupportedSlideTemplateOverride,
-                    error.UnsupportedSharedTemplateDeletion,
-                    error.UnsupportedItemDuplication,
-                    error.TemplateInstanceDuplicationUnsupported,
-                    error.MorphItemDuplicationUnsupported,
-                    error.AmbiguousItemLayer,
-                    error.InvalidItemScene,
-                    error.UnsupportedItemLayerMove,
-                    error.UnsupportedClipboardItem,
-                    error.UnsupportedBatchDeletion,
-                    => .structural_source_locked,
-                    error.StudioClipboardEmpty => .clipboard_empty,
-                    error.LockedLayerBarrier => .locked_item,
-                    error.NameCollision => .library_name_conflict,
-                    error.SlideTemplateNameCollision => .library_name_conflict,
-                    error.LiveUses => .library_entry_in_use,
-                    error.UnsafeSlideTemplateDelete => .library_delete_unsupported,
-                    error.DynamicContextName => .structural_source_locked,
-                    error.UnsupportedSlidePromotion => .slide_template_promotion_locked,
-                    else => .edit_failed,
-                });
-                log.err("Studio property edit failed: {any}", .{err});
-                reparseEditorSource() catch {};
+                const invalid_prompt_value = switch (err) {
+                    error.InvalidStudioNumber,
+                    error.InvalidStudioDimension,
+                    error.InvalidStudioColor,
+                    error.InvalidStudioFontSize,
+                    error.InvalidStudioOpacity,
+                    => true,
+                    else => false,
+                };
+                if (invalid_prompt_value) {
+                    property_prompt.rejectValue();
+                    pending_semantic_command = command;
+                    studio_mode.setNotice(.none);
+                } else {
+                    semantic_source_changed = true;
+                    studio_mode.setNotice(switch (err) {
+                        error.AmbiguousSlideTemplateLayout,
+                        error.AmbiguousSlideTemplateDependency,
+                        error.UnsafeSlideGlobalDirective,
+                        error.UnsupportedSlideTemplateOverride,
+                        error.UnsupportedSharedTemplateDeletion,
+                        error.UnsupportedItemDuplication,
+                        error.TemplateInstanceDuplicationUnsupported,
+                        error.MorphItemDuplicationUnsupported,
+                        error.AmbiguousItemLayer,
+                        error.InvalidItemScene,
+                        error.UnsupportedItemLayerMove,
+                        error.UnsupportedClipboardItem,
+                        error.UnsupportedBatchDeletion,
+                        => .structural_source_locked,
+                        error.StudioClipboardEmpty => .clipboard_empty,
+                        error.LockedLayerBarrier,
+                        error.StudioItemLocked,
+                        => .locked_item,
+                        error.NameCollision => .library_name_conflict,
+                        error.SlideTemplateNameCollision => .library_name_conflict,
+                        error.LiveUses => .library_entry_in_use,
+                        error.UnsafeSlideTemplateDelete => .library_delete_unsupported,
+                        error.DynamicContextName => .structural_source_locked,
+                        error.UnsupportedSlidePromotion => .slide_template_promotion_locked,
+                        else => .edit_failed,
+                    });
+                    log.err("Studio property edit failed: {any}", .{err});
+                    reparseEditorSource() catch {};
+                }
             }
             if (semantic_source_changed) {
                 studio_mode.dirty = editorSourceDirty();
@@ -1871,8 +1978,14 @@ fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticComman
     }
     const target: studio.CommandTarget = switch (command) {
         .edit_text => |value| value,
+        .edit_numeric_geometry => |value| value.target,
         .set_foreground, .set_background => |value| value.target,
-        .clear_background => |value| value,
+        .set_custom_foreground,
+        .set_custom_background,
+        .set_font_size,
+        .set_opacity,
+        .clear_background,
+        => |value| value,
         else => return false,
     };
     if (target.edit_scope != .shared_template) return false;
@@ -2446,6 +2559,68 @@ fn colorLiteral(buffer: *[9]u8, color: rl.Color) []const u8 {
     return buffer;
 }
 
+fn parseStudioFiniteFloat(value: []const u8) !f32 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidStudioNumber;
+    const parsed = std.fmt.parseFloat(f32, trimmed) catch return error.InvalidStudioNumber;
+    if (!std.math.isFinite(parsed)) return error.InvalidStudioNumber;
+    return if (parsed == 0) 0 else parsed;
+}
+
+fn formatStudioFloat(buffer: []u8, value: f32) ![]const u8 {
+    if (!std.math.isFinite(value)) return error.InvalidStudioNumber;
+    return std.fmt.bufPrint(buffer, "{d}", .{if (value == 0) @as(f32, 0) else value});
+}
+
+fn canonicalStudioColor(input: []const u8, buffer: *[9]u8) ![]const u8 {
+    const value = std.mem.trim(u8, input, " \t\r\n");
+    if ((value.len != 7 and value.len != 9) or value[0] != '#') return error.InvalidStudioColor;
+    buffer[0] = '#';
+    for (value[1..]) |byte| {
+        if (!std.ascii.isHex(byte)) return error.InvalidStudioColor;
+    }
+    for (value[1..], 1..) |byte, index| buffer[index] = std.ascii.toLower(byte);
+    if (value.len == 7) {
+        buffer[7] = 'f';
+        buffer[8] = 'f';
+    }
+    return buffer;
+}
+
+fn canonicalStudioOpacity(input: []const u8, buffer: []u8) ![]const u8 {
+    const value = std.mem.trim(u8, input, " \t\r\n");
+    if (value.len == 0) return error.InvalidStudioOpacity;
+    const opacity = if (value[value.len - 1] == '%') blk: {
+        const percent = try parseStudioFiniteFloat(value[0 .. value.len - 1]);
+        break :blk percent / 100;
+    } else try parseStudioFiniteFloat(value);
+    if (opacity < 0.01 or opacity > 1) return error.InvalidStudioOpacity;
+    return formatStudioFloat(buffer, opacity);
+}
+
+fn canonicalStudioFontSize(input: []const u8, buffer: []u8) ![]const u8 {
+    const value = std.mem.trim(u8, input, " \t\r\n");
+    const size = std.fmt.parseInt(i32, value, 10) catch return error.InvalidStudioFontSize;
+    if (size <= 0 or size > 4096) return error.InvalidStudioFontSize;
+    return std.fmt.bufPrint(buffer, "{d}", .{size});
+}
+
+test "Studio custom property values canonicalize safely" {
+    var color_buffer: [9]u8 = undefined;
+    try std.testing.expectEqualStrings("#aabbccff", try canonicalStudioColor(" #AaBbCc ", &color_buffer));
+    try std.testing.expectEqualStrings("#01020304", try canonicalStudioColor("#01020304", &color_buffer));
+    try std.testing.expectError(error.InvalidStudioColor, canonicalStudioColor("#12345g", &color_buffer));
+
+    var number_buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("0.75", try canonicalStudioOpacity("75%", &number_buffer));
+    try std.testing.expectEqualStrings("0.25", try canonicalStudioOpacity("0.25", &number_buffer));
+    try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("0", &number_buffer));
+    try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("0.5%", &number_buffer));
+    try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("101%", &number_buffer));
+    try std.testing.expectEqualStrings("48", try canonicalStudioFontSize("48", &number_buffer));
+    try std.testing.expectError(error.InvalidStudioFontSize, canonicalStudioFontSize("0", &number_buffer));
+}
+
 fn validReusableName(name: []const u8) bool {
     if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
     for (name[1..]) |byte| {
@@ -2896,6 +3071,11 @@ fn applyStudioLockEdit(
 const StudioSemanticEditResult = struct {
     source_changed: bool = true,
     slide_index: ?usize = null,
+    /// Non-structural property edits preserve item identity/order. Leaving the
+    /// source-bound selection in Studio lets it rebind on the next frame,
+    /// including id-less literal items, so inspector workflows can edit
+    /// several fields without reselecting after every commit.
+    preserve_selection: bool = false,
 };
 
 fn applyStudioSemanticEdit(
@@ -3103,6 +3283,7 @@ fn applyStudioSemanticEdit(
         .edit_text => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
             if (item.kind != .textbox and item.kind != .crowd) return error.ItemHasNoEditableText;
+            if (item.locked) return error.StudioItemLocked;
             try applyStudioText(
                 history,
                 slide,
@@ -3111,16 +3292,57 @@ fn applyStudioSemanticEdit(
                 target.edit_scope,
                 prompted_text orelse return error.StudioPromptMissing,
             );
+            return .{ .preserve_selection = true };
+        },
+        .edit_numeric_geometry => |request| {
+            const item = studioItemByIdentity(items, request.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind == .background) return error.ItemHasNoEditableGeometry;
+            if (item.locked) return error.StudioItemLocked;
+            const parsed = try parseStudioFiniteFloat(prompted_text orelse return error.StudioPromptMissing);
+            const key: []const u8 = switch (request.field) {
+                .x => "x",
+                .y => "y",
+                .width => "w",
+                .height => "h",
+            };
+            if ((request.field == .width or request.field == .height) and parsed < studio.default_min_item_size) {
+                return error.InvalidStudioDimension;
+            }
+            var value_buffer: [64]u8 = undefined;
+            const value = try formatStudioFloat(&value_buffer, parsed);
+            try applyStudioLiteralAttribute(
+                history,
+                slide,
+                morph_state,
+                item,
+                request.target.edit_scope,
+                key,
+                value,
+            );
+            return .{ .preserve_selection = true };
         },
         .set_foreground => |change| {
             const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
             if (item.kind != .textbox) return error.ItemHasNoForegroundColor;
+            if (item.locked) return error.StudioItemLocked;
             var color_buffer: [9]u8 = undefined;
             const color = colorLiteral(&color_buffer, studio.paletteColor(change.color));
             try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "color", color);
+            return .{ .preserve_selection = true };
+        },
+        .set_custom_foreground => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .textbox) return error.ItemHasNoForegroundColor;
+            if (item.locked) return error.StudioItemLocked;
+            var color_buffer: [9]u8 = undefined;
+            const color = try canonicalStudioColor(prompted_text orelse return error.StudioPromptMissing, &color_buffer);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "color", color);
+            return .{ .preserve_selection = true };
         },
         .set_background => |change| {
             const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind == .background) return error.ItemHasNoBackgroundColor;
+            if (item.locked) return error.StudioItemLocked;
             var color_buffer: [9]u8 = undefined;
             const color = colorLiteral(&color_buffer, studio.paletteColor(change.color));
             try applyStudioLiteralAttribute(
@@ -3132,10 +3354,41 @@ fn applyStudioSemanticEdit(
                 "bg",
                 color,
             );
+            return .{ .preserve_selection = true };
+        },
+        .set_custom_background => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind == .background) return error.ItemHasNoBackgroundColor;
+            if (item.locked) return error.StudioItemLocked;
+            var color_buffer: [9]u8 = undefined;
+            const color = try canonicalStudioColor(prompted_text orelse return error.StudioPromptMissing, &color_buffer);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "bg", color);
+            return .{ .preserve_selection = true };
+        },
+        .set_font_size => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .textbox) return error.ItemHasNoFontSize;
+            if (item.locked) return error.StudioItemLocked;
+            var value_buffer: [32]u8 = undefined;
+            const value = try canonicalStudioFontSize(prompted_text orelse return error.StudioPromptMissing, &value_buffer);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "fontsize", value);
+            return .{ .preserve_selection = true };
+        },
+        .set_opacity => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind == .background) return error.ItemHasNoOpacity;
+            if (item.locked) return error.StudioItemLocked;
+            var value_buffer: [64]u8 = undefined;
+            const value = try canonicalStudioOpacity(prompted_text orelse return error.StudioPromptMissing, &value_buffer);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "opacity", value);
+            return .{ .preserve_selection = true };
         },
         .clear_background => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind == .background) return error.ItemHasNoBackgroundColor;
+            if (item.locked) return error.StudioItemLocked;
             try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "bg", "none");
+            return .{ .preserve_selection = true };
         },
         .reorder_items => |layer| {
             if (layer.count == 0 or layer.count > studio.max_selection_items) return error.InvalidStudioLayerBatch;

@@ -23,6 +23,33 @@ pub const default_grid_spacing: f32 = 20;
 pub const marquee_drag_threshold_screen: f32 = 3;
 pub const max_selection_items: usize = 64;
 
+/// Studio typography has a deliberate 14 px floor at the reference 1280x720
+/// viewport. Controls scale up to 2x on large/full-screen displays, but never
+/// shrink into the hard-to-read 10-12 px labels used by the first prototype.
+pub const UiTypography = struct {
+    pub const minimum: i32 = 14;
+    pub const compact: i32 = 14;
+    pub const body: i32 = 16;
+    pub const heading: i32 = 18;
+    pub const status_heading: i32 = 20;
+};
+
+pub fn uiScale(viewport: Viewport) f32 {
+    if (!viewport.valid()) return 1;
+    const reference_width: f32 = 1280;
+    const reference_height: f32 = 720;
+    return std.math.clamp(
+        @min(viewport.slide_size.x / reference_width, viewport.slide_size.y / reference_height),
+        1,
+        2,
+    );
+}
+
+fn scaledUiFont(scale: f32, base_size: i32) i32 {
+    const scaled: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(base_size)) * scale));
+    return @max(UiTypography.minimum, scaled);
+}
+
 pub const SourceRef = slides.SourceRef;
 pub const SourceScope = slides.SourceScope;
 
@@ -734,6 +761,22 @@ pub const ColorCommand = struct {
     color: PaletteColor,
 };
 
+/// One scalar geometry value to edit through a precise numeric prompt. The
+/// request intentionally carries no value: Studio owns the hit target and
+/// edit destination, while the integration layer owns text entry, validation,
+/// and the eventual atomic source patch.
+pub const GeometryField = enum {
+    x,
+    y,
+    width,
+    height,
+};
+
+pub const NumericGeometryRequest = struct {
+    target: CommandTarget,
+    field: GeometryField,
+};
+
 pub const MorphSceneCommand = struct {
     /// null selects the authored base scene; otherwise this is a zero-based
     /// morph-state index.
@@ -804,8 +847,13 @@ pub const SemanticCommand = union(enum) {
     delete_item: CommandTarget,
     delete_items: ItemBatchCommand,
     edit_text: CommandTarget,
+    edit_numeric_geometry: NumericGeometryRequest,
     set_foreground: ColorCommand,
+    set_custom_foreground: CommandTarget,
     set_background: ColorCommand,
+    set_custom_background: CommandTarget,
+    set_font_size: CommandTarget,
+    set_opacity: CommandTarget,
     /// Removes an item's authored fill (`bg=none`). This remains a distinct
     /// intention so integrations never have to overload a palette color.
     clear_background: CommandTarget,
@@ -838,7 +886,17 @@ pub const SemanticCommand = union(enum) {
 
 /// Stable hit targets shared by drawing, mouse handling, and tests. Keeping
 /// this layout in logical UI code also makes a future alternate frontend easy.
+const empty_ui_rectangle: rl.Rectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+
 pub const UiLayout = struct {
+    /// Scale applied to panel metrics and typography for this viewport.
+    scale: f32 = 1,
+    /// Denser vertical reflow used when the viewport cannot fit the full
+    /// property rhythm above the status panel. Font sizes retain their floor.
+    compact_properties: bool = false,
+    /// Very short letterboxed viewports retain creation/precise properties
+    /// and lock, while hiding lower layout groups that cannot fit safely.
+    minimal_properties: bool = false,
     toolbar: rl.Rectangle,
     tool_buttons: [6]rl.Rectangle,
     new_slide: rl.Rectangle,
@@ -851,9 +909,14 @@ pub const UiLayout = struct {
     duplicate_item: rl.Rectangle,
     delete_item: rl.Rectangle,
     promote: rl.Rectangle,
+    geometry_fields: [4]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 4,
     foreground_swatches: [palette.len]rl.Rectangle,
+    custom_foreground: rl.Rectangle = empty_ui_rectangle,
     background_swatches: [palette.len]rl.Rectangle,
+    custom_background: rl.Rectangle = empty_ui_rectangle,
     clear_background: rl.Rectangle,
+    font_size: rl.Rectangle = empty_ui_rectangle,
+    opacity: rl.Rectangle = empty_ui_rectangle,
     align_buttons: [6]rl.Rectangle,
     distribute_buttons: [2]rl.Rectangle,
     layer_buttons: [4]rl.Rectangle,
@@ -1045,12 +1108,13 @@ fn rowsThatFit(height: f32, row_height: f32, gap: f32) usize {
 }
 
 pub fn uiLayout(viewport: Viewport) UiLayout {
-    const margin: f32 = 12;
-    const gap: f32 = 6;
-    const tool_size: f32 = 42;
-    const new_slide_width: f32 = 74;
-    const grid_width: f32 = 58;
-    const scene_width: f32 = 132;
+    const scale = uiScale(viewport);
+    const margin: f32 = 12 * scale;
+    const gap: f32 = 8 * scale;
+    const tool_size: f32 = 46 * scale;
+    const new_slide_width: f32 = 82 * scale;
+    const grid_width: f32 = 66 * scale;
+    const scene_width: f32 = 150 * scale;
     const toolbar_width = margin * 2 + tool_size * 6 + gap * 5 + gap + new_slide_width + gap + grid_width + gap + scene_width;
     const toolbar: rl.Rectangle = .{
         .x = viewport.slide_top_left.x + margin,
@@ -1080,91 +1144,150 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     const scene_previous: rl.Rectangle = .{
         .x = grid_toggle.x + grid_toggle.width + gap,
         .y = new_slide.y,
-        .width = 26,
+        .width = 32 * scale,
         .height = tool_size,
     };
     const scene_label: rl.Rectangle = .{
         .x = scene_previous.x + scene_previous.width,
         .y = new_slide.y,
-        .width = scene_width - 52,
+        .width = scene_width - 64 * scale,
         .height = tool_size,
     };
     const scene_next: rl.Rectangle = .{
         .x = scene_label.x + scene_label.width,
         .y = new_slide.y,
-        .width = 26,
+        .width = 32 * scale,
         .height = tool_size,
     };
 
-    const property_width: f32 = 264;
-    const properties: rl.Rectangle = .{
+    const property_width: f32 = 304 * scale;
+    var properties: rl.Rectangle = .{
         .x = viewport.slide_top_left.x + viewport.slide_size.x - property_width - margin,
         .y = viewport.slide_top_left.y + margin,
         .width = property_width,
-        .height = 400,
+        .height = 558 * scale,
     };
-    const action_y = properties.y + 38;
-    const action_gap: f32 = 4;
-    const action_width: f32 = 54;
-    const edit_text: rl.Rectangle = .{ .x = properties.x + 12, .y = action_y, .width = action_width, .height = 30 };
-    const duplicate_item: rl.Rectangle = .{ .x = edit_text.x + action_width + action_gap, .y = action_y, .width = action_width, .height = 30 };
-    const delete_item: rl.Rectangle = .{ .x = duplicate_item.x + action_width + action_gap, .y = action_y, .width = action_width, .height = 30 };
-    const promote: rl.Rectangle = .{ .x = delete_item.x + action_width + action_gap, .y = action_y, .width = action_width, .height = 30 };
+    properties.height = @min(properties.height, @max(0, statusPanel(viewport).y - gap - properties.y));
+    const compact_properties = properties.height < 520 * scale;
+    const minimal_properties = properties.height < 400 * scale;
+    const inset = 12 * scale;
+    const inner_width = properties.width - inset * 2;
+    const action_y = properties.y + @as(f32, if (compact_properties) 36 else 42) * scale;
+    const action_gap: f32 = 6 * scale;
+    const action_width = (inner_width - action_gap * 3) / 4;
+    const action_height: f32 = @as(f32, if (compact_properties) 34 else 36) * scale;
+    const edit_text: rl.Rectangle = .{ .x = properties.x + inset, .y = action_y, .width = action_width, .height = action_height };
+    const duplicate_item: rl.Rectangle = .{ .x = edit_text.x + action_width + action_gap, .y = action_y, .width = action_width, .height = action_height };
+    const delete_item: rl.Rectangle = .{ .x = duplicate_item.x + action_width + action_gap, .y = action_y, .width = action_width, .height = action_height };
+    const promote: rl.Rectangle = .{ .x = delete_item.x + action_width + action_gap, .y = action_y, .width = action_width, .height = action_height };
+
+    var geometry_fields: [4]rl.Rectangle = undefined;
+    const geometry_gap: f32 = 6 * scale;
+    const geometry_width = if (compact_properties)
+        (inner_width - geometry_gap * 3) / 4
+    else
+        (inner_width - geometry_gap) / 2;
+    for (&geometry_fields, 0..) |*button, index| button.* = .{
+        .x = properties.x + inset + @as(f32, @floatFromInt(if (compact_properties) index else index % 2)) * (geometry_width + geometry_gap),
+        .y = properties.y + @as(f32, if (compact_properties)
+            94
+        else
+            108 + @as(f32, @floatFromInt(index / 2)) * 40) * scale,
+        .width = geometry_width,
+        .height = @as(f32, if (compact_properties) 34 else 36) * scale,
+    };
 
     var foreground_swatches: [palette.len]rl.Rectangle = undefined;
     var background_swatches: [palette.len]rl.Rectangle = undefined;
-    const swatch_size: f32 = 24;
+    const swatch_size: f32 = @as(f32, if (compact_properties) 24 else 26) * scale;
+    const swatch_gap = (inner_width - swatch_size * @as(f32, @floatFromInt(palette.len))) /
+        @as(f32, @floatFromInt(palette.len - 1));
     for (&foreground_swatches, 0..) |*swatch, index| swatch.* = .{
-        .x = properties.x + 12 + @as(f32, @floatFromInt(index)) * (swatch_size + gap),
-        .y = properties.y + 105,
+        .x = properties.x + inset + @as(f32, @floatFromInt(index)) * (swatch_size + swatch_gap),
+        .y = properties.y + @as(f32, if (compact_properties) 160 else 220) * scale,
         .width = swatch_size,
         .height = swatch_size,
     };
     for (&background_swatches, 0..) |*swatch, index| swatch.* = .{
-        .x = properties.x + 12 + @as(f32, @floatFromInt(index)) * (swatch_size + gap),
-        .y = properties.y + 169,
+        .x = properties.x + inset + @as(f32, @floatFromInt(index)) * (swatch_size + swatch_gap),
+        .y = properties.y + @as(f32, if (compact_properties) 218 else 282) * scale,
         .width = swatch_size,
         .height = swatch_size,
     };
+    const custom_foreground: rl.Rectangle = .{
+        .x = properties.x + properties.width - inset - 84 * scale,
+        .y = properties.y + @as(f32, if (compact_properties) 132 else 188) * scale,
+        .width = 84 * scale,
+        .height = @as(f32, if (compact_properties) 26 else 30) * scale,
+    };
+    const custom_background: rl.Rectangle = .{
+        .x = custom_foreground.x,
+        .y = properties.y + @as(f32, if (compact_properties) 190 else 250) * scale,
+        .width = custom_foreground.width,
+        .height = custom_foreground.height,
+    };
     const clear_background: rl.Rectangle = .{
-        .x = properties.x + properties.width - 66,
-        .y = properties.y + 140,
-        .width = 54,
-        .height = 22,
+        .x = custom_background.x - 6 * scale - 58 * scale,
+        .y = custom_background.y,
+        .width = 58 * scale,
+        .height = custom_background.height,
     };
+
+    const scalar_gap: f32 = 8 * scale;
+    const scalar_width = if (minimal_properties)
+        (inner_width - scalar_gap * 2) / 3
+    else
+        (inner_width - scalar_gap) / 2;
+    const font_size: rl.Rectangle = .{
+        .x = properties.x + inset,
+        .y = properties.y + @as(f32, if (compact_properties) 270 else 334) * scale,
+        .width = scalar_width,
+        .height = @as(f32, if (compact_properties) 34 else 36) * scale,
+    };
+    const opacity: rl.Rectangle = .{
+        .x = font_size.x + scalar_width + scalar_gap,
+        .y = font_size.y,
+        .width = scalar_width,
+        .height = font_size.height,
+    };
+
     var align_buttons: [6]rl.Rectangle = undefined;
-    const align_gap: f32 = 4;
-    const align_width = (properties.width - 24 - align_gap * 5) / 6;
+    const align_gap: f32 = 5 * scale;
+    const align_width = (inner_width - align_gap * 5) / 6;
     for (&align_buttons, 0..) |*button, index| button.* = .{
-        .x = properties.x + 12 + @as(f32, @floatFromInt(index)) * (align_width + align_gap),
-        .y = properties.y + 232,
-        .width = align_width,
-        .height = 28,
+        .x = if (minimal_properties) properties.x else properties.x + inset + @as(f32, @floatFromInt(index)) * (align_width + align_gap),
+        .y = if (minimal_properties) properties.y else properties.y + @as(f32, if (compact_properties) 330 else 396) * scale,
+        .width = if (minimal_properties) 0 else align_width,
+        .height = if (minimal_properties) 0 else @as(f32, if (compact_properties) 32 else 34) * scale,
     };
-    const distribute_y = properties.y + 284;
-    const distribute_gap: f32 = 6;
-    const distribute_width = (properties.width - 24 - distribute_gap) / 2;
+    const distribute_y = properties.y + @as(f32, if (compact_properties) 388 else 456) * scale;
+    const distribute_gap: f32 = 8 * scale;
+    const distribute_width = (inner_width - distribute_gap) / 2;
     const distribute_buttons = [2]rl.Rectangle{
-        .{ .x = properties.x + 12, .y = distribute_y, .width = distribute_width, .height = 28 },
-        .{ .x = properties.x + 12 + distribute_width + distribute_gap, .y = distribute_y, .width = distribute_width, .height = 28 },
+        .{ .x = if (minimal_properties) properties.x else properties.x + inset, .y = if (minimal_properties) properties.y else distribute_y, .width = if (minimal_properties) 0 else distribute_width, .height = if (minimal_properties) 0 else @as(f32, if (compact_properties) 32 else 34) * scale },
+        .{ .x = if (minimal_properties) properties.x else properties.x + inset + distribute_width + distribute_gap, .y = if (minimal_properties) properties.y else distribute_y, .width = if (minimal_properties) 0 else distribute_width, .height = if (minimal_properties) 0 else @as(f32, if (compact_properties) 32 else 34) * scale },
     };
     var layer_buttons: [4]rl.Rectangle = undefined;
-    const layer_y = properties.y + 354;
-    const layer_width: f32 = 40;
-    const layer_gap: f32 = 4;
+    const layer_y = properties.y + @as(f32, if (compact_properties) 423 else 520) * scale;
+    const layer_gap: f32 = 5 * scale;
+    const lock_width: f32 = 68 * scale;
+    const layer_width = (inner_width - lock_width - 10 * scale - layer_gap * 3) / 4;
     for (&layer_buttons, 0..) |*button, index| button.* = .{
-        .x = properties.x + 12 + @as(f32, @floatFromInt(index)) * (layer_width + layer_gap),
-        .y = layer_y,
-        .width = layer_width,
-        .height = 28,
+        .x = if (minimal_properties) properties.x else properties.x + inset + @as(f32, @floatFromInt(index)) * (layer_width + layer_gap),
+        .y = if (minimal_properties) properties.y else layer_y,
+        .width = if (minimal_properties) 0 else layer_width,
+        .height = if (minimal_properties) 0 else @as(f32, if (compact_properties) 26 else 30) * scale,
     };
     const lock_item: rl.Rectangle = .{
-        .x = properties.x + properties.width - 72,
-        .y = layer_y,
-        .width = 60,
-        .height = 28,
+        .x = if (minimal_properties) opacity.x + scalar_width + scalar_gap else properties.x + properties.width - inset - lock_width,
+        .y = if (minimal_properties) font_size.y else layer_y,
+        .width = if (minimal_properties) scalar_width else lock_width,
+        .height = if (minimal_properties) font_size.height else @as(f32, if (compact_properties) 26 else 30) * scale,
     };
     return .{
+        .scale = scale,
+        .compact_properties = compact_properties,
+        .minimal_properties = minimal_properties,
         .toolbar = toolbar,
         .tool_buttons = tool_buttons,
         .new_slide = new_slide,
@@ -1177,9 +1300,14 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .duplicate_item = duplicate_item,
         .delete_item = delete_item,
         .promote = promote,
+        .geometry_fields = geometry_fields,
         .foreground_swatches = foreground_swatches,
+        .custom_foreground = custom_foreground,
         .background_swatches = background_swatches,
+        .custom_background = custom_background,
         .clear_background = clear_background,
+        .font_size = font_size,
+        .opacity = opacity,
         .align_buttons = align_buttons,
         .distribute_buttons = distribute_buttons,
         .layer_buttons = layer_buttons,
@@ -1188,11 +1316,13 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
 }
 
 fn statusPanel(viewport: Viewport) rl.Rectangle {
-    const panel_height: f32 = 103;
+    const scale = uiScale(viewport);
+    const margin = 12 * scale;
+    const panel_height: f32 = 116 * scale;
     return .{
-        .x = viewport.slide_top_left.x + 12,
-        .y = viewport.slide_top_left.y + viewport.slide_size.y - panel_height - 12,
-        .width = @max(340, @min(900, viewport.slide_size.x - 24)),
+        .x = viewport.slide_top_left.x + margin,
+        .y = viewport.slide_top_left.y + viewport.slide_size.y - panel_height - margin,
+        .width = @max(340 * scale, @min(960 * scale, viewport.slide_size.x - margin * 2)),
         .height = panel_height,
     };
 }
@@ -1649,6 +1779,53 @@ pub const Studio = struct {
         }
     }
 
+    /// Rebinds one non-structural edit after source rewrite/reparse. A unique
+    /// author ID wins when present; otherwise all known provenance layers are
+    /// checked so legacy id-less direct items and customized template items
+    /// retain a continuous selection across repeated property edits.
+    pub fn selectItemByIdOrSource(
+        self: *Studio,
+        items: []const slides.SlideItem,
+        id: ?[]const u8,
+        source: slides.SourceRef,
+    ) bool {
+        var match: ?usize = null;
+        if (id) |wanted_id| {
+            var id_matches: usize = 0;
+            for (items, 0..) |item, index| {
+                const item_id = item.id orelse continue;
+                if (!std.mem.eql(u8, item_id, wanted_id)) continue;
+                id_matches += 1;
+                match = index;
+            }
+            if (id_matches != 1) match = null;
+        }
+        if (match == null and source.scope != .none) {
+            var source_matches_count: usize = 0;
+            for (items, 0..) |item, index| {
+                const source_matches = sourceEqual(item.source, source) or
+                    (item.instance_source != null and sourceEqual(item.instance_source.?, source)) or
+                    (item.state_source != null and sourceEqual(item.state_source.?, source));
+                if (!source_matches) continue;
+                source_matches_count += 1;
+                match = index;
+            }
+            if (source_matches_count != 1) match = null;
+        }
+        const index = match orelse {
+            self.clearSelectionState();
+            return false;
+        };
+        if (items[index].kind == .background) {
+            self.clearSelectionState();
+            return false;
+        }
+        self.clearSelectionState();
+        self.setSingleSelection(items[index]);
+        self.notice = .none;
+        return true;
+    }
+
     pub fn selectedGeometry(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds) ?Geometry {
         const index = self.selectedIndex(items) orelse return null;
         if (self.interaction != .idle) return self.preview;
@@ -1720,11 +1897,12 @@ pub const Studio = struct {
 
     fn lockBadgeRect(viewport: Viewport, geometry: Geometry) ?rl.Rectangle {
         const rect = geometryToScreenRect(viewport, geometry) orelse return null;
+        const scale = uiScale(viewport);
         return .{
-            .x = rect.x + 4,
-            .y = rect.y + 4,
-            .width = 48,
-            .height = 20,
+            .x = rect.x + 4 * scale,
+            .y = rect.y + 4 * scale,
+            .width = 56 * scale,
+            .height = 24 * scale,
         };
     }
 
@@ -2214,10 +2392,6 @@ pub const Studio = struct {
             self.notice = .property_unavailable;
             return true;
         }
-        if (background and self.active_morph_state != null) {
-            self.notice = .base_scene_only;
-            return true;
-        }
         const command: ColorCommand = .{
             .target = self.selectedTarget(items, edit_scope) orelse return true,
             .color = color,
@@ -2244,13 +2418,54 @@ pub const Studio = struct {
             self.notice = .locked_item;
             return true;
         }
-        if (self.active_morph_state != null) {
-            self.notice = .base_scene_only;
-            return true;
-        }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         self.pending_semantic_command = .{
             .clear_background = self.selectedTarget(items, edit_scope) orelse return true,
+        };
+        return true;
+    }
+
+    const PropertyRequestKind = union(enum) {
+        numeric_geometry: GeometryField,
+        custom_foreground,
+        custom_background,
+        font_size,
+        opacity,
+    };
+
+    fn emitPropertyRequest(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+        request: PropertyRequestKind,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        if (self.selectionCount() > 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        const applies = switch (request) {
+            .numeric_geometry, .custom_background, .opacity => item.kind != .background,
+            .custom_foreground, .font_size => item.kind == .textbox,
+        };
+        if (!applies) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
+        self.pending_semantic_command = switch (request) {
+            .numeric_geometry => |field| .{ .edit_numeric_geometry = .{ .target = target, .field = field } },
+            .custom_foreground => .{ .set_custom_foreground = target },
+            .custom_background => .{ .set_custom_background = target },
+            .font_size => .{ .set_font_size = target },
+            .opacity => .{ .set_opacity = target },
         };
         return true;
     }
@@ -2823,16 +3038,28 @@ pub const Studio = struct {
             return self.emitSelectedCommand(items, allow_shared_edit, .delete_item);
         if (pointInRectangle(pointer, layout.promote))
             return self.emitSelectedCommand(items, allow_shared_edit, .promote_to_reusable);
+        for (layout.geometry_fields, 0..) |button, index| {
+            if (pointInRectangle(pointer, button))
+                return self.emitPropertyRequest(items, allow_shared_edit, .{ .numeric_geometry = @enumFromInt(index) });
+        }
+        if (pointInRectangle(pointer, layout.custom_foreground))
+            return self.emitPropertyRequest(items, allow_shared_edit, .custom_foreground);
         for (layout.foreground_swatches, 0..) |swatch, index| {
             if (pointInRectangle(pointer, swatch))
                 return self.emitColorCommand(items, allow_shared_edit, palette[index], false);
         }
+        if (pointInRectangle(pointer, layout.custom_background))
+            return self.emitPropertyRequest(items, allow_shared_edit, .custom_background);
         for (layout.background_swatches, 0..) |swatch, index| {
             if (pointInRectangle(pointer, swatch))
                 return self.emitColorCommand(items, allow_shared_edit, palette[index], true);
         }
         if (pointInRectangle(pointer, layout.clear_background))
             return self.emitClearBackgroundCommand(items, allow_shared_edit);
+        if (pointInRectangle(pointer, layout.font_size))
+            return self.emitPropertyRequest(items, allow_shared_edit, .font_size);
+        if (pointInRectangle(pointer, layout.opacity))
+            return self.emitPropertyRequest(items, allow_shared_edit, .opacity);
         for (layout.align_buttons, 0..) |button, index| {
             if (pointInRectangle(pointer, button)) {
                 self.pending_geometry_command = self.alignSelected(
@@ -4082,7 +4309,8 @@ pub const Studio = struct {
             const badge = lockBadgeRect(viewport, itemGeometry(item, resolved_bounds)) orelse continue;
             rl.drawRectangleRec(badge, .{ .r = 111, .g = 42, .b = 57, .a = 240 });
             rl.drawRectangleLinesEx(badge, 1, .{ .r = 255, .g = 112, .b = 132, .a = 255 });
-            rl.drawText("LOCK", @intFromFloat(badge.x + 7), @intFromFloat(badge.y + 4), 11, .white);
+            const badge_font = scaledUiFont(uiScale(viewport), UiTypography.compact);
+            rl.drawText("LOCK", @intFromFloat(badge.x + 8 * uiScale(viewport)), @intFromFloat(badge.y + (badge.height - @as(f32, @floatFromInt(badge_font))) / 2), badge_font, .white);
         }
 
         if (self.interaction != .idle) {
@@ -4099,7 +4327,7 @@ pub const Studio = struct {
                         "SHARED SOURCE",
                         @intFromFloat(source_rect.x + 5),
                         @intFromFloat(source_rect.y + 5),
-                        12,
+                        scaledUiFont(uiScale(viewport), UiTypography.compact),
                         shared_accent,
                     );
                     self.drawGeometryHud(viewport, source_rect, self.drag.source_after);
@@ -4154,7 +4382,7 @@ pub const Studio = struct {
         self.drawToolbar(viewport);
         if (self.selected_identity != null) {
             const selected_locked = if (self.selectedIndex(items)) |index| items[index].locked else false;
-            self.drawProperties(viewport, selected_locked);
+            self.drawProperties(items, resolved_bounds, viewport, selected_locked);
         }
         self.drawStatus(items, resolved_bounds, viewport);
     }
@@ -4224,15 +4452,16 @@ pub const Studio = struct {
             "x {d:.1}  y {d:.1}  w {d:.1}  h {d:.1}",
             .{ geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
         ) catch return;
-        const font_size: i32 = 14;
-        const padding: f32 = 7;
+        const scale = uiScale(viewport);
+        const font_size = scaledUiFont(scale, UiTypography.body);
+        const padding: f32 = 8 * scale;
         const width: f32 = @floatFromInt(rl.measureText(text, font_size));
         const hud_width = width + padding * 2;
-        const hud_height: f32 = 28;
+        const hud_height: f32 = 32 * scale;
         const rect = geometryHudRectangle(viewport, item_rect, hud_width, hud_height);
         rl.drawRectangleRec(rect, .{ .r = 12, .g = 16, .b = 28, .a = 238 });
         rl.drawRectangleLinesEx(rect, 1, .{ .r = 255, .g = 92, .b = 198, .a = 220 });
-        rl.drawText(text, @intFromFloat(rect.x + padding), @intFromFloat(rect.y + 7), font_size, .white);
+        rl.drawText(text, @intFromFloat(rect.x + padding), @intFromFloat(rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2), font_size, .white);
     }
 
     fn geometryHudRectangle(viewport: Viewport, item_rect: rl.Rectangle, hud_width: f32, hud_height: f32) rl.Rectangle {
@@ -4292,7 +4521,14 @@ pub const Studio = struct {
         if (!self.enabled or !workspace.visible) return;
         const layout = workspaceLayout(viewport);
         if (layout.sidebar.height < workspace_min_height) return;
-        rl.drawText("SLIDES", @intFromFloat(layout.organizer.x + 12), @intFromFloat(layout.organizer.y + 10), 15, .white);
+        // Sidebar rows have fixed logical heights, so they scale more
+        // conservatively than the canvas controls while still remaining
+        // readable from a distance on large external displays.
+        const font_scale = @min(uiScale(viewport), @as(f32, 1.4));
+        const heading_font = scaledUiFont(font_scale, UiTypography.heading);
+        const body_font = scaledUiFont(font_scale, UiTypography.body);
+        const compact_font = scaledUiFont(font_scale, UiTypography.compact);
+        rl.drawText("SLIDES", @intFromFloat(layout.organizer.x + 12), @intFromFloat(layout.organizer.y + 9), heading_font, .white);
         const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down", "Tpl" };
         for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(button, label);
         drawCompactButton(layout.slide_page_previous, "Prev");
@@ -4315,20 +4551,20 @@ pub const Studio = struct {
             const text_x = preview.x + preview.width + 9;
             var line_buffer: [96]u8 = undefined;
             const slide_number = std.fmt.bufPrintZ(&line_buffer, "SLIDE {d}", .{summary.index + 1}) catch "SLIDE";
-            rl.drawText(slide_number, @intFromFloat(text_x), @intFromFloat(card.y + 9), 12, if (active) border else .white);
+            rl.drawText(slide_number, @intFromFloat(text_x), @intFromFloat(card.y + 7), compact_font, if (active) border else .white);
             var title_buffer: [96]u8 = undefined;
             const title = textForDraw(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title);
-            rl.drawText(title, @intFromFloat(text_x), @intFromFloat(card.y + 30), 14, .white);
+            rl.drawText(title, @intFromFloat(text_x), @intFromFloat(card.y + 28), body_font, .white);
             var metadata_buffer: [96]u8 = undefined;
             const metadata = std.fmt.bufPrintZ(
                 &metadata_buffer,
                 "{d} items · {d} states",
                 .{ summary.item_count, summary.morph_count },
             ) catch "slide details";
-            rl.drawText(metadata, @intFromFloat(text_x), @intFromFloat(card.y + 57), 11, .{ .r = 168, .g = 179, .b = 198, .a = 255 });
+            rl.drawText(metadata, @intFromFloat(text_x), @intFromFloat(card.y + 57), compact_font, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
         }
 
-        rl.drawText("LIBRARY", @intFromFloat(layout.library.x + 12), @intFromFloat(layout.library.y + 10), 15, .white);
+        rl.drawText("LIBRARY", @intFromFloat(layout.library.x + 12), @intFromFloat(layout.library.y + 9), heading_font, .white);
         drawCompactButton(layout.library_use, "Use");
         drawCompactButton(layout.library_rename, "Ren");
         drawCompactButton(layout.library_delete, "Del");
@@ -4355,8 +4591,8 @@ pub const Studio = struct {
                 .{ .r = 116, .g = 83, .b = 160, .a = if (entry.available) 255 else 100 });
             var name_buffer: [128]u8 = undefined;
             const name = textForDraw(&name_buffer, entry.name);
-            rl.drawText(badge, @intFromFloat(badge_rect.x + 7), @intFromFloat(badge_rect.y + 7), 11, .white);
-            rl.drawText(name, @intFromFloat(row.x + 64), @intFromFloat(row.y + 8), 14, if (entry.available)
+            rl.drawText(badge, @intFromFloat(badge_rect.x + 6), @intFromFloat(badge_rect.y + (badge_rect.height - @as(f32, @floatFromInt(compact_font))) / 2), compact_font, .white);
+            rl.drawText(name, @intFromFloat(row.x + 64), @intFromFloat(row.y + 6), body_font, if (entry.available)
                 .white
             else
                 .{ .r = 130, .g = 136, .b = 149, .a = 255 });
@@ -4365,7 +4601,7 @@ pub const Studio = struct {
                 "unused"
             else
                 std.fmt.bufPrintZ(&usage_buffer, "{d} use{s}", .{ entry.use_count, if (entry.use_count == 1) "" else "s" }) catch "used";
-            rl.drawText(usage, @intFromFloat(row.x + 64), @intFromFloat(row.y + 27), 10, if (entry.deletable)
+            rl.drawText(usage, @intFromFloat(row.x + 64), @intFromFloat(row.y + 27), compact_font, if (entry.deletable)
                 .{ .r = 126, .g = 231, .b = 177, .a = 255 }
             else
                 .{ .r = 168, .g = 179, .b = 198, .a = 255 });
@@ -4374,6 +4610,8 @@ pub const Studio = struct {
 
     fn drawToolbar(self: Studio, viewport: Viewport) void {
         const layout = uiLayout(viewport);
+        const body_font = scaledUiFont(layout.scale, UiTypography.body);
+        const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
         drawStudioPanel(layout.toolbar);
         const tools = [_]Tool{ .select, .add_text, .add_bullets, .add_image, .add_shape, .add_reusable };
         for (layout.tool_buttons, tools) |button, tool| {
@@ -4387,12 +4625,12 @@ pub const Studio = struct {
             else
                 .{ .r = 115, .g = 128, .b = 150, .a = 200 });
             const label = toolLabel(tool);
-            const font_size: i32 = 15;
+            const font_size = body_font;
             const width = rl.measureText(label, font_size);
             rl.drawText(
                 label,
                 @intFromFloat(button.x + (button.width - @as(f32, @floatFromInt(width))) / 2),
-                @intFromFloat(button.y + 13),
+                @intFromFloat(button.y + (button.height - @as(f32, @floatFromInt(font_size))) / 2),
                 font_size,
                 .white,
             );
@@ -4407,12 +4645,12 @@ pub const Studio = struct {
         else
             .{ .r = 115, .g = 128, .b = 150, .a = 200 });
         const grid_label: [:0]const u8 = if (self.grid_snapping) "GRID ON" else "GRID";
-        const grid_label_width = rl.measureText(grid_label, 11);
+        const grid_label_width = rl.measureText(grid_label, compact_font);
         rl.drawText(
             grid_label,
             @intFromFloat(layout.grid_toggle.x + (layout.grid_toggle.width - @as(f32, @floatFromInt(grid_label_width))) / 2),
-            @intFromFloat(layout.grid_toggle.y + 15),
-            11,
+            @intFromFloat(layout.grid_toggle.y + (layout.grid_toggle.height - @as(f32, @floatFromInt(compact_font))) / 2),
+            compact_font,
             .white,
         );
         drawActionButton(layout.scene_previous, "<");
@@ -4425,39 +4663,110 @@ pub const Studio = struct {
         drawActionButton(layout.scene_next, ">");
     }
 
-    fn drawProperties(self: Studio, viewport: Viewport, selected_locked: bool) void {
+    fn drawProperties(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        selected_locked: bool,
+    ) void {
         const layout = uiLayout(viewport);
+        const heading_font = scaledUiFont(layout.scale, UiTypography.heading);
+        const body_font = scaledUiFont(layout.scale, UiTypography.body);
+        const secondary: rl.Color = .{ .r = 205, .g = 214, .b = 230, .a = 255 };
         drawStudioPanel(layout.properties);
-        rl.drawText("PROPERTIES", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 11), 15, .white);
+        rl.drawText("PROPERTIES", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + 11 * layout.scale), heading_font, .white);
         drawActionButton(layout.edit_text, "Text");
         drawActionButton(layout.duplicate_item, "Dup");
         drawActionButton(layout.delete_item, "Del");
         drawActionButton(layout.promote, "Reuse");
-        rl.drawText("FOREGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 82), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
-        drawSwatches(layout.foreground_swatches);
-        rl.drawText("BACKGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 146), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+
+        const selected_item: ?slides.SlideItem = if (self.selectionCount() == 1)
+            if (self.selectedIndex(items)) |index| items[index] else null
+        else
+            null;
+        const selected_geometry: ?Geometry = if (selected_item != null)
+            itemGeometry(selected_item.?, resolved_bounds)
+        else
+            null;
+        rl.drawText("GEOMETRY", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 75 else 85) * layout.scale), body_font, secondary);
+        var geometry_buffers: [4][32]u8 = undefined;
+        const geometry_fallbacks = [_][:0]const u8{ "X --", "Y --", "W --", "H --" };
+        for (layout.geometry_fields, 0..) |button, index| {
+            const label = if (selected_geometry) |geometry| blk: {
+                const value = switch (@as(GeometryField, @enumFromInt(index))) {
+                    .x => geometry.position.x,
+                    .y => geometry.position.y,
+                    .width => geometry.size.x,
+                    .height => geometry.size.y,
+                };
+                const prefix: []const u8 = switch (@as(GeometryField, @enumFromInt(index))) {
+                    .x => "X",
+                    .y => "Y",
+                    .width => "W",
+                    .height => "H",
+                };
+                break :blk if (layout.compact_properties)
+                    std.fmt.bufPrintZ(&geometry_buffers[index], "{s} {d:.0}", .{ prefix, value }) catch geometry_fallbacks[index]
+                else
+                    std.fmt.bufPrintZ(&geometry_buffers[index], "{s} {d:.1}", .{ prefix, value }) catch geometry_fallbacks[index];
+            } else geometry_fallbacks[index];
+            drawActionButton(button, label);
+        }
+
+        rl.drawText("FOREGROUND", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 135 else 193) * layout.scale), body_font, secondary);
+        drawCompactButton(layout.custom_foreground, "Custom");
+        drawSwatches(layout.foreground_swatches, if (selected_item) |item| item.color else null);
+        rl.drawText("BACKGROUND", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 193 else 255) * layout.scale), body_font, secondary);
         drawCompactButton(layout.clear_background, "None");
-        drawSwatches(layout.background_swatches);
-        rl.drawText(
-            if (self.selectionCount() > 1) "ALIGN TO SELECTION" else "ALIGN TO SLIDE",
-            @intFromFloat(layout.properties.x + 12),
-            @intFromFloat(layout.properties.y + 210),
-            12,
-            .{ .r = 185, .g = 196, .b = 215, .a = 255 },
-        );
-        const align_labels = [_][:0]const u8{ "L", "HC", "R", "T", "VC", "B" };
-        for (layout.align_buttons, align_labels) |button, label| drawCompactButton(button, label);
-        rl.drawText("DISTRIBUTE", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 266), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
-        const distribute_labels = [_][:0]const u8{ "H EQUAL GAP", "V EQUAL GAP" };
-        for (layout.distribute_buttons, distribute_labels) |button, label| drawCompactButton(button, label);
-        rl.drawText("LAYER", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 332), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
-        const layer_labels = [_][:0]const u8{ "Back", "Down", "Up", "Front" };
-        for (layout.layer_buttons, layer_labels) |button, label| drawCompactButton(button, label);
+        drawCompactButton(layout.custom_background, "Custom");
+        drawSwatches(layout.background_swatches, if (selected_item) |item| item.background_color else null);
+
+        rl.drawText("TYPE & OPACITY", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 251 else 315) * layout.scale), body_font, secondary);
+        var font_buffer: [32]u8 = undefined;
+        const font_label: [:0]const u8 = if (selected_item) |item|
+            if (item.kind == .textbox and item.fontSize != null)
+                std.fmt.bufPrintZ(&font_buffer, "Font {d}", .{item.fontSize.?}) catch "Font"
+            else
+                "Font --"
+        else
+            "Font --";
+        drawActionButton(layout.font_size, font_label);
+        var opacity_buffer: [32]u8 = undefined;
+        const opacity_label: [:0]const u8 = if (selected_item) |item|
+            if (layout.minimal_properties)
+                std.fmt.bufPrintZ(&opacity_buffer, "Op {d:.0}%", .{item.opacity * 100}) catch "Opacity"
+            else
+                std.fmt.bufPrintZ(&opacity_buffer, "Opacity {d:.0}%", .{item.opacity * 100}) catch "Opacity"
+        else if (layout.minimal_properties) "Op --" else "Opacity --";
+        drawActionButton(layout.opacity, opacity_label);
+
+        if (!layout.minimal_properties) {
+            rl.drawText(
+                if (self.selectionCount() > 1) "ALIGN TO SELECTION" else "ALIGN TO SLIDE",
+                @intFromFloat(layout.properties.x + 12 * layout.scale),
+                @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 311 else 377) * layout.scale),
+                body_font,
+                secondary,
+            );
+            const align_labels = [_][:0]const u8{ "L", "HC", "R", "T", "VC", "B" };
+            for (layout.align_buttons, align_labels) |button, label| drawCompactButton(button, label);
+            rl.drawText("DISTRIBUTE", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + @as(f32, if (layout.compact_properties) 369 else 437) * layout.scale), body_font, secondary);
+            const distribute_labels = [_][:0]const u8{ "H EQUAL GAP", "V EQUAL GAP" };
+            for (layout.distribute_buttons, distribute_labels) |button, label| drawCompactButton(button, label);
+            if (!layout.compact_properties)
+                rl.drawText("LAYER", @intFromFloat(layout.properties.x + 12 * layout.scale), @intFromFloat(layout.properties.y + 499 * layout.scale), body_font, secondary);
+            const layer_labels = [_][:0]const u8{ "Back", "Down", "Up", "Front" };
+            for (layout.layer_buttons, layer_labels) |button, label| drawCompactButton(button, label);
+        }
         drawCompactButton(layout.lock_item, if (selected_locked) "Unlock" else "Lock");
     }
 
     fn drawStatus(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
         const panel = statusPanel(viewport);
+        const scale = uiScale(viewport);
+        const heading_font = scaledUiFont(scale, UiTypography.status_heading);
+        const body_font = scaledUiFont(scale, UiTypography.body);
         rl.drawRectangleRec(panel, .{ .r = 10, .g = 14, .b = 24, .a = 225 });
         rl.drawRectangleLinesEx(panel, 1, .{ .r = 80, .g = 215, .b = 255, .a = 180 });
 
@@ -4481,22 +4790,22 @@ pub const Studio = struct {
             ) catch "STUDIO · selected item";
         } else if (self.dirty) "STUDIO * · click an item to select it" else "STUDIO · click an item to select it";
 
-        rl.drawText(status_text, @intFromFloat(panel.x + 12), @intFromFloat(panel.y + 9), 18, .white);
+        rl.drawText(status_text, @intFromFloat(panel.x + 12 * scale), @intFromFloat(panel.y + 9 * scale), heading_font, .white);
         rl.drawText(
             if (self.grid_snapping)
                 "GRID ON · G toggle · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap"
             else
                 "G grid · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap · [ ] morph scenes",
-            @intFromFloat(panel.x + 12),
-            @intFromFloat(panel.y + 35),
-            14,
+            @intFromFloat(panel.x + 12 * scale),
+            @intFromFloat(panel.y + 39 * scale),
+            body_font,
             .{ .r = 185, .g = 196, .b = 215, .a = 255 },
         );
         rl.drawText(
             "Cmd/Ctrl-S save  ·  Shift-Cmd/Ctrl-S save copy  ·  Cmd/Ctrl-Z undo  ·  Shift-Cmd/Ctrl-Z redo",
-            @intFromFloat(panel.x + 12),
-            @intFromFloat(panel.y + 55),
-            14,
+            @intFromFloat(panel.x + 12 * scale),
+            @intFromFloat(panel.y + 64 * scale),
+            body_font,
             .{ .r = 185, .g = 196, .b = 215, .a = 255 },
         );
         const notice_text: ?[:0]const u8 = switch (self.notice) {
@@ -4534,7 +4843,7 @@ pub const Studio = struct {
                 .saved, .copy_saved => .{ .r = 126, .g = 231, .b = 177, .a = 255 },
                 else => .{ .r = 255, .g = 145, .b = 132, .a = 255 },
             };
-            rl.drawText(message, @intFromFloat(panel.x + 12), @intFromFloat(panel.y + 75), 14, notice_color);
+            rl.drawText(message, @intFromFloat(panel.x + 12 * scale), @intFromFloat(panel.y + 89 * scale), body_font, notice_color);
         }
     }
 };
@@ -4556,23 +4865,25 @@ fn drawStudioPanel(rect: rl.Rectangle) void {
 }
 
 fn drawActionButton(rect: rl.Rectangle, label: [:0]const u8) void {
+    if (rect.width <= 0 or rect.height <= 0) return;
     rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 115, .g = 128, .b = 150, .a = 200 });
-    const font_size: i32 = 13;
+    const font_size: i32 = @max(UiTypography.body, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
     const width = rl.measureText(label, font_size);
     rl.drawText(
         label,
         @intFromFloat(rect.x + (rect.width - @as(f32, @floatFromInt(width))) / 2),
-        @intFromFloat(rect.y + 8),
+        @intFromFloat(rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2),
         font_size,
         .white,
     );
 }
 
 fn drawCompactButton(rect: rl.Rectangle, label: [:0]const u8) void {
+    if (rect.width <= 0 or rect.height <= 0) return;
     rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 105, .g = 120, .b = 143, .a = 210 });
-    const font_size: i32 = 11;
+    const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
     const width = rl.measureText(label, font_size);
     rl.drawText(
         label,
@@ -4598,15 +4909,25 @@ fn textForDraw(buffer: []u8, value: []const u8) [:0]const u8 {
     return buffer[0 .. end + 3 :0];
 }
 
-fn drawSwatches(rects: [palette.len]rl.Rectangle) void {
+fn drawSwatches(rects: [palette.len]rl.Rectangle, current: ?rl.Color) void {
     for (rects, palette) |rect, value| {
-        rl.drawRectangleRec(rect, paletteColor(value));
-        rl.drawRectangleLinesEx(rect, 1, .{ .r = 225, .g = 231, .b = 240, .a = 210 });
+        const color = paletteColor(value);
+        rl.drawRectangleRec(rect, color);
+        const selected = if (current) |selected_color|
+            selected_color.r == color.r and selected_color.g == color.g and selected_color.b == color.b and selected_color.a == color.a
+        else
+            false;
+        rl.drawRectangleLinesEx(
+            rect,
+            if (selected) 3 else 1,
+            if (selected) .{ .r = 80, .g = 215, .b = 255, .a = 255 } else .{ .r = 225, .g = 231, .b = 240, .a = 210 },
+        );
     }
 }
 
 fn pointInRectangle(point: rl.Vector2, rect: rl.Rectangle) bool {
-    return point.x >= rect.x and point.y >= rect.y and
+    return rect.width > 0 and rect.height > 0 and
+        point.x >= rect.x and point.y >= rect.y and
         point.x <= rect.x + rect.width and point.y <= rect.y + rect.height;
 }
 
@@ -6868,7 +7189,7 @@ test "template background color emits local and shared targets" {
     }
 }
 
-test "background clear emits direct local and shared targets and stays base-scene only" {
+test "background clear emits direct local shared and morph targets" {
     var items = [_]slides.SlideItem{testItem(901, .textbox, 100, 100, 300, 100)};
     const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
     var studio: Studio = .{ .enabled = true, .selected_identity = 901 };
@@ -6896,8 +7217,10 @@ test "background clear emits direct local and shared targets and stays base-scen
     studio.active_morph_state = 0;
     studio.morph_state_count = 1;
     _ = studio.update(&items, &.{}, viewport, .{ .clear_background_pressed = true });
-    try std.testing.expect(studio.takeSemanticCommand() == null);
-    try std.testing.expectEqual(Notice.base_scene_only, studio.notice);
+    switch (studio.takeSemanticCommand().?) {
+        .clear_background => |target| try std.testing.expectEqual(EditScope.direct, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
 
     studio.active_morph_state = null;
     const layout = uiLayout(viewport);
@@ -7051,12 +7374,12 @@ test "semantic keyboard and panel actions cancel active geometry first" {
     var studio: Studio = .{ .enabled = true };
 
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = .{ .x = 120, .y = 120 },
+        .pointer_screen = .{ .x = 120, .y = 160 },
         .pointer_pressed = true,
         .pointer_down = true,
     });
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = .{ .x = 220, .y = 180 },
+        .pointer_screen = .{ .x = 220, .y = 220 },
         .pointer_down = true,
     });
     try expectVector(.{ .x = 200, .y = 160 }, items[0].position);
@@ -7066,12 +7389,12 @@ test "semantic keyboard and panel actions cancel active geometry first" {
     try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .delete_item);
 
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = .{ .x = 120, .y = 120 },
+        .pointer_screen = .{ .x = 120, .y = 160 },
         .pointer_pressed = true,
         .pointer_down = true,
     });
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = .{ .x = 260, .y = 200 },
+        .pointer_screen = .{ .x = 260, .y = 240 },
         .pointer_down = true,
     });
     try expectVector(.{ .x = 240, .y = 180 }, items[0].position);
@@ -7712,6 +8035,200 @@ test "locked badge unlocks topmost item and property panels win overlapping clic
     try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .reorder_items);
 }
 
+test "precise property controls emit field-specific single-item intentions" {
+    var items = [_]slides.SlideItem{testItem(301, .textbox, 100.5, 200.25, 320.75, 140.5)};
+    items[0].id = "hero";
+    items[0].fontSize = 42;
+    items[0].opacity = 0.65;
+    items[0].source = .{ .scope = .direct, .line_number = 7, .line_offset = 70, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = .{ .x = 1280, .y = 720 } };
+    const layout = uiLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .selected_identity = 301 };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[@intFromEnum(GeometryField.width)]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .edit_numeric_geometry => |request| {
+            try std.testing.expectEqual(GeometryField.width, request.field);
+            try std.testing.expectEqual(@as(usize, 301), request.target.item_identity);
+            try std.testing.expectEqual(EditScope.direct, request.target.edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.custom_foreground),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .set_custom_foreground);
+
+    studio.active_morph_state = 0;
+    studio.morph_state_count = 1;
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.custom_background),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_custom_background => |target| try std.testing.expectEqual(EditScope.direct, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    studio.active_morph_state = null;
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.font_size),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .set_font_size);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.opacity),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .set_opacity);
+}
+
+test "property requests honor local shared lock group and item-kind guards" {
+    var items = [_]slides.SlideItem{
+        testItem(302, .textbox, 100, 100, 300, 100),
+        testItem(303, .textbox, 500, 100, 300, 100),
+    };
+    items[0].id = "template-hero";
+    items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 90, .patchable = true };
+    items[1].source = .{ .scope = .direct, .line_number = 12, .line_offset = 120, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = .{ .x = 1280, .y = 720 } };
+    const layout = uiLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .selected_identity = 302 };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[@intFromEnum(GeometryField.x)]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .edit_numeric_geometry => |request| try std.testing.expectEqual(EditScope.local_instance, request.target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.geometry_fields[@intFromEnum(GeometryField.x)]),
+        .pointer_pressed = true,
+        .allow_shared_edit = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .edit_numeric_geometry => |request| try std.testing.expectEqual(EditScope.shared_template, request.target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[0].locked = true;
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.opacity),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.locked_item, studio.notice);
+    items[0].locked = false;
+
+    setTestSelection(&studio, &items, &.{ 302, 303 });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.opacity),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.multi_selection_property_unsupported, studio.notice);
+
+    studio.setSingleSelection(items[0]);
+    items[0].kind = .img;
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.font_size),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
+}
+
+test "property layout stays contained and typography remains legible" {
+    try std.testing.expect(UiTypography.compact >= 14);
+    try std.testing.expect(UiTypography.body >= 16);
+    try std.testing.expect(UiTypography.heading >= 18);
+    const viewports = [_]Viewport{
+        .{ .slide_top_left = .zero(), .slide_size = .{ .x = 1280, .y = 720 } },
+        .{ .slide_top_left = .zero(), .slide_size = .{ .x = 900, .y = 600 } },
+        .{ .slide_top_left = .zero(), .slide_size = .{ .x = 900, .y = 506 } },
+    };
+    for (viewports) |viewport| {
+        const layout = uiLayout(viewport);
+        try std.testing.expect(!rectanglesOverlap(layout.properties, statusPanel(viewport)));
+        const fixed = [_]rl.Rectangle{
+            layout.edit_text,
+            layout.duplicate_item,
+            layout.delete_item,
+            layout.promote,
+            layout.custom_foreground,
+            layout.custom_background,
+            layout.clear_background,
+            layout.font_size,
+            layout.opacity,
+            layout.lock_item,
+        };
+        for (fixed) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.geometry_fields) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.foreground_swatches) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.background_swatches) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.align_buttons) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.distribute_buttons) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.layer_buttons) |rect| try expectRectangleContained(layout.properties, rect);
+    }
+    try std.testing.expect(!uiLayout(viewports[0]).compact_properties);
+    try std.testing.expect(uiLayout(viewports[1]).compact_properties);
+    try std.testing.expect(uiLayout(viewports[2]).minimal_properties);
+
+    const full_screen: Viewport = .{ .slide_top_left = .zero(), .slide_size = .{ .x = 2560, .y = 1440 } };
+    try std.testing.expectApproxEqAbs(@as(f32, 2), uiScale(full_screen), 0.0001);
+    try std.testing.expect(uiLayout(full_screen).edit_text.height > uiLayout(viewports[0]).edit_text.height);
+}
+
+test "single item rebind prefers unique IDs and falls back to every source layer" {
+    const direct_source: slides.SourceRef = .{ .scope = .direct, .line_number = 4, .line_offset = 40, .patchable = true };
+    var direct_items = [_]slides.SlideItem{testItem(401, .textbox, 100, 100, 200, 80)};
+    direct_items[0].source = direct_source;
+    var studio: Studio = .{ .enabled = true, .selected_identity = 99 };
+    try std.testing.expect(studio.selectItemByIdOrSource(&direct_items, null, direct_source));
+    try std.testing.expectEqual(@as(?usize, 401), studio.selected_identity);
+
+    var identified = [_]slides.SlideItem{testItem(402, .textbox, 100, 100, 200, 80)};
+    identified[0].id = "stable";
+    identified[0].source = .{ .scope = .direct, .line_number = 7, .line_offset = 700, .patchable = true };
+    try std.testing.expect(studio.selectItemByIdOrSource(&identified, "stable", direct_source));
+    try std.testing.expectEqual(@as(?usize, 402), studio.selected_identity);
+
+    const instance_source: slides.SourceRef = .{ .scope = .slide_instance_override, .line_number = 20, .line_offset = 200, .patchable = true };
+    var customized = [_]slides.SlideItem{testItem(403, .textbox, 100, 100, 200, 80)};
+    customized[0].source = .{ .scope = .slide_template, .line_number = 2, .line_offset = 20, .patchable = true };
+    customized[0].instance_source = instance_source;
+    try std.testing.expect(studio.selectItemByIdOrSource(&customized, null, instance_source));
+    try std.testing.expectEqual(@as(?usize, 403), studio.selected_identity);
+
+    var ambiguous = [_]slides.SlideItem{
+        testItem(404, .textbox, 100, 100, 200, 80),
+        testItem(405, .textbox, 400, 100, 200, 80),
+    };
+    ambiguous[0].source = direct_source;
+    ambiguous[1].source = direct_source;
+    try std.testing.expect(!studio.selectItemByIdOrSource(&ambiguous, null, direct_source));
+    try std.testing.expectEqual(@as(?usize, null), studio.selected_identity);
+}
+
 fn rectangleCenter(rect: rl.Rectangle) rl.Vector2 {
     return .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 };
+}
+
+fn rectanglesOverlap(a: rl.Rectangle, b: rl.Rectangle) bool {
+    return a.x < b.x + b.width and a.x + a.width > b.x and
+        a.y < b.y + b.height and a.y + a.height > b.y;
+}
+
+fn expectRectangleContained(outer: rl.Rectangle, inner: rl.Rectangle) !void {
+    if (inner.width <= 0 or inner.height <= 0) return;
+    try std.testing.expect(inner.x >= outer.x and inner.y >= outer.y);
+    try std.testing.expect(inner.x + inner.width <= outer.x + outer.width + 0.001);
+    try std.testing.expect(inner.y + inner.height <= outer.y + outer.height + 0.001);
 }

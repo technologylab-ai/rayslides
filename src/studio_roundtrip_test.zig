@@ -587,10 +587,10 @@ test "Studio local template background stays instance owned through morph" {
 test "Studio shared edits update ordinary instances without unmasking customized values" {
     const allocator = std.testing.allocator;
     const original =
-        "@box id=hero x=10 y=20 w=300 h=120 bg=#102030ff text=Original-shared\n" ++
+        "@box id=hero x=10 y=20 w=300 h=120 fontsize=40 color=#102030ff bg=#102030ff opacity=0.9 text=Original-shared\n" ++
         "@pushslide layout\n" ++
         "@popslide layout\n" ++
-        "@set hero x=110 bg=#01020304 text=Local-only\n" ++
+        "@set hero x=110 fontsize=52 color=#010203ff bg=#01020304 opacity=0.5 text=Local-only\n" ++
         "@popslide layout\n";
     const shared_offset = std.mem.indexOf(u8, original, "@box id=hero").?;
     const shared_changes = [_]source_editor.LiteralAttributePatch{
@@ -598,7 +598,10 @@ test "Studio shared edits update ordinary instances without unmasking customized
         .{ .key = "y", .value = "50" },
         .{ .key = "w", .value = "420" },
         .{ .key = "h", .value = "180" },
+        .{ .key = "fontsize", .value = "64" },
+        .{ .key = "color", .value = "#ddeeffff" },
         .{ .key = "bg", .value = "#aabbccdd" },
+        .{ .key = "opacity", .value = "0.75" },
         .{ .key = "text", .value = "Reworked-shared" },
     };
 
@@ -627,8 +630,11 @@ test "Studio shared edits update ordinary instances without unmasking customized
     try std.testing.expectApproxEqAbs(@as(f32, 420), customized.size.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 180), customized.size.y, 0.0001);
     try std.testing.expectEqualStrings("Local-only", customized.text.?);
+    try std.testing.expectEqual(@as(?i32, 52), customized.fontSize);
+    try std.testing.expectEqual(@as(u8, 0x01), customized.color.?.r);
     try std.testing.expectEqual(@as(u8, 0x01), customized.background_color.?.r);
     try std.testing.expectEqual(@as(u8, 0x04), customized.background_color.?.a);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), customized.opacity, 0.0001);
     try std.testing.expectEqual(slides.SourceScope.slide_instance_override, customized.instance_source.?.scope);
 
     // Its immutable shared layer still refreshes, which is what allows later
@@ -637,8 +643,11 @@ test "Studio shared edits update ordinary instances without unmasking customized
     try std.testing.expectApproxEqAbs(@as(f32, 40), shared.position.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 50), shared.position.y, 0.0001);
     try std.testing.expectEqualStrings("Reworked-shared", shared.text.?);
+    try std.testing.expectEqual(@as(?i32, 64), shared.font_size);
+    try std.testing.expectEqual(@as(u8, 0xdd), shared.color.?.r);
     try std.testing.expectEqual(@as(u8, 0xaa), shared.background_color.?.r);
     try std.testing.expectEqual(@as(u8, 0xdd), shared.background_color.?.a);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), shared.opacity, 0.0001);
 
     const ordinary = slideshow.slides.items[1].items.?.items[0];
     try std.testing.expectApproxEqAbs(@as(f32, 40), ordinary.position.x, 0.0001);
@@ -646,9 +655,42 @@ test "Studio shared edits update ordinary instances without unmasking customized
     try std.testing.expectApproxEqAbs(@as(f32, 420), ordinary.size.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 180), ordinary.size.y, 0.0001);
     try std.testing.expectEqualStrings("Reworked-shared", ordinary.text.?);
+    try std.testing.expectEqual(@as(?i32, 64), ordinary.fontSize);
+    try std.testing.expectEqual(@as(u8, 0xdd), ordinary.color.?.r);
     try std.testing.expectEqual(@as(u8, 0xaa), ordinary.background_color.?.r);
     try std.testing.expectEqual(@as(u8, 0xdd), ordinary.background_color.?.a);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), ordinary.opacity, 0.0001);
     try std.testing.expect(ordinary.instance_source == null);
+}
+
+test "Studio numeric width edit preserves an auto-sized image height" {
+    const allocator = std.testing.allocator;
+    const original = "@slide\n@box id=photo img=missing.png x=10 y=20\n";
+    const directive_offset = std.mem.indexOf(u8, original, "@box").?;
+    const changes = [_]source_editor.LiteralAttributePatch{
+        .{ .key = "w", .value = "333" },
+    };
+    const patch = try source_editor.patchLiteralAttributes(
+        allocator,
+        original,
+        directive_offset,
+        &changes,
+    );
+    defer patch.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, " w=333") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, " h=") == null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const image = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SlideItemKind.img, image.kind);
+    try std.testing.expectApproxEqAbs(@as(f32, 333), image.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), image.size.y, 0.0001);
 }
 
 test "Studio shared deletion removes dependent overrides and preserves unrelated content" {

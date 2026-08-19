@@ -9,6 +9,11 @@ pub const Kind = enum {
     bullets,
     image_path,
     reusable_name,
+    coordinate,
+    dimension,
+    color,
+    font_size,
+    opacity,
 };
 
 pub const Outcome = enum {
@@ -30,6 +35,7 @@ pub const Notice = enum {
     append_overflow,
     invalid_initial_utf8,
     invalid_append_utf8,
+    invalid_value,
 
     fn blocksEditing(self: Notice) bool {
         return self == .initial_overflow or self == .invalid_initial_utf8;
@@ -74,6 +80,15 @@ pub const Prompt = struct {
     pub fn cancel(self: *Prompt) void {
         self.active = false;
         self.notice = .none;
+    }
+
+    /// Reopens a just-submitted scalar prompt after semantic validation
+    /// rejects its complete value. The input remains intact so a typo can be
+    /// corrected in place instead of forcing the user to reopen the property
+    /// and type it again.
+    pub fn rejectValue(self: *Prompt) void {
+        self.active = true;
+        self.notice = .invalid_value;
     }
 
     pub fn text(self: *const Prompt) []const u8 {
@@ -208,6 +223,7 @@ pub const Prompt = struct {
             .append_overflow => "Input rejected: it would exceed 8 KiB. Existing text was kept.",
             .invalid_initial_utf8 => "Text is not valid UTF-8; nothing was changed. Esc cancels.",
             .invalid_append_utf8 => "Input rejected: it is not valid UTF-8. Existing text was kept.",
+            .invalid_value => "That value is invalid. Correct it and press Enter; the slide is unchanged.",
         };
     }
 };
@@ -226,6 +242,11 @@ fn promptTitle(kind: Kind) [:0]const u8 {
         .bullets => "Edit bullet list",
         .image_path => "Choose image",
         .reusable_name => "Name reusable or template",
+        .coordinate => "Set coordinate",
+        .dimension => "Set object size",
+        .color => "Set custom color",
+        .font_size => "Set font size",
+        .opacity => "Set opacity",
     };
 }
 
@@ -236,6 +257,11 @@ fn promptHint(kind: Kind) [:0]const u8 {
         .bullets => "One item per line; '-' is added when needed · Shift-Enter adds a line",
         .image_path => "Path relative to the slide file · Enter commits · Esc cancels",
         .reusable_name => "Use letters, numbers, '_' or '-' · Enter commits · Esc cancels",
+        .coordinate => "Logical slide pixels · decimals and negative values are allowed · Enter commits",
+        .dimension => "Logical slide pixels · use a positive value · Enter commits",
+        .color => "Use #RRGGBB or #RRGGBBAA · Enter commits · Esc cancels",
+        .font_size => "Positive whole-number pixels · Enter commits · Esc cancels",
+        .opacity => "Use 0.01–1 or 1–100% · zero would make the item unselectable",
     };
 }
 
@@ -316,4 +342,16 @@ test "invalid UTF-8 append is refused without modifying the prompt" {
     try std.testing.expectEqual(InputResult.invalid_utf8, prompt.append(&invalid));
     try std.testing.expectEqualStrings("valid", prompt.text());
     try std.testing.expectEqual(Notice.invalid_append_utf8, prompt.notice);
+}
+
+test "semantic value rejection keeps submitted input editable" {
+    var prompt = Prompt{};
+    prompt.begin(.color, "#12345g");
+    prompt.active = false;
+    prompt.rejectValue();
+    try std.testing.expect(prompt.active);
+    try std.testing.expectEqual(Notice.invalid_value, prompt.notice);
+    try std.testing.expectEqualStrings("#12345g", prompt.text());
+    try std.testing.expectEqual(InputResult.accepted, prompt.append("0"));
+    try std.testing.expectEqual(Notice.none, prompt.notice);
 }
