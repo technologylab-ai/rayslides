@@ -525,3 +525,209 @@ test "Studio group geometry mixes direct patch and template-local insertion atom
     try std.testing.expectApproxEqAbs(@as(f32, 20), second_items[0].position.y, 0.0001);
     try std.testing.expect(second_items[0].instance_source == null);
 }
+
+test "Studio local template background stays instance owned through morph" {
+    const allocator = std.testing.allocator;
+    const original =
+        "@box id=hero x=10 y=20 w=300 h=120 bg=#102030ff text=Shared hero\n" ++
+        "@box id=keep x=40 y=200 w=200 h=80 text=Keep\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@state(morph)\n" ++
+        "@set keep x=140\n" ++
+        "@popslide layout\n";
+    const first_instance = std.mem.indexOf(u8, original, "@popslide layout").?;
+
+    // One Studio action authors one instance-local background mutation.
+    const patch = try source_editor.insertSlideTemplateBackgroundOverride(
+        allocator,
+        original,
+        first_instance,
+        "hero",
+        "#a0b0c0d0",
+    );
+    defer patch.deinit(allocator);
+    const local_override = std.mem.indexOf(u8, patch.source, "@set hero bg=#a0b0c0d0").?;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+
+    const customized = slideshow.slides.items[0];
+    const local_base = customized.items.?.items[0];
+    try std.testing.expectEqual(slides.SlideItemKind.textbox, local_base.kind);
+    try std.testing.expectEqual(@as(u8, 0xa0), local_base.background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0xd0), local_base.background_color.?.a);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, local_base.source.scope);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, local_base.instance_source.?.scope);
+    try std.testing.expectEqual(local_override, local_base.instance_source.?.line_offset);
+    try std.testing.expectEqual(@as(u8, 0x10), local_base.sharedTemplateValues().?.background_color.?.r);
+
+    // A morph that changes another item inherits both the local fill and its
+    // instance-local provenance instead of reassigning it to the state.
+    const local_morph = customized.morph_states.items[0].items.items[0];
+    try std.testing.expectEqual(@as(u8, 0xa0), local_morph.background_color.?.r);
+    try std.testing.expectEqual(local_override, local_morph.effectiveSource().line_offset);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, local_morph.effectiveSource().scope);
+    try std.testing.expect(local_morph.state_source == null);
+
+    const ordinary = slideshow.slides.items[1].items.?.items[0];
+    try std.testing.expectEqual(@as(u8, 0x10), ordinary.background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0xff), ordinary.background_color.?.a);
+    try std.testing.expect(ordinary.instance_source == null);
+    try std.testing.expectEqual(slides.SourceScope.slide_template, ordinary.effectiveSource().scope);
+}
+
+test "Studio shared edits update ordinary instances without unmasking customized values" {
+    const allocator = std.testing.allocator;
+    const original =
+        "@box id=hero x=10 y=20 w=300 h=120 bg=#102030ff text=Original-shared\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@set hero x=110 bg=#01020304 text=Local-only\n" ++
+        "@popslide layout\n";
+    const shared_offset = std.mem.indexOf(u8, original, "@box id=hero").?;
+    const shared_changes = [_]source_editor.LiteralAttributePatch{
+        .{ .key = "x", .value = "40" },
+        .{ .key = "y", .value = "50" },
+        .{ .key = "w", .value = "420" },
+        .{ .key = "h", .value = "180" },
+        .{ .key = "bg", .value = "#aabbccdd" },
+        .{ .key = "text", .value = "Reworked-shared" },
+    };
+
+    // Geometry, semantic text, and fill are one shared-definition action and
+    // therefore produce one undoable source result.
+    const patch = try source_editor.patchLiteralAttributes(
+        allocator,
+        original,
+        shared_offset,
+        &shared_changes,
+    );
+    defer patch.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+
+    const customized = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 110), customized.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), customized.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 420), customized.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 180), customized.size.y, 0.0001);
+    try std.testing.expectEqualStrings("Local-only", customized.text.?);
+    try std.testing.expectEqual(@as(u8, 0x01), customized.background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x04), customized.background_color.?.a);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, customized.instance_source.?.scope);
+
+    // Its immutable shared layer still refreshes, which is what allows later
+    // shared edits to remain delta-based even from a customized instance.
+    const shared = customized.sharedTemplateValues().?;
+    try std.testing.expectApproxEqAbs(@as(f32, 40), shared.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), shared.position.y, 0.0001);
+    try std.testing.expectEqualStrings("Reworked-shared", shared.text.?);
+    try std.testing.expectEqual(@as(u8, 0xaa), shared.background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0xdd), shared.background_color.?.a);
+
+    const ordinary = slideshow.slides.items[1].items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 40), ordinary.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), ordinary.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 420), ordinary.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 180), ordinary.size.y, 0.0001);
+    try std.testing.expectEqualStrings("Reworked-shared", ordinary.text.?);
+    try std.testing.expectEqual(@as(u8, 0xaa), ordinary.background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0xdd), ordinary.background_color.?.a);
+    try std.testing.expect(ordinary.instance_source == null);
+}
+
+test "Studio shared deletion removes dependent overrides and preserves unrelated content" {
+    const allocator = std.testing.allocator;
+    const original =
+        "@box id=hero x=10 y=20 w=300 h=120 text=Shared hero\n" ++
+        "Hero body\n" ++
+        "# shared note survives\n" ++
+        "@box id=keep x=20 y=30 w=200 h=80 text=Keep\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@set hero bg=#10203040\n" ++
+        "Local hero body\n" ++
+        "# local note survives\n" ++
+        "@set keep x=25\n" ++
+        "@state(morph)\n" ++
+        "@set hero x=400\n" ++
+        "Morph hero body\n" ++
+        "@set keep y=35\n" ++
+        "@popslide layout\n" ++
+        "@hide hero\n" ++
+        "@state(morph)\n" ++
+        "@show hero\n" ++
+        "@set keep x=55\n" ++
+        "@slide\n" ++
+        "@box id=outsider x=700 y=80 w=240 h=100 text=Unrelated\n";
+    const representative = std.mem.indexOf(u8, original, "@popslide layout").?;
+    const shared_hero = std.mem.indexOf(u8, original, "@box id=hero").?;
+
+    // Shared deletion is one source transaction spanning the definition and
+    // every base/morph dependency of all instances bound to it.
+    const patch = try source_editor.deleteSharedSlideTemplateItem(
+        allocator,
+        original,
+        representative,
+        shared_hero,
+        "hero",
+    );
+    defer patch.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, patch.source, "@box id=hero"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, patch.source, "@set hero"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, patch.source, "@hide hero"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, patch.source, "@show hero"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, patch.source, "@popslide layout"));
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "# shared note survives") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "# local note survives") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@set keep x=25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@set keep y=35") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch.source, "@set keep x=55") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 3), slideshow.slides.items.len);
+    const shared_template = context.push_slides.get("layout").?;
+    try std.testing.expectEqual(@as(usize, 1), shared_template.items.?.items.len);
+    try std.testing.expectEqualStrings("keep", shared_template.items.?.items[0].id.?);
+
+    const first = slideshow.slides.items[0];
+    try std.testing.expectEqual(@as(usize, 1), first.items.?.items.len);
+    try std.testing.expectEqualStrings("keep", first.items.?.items[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 25), first.items.?.items[0].position.x, 0.0001);
+    try std.testing.expectEqual(@as(usize, 1), first.morph_states.items.len);
+    try std.testing.expectEqual(@as(usize, 1), first.morph_states.items[0].items.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 35), first.morph_states.items[0].items.items[0].position.y, 0.0001);
+
+    const second = slideshow.slides.items[1];
+    try std.testing.expectEqual(@as(usize, 1), second.items.?.items.len);
+    try std.testing.expectEqualStrings("keep", second.items.?.items[0].id.?);
+    try std.testing.expectEqual(@as(usize, 1), second.morph_states.items.len);
+    try std.testing.expectEqual(@as(usize, 1), second.morph_states.items[0].items.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 55), second.morph_states.items[0].items.items[0].position.x, 0.0001);
+
+    const unrelated = slideshow.slides.items[2].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), unrelated.len);
+    try std.testing.expectEqualStrings("outsider", unrelated[0].id.?);
+    try std.testing.expectEqualStrings("Unrelated", unrelated[0].text.?);
+}

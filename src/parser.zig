@@ -713,6 +713,21 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.color = color;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "bg")) {
+                    if (attr_it.next()) |colorstr| {
+                        item_context.has_background_color = true;
+                        if (std.mem.eql(u8, colorstr, "none")) {
+                            item_context.background_color = null;
+                        } else {
+                            const color = parseColorLiteral(colorstr, context) catch |err| {
+                                reportErrorInContext(err, context, "cannot parse bg=");
+                                item_context.has_background_color = false;
+                                continue;
+                            };
+                            item_context.background_color = color;
+                        }
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "opacity")) {
                     if (attr_it.next()) |opacitystr| {
                         const opacity = std.fmt.parseFloat(f32, opacitystr) catch |err| {
@@ -994,6 +1009,10 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     if (parsing_item_context.text == null) parsing_item_context.text = item_context.text;
     if (parsing_item_context.fontSize == null) parsing_item_context.fontSize = item_context.fontSize;
     if (parsing_item_context.color == null) parsing_item_context.color = item_context.color;
+    if (!parsing_item_context.has_background_color and item_context.has_background_color) {
+        parsing_item_context.background_color = item_context.background_color;
+        parsing_item_context.has_background_color = true;
+    }
     if (parsing_item_context.position) |own_position| {
         if (item_context.position) |inherited_position| {
             var merged = own_position;
@@ -1267,6 +1286,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                 if (item.instance_source) |instance_source| item.source = instance_source;
                 item.source.scope = .slide_template;
                 item.instance_source = null;
+                item.captureSharedTemplateValues();
             }
             try context.push_slides.put(context_name, context.current_slide);
         }
@@ -2313,4 +2333,134 @@ test "crowd text mutations rebuild the renderer-facing prompt" {
     try std.testing.expectEqualStrings("Local invitation", slideshow.slides.items[0].items.?.items[0].crowd.?.prompt);
     try std.testing.expectEqualStrings("Morph invitation", slideshow.slides.items[0].morph_states.items[0].items.items[0].crowd.?.prompt);
     try std.testing.expectEqualStrings("Shared invitation", slideshow.slides.items[1].items.?.items[0].crowd.?.prompt);
+}
+
+test "item backgrounds inherit and support local and morph set or clear mutations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=300 h=100 color=#112233ff bg=#203040ff text=Hero
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set hero bg=#50607080
+        \\@state(morph)
+        \\@set hero bg=none
+        \\@popslide layout
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const template_item = context.push_slides.get("layout").?.items.?.items[0];
+    try std.testing.expectEqual(@as(u8, 0x20), template_item.background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x40), template_item.background_color.?.b);
+    try std.testing.expectEqual(@as(u8, 0x20), template_item.sharedTemplateValues().?.background_color.?.r);
+
+    const instance = slideshow.slides.items[0];
+    try std.testing.expectEqual(@as(u8, 0x50), instance.items.?.items[0].background_color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x80), instance.items.?.items[0].background_color.?.a);
+    try std.testing.expect(instance.morph_states.items[0].items.items[0].background_color == null);
+    // Neither local mutation changes the captured template layer.
+    try std.testing.expectEqual(
+        @as(u8, 0x20),
+        instance.morph_states.items[0].items.items[0].sharedTemplateValues().?.background_color.?.r,
+    );
+}
+
+test "nested slide templates refresh and preserve their shared authored value layer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=300 h=100 color=#112233ff bg=#203040ff opacity=0.8 text=Original
+        \\@pushslide first
+        \\@popslide first
+        \\@set hero x=100 color=#405060ff bg=none opacity=0.6 text=Captured
+        \\@hide hero
+        \\@pushslide second
+        \\@popslide second
+        \\@set hero y=200 color=#708090ff bg=#90a0b0ff text=Local
+        \\@show hero
+        \\@state(morph)
+        \\@set hero x=300 color=#a0b0c0ff bg=none opacity=0.2 text=Morph
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const first = context.push_slides.get("first").?.items.?.items[0];
+    const first_values = first.sharedTemplateValues().?;
+    try std.testing.expectApproxEqAbs(@as(f32, 10), first_values.position.x, 0.0001);
+    try std.testing.expectEqualStrings("Original", first_values.text.?);
+    try std.testing.expectEqual(@as(u8, 0x11), first_values.color.?.r);
+    try std.testing.expectEqual(@as(u8, 0x20), first_values.background_color.?.r);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), first_values.opacity, 0.0001);
+    try std.testing.expect(first_values.visible);
+
+    const second = context.push_slides.get("second").?.items.?.items[0];
+    const captured_values = second.sharedTemplateValues().?;
+    try std.testing.expectApproxEqAbs(@as(f32, 100), captured_values.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), captured_values.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), captured_values.size.x, 0.0001);
+    try std.testing.expectEqualStrings("Captured", captured_values.text.?);
+    try std.testing.expectEqual(@as(u8, 0x40), captured_values.color.?.r);
+    try std.testing.expect(captured_values.background_color == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), captured_values.opacity, 0.0001);
+    try std.testing.expect(!captured_values.visible);
+    try std.testing.expectEqual(
+        std.mem.indexOf(u8, input, "@hide hero").?,
+        second.source.line_offset,
+    );
+
+    // Later instance and morph patches change only effective values. Both
+    // cumulative layers retain the nested template's captured authored data.
+    const rendered = slideshow.slides.items[1];
+    const local = rendered.items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 100), local.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), local.position.y, 0.0001);
+    try std.testing.expectEqualStrings("Local", local.text.?);
+    try std.testing.expect(local.visible);
+    try std.testing.expectEqual(@as(u8, 0x90), local.background_color.?.r);
+    try std.testing.expectEqualStrings("Captured", local.sharedTemplateValues().?.text.?);
+    try std.testing.expect(!local.sharedTemplateValues().?.visible);
+
+    const morphed = rendered.morph_states.items[0].items.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 300), morphed.position.x, 0.0001);
+    try std.testing.expectEqualStrings("Morph", morphed.text.?);
+    try std.testing.expectEqual(@as(u8, 0xa0), morphed.color.?.r);
+    try std.testing.expect(morphed.background_color == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), morphed.opacity, 0.0001);
+    try std.testing.expectEqualStrings("Captured", morphed.sharedTemplateValues().?.text.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), morphed.sharedTemplateValues().?.position.x, 0.0001);
+    try std.testing.expect(morphed.sharedTemplateValues().?.background_color == null);
+}
+
+test "component item background can explicitly clear an inherited fill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@push card x=10 y=20 w=300 h=100 bg=#102030ff
+        \\@slide
+        \\@pop card text=Filled
+        \\@pop card bg=none text=Clear
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(u8, 0x10), items[0].background_color.?.r);
+    try std.testing.expect(items[1].background_color == null);
 }

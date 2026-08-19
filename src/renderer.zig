@@ -51,6 +51,7 @@ const RenderElement = struct {
     opacity: f32 = 1.0,
     owner_identity: usize = 0,
     part_index: usize = 0,
+    is_item_background: bool = false,
 };
 
 const RenderedScene = struct {
@@ -374,15 +375,36 @@ pub const SlideshowRenderer = struct {
         // clicks while hidden in the base state.
         if (!rendered_item.visible) rendered_item.animation = null;
         const first_element = renderSlide.elements.items.len;
+        const has_item_background = itemBackgroundElement(rendered_item) != null;
+        if (itemBackgroundElement(rendered_item)) |background| {
+            // An item-owned fill is the first part of its owner group, so the
+            // item's actual content always remains above it.
+            try renderSlide.elements.append(self.allocator, background);
+        }
         switch (rendered_item.kind) {
             .background => try self.createBg(renderSlide, rendered_item, slideshow_filp),
             .textbox => try self.preRenderTextBlock(renderSlide, rendered_item, slide_number),
             .img => try self.createImg(renderSlide, rendered_item, slideshow_filp),
             .crowd => try self.createCrowd(renderSlide, rendered_item),
         }
-        for (renderSlide.elements.items[first_element..], 0..) |*element, part_index| {
+        if (has_item_background and renderSlide.elements.items.len > first_element + 1) {
+            resolveItemBackgroundGeometry(
+                &renderSlide.elements.items[first_element],
+                renderSlide.elements.items[first_element + 1 ..],
+            );
+        }
+        if (has_item_background and renderSlide.elements.items.len > first_element + 1) {
+            // Enter with the first content fragment. This is the shared item
+            // step for by-item animations and the first line/bullet step for
+            // progressive text.
+            renderSlide.elements.items[first_element].reveal_step = renderSlide.elements.items[first_element + 1].reveal_step;
+        }
+        for (renderSlide.elements.items[first_element..], 0..) |*element, emitted_index| {
             element.owner_identity = rendered_item.identity;
-            element.part_index = part_index;
+            // Backgrounds have their own semantic role. Foreground part
+            // indexes stay stable when a state adds or removes `bg=`, which
+            // lets the morph planner keep unchanged content above the fill.
+            element.part_index = emitted_index - @intFromBool(has_item_background and emitted_index > 0);
             element.opacity = if (rendered_item.visible) rendered_item.opacity else 0.0;
         }
     }
@@ -1428,6 +1450,62 @@ pub const SlideshowRenderer = struct {
     }
 };
 
+fn itemBackgroundElement(item: slides.SlideItem) ?RenderElement {
+    if (item.kind == .background) return null;
+    const color = item.background_color orelse return null;
+    return .{
+        .kind = .text,
+        .position = item.position,
+        .size = item.size,
+        .fontSize = null,
+        .underline_width = null,
+        .line_height_factor = null,
+        .text = null,
+        .color = color,
+        .is_item_background = true,
+    };
+}
+
+/// Fill omitted dimensions from the content fragments produced for the same
+/// owner. This keeps `bg=` useful for naturally-sized images without turning
+/// an omitted image width or height into an explicit source value.
+fn resolveItemBackgroundGeometry(background: *RenderElement, content: []const RenderElement) void {
+    if (background.size.x > 0 and background.size.y > 0) return;
+
+    var bounds: ?rl.Rectangle = null;
+    for (content) |element| {
+        if (element.kind == .background) continue;
+        const right = element.position.x + element.size.x;
+        const bottom = element.position.y + element.size.y;
+        if (bounds) |current| {
+            const left = @min(current.x, element.position.x);
+            const top = @min(current.y, element.position.y);
+            bounds = .{
+                .x = left,
+                .y = top,
+                .width = @max(current.x + current.width, right) - left,
+                .height = @max(current.y + current.height, bottom) - top,
+            };
+        } else {
+            bounds = .{
+                .x = element.position.x,
+                .y = element.position.y,
+                .width = element.size.x,
+                .height = element.size.y,
+            };
+        }
+    }
+    const resolved = bounds orelse return;
+    if (background.size.x <= 0) {
+        background.position.x = resolved.x;
+        background.size.x = resolved.width;
+    }
+    if (background.size.y <= 0) {
+        background.position.y = resolved.y;
+        background.size.y = resolved.height;
+    }
+}
+
 fn elementWithGeometryPreview(element: RenderElement, preview: ItemGeometryPreview) RenderElement {
     if (element.kind == .background or element.owner_identity != preview.owner_identity) return element;
 
@@ -1507,15 +1585,80 @@ fn indexOwnerGroups(groups: *std.AutoHashMap(usize, ElementGroup), elements: []c
     }
 }
 
-fn groupsCompatible(source: []const RenderElement, source_group: ElementGroup, target: []const RenderElement, target_group: ElementGroup) bool {
-    if (source_group.len == 0 or source_group.len != target_group.len) return false;
+fn groupBackgroundIndex(elements: []const RenderElement, group: ElementGroup) ?usize {
+    if (group.len == 0) return null;
+    const index = group.first;
+    return if (elements[index].is_item_background) index else null;
+}
+
+fn groupForeground(group: ElementGroup, background_index: ?usize) ElementGroup {
+    const skip: usize = @intFromBool(background_index != null);
+    return .{ .first = group.first + skip, .len = group.len - skip };
+}
+
+fn foregroundGroupsCompatible(source: []const RenderElement, source_group: ElementGroup, target: []const RenderElement, target_group: ElementGroup) bool {
+    if (source_group.len != target_group.len) return false;
     for (0..source_group.len) |offset| {
         const source_element = &source[source_group.first + offset];
         const target_element = &target[target_group.first + offset];
-        if (source_element.part_index != target_element.part_index or
+        if (source_element.is_item_background or target_element.is_item_background or
+            source_element.part_index != target_element.part_index or
             !elementPayloadCompatible(source_element, target_element)) return false;
     }
     return true;
+}
+
+fn appendOwnerMorphDraws(
+    plan: *MorphPlan,
+    allocator: std.mem.Allocator,
+    source: []const RenderElement,
+    source_group: ElementGroup,
+    target: []const RenderElement,
+    target_group: ElementGroup,
+) !void {
+    const source_background = groupBackgroundIndex(source, source_group);
+    const target_background = groupBackgroundIndex(target, target_group);
+
+    // Paint both background layers before any foreground fragment. Adding,
+    // removing, or recoloring `bg=` can therefore never cover text that is
+    // cross-fading within the same semantic owner.
+    if (source_background) |source_index| {
+        if (target_background) |target_index| {
+            if (elementPayloadCompatible(&source[source_index], &target[target_index])) {
+                try plan.draws.append(allocator, .{
+                    .kind = .interpolate,
+                    .source_index = source_index,
+                    .target_index = target_index,
+                });
+            } else {
+                try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_index });
+                try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_index });
+            }
+        } else {
+            try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_index });
+        }
+    } else if (target_background) |target_index| {
+        try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_index });
+    }
+
+    const source_foreground = groupForeground(source_group, source_background);
+    const target_foreground = groupForeground(target_group, target_background);
+    if (foregroundGroupsCompatible(source, source_foreground, target, target_foreground)) {
+        for (0..target_foreground.len) |offset| {
+            try plan.draws.append(allocator, .{
+                .kind = .interpolate,
+                .source_index = source_foreground.first + offset,
+                .target_index = target_foreground.first + offset,
+            });
+        }
+    } else {
+        for (0..source_foreground.len) |offset| {
+            try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_foreground.first + offset });
+        }
+        for (0..target_foreground.len) |offset| {
+            try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_foreground.first + offset });
+        }
+    }
 }
 
 fn buildMorphPlan(allocator: std.mem.Allocator, source: []const RenderElement, target: []const RenderElement) !MorphPlan {
@@ -1535,22 +1678,7 @@ fn buildMorphPlan(allocator: std.mem.Allocator, source: []const RenderElement, t
         const owner_identity = target[target_first].owner_identity;
         const target_group = target_groups.get(owner_identity).?;
         if (source_groups.get(owner_identity)) |source_group| {
-            if (groupsCompatible(source, source_group, target, target_group)) {
-                for (0..target_group.len) |offset| {
-                    try plan.draws.append(allocator, .{
-                        .kind = .interpolate,
-                        .source_index = source_group.first + offset,
-                        .target_index = target_group.first + offset,
-                    });
-                }
-            } else {
-                for (0..source_group.len) |offset| {
-                    try plan.draws.append(allocator, .{ .kind = .source_fade, .source_index = source_group.first + offset });
-                }
-                for (0..target_group.len) |offset| {
-                    try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_group.first + offset });
-                }
-            }
+            try appendOwnerMorphDraws(&plan, allocator, source, source_group, target, target_group);
         } else {
             for (0..target_group.len) |offset| {
                 try plan.draws.append(allocator, .{ .kind = .target_fade, .target_index = target_group.first + offset });
@@ -1984,6 +2112,50 @@ test "semantic morph plan keeps a changed foreground above its background" {
     try std.testing.expectEqual(@as(?usize, 1), plan.draws.items[2].target_index);
 }
 
+test "item background morphs below changed or unchanged foreground content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const old_text: [:0]const u8 = "old";
+    const new_text: [:0]const u8 = "new";
+    const source = [_]RenderElement{
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .is_item_background = true, .color = .black },
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .text = old_text },
+    };
+    const changed = [_]RenderElement{
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .is_item_background = true, .color = .white },
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .text = new_text },
+    };
+
+    const changed_plan = try buildMorphPlan(allocator, &source, &changed);
+    try std.testing.expectEqual(@as(usize, 3), changed_plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, changed_plan.draws.items[0].kind);
+    try std.testing.expectEqual(@as(?usize, 0), changed_plan.draws.items[0].target_index);
+    try std.testing.expectEqual(MorphDrawKind.source_fade, changed_plan.draws.items[1].kind);
+    try std.testing.expectEqual(@as(?usize, 1), changed_plan.draws.items[1].source_index);
+    try std.testing.expectEqual(MorphDrawKind.target_fade, changed_plan.draws.items[2].kind);
+    try std.testing.expectEqual(@as(?usize, 1), changed_plan.draws.items[2].target_index);
+
+    const without_background = [_]RenderElement{
+        .{ .kind = .text, .owner_identity = 7, .part_index = 0, .text = old_text },
+    };
+    const added_plan = try buildMorphPlan(allocator, &without_background, &source);
+    try std.testing.expectEqual(@as(usize, 2), added_plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.target_fade, added_plan.draws.items[0].kind);
+    try std.testing.expectEqual(@as(?usize, 0), added_plan.draws.items[0].target_index);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, added_plan.draws.items[1].kind);
+    try std.testing.expectEqual(@as(?usize, 0), added_plan.draws.items[1].source_index);
+    try std.testing.expectEqual(@as(?usize, 1), added_plan.draws.items[1].target_index);
+
+    const removed_plan = try buildMorphPlan(allocator, &source, &without_background);
+    try std.testing.expectEqual(@as(usize, 2), removed_plan.draws.items.len);
+    try std.testing.expectEqual(MorphDrawKind.source_fade, removed_plan.draws.items[0].kind);
+    try std.testing.expectEqual(@as(?usize, 0), removed_plan.draws.items[0].source_index);
+    try std.testing.expectEqual(MorphDrawKind.interpolate, removed_plan.draws.items[1].kind);
+    try std.testing.expectEqual(@as(?usize, 1), removed_plan.draws.items[1].source_index);
+    try std.testing.expectEqual(@as(?usize, 0), removed_plan.draws.items[1].target_index);
+}
+
 test "stable semantic state follows morph steps in the shared timeline" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2063,6 +2235,61 @@ test "Studio geometry preview batches resolve by item identity" {
     try std.testing.expectEqual(@as(usize, 7), geometryPreviewFor(&previews, 7).?.owner_identity);
     try std.testing.expectEqual(@as(usize, 9), geometryPreviewFor(&previews, 9).?.owner_identity);
     try std.testing.expect(geometryPreviewFor(&previews, 8) == null);
+}
+
+test "item-owned background is a bounded color part behind its content" {
+    const item = slides.SlideItem{
+        .kind = .textbox,
+        .position = .{ .x = 120, .y = 240 },
+        .size = .{ .x = 640, .y = 180 },
+        .background_color = .{ .r = 12, .g = 34, .b = 56, .a = 200 },
+    };
+    const background = itemBackgroundElement(item).?;
+    try std.testing.expectEqual(RenderElementKind.text, background.kind);
+    try std.testing.expect(background.text == null);
+    try std.testing.expectEqual(item.position, background.position);
+    try std.testing.expectEqual(item.size, background.size);
+    try std.testing.expectEqual(@as(u8, 12), background.color.?.r);
+    try std.testing.expectEqual(@as(u8, 200), background.color.?.a);
+
+    var without = item;
+    without.background_color = null;
+    try std.testing.expect(itemBackgroundElement(without) == null);
+    var slide_background = item;
+    slide_background.kind = .background;
+    try std.testing.expect(itemBackgroundElement(slide_background) == null);
+}
+
+test "item-owned background resolves omitted image dimensions from content" {
+    var background: RenderElement = .{
+        .kind = .text,
+        .position = .{ .x = 120, .y = 240 },
+        .size = .zero(),
+        .color = .black,
+    };
+    const content = [_]RenderElement{.{
+        .kind = .image,
+        .position = .{ .x = 120, .y = 240 },
+        .size = .{ .x = 640, .y = 360 },
+    }};
+
+    resolveItemBackgroundGeometry(&background, &content);
+    try std.testing.expectEqual(content[0].position, background.position);
+    try std.testing.expectEqual(content[0].size, background.size);
+
+    // An explicitly authored dimension remains authoritative while the other
+    // dimension can still follow the resolved image aspect.
+    background = .{
+        .kind = .text,
+        .position = .{ .x = 50, .y = 240 },
+        .size = .{ .x = 500, .y = 0 },
+        .color = .black,
+    };
+    resolveItemBackgroundGeometry(&background, &content);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), background.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), background.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 240), background.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 360), background.size.y, 0.0001);
 }
 
 pub fn slidePosToRenderPos(pos: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) rl.Vector2 {

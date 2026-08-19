@@ -120,15 +120,21 @@ unrelated spacing, comments, text, and line endings. Objects instantiated with
 are also edited locally by default: Studio creates or updates an `@set` beside
 the current `@popslide`, and Delete adds `@hide`. Hold <kbd>Alt</kbd> while
 moving, resizing, nudging, or changing a property to edit the shared template
-definition instead. Shared deletion is deliberately unavailable until Studio
-can clean up dependent local and morph mutations safely. Template items use an
+definition instead. This also works from an already-customized instance:
+Studio retains the shared authored value layer and applies the gesture delta
+there without baking the local coordinates into every slide. The current slide
+keeps any properties it overrides. <kbd>Alt</kbd>-Delete removes the shared item
+and its source-resolved local and morph mutations together; ambiguous or
+generated dependency layouts are refused atomically. Template items use an
 amber outline and the status bar states whether an operation is local or
 shared. An inherited object without a unique `id=` cannot receive a local
 override; add an ID or use <kbd>Alt</kbd> for an intentional shared edit. A
 generated shared directive produced through `@let` remains read-only, but an
 identified inherited item can still receive a later literal local override.
-The background-swatch action remains shared-only for template items because a
-locally appended rectangle could not retain its behind-the-item z-order.
+Background swatches write an item-owned `bg=` fill, so a local template
+override stays behind its own text, image, or panel without creating a
+z-order-sensitive sibling rectangle. Use the **None** background control to
+write `bg=none` and clear an inherited or directly authored fill.
 
 **Reuse** (or <kbd>P</kbd>) promotes a direct box to a named `@push` definition
 and leaves an equivalent `@pop` instance in place. The Library tool creates
@@ -484,9 +490,12 @@ backward pauses automatic progression and reverses the same interpolation.
 Changing direction during a morph continues from the current frame.
 
 Morphable properties include position and size (`x`, `y`, `w`, `h`),
-`fontsize`, `color`, `bullet_color`, `line_height`, `underline_width`, image
-`scale` and `ratio`, text-shadow properties, and `opacity` from `0` to `1`.
-Text content and an existing image object's `img=` path may also change.
+`fontsize`, foreground `color`, item background `bg`, `bullet_color`,
+`line_height`, `underline_width`, image `scale` and `ratio`, text-shadow
+properties, and `opacity` from `0` to `1`. Use `bg=#rrggbbaa` for a bounded
+fill behind that item and `bg=none` to clear it; this is distinct from the
+slide-wide `@bg` directive. Text content and an existing image object's `img=`
+path may also change.
 Rayslides interpolates geometry, font size, colors, opacity, and shadows when
 the rendered content is compatible. Changed text, changed images, wrapping
 changes, new objects, and removed objects use a cross-fade instead, avoiding

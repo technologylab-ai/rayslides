@@ -192,6 +192,21 @@ pub const SourceRef = struct {
     patchable: bool = false,
 };
 
+/// The values authored by the shared slide-template definition, before an
+/// individual `@popslide` instance or a semantic-morph state customizes the
+/// item. Keeping this small, immutable layer beside the renderer-facing
+/// effective values lets an editor apply a delta to the shared definition
+/// without accidentally baking an instance-local value into every clone.
+pub const TemplateItemValues = struct {
+    text: ?[]const u8 = null,
+    color: ?rl.Color = null,
+    background_color: ?rl.Color = null,
+    position: rl.Vector2 = .zero(),
+    size: rl.Vector2 = .zero(),
+    opacity: f32 = 1.0,
+    visible: bool = true,
+};
+
 pub const SlideItem = struct {
     /// Stable within a logical slide and preserved by morph snapshots.
     identity: usize = 0,
@@ -221,11 +236,18 @@ pub const SlideItem = struct {
     /// cumulative snapshots along with the item, allowing an editor to tell a
     /// local override from one inherited from an earlier state.
     state_source_state: ?usize = null,
+    /// Snapshot of this item's shared `@pushslide` values. It is refreshed
+    /// only when a slide template is captured, then survives instance and
+    /// morph patches unchanged.
+    shared_template_values: ?TemplateItemValues = null,
     kind: SlideItemKind = .background,
     text: ?[]const u8 = null,
     fontSize: ?i32 = null,
     line_height_factor: ?f32 = null,
     color: ?rl.Color = .blank,
+    /// Optional fill behind this individual item. This is separate from an
+    /// `@bg` slide-background item and does not affect item ordering.
+    background_color: ?rl.Color = null,
     img_path: ?[]const u8 = null,
     position: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
@@ -261,6 +283,28 @@ pub const SlideItem = struct {
     pub fn effectiveSource(self: *const SlideItem) SourceRef {
         return self.state_source orelse self.instance_source orelse self.source;
     }
+
+    /// Returns the immutable shared authoring layer for a slide-template
+    /// clone. Non-template items intentionally have no such layer.
+    pub fn sharedTemplateValues(self: *const SlideItem) ?TemplateItemValues {
+        if (self.source.scope != .slide_template) return null;
+        return self.shared_template_values;
+    }
+
+    /// Establishes a fresh shared authoring layer from the item's currently
+    /// effective values. The parser calls this exactly at `@pushslide`
+    /// capture boundaries, including nested captures.
+    pub fn captureSharedTemplateValues(self: *SlideItem) void {
+        self.shared_template_values = .{
+            .text = self.text,
+            .color = self.color,
+            .background_color = self.background_color,
+            .position = self.position,
+            .size = self.size,
+            .opacity = self.opacity,
+            .visible = self.visible,
+        };
+    }
     pub fn deinit(_: *Slide) void {
         // empty
     }
@@ -271,6 +315,7 @@ pub const SlideItem = struct {
         if (context.img_path) |img_path| self.img_path = img_path;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
         if (context.color) |color| self.color = color;
+        if (context.has_background_color) self.background_color = context.background_color;
         if (context.position) |position| self.position = position;
         if (context.size) |size| self.size = size;
         if (context.underline_width) |w| self.underline_width = w;
@@ -293,6 +338,7 @@ pub const SlideItem = struct {
         if (context.img_path) |img_path| self.img_path = img_path;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
         if (context.color) |color| self.color = color;
+        if (context.has_background_color) self.background_color = context.background_color;
         if (context.position) |position| {
             if (context.has_x) self.position.x = position.x;
             if (context.has_y) self.position.y = position.y;
@@ -426,6 +472,10 @@ pub const ItemContext = struct {
     fontSize: ?i32 = null,
     line_height_factor: ?f32 = null,
     color: ?rl.Color = null,
+    /// Tri-state item fill: `has_background_color == false` means omitted,
+    /// while true pairs with a color or null for `bg=none`.
+    background_color: ?rl.Color = null,
+    has_background_color: bool = false,
     img_path: ?[]const u8 = null,
     position: ?rl.Vector2 = null,
     size: ?rl.Vector2 = null,
@@ -471,6 +521,10 @@ pub const ItemContext = struct {
         }
         if (self.color == null) {
             if (other.color) |color| self.color = color;
+        }
+        if (!self.has_background_color and other.has_background_color) {
+            self.background_color = other.background_color;
+            self.has_background_color = true;
         }
         if (self.position) |own_position| {
             if (other.position) |inherited_position| {
@@ -559,6 +613,12 @@ test "slide cloning preserves morph source provenance" {
         .identity = 1,
         .source = .{ .scope = .direct, .line_number = 2, .line_offset = 7, .patchable = true },
         .instance_source = .{ .scope = .slide_instance_override, .line_number = 3, .line_offset = 21, .patchable = true },
+        .shared_template_values = .{
+            .text = "shared",
+            .position = .{ .x = 10, .y = 20 },
+            .size = .{ .x = 300, .y = 80 },
+            .background_color = .{ .r = 1, .g = 2, .b = 3, .a = 4 },
+        },
     });
     const state_index = try original.beginMorphState(
         .{},
@@ -583,4 +643,8 @@ test "slide cloning preserves morph source provenance" {
     try std.testing.expectEqual(@as(usize, 56), clone.morph_states.items[0].items.items[0].effectiveSource().line_offset);
     try std.testing.expectEqual(@as(?usize, 0), clone.morph_states.items[0].items.items[0].state_source_state);
     try std.testing.expectEqual(@as(?usize, 0), clone.morph_states.items[0].items.items[0].creation_morph_state);
+    const cloned_values = clone.morph_states.items[0].items.items[0].shared_template_values.?;
+    try std.testing.expectEqualStrings("shared", cloned_values.text.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), cloned_values.position.x, 0.0001);
+    try std.testing.expectEqual(@as(u8, 4), cloned_values.background_color.?.a);
 }

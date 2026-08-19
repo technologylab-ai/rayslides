@@ -93,6 +93,12 @@ pub const GeometryCommand = struct {
     before_size: rl.Vector2,
     after_position: rl.Vector2,
     after_size: rl.Vector2,
+    /// Optional geometry to persist when the displayed item is a customized
+    /// slide-template instance but Alt targets the shared definition. Keeping
+    /// this separate preserves effective-value previews while preventing an
+    /// instance override from being baked into the shared source.
+    source_after_position: ?rl.Vector2 = null,
+    source_after_size: ?rl.Vector2 = null,
     /// False for both pointer moves and keyboard nudges.
     resized: bool,
 };
@@ -519,14 +525,13 @@ pub const Notice = enum {
     source_changed_on_disk,
     edit_failed,
     undo_failed,
-    shared_template_masked,
-    shared_template_delete_unsupported,
+    shared_template_customized,
+    shared_template_auto_size,
     local_override_needs_unique_id,
     duplicate_item_unsupported,
     multi_selection_property_unsupported,
     selection_capacity_reached,
     distribution_needs_three,
-    template_background_local_unsupported,
     generated_source_read_only,
     property_unavailable,
     base_scene_only,
@@ -672,6 +677,9 @@ pub const SemanticCommand = union(enum) {
     edit_text: CommandTarget,
     set_foreground: ColorCommand,
     set_background: ColorCommand,
+    /// Removes an item's authored fill (`bg=none`). This remains a distinct
+    /// intention so integrations never have to overload a palette color.
+    clear_background: CommandTarget,
     promote_to_reusable: CommandTarget,
     select_morph_scene: MorphSceneCommand,
     new_slide: void,
@@ -712,6 +720,7 @@ pub const UiLayout = struct {
     promote: rl.Rectangle,
     foreground_swatches: [palette.len]rl.Rectangle,
     background_swatches: [palette.len]rl.Rectangle,
+    clear_background: rl.Rectangle,
     align_buttons: [6]rl.Rectangle,
     distribute_buttons: [2]rl.Rectangle,
 };
@@ -982,6 +991,12 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = swatch_size,
         .height = swatch_size,
     };
+    const clear_background: rl.Rectangle = .{
+        .x = properties.x + properties.width - 66,
+        .y = properties.y + 140,
+        .width = 54,
+        .height = 22,
+    };
     var align_buttons: [6]rl.Rectangle = undefined;
     const align_gap: f32 = 4;
     const align_width = (properties.width - 24 - align_gap * 5) / 6;
@@ -1013,6 +1028,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .promote = promote,
         .foreground_swatches = foreground_swatches,
         .background_swatches = background_swatches,
+        .clear_background = clear_background,
         .align_buttons = align_buttons,
         .distribute_buttons = distribute_buttons,
     };
@@ -1052,6 +1068,7 @@ pub const FrameInput = struct {
     promote_pressed: bool = false,
     foreground_color: ?PaletteColor = null,
     background_color: ?PaletteColor = null,
+    clear_background_pressed: bool = false,
     new_slide_pressed: bool = false,
     /// Negative selects the previous base/morph scene, positive the next.
     cycle_morph_scene: i8 = 0,
@@ -1158,6 +1175,15 @@ const Drag = struct {
         .position = .{ .x = 0, .y = 0 },
         .size = .{ .x = 0, .y = 0 },
     },
+    source_before: Geometry = .{
+        .position = .{ .x = 0, .y = 0 },
+        .size = .{ .x = 0, .y = 0 },
+    },
+    source_after: Geometry = .{
+        .position = .{ .x = 0, .y = 0 },
+        .size = .{ .x = 0, .y = 0 },
+    },
+    separate_source_geometry: bool = false,
     edit_scope: EditScope = .direct,
 };
 
@@ -1170,6 +1196,9 @@ const GroupDragMember = struct {
     identity: usize,
     before: Geometry,
     authored_before: Geometry,
+    source_before: Geometry,
+    source_after: Geometry,
+    separate_source_geometry: bool,
     after: Geometry,
     edit_scope: EditScope,
 };
@@ -1179,6 +1208,8 @@ const SelectionGeometry = struct {
     item_index: usize,
     geometry: Geometry,
     authored_geometry: Geometry,
+    source_geometry: Geometry,
+    separate_source_geometry: bool,
     edit_scope: EditScope,
 };
 
@@ -1567,6 +1598,10 @@ pub const Studio = struct {
             _ = self.emitColorCommand(items, input.allow_shared_edit, color, true);
             return null;
         }
+        if (input.clear_background_pressed) {
+            _ = self.emitClearBackgroundCommand(items, input.allow_shared_edit);
+            return null;
+        }
 
         if (input.pointer_pressed and workspace.visible and
             self.handleWorkspaceClick(items, viewport, workspace, input.pointer_screen)) return null;
@@ -1594,10 +1629,16 @@ pub const Studio = struct {
                     if (pointInRectangle(input.pointer_screen, handle)) {
                         const selected_index = self.selectedIndex(items) orelse return null;
                         const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
+                        if (!sharedResizeSupported(items[selected_index], edit_scope)) {
+                            self.notice = .shared_template_auto_size;
+                            return null;
+                        }
                         self.beginInteraction(
                             .resizing,
                             selected_geometry,
                             Geometry.fromItem(items[selected_index]),
+                            sourceGeometryForEdit(items[selected_index], selected_geometry, edit_scope),
+                            edit_scope == .shared_template and items[selected_index].instance_source != null,
                             pointer_logical orelse return null,
                             edit_scope,
                         );
@@ -1631,10 +1672,16 @@ pub const Studio = struct {
                     if (pointInRectangle(input.pointer_screen, handle)) {
                         const selected_index = self.selectedIndex(items) orelse return null;
                         const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
+                        if (!sharedResizeSupported(items[selected_index], edit_scope)) {
+                            self.notice = .shared_template_auto_size;
+                            return null;
+                        }
                         self.beginInteraction(
                             .resizing,
                             selected_geometry,
                             Geometry.fromItem(items[selected_index]),
+                            sourceGeometryForEdit(items[selected_index], selected_geometry, edit_scope),
+                            edit_scope == .shared_template and items[selected_index].instance_source != null,
                             pointer_logical orelse return null,
                             edit_scope,
                         );
@@ -1765,10 +1812,6 @@ pub const Studio = struct {
             self.notice = .property_unavailable;
             return true;
         }
-        if (kind == .delete_item and edit_scope == .shared_template) {
-            self.notice = .shared_template_delete_unsupported;
-            return true;
-        }
         const target = self.selectedTarget(items, edit_scope) orelse return true;
         self.pending_semantic_command = switch (kind) {
             .delete_item => .{ .delete_item = target },
@@ -1800,13 +1843,6 @@ pub const Studio = struct {
             self.notice = .base_scene_only;
             return true;
         }
-        // The background action creates a sibling rectangle behind the item;
-        // an override after @popslide cannot place that rectangle behind the
-        // inherited template content. Alt still permits the shared edit.
-        if (background and edit_scope == .local_instance and items[index].source.scope == .slide_template) {
-            self.notice = .template_background_local_unsupported;
-            return true;
-        }
         const command: ColorCommand = .{
             .target = self.selectedTarget(items, edit_scope) orelse return true,
             .color = color,
@@ -1815,6 +1851,28 @@ pub const Studio = struct {
             .{ .set_background = command }
         else
             .{ .set_foreground = command };
+        return true;
+    }
+
+    fn emitClearBackgroundCommand(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        if (self.selectionCount() > 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        if (self.active_morph_state != null) {
+            self.notice = .base_scene_only;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        self.pending_semantic_command = .{
+            .clear_background = self.selectedTarget(items, edit_scope) orelse return true,
+        };
         return true;
     }
 
@@ -2250,6 +2308,8 @@ pub const Studio = struct {
             if (pointInRectangle(pointer, swatch))
                 return self.emitColorCommand(items, allow_shared_edit, palette[index], true);
         }
+        if (pointInRectangle(pointer, layout.clear_background))
+            return self.emitClearBackgroundCommand(items, allow_shared_edit);
         for (layout.align_buttons, 0..) |button, index| {
             if (pointInRectangle(pointer, button)) {
                 self.pending_geometry_command = self.alignSelected(
@@ -2516,6 +2576,8 @@ pub const Studio = struct {
             .moving,
             itemGeometry(items[hit_index], resolved_bounds),
             Geometry.fromItem(items[hit_index]),
+            sourceGeometryForEdit(items[hit_index], itemGeometry(items[hit_index], resolved_bounds), edit_scope),
+            edit_scope == .shared_template and items[hit_index].instance_source != null,
             pointer,
             edit_scope,
         );
@@ -2563,14 +2625,15 @@ pub const Studio = struct {
 
         if (item.source.scope == .slide_template) {
             if (allow_shared_edit) {
-                // The displayed geometry/text may already include a local
-                // override. Writing those effective absolute values back to
-                // the shared directive would make other instances jump and
-                // can leave this instance masked. Use an uncustomized
-                // instance until Studio retains both authored value layers.
                 if (item.instance_source != null) {
-                    self.notice = .shared_template_masked;
-                    return null;
+                    // Parser-provided authored values let geometry commands
+                    // carry a distinct shared target while their preview
+                    // remains in effective instance coordinates.
+                    if (item.sharedTemplateValues() == null) {
+                        self.notice = .generated_source_read_only;
+                        return null;
+                    }
+                    self.notice = .shared_template_customized;
                 }
                 if (item.source.patchable) return .shared_template;
                 self.notice = .generated_source_read_only;
@@ -2592,6 +2655,42 @@ pub const Studio = struct {
             .local_instance => item.effectiveBaseSource(),
             .direct => if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource(),
         };
+    }
+
+    fn sourceGeometryForEdit(item: slides.SlideItem, displayed: Geometry, edit_scope: EditScope) Geometry {
+        if (edit_scope == .shared_template) {
+            if (item.sharedTemplateValues()) |shared| return .{
+                .position = shared.position,
+                .size = shared.size,
+            };
+        }
+        return displayed;
+    }
+
+    fn selectionLayoutGeometry(entry: SelectionGeometry) Geometry {
+        return if (entry.separate_source_geometry) entry.source_geometry else entry.geometry;
+    }
+
+    fn groupMemberLayoutGeometry(member: GroupDragMember) Geometry {
+        return if (member.separate_source_geometry) member.source_before else member.before;
+    }
+
+    fn sharedResizeSupported(item: slides.SlideItem, edit_scope: EditScope) bool {
+        if (edit_scope != .shared_template or item.instance_source == null) return true;
+        const shared = item.sharedTemplateValues() orelse return false;
+        return shared.size.x > 0 and shared.size.y > 0;
+    }
+
+    fn sourceAfterDisplayDelta(source_before: Geometry, display_before: Geometry, display_after: Geometry, resized: bool) Geometry {
+        var after = source_before;
+        after.position = add(source_before.position, subtract(display_after.position, display_before.position));
+        if (resized) {
+            after.size = .{
+                .x = source_before.size.x * display_after.size.x / display_before.size.x,
+                .y = source_before.size.y * display_after.size.y / display_before.size.y,
+            };
+        }
+        return after;
     }
 
     fn itemEditableInScene(self: Studio, item: slides.SlideItem) bool {
@@ -2618,11 +2717,15 @@ pub const Studio = struct {
             return switch (self.drag.edit_scope) {
                 .direct => sourceScopeLabel(if (self.active_morph_state != null) item.effectiveSource().scope else item.effectiveBaseSource().scope),
                 .local_instance => "editing local instance override",
-                .shared_template => "editing shared template (Alt)",
+                .shared_template => if (item.instance_source != null)
+                    "editing shared template (Alt) · local override remains"
+                else
+                    "editing shared template (Alt)",
             };
         }
         if (self.active_morph_state == null and item.source.scope == .slide_template) {
             if (item.id != null) {
+                if (item.instance_source != null) return "local override active; Alt edits shared template";
                 if (item.source.patchable) return "local instance override; Alt edits shared template";
                 return "local instance override; shared source is generated/read-only";
             }
@@ -2659,11 +2762,14 @@ pub const Studio = struct {
             const identity = self.selectedIdentityAt(selection_index) orelse return null;
             const item_index = itemIndexByIdentity(items, identity) orelse return null;
             const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return null;
+            const geometry = itemGeometry(items[item_index], resolved_bounds);
             output[selection_index] = .{
                 .identity = identity,
                 .item_index = item_index,
-                .geometry = itemGeometry(items[item_index], resolved_bounds),
+                .geometry = geometry,
                 .authored_geometry = Geometry.fromItem(items[item_index]),
+                .source_geometry = sourceGeometryForEdit(items[item_index], geometry, edit_scope),
+                .separate_source_geometry = edit_scope == .shared_template and items[item_index].instance_source != null,
                 .edit_scope = edit_scope,
             };
         }
@@ -2672,15 +2778,17 @@ pub const Studio = struct {
 
     fn geometryBounds(geometries: []const SelectionGeometry) Geometry {
         std.debug.assert(geometries.len > 0);
-        var min_x = geometries[0].geometry.position.x;
-        var min_y = geometries[0].geometry.position.y;
-        var max_x = min_x + geometries[0].geometry.size.x;
-        var max_y = min_y + geometries[0].geometry.size.y;
+        const first = selectionLayoutGeometry(geometries[0]);
+        var min_x = first.position.x;
+        var min_y = first.position.y;
+        var max_x = min_x + first.size.x;
+        var max_y = min_y + first.size.y;
         for (geometries[1..]) |entry| {
-            min_x = @min(min_x, entry.geometry.position.x);
-            min_y = @min(min_y, entry.geometry.position.y);
-            max_x = @max(max_x, entry.geometry.position.x + entry.geometry.size.x);
-            max_y = @max(max_y, entry.geometry.position.y + entry.geometry.size.y);
+            const geometry = selectionLayoutGeometry(entry);
+            min_x = @min(min_x, geometry.position.x);
+            min_y = @min(min_y, geometry.position.y);
+            max_x = @max(max_x, geometry.position.x + geometry.size.x);
+            max_y = @max(max_y, geometry.position.y + geometry.size.y);
         }
         return .{
             .position = .{ .x = min_x, .y = min_y },
@@ -2696,17 +2804,21 @@ pub const Studio = struct {
     ) void {
         std.debug.assert(entries.len == after.len and entries.len <= max_selection_items);
         var batch = GeometryBatchCommand{};
-        for (entries, after) |entry, geometry| {
-            if (geometryEqual(entry.geometry, geometry)) continue;
-            items[entry.item_index].position = geometry.position;
+        for (entries, after) |entry, layout_after| {
+            const display_after = if (entry.separate_source_geometry) entry.geometry else layout_after;
+            const source_changed = entry.separate_source_geometry and !geometryEqual(entry.source_geometry, layout_after);
+            if (geometryEqual(entry.geometry, display_after) and !source_changed) continue;
+            if (!geometryEqual(entry.geometry, display_after)) items[entry.item_index].position = display_after.position;
             batch.commands[batch.count] = .{
                 .item_identity = entry.identity,
                 .source = self.commandSource(items[entry.item_index], entry.edit_scope),
                 .edit_scope = entry.edit_scope,
                 .before_position = entry.geometry.position,
                 .before_size = entry.geometry.size,
-                .after_position = geometry.position,
-                .after_size = geometry.size,
+                .after_position = display_after.position,
+                .after_size = display_after.size,
+                .source_after_position = if (entry.separate_source_geometry) layout_after.position else null,
+                .source_after_size = null,
                 .resized = false,
             };
             batch.count += 1;
@@ -2732,6 +2844,9 @@ pub const Studio = struct {
                 .identity = entry.identity,
                 .before = entry.geometry,
                 .authored_before = entry.authored_geometry,
+                .source_before = entry.source_geometry,
+                .source_after = entry.source_geometry,
+                .separate_source_geometry = entry.separate_source_geometry,
                 .after = entry.geometry,
                 .edit_scope = entry.edit_scope,
             };
@@ -2792,9 +2907,16 @@ pub const Studio = struct {
         self.group_bounds_after = candidate;
         for (self.group_drag[0..self.group_drag_count]) |*member| {
             const item_index = itemIndexByIdentity(items, member.identity) orelse continue;
-            member.after = member.before;
-            member.after.position = add(member.before.position, effective_delta);
-            items[item_index].position = member.after.position;
+            const layout_before = groupMemberLayoutGeometry(member.*);
+            var layout_after = layout_before;
+            layout_after.position = add(layout_before.position, effective_delta);
+            if (member.separate_source_geometry) {
+                member.source_after = layout_after;
+                member.after = member.before;
+            } else {
+                member.after = layout_after;
+                items[item_index].position = member.after.position;
+            }
         }
         self.preview = self.group_drag[0].after;
     }
@@ -2802,7 +2924,9 @@ pub const Studio = struct {
     fn finishGroupInteraction(self: *Studio, items: []slides.SlideItem) void {
         var batch = GeometryBatchCommand{};
         for (self.group_drag[0..self.group_drag_count]) |member| {
-            if (geometryEqual(member.before, member.after)) continue;
+            const source_changed = member.separate_source_geometry and
+                !geometryEqual(member.source_before, member.source_after);
+            if (geometryEqual(member.before, member.after) and !source_changed) continue;
             const item_index = itemIndexByIdentity(items, member.identity) orelse continue;
             batch.commands[batch.count] = .{
                 .item_identity = member.identity,
@@ -2812,6 +2936,8 @@ pub const Studio = struct {
                 .before_size = member.before.size,
                 .after_position = member.after.position,
                 .after_size = member.after.size,
+                .source_after_position = if (member.separate_source_geometry) member.source_after.position else null,
+                .source_after_size = null,
                 .resized = false,
             };
             batch.count += 1;
@@ -2842,8 +2968,9 @@ pub const Studio = struct {
         if (count < 2) return;
         var after: [max_selection_items]Geometry = undefined;
         for (entries[0..count], 0..) |entry, index| {
-            after[index] = entry.geometry;
-            after[index].position = add(entry.geometry.position, delta);
+            const before = selectionLayoutGeometry(entry);
+            after[index] = before;
+            after[index].position = add(before.position, delta);
         }
         self.applySelectionGeometryBatch(items, entries[0..count], after[0..count]);
     }
@@ -2853,6 +2980,8 @@ pub const Studio = struct {
         interaction: Interaction,
         geometry: Geometry,
         authored_geometry: Geometry,
+        source_geometry: Geometry,
+        separate_source_geometry: bool,
         pointer: rl.Vector2,
         edit_scope: EditScope,
     ) void {
@@ -2863,6 +2992,9 @@ pub const Studio = struct {
             .pointer_start = pointer,
             .before = geometry,
             .authored_before = authored_geometry,
+            .source_before = source_geometry,
+            .source_after = source_geometry,
+            .separate_source_geometry = separate_source_geometry,
             .edit_scope = edit_scope,
         };
         self.preview = geometry;
@@ -2879,11 +3011,12 @@ pub const Studio = struct {
     ) void {
         const index = self.selectedIndex(items) orelse return;
         const delta = subtract(pointer, self.drag.pointer_start);
-        var geometry = self.drag.before;
+        const moving_shared_source = self.drag.separate_source_geometry and self.interaction == .moving;
+        var geometry = if (moving_shared_source) self.drag.source_before else self.drag.before;
         var aspect_ratio: ?f32 = null;
         switch (self.interaction) {
             .idle => return,
-            .moving => geometry.position = roundVector(add(self.drag.before.position, delta)),
+            .moving => geometry.position = roundVector(add(geometry.position, delta)),
             .resizing => {
                 if (lock_aspect_ratio and self.drag.before.size.x > 0 and self.drag.before.size.y > 0) {
                     const ratio = self.drag.before.size.x / self.drag.before.size.y;
@@ -2926,9 +3059,25 @@ pub const Studio = struct {
             geometry = snapped.geometry;
             self.snap_guides = snapped.guides;
         }
-        self.preview = geometry;
-        items[index].position = geometry.position;
-        if (self.interaction == .resizing) items[index].size = geometry.size;
+        if (self.drag.separate_source_geometry) {
+            self.drag.source_after = if (moving_shared_source)
+                geometry
+            else
+                sourceAfterDisplayDelta(
+                    self.drag.source_before,
+                    self.drag.before,
+                    geometry,
+                    self.interaction == .resizing,
+                );
+            // A local override masks the shared edit on this instance. Keep
+            // both the logical item and renderer preview truthful: only the
+            // authored source target moves.
+            self.preview = self.drag.before;
+        } else {
+            self.preview = geometry;
+            items[index].position = geometry.position;
+            if (self.interaction == .resizing) items[index].size = geometry.size;
+        }
     }
 
     fn finishInteraction(self: *Studio, items: []slides.SlideItem) ?GeometryCommand {
@@ -2939,7 +3088,17 @@ pub const Studio = struct {
         const identity = self.selected_identity orelse return null;
         const index = itemIndexByIdentity(items, identity) orelse return null;
         const after = self.preview;
-        if (geometryEqual(self.drag.before, after)) return null;
+        const source_after = if (self.drag.separate_source_geometry)
+            self.drag.source_after
+        else
+            sourceAfterDisplayDelta(
+                self.drag.source_before,
+                self.drag.before,
+                after,
+                interaction == .resizing,
+            );
+        if (geometryEqual(self.drag.before, after) and
+            (!self.drag.separate_source_geometry or geometryEqual(self.drag.source_before, source_after))) return null;
         self.dirty = true;
         self.copy_is_current = false;
         return .{
@@ -2950,6 +3109,11 @@ pub const Studio = struct {
             .before_size = self.drag.before.size,
             .after_position = after.position,
             .after_size = after.size,
+            .source_after_position = if (self.drag.separate_source_geometry) source_after.position else null,
+            .source_after_size = if (self.drag.separate_source_geometry and interaction == .resizing)
+                source_after.size
+            else
+                null,
             .resized = interaction == .resizing,
         };
     }
@@ -2984,8 +3148,15 @@ pub const Studio = struct {
         const identity = self.selected_identity orelse return null;
         const index = itemIndexByIdentity(items, identity) orelse return null;
         const before = itemGeometry(items[index], resolved_bounds);
-        items[index].position = add(items[index].position, delta);
-        const after: Geometry = .{ .position = items[index].position, .size = before.size };
+        const source_before = sourceGeometryForEdit(items[index], before, edit_scope);
+        const separate_source_geometry = edit_scope == .shared_template and items[index].instance_source != null;
+        var source_after = source_before;
+        source_after.position = add(source_before.position, delta);
+        var after = before;
+        if (!separate_source_geometry) {
+            items[index].position = add(items[index].position, delta);
+            after.position = items[index].position;
+        }
         self.dirty = true;
         self.copy_is_current = false;
         return .{
@@ -2996,6 +3167,11 @@ pub const Studio = struct {
             .before_size = before.size,
             .after_position = after.position,
             .after_size = after.size,
+            .source_after_position = if (separate_source_geometry)
+                source_after.position
+            else
+                null,
+            .source_after_size = null,
             .resized = false,
         };
     }
@@ -3016,6 +3192,7 @@ pub const Studio = struct {
         if (self.interaction != .idle) self.cancelInteraction(items);
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return null;
         const before = itemGeometry(items[index], resolved_bounds);
+        const separate_source_geometry = edit_scope == .shared_template and items[index].instance_source != null;
         var after = before;
         switch (action) {
             .left => after.position.x = 0,
@@ -3025,8 +3202,34 @@ pub const Studio = struct {
             .vertical_center => after.position.y = (logical_size.y - before.size.y) / 2,
             .bottom => after.position.y = logical_size.y - before.size.y,
         }
-        if (geometryEqual(before, after)) return null;
-        items[index].position = after.position;
+        const source_before = sourceGeometryForEdit(items[index], before, edit_scope);
+        var source_after = source_before;
+        if (separate_source_geometry) {
+            const needs_width = action == .horizontal_center or action == .right;
+            const needs_height = action == .vertical_center or action == .bottom;
+            if ((needs_width and source_before.size.x <= 0) or
+                (needs_height and source_before.size.y <= 0))
+            {
+                self.notice = .shared_template_auto_size;
+                return null;
+            }
+        }
+        const source_layout_size: rl.Vector2 = .{
+            .x = if (source_after.size.x > 0) source_after.size.x else before.size.x,
+            .y = if (source_after.size.y > 0) source_after.size.y else before.size.y,
+        };
+        switch (action) {
+            .left => source_after.position.x = 0,
+            .horizontal_center => source_after.position.x = (logical_size.x - source_layout_size.x) / 2,
+            .right => source_after.position.x = logical_size.x - source_layout_size.x,
+            .top => source_after.position.y = 0,
+            .vertical_center => source_after.position.y = (logical_size.y - source_layout_size.y) / 2,
+            .bottom => source_after.position.y = logical_size.y - source_layout_size.y,
+        }
+        if (separate_source_geometry) after = before;
+        if (geometryEqual(before, after) and
+            (edit_scope != .shared_template or geometryEqual(source_before, source_after))) return null;
+        if (!geometryEqual(before, after)) items[index].position = after.position;
         self.dirty = true;
         self.copy_is_current = false;
         return .{
@@ -3037,6 +3240,11 @@ pub const Studio = struct {
             .before_size = before.size,
             .after_position = after.position,
             .after_size = after.size,
+            .source_after_position = if (separate_source_geometry)
+                source_after.position
+            else
+                null,
+            .source_after_size = null,
             .resized = false,
         };
     }
@@ -3052,17 +3260,28 @@ pub const Studio = struct {
         var entries: [max_selection_items]SelectionGeometry = undefined;
         const count = self.gatherSelectionGeometry(items, resolved_bounds, allow_shared_edit, &entries) orelse return;
         if (count < 2) return;
+        for (entries[0..count]) |entry| {
+            if (!entry.separate_source_geometry) continue;
+            const source = entry.source_geometry;
+            const needs_width = action == .horizontal_center or action == .right;
+            const needs_height = action == .vertical_center or action == .bottom;
+            if ((needs_width and source.size.x <= 0) or (needs_height and source.size.y <= 0)) {
+                self.notice = .shared_template_auto_size;
+                return;
+            }
+        }
         const bounds = geometryBounds(entries[0..count]);
         var after: [max_selection_items]Geometry = undefined;
         for (entries[0..count], 0..) |entry, index| {
-            after[index] = entry.geometry;
+            const before = selectionLayoutGeometry(entry);
+            after[index] = before;
             switch (action) {
                 .left => after[index].position.x = bounds.position.x,
-                .horizontal_center => after[index].position.x = bounds.position.x + (bounds.size.x - entry.geometry.size.x) / 2,
-                .right => after[index].position.x = bounds.position.x + bounds.size.x - entry.geometry.size.x,
+                .horizontal_center => after[index].position.x = bounds.position.x + (bounds.size.x - before.size.x) / 2,
+                .right => after[index].position.x = bounds.position.x + bounds.size.x - before.size.x,
                 .top => after[index].position.y = bounds.position.y,
-                .vertical_center => after[index].position.y = bounds.position.y + (bounds.size.y - entry.geometry.size.y) / 2,
-                .bottom => after[index].position.y = bounds.position.y + bounds.size.y - entry.geometry.size.y,
+                .vertical_center => after[index].position.y = bounds.position.y + (bounds.size.y - before.size.y) / 2,
+                .bottom => after[index].position.y = bounds.position.y + bounds.size.y - before.size.y,
             }
         }
         self.applySelectionGeometryBatch(items, entries[0..count], after[0..count]);
@@ -3086,12 +3305,20 @@ pub const Studio = struct {
             self.notice = .distribution_needs_three;
             return;
         }
+        for (entries[0..count]) |entry| {
+            if (!entry.separate_source_geometry) continue;
+            const extent = if (action == .horizontal) entry.source_geometry.size.x else entry.source_geometry.size.y;
+            if (extent <= 0) {
+                self.notice = .shared_template_auto_size;
+                return;
+            }
+        }
         const bounds = geometryBounds(entries[0..count]);
         var order: [max_selection_items]usize = undefined;
         var after: [max_selection_items]Geometry = undefined;
         for (entries[0..count], 0..) |entry, index| {
             order[index] = index;
-            after[index] = entry.geometry;
+            after[index] = selectionLayoutGeometry(entry);
         }
         var index: usize = 1;
         while (index < count) : (index += 1) {
@@ -3108,9 +3335,10 @@ pub const Studio = struct {
 
         var total_extent: f32 = 0;
         for (entries[0..count]) |entry| {
+            const geometry = selectionLayoutGeometry(entry);
             total_extent += switch (action) {
-                .horizontal => entry.geometry.size.x,
-                .vertical => entry.geometry.size.y,
+                .horizontal => geometry.size.x,
+                .vertical => geometry.size.y,
             };
         }
         const available_extent = switch (action) {
@@ -3123,20 +3351,21 @@ pub const Studio = struct {
             .vertical => bounds.position.y,
         };
         for (order[0..count], 0..) |entry_index, ordinal| {
+            const geometry = selectionLayoutGeometry(entries[entry_index]);
             switch (action) {
                 .horizontal => {
                     after[entry_index].position.x = if (ordinal + 1 == count)
-                        bounds.position.x + bounds.size.x - entries[entry_index].geometry.size.x
+                        bounds.position.x + bounds.size.x - geometry.size.x
                     else
                         cursor;
-                    cursor += entries[entry_index].geometry.size.x + gap;
+                    cursor += geometry.size.x + gap;
                 },
                 .vertical => {
                     after[entry_index].position.y = if (ordinal + 1 == count)
-                        bounds.position.y + bounds.size.y - entries[entry_index].geometry.size.y
+                        bounds.position.y + bounds.size.y - geometry.size.y
                     else
                         cursor;
-                    cursor += entries[entry_index].geometry.size.y + gap;
+                    cursor += geometry.size.y + gap;
                 },
             }
         }
@@ -3144,11 +3373,13 @@ pub const Studio = struct {
     }
 
     fn distributionBefore(a: SelectionGeometry, b: SelectionGeometry, action: DistributionAction) bool {
-        const primary_a = if (action == .horizontal) a.geometry.position.x else a.geometry.position.y;
-        const primary_b = if (action == .horizontal) b.geometry.position.x else b.geometry.position.y;
+        const geometry_a = selectionLayoutGeometry(a);
+        const geometry_b = selectionLayoutGeometry(b);
+        const primary_a = if (action == .horizontal) geometry_a.position.x else geometry_a.position.y;
+        const primary_b = if (action == .horizontal) geometry_b.position.x else geometry_b.position.y;
         if (primary_a != primary_b) return primary_a < primary_b;
-        const secondary_a = if (action == .horizontal) a.geometry.position.y else a.geometry.position.x;
-        const secondary_b = if (action == .horizontal) b.geometry.position.y else b.geometry.position.x;
+        const secondary_a = if (action == .horizontal) geometry_a.position.y else geometry_a.position.x;
+        const secondary_b = if (action == .horizontal) geometry_b.position.y else geometry_b.position.x;
         if (secondary_a != secondary_b) return secondary_a < secondary_b;
         return a.identity < b.identity;
     }
@@ -3165,6 +3396,20 @@ pub const Studio = struct {
             const original_geometry = if (self.group_drag_count > 1) self.group_bounds_before else self.drag.before;
             if (geometryToScreenRect(viewport, original_geometry)) |original| {
                 rl.drawRectangleLinesEx(original, 1, .{ .r = 255, .g = 255, .b = 255, .a = 105 });
+            }
+            if (self.group_drag_count <= 1 and self.drag.separate_source_geometry) {
+                if (geometryToScreenRect(viewport, self.drag.source_after)) |source_rect| {
+                    const shared_accent: rl.Color = .{ .r = 255, .g = 92, .b = 198, .a = 235 };
+                    rl.drawRectangleLinesEx(source_rect, 2, shared_accent);
+                    rl.drawText(
+                        "SHARED SOURCE",
+                        @intFromFloat(source_rect.x + 5),
+                        @intFromFloat(source_rect.y + 5),
+                        12,
+                        shared_accent,
+                    );
+                    self.drawGeometryHud(viewport, source_rect, self.drag.source_after);
+                }
             }
         }
 
@@ -3197,7 +3442,8 @@ pub const Studio = struct {
                         }
                     }
                 }
-                if (self.interaction != .idle and self.group_drag_count <= 1) self.drawGeometryHud(viewport, rect, geometry);
+                if (self.interaction != .idle and self.group_drag_count <= 1 and !self.drag.separate_source_geometry)
+                    self.drawGeometryHud(viewport, rect, geometry);
             }
         }
 
@@ -3493,6 +3739,7 @@ pub const Studio = struct {
         rl.drawText("FOREGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 82), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
         drawSwatches(layout.foreground_swatches);
         rl.drawText("BACKGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 146), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+        drawCompactButton(layout.clear_background, "None");
         drawSwatches(layout.background_swatches);
         rl.drawText(
             if (self.selectionCount() > 1) "ALIGN TO SELECTION" else "ALIGN TO SLIDE",
@@ -3559,14 +3806,13 @@ pub const Studio = struct {
             .source_changed_on_disk => "Original changed on disk - use Save Copy to preserve this version",
             .edit_failed => "Edit rejected - the original source is unchanged",
             .undo_failed => "Undo/redo failed - see the log for details",
-            .shared_template_masked => "This slide already overrides the item; edit the shared template from an uncustomized instance",
-            .shared_template_delete_unsupported => "Shared template deletion needs dependency cleanup and is not available yet",
-            .local_override_needs_unique_id => "Add a unique id=... to create a local override; Alt edits an uncustomized shared item",
-            .duplicate_item_unsupported => "Duplicate is not source-safe here; use a direct item, current-state birth, or Alt on an uncustomized template",
+            .shared_template_customized => "Editing shared template; this slide keeps any local overrides",
+            .shared_template_auto_size => "Shared resize needs explicit template width and height",
+            .local_override_needs_unique_id => "Add a unique id=... to create a local override; Alt edits the shared template",
+            .duplicate_item_unsupported => "Duplicate is not source-safe here; use a direct item, current-state birth, or Alt on a template item",
             .multi_selection_property_unsupported => "That property is single-item only; align, distribute, move, or nudge the selection",
             .selection_capacity_reached => "Selection is limited to 64 items; the remaining items were left unselected",
             .distribution_needs_three => "Equal-gap distribution needs at least three selected items",
-            .template_background_local_unsupported => "Background insertion cannot be local to a template instance; hold Alt to edit the shared template",
             .generated_source_read_only => "Read-only in Studio: this item directive is produced with @let",
             .property_unavailable => "That property does not apply to this kind of item",
             .base_scene_only => "That action is available in the BASE scene",
@@ -4947,27 +5193,270 @@ test "local template geometry targets an existing instance override" {
     try std.testing.expectEqual(@as(usize, 180), command.source.line_offset);
 }
 
-test "an existing local override blocks ambiguous Alt shared edits" {
+test "a customized instance emits shared nudge and text edits from the authored layer" {
     var items = [_]slides.SlideItem{testItem(76, .textbox, 500, 100, 300, 100)};
     items[0].id = "hero";
     items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
     items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 12, .line_offset = 180, .patchable = true };
+    items[0].shared_template_values = .{
+        .position = .{ .x = 100, .y = 80 },
+        .size = .{ .x = 260, .y = 90 },
+        .text = "Shared hero",
+    };
     const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
     var studio: Studio = .{ .enabled = true, .selected_identity = 76 };
 
-    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+    const nudge = studio.update(&items, &.{}, viewport, .{
         .nudge = .{ .x = 10, .y = 0 },
         .allow_shared_edit = true,
-    }) == null);
+    }).?;
+    try expectVector(.{ .x = 500, .y = 100 }, nudge.after_position);
     try expectVector(.{ .x = 500, .y = 100 }, items[0].position);
-    try std.testing.expectEqual(Notice.shared_template_masked, studio.notice);
+    try expectVector(.{ .x = 110, .y = 80 }, nudge.source_after_position.?);
+    try std.testing.expectEqual(Notice.shared_template_customized, studio.notice);
 
     _ = studio.update(&items, &.{}, viewport, .{
         .edit_text_pressed = true,
         .allow_shared_edit = true,
     });
-    try std.testing.expect(studio.takeSemanticCommand() == null);
-    try std.testing.expectEqual(Notice.shared_template_masked, studio.notice);
+    switch (studio.takeSemanticCommand().?) {
+        .edit_text => |target| try std.testing.expectEqual(EditScope.shared_template, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(Notice.shared_template_customized, studio.notice);
+}
+
+test "customized shared move and resize keep display preview geometry separate from source targets" {
+    var items = [_]slides.SlideItem{testItem(761, .textbox, 500, 100, 300, 100)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 12, .line_offset = 180, .patchable = true };
+    items[0].shared_template_values = .{
+        .position = .{ .x = 100, .y = 80 },
+        .size = .{ .x = 250, .y = 80 },
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 550, .y = 130 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .allow_shared_edit = true,
+        .disable_snapping = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 580, .y = 150 },
+        .pointer_down = true,
+        .allow_shared_edit = true,
+        .disable_snapping = true,
+    });
+    const live = studio.livePreview().?;
+    try expectVector(live.before.position, live.after.position);
+    try expectVector(.{ .x = 500, .y = 100 }, items[0].position);
+    try expectVector(.{ .x = 130, .y = 100 }, studio.drag.source_after.position);
+    const move = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 580, .y = 150 },
+        .pointer_released = true,
+        .allow_shared_edit = true,
+        .disable_snapping = true,
+    }).?;
+    try expectVector(.{ .x = 500, .y = 100 }, move.after_position);
+    try expectVector(move.before_position, move.after_position);
+    try expectVector(.{ .x = 130, .y = 100 }, move.source_after_position.?);
+    try std.testing.expect(move.source_after_size == null);
+
+    // Simulate reparse: the local instance override still supplies the
+    // effective geometry while the shared layer reflects the persisted move.
+    items[0].position = .{ .x = 500, .y = 100 };
+    items[0].size = .{ .x = 300, .y = 100 };
+    items[0].shared_template_values.?.position = move.source_after_position.?;
+    studio.selected_identity = 761;
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 800, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .allow_shared_edit = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 830, .y = 220 },
+        .pointer_down = true,
+        .allow_shared_edit = true,
+        .disable_snapping = true,
+    });
+    const resize = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 830, .y = 220 },
+        .pointer_released = true,
+        .allow_shared_edit = true,
+        .disable_snapping = true,
+    }).?;
+    try expectVector(.{ .x = 300, .y = 100 }, resize.after_size);
+    try expectVector(resize.before_size, resize.after_size);
+    try expectVector(.{ .x = 275, .y = 96 }, resize.source_after_size.?);
+    try expectVector(.{ .x = 130, .y = 100 }, resize.source_after_position.?);
+}
+
+test "customized shared align uses authored template geometry" {
+    var items = [_]slides.SlideItem{testItem(762, .textbox, 400, 100, 600, 120)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 12, .line_offset = 180, .patchable = true };
+    items[0].shared_template_values = .{
+        .position = .{ .x = 100, .y = 80 },
+        .size = .{ .x = 300, .y = 100 },
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 762 };
+
+    const command = studio.update(&items, &.{}, viewport, .{
+        .align_action = .horizontal_center,
+        .allow_shared_edit = true,
+    }).?;
+    try expectVector(.{ .x = 400, .y = 100 }, command.after_position);
+    try expectVector(command.before_position, command.after_position);
+    try expectVector(.{ .x = 810, .y = 80 }, command.source_after_position.?);
+}
+
+test "group align uses shared authored geometry while customized display stays stable" {
+    var items = [_]slides.SlideItem{
+        testItem(765, .textbox, 1000, 100, 400, 100),
+        testItem(766, .textbox, 300, 200, 200, 100),
+        testItem(767, .textbox, 800, 300, 100, 100),
+    };
+    items[0].id = "custom";
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 20, .line_offset = 200, .patchable = true };
+    items[0].shared_template_values = .{ .position = .{ .x = 100, .y = 100 }, .size = .{ .x = 100, .y = 100 } };
+    items[1].id = "ordinary";
+    items[1].source = .{ .scope = .slide_template, .line_number = 5, .line_offset = 50, .patchable = true };
+    items[1].shared_template_values = .{ .position = items[1].position, .size = items[1].size };
+    items[2].id = "direct";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 765, 766, 767 });
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+        .align_action = .horizontal_center,
+        .allow_shared_edit = true,
+    }) == null);
+    const batch = studio.takeGeometryBatch().?;
+    try std.testing.expectEqual(@as(usize, 3), batch.count);
+    var customized: ?GeometryCommand = null;
+    var ordinary: ?GeometryCommand = null;
+    var direct: ?GeometryCommand = null;
+    for (batch.slice()) |command| switch (command.item_identity) {
+        765 => customized = command,
+        766 => ordinary = command,
+        767 => direct = command,
+        else => return error.UnexpectedGeometryCommand,
+    };
+    try expectVector(.{ .x = 1000, .y = 100 }, items[0].position);
+    try expectVector(customized.?.before_position, customized.?.after_position);
+    try expectVector(.{ .x = 450, .y = 100 }, customized.?.source_after_position.?);
+    try std.testing.expectEqual(EditScope.shared_template, customized.?.edit_scope);
+    try expectVector(.{ .x = 400, .y = 200 }, ordinary.?.after_position);
+    try std.testing.expect(ordinary.?.source_after_position == null);
+    try std.testing.expectEqual(EditScope.shared_template, ordinary.?.edit_scope);
+    try expectVector(.{ .x = 450, .y = 300 }, direct.?.after_position);
+    try std.testing.expectEqual(EditScope.direct, direct.?.edit_scope);
+    try std.testing.expectEqual(Notice.shared_template_customized, studio.notice);
+}
+
+test "group distribution uses shared layout and supports a direct auto-sized member" {
+    var items = [_]slides.SlideItem{
+        testItem(768, .textbox, 0, 100, 50, 100),
+        testItem(769, .textbox, 900, 200, 500, 100),
+        testItem(770, .textbox, 350, 300, 100, 100),
+        testItem(771, .img, 700, 400, 0, 0),
+    };
+    items[0].id = "first";
+    items[1].id = "custom";
+    items[1].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[1].instance_source = .{ .scope = .slide_instance_override, .line_number = 20, .line_offset = 200, .patchable = true };
+    items[1].shared_template_values = .{ .position = .{ .x = 150, .y = 200 }, .size = .{ .x = 100, .y = 100 } };
+    items[2].id = "ordinary";
+    items[2].source = .{ .scope = .slide_template, .line_number = 5, .line_offset = 50, .patchable = true };
+    items[2].shared_template_values = .{ .position = items[2].position, .size = items[2].size };
+    items[3].id = "auto";
+    const bounds = [_]ResolvedBounds{.{
+        .identity = 771,
+        .position = .{ .x = 700, .y = 400 },
+        .size = .{ .x = 50, .y = 100 },
+    }};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 768, 769, 770, 771 });
+
+    _ = studio.update(&items, &bounds, viewport, .{
+        .distribute_action = .horizontal,
+        .allow_shared_edit = true,
+    });
+    const batch = studio.takeGeometryBatch().?;
+    try std.testing.expectEqual(@as(usize, 2), batch.count);
+    var customized: ?GeometryCommand = null;
+    var ordinary: ?GeometryCommand = null;
+    for (batch.slice()) |command| switch (command.item_identity) {
+        769 => customized = command,
+        770 => ordinary = command,
+        else => return error.UnexpectedGeometryCommand,
+    };
+    try expectVector(.{ .x = 900, .y = 200 }, items[1].position);
+    try expectVector(customized.?.before_position, customized.?.after_position);
+    try expectVector(.{ .x = 200, .y = 200 }, customized.?.source_after_position.?);
+    try expectVector(.{ .x = 450, .y = 300 }, ordinary.?.after_position);
+    try std.testing.expect(ordinary.?.source_after_position == null);
+    try expectVector(.{ .x = 700, .y = 400 }, items[3].position);
+}
+
+test "customized shared semantic colors and delete retain the shared target" {
+    var items = [_]slides.SlideItem{testItem(763, .textbox, 500, 100, 300, 100)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 12, .line_offset = 180, .patchable = true };
+    items[0].shared_template_values = .{
+        .text = "Shared hero",
+        .color = .white,
+        .background_color = .black,
+        .position = .{ .x = 100, .y = 80 },
+        .size = .{ .x = 260, .y = 90 },
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 763 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .foreground_color = .orange, .allow_shared_edit = true });
+    switch (studio.takeSemanticCommand().?) {
+        .set_foreground => |command| try std.testing.expectEqual(EditScope.shared_template, command.target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    _ = studio.update(&items, &.{}, viewport, .{ .background_color = .blue, .allow_shared_edit = true });
+    switch (studio.takeSemanticCommand().?) {
+        .set_background => |command| try std.testing.expectEqual(EditScope.shared_template, command.target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true, .allow_shared_edit = true });
+    switch (studio.takeSemanticCommand().?) {
+        .delete_item => |target| try std.testing.expectEqual(EditScope.shared_template, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "customized shared resize refuses an auto-sized authored layer" {
+    var items = [_]slides.SlideItem{testItem(764, .img, 500, 100, 300, 100)};
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 12, .line_offset = 180, .patchable = true };
+    items[0].shared_template_values = .{ .position = .{ .x = 100, .y = 80 }, .size = .zero() };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 764 };
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 800, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .allow_shared_edit = true,
+    }) == null);
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try std.testing.expectEqual(Notice.shared_template_auto_size, studio.notice);
 }
 
 test "template status labels distinguish local and shared destinations" {
@@ -4977,12 +5466,20 @@ test "template status labels distinguish local and shared destinations" {
     var studio: Studio = .{ .enabled = true };
 
     try std.testing.expectEqualStrings("local instance override; Alt edits shared template", studio.editDestinationLabel(item));
+    item.instance_source = .{ .scope = .slide_instance_override, .patchable = true };
+    try std.testing.expectEqualStrings("local override active; Alt edits shared template", studio.editDestinationLabel(item));
+    item.instance_source = null;
     item.id = null;
     try std.testing.expectEqualStrings("shared template; add id for local edit (Alt edits shared)", studio.editDestinationLabel(item));
 
     studio.interaction = .moving;
     studio.drag.edit_scope = .shared_template;
     try std.testing.expectEqualStrings("editing shared template (Alt)", studio.editDestinationLabel(item));
+    item.instance_source = .{ .scope = .slide_instance_override, .patchable = true };
+    try std.testing.expectEqualStrings(
+        "editing shared template (Alt) · local override remains",
+        studio.editDestinationLabel(item),
+    );
     studio.drag.edit_scope = .local_instance;
     try std.testing.expectEqualStrings("editing local instance override", studio.editDestinationLabel(item));
 }
@@ -5165,7 +5662,7 @@ test "duplicate property button dispatches the selected direct item" {
     }
 }
 
-test "template duplication is shared-only and rejects customized instances" {
+test "template duplication is shared-only including customized instances" {
     var items = [_]slides.SlideItem{testItem(183, .textbox, 100, 100, 300, 100)};
     items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
     items[0].id = "hero";
@@ -5183,9 +5680,12 @@ test "template duplication is shared-only and rejects customized instances" {
     }
 
     items[0].instance_source = .{ .scope = .slide_instance_override, .line_number = 20, .line_offset = 220, .patchable = true };
+    items[0].shared_template_values = .{ .position = items[0].position, .size = items[0].size };
     _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true, .allow_shared_edit = true });
-    try std.testing.expect(studio.takeSemanticCommand() == null);
-    try std.testing.expectEqual(Notice.shared_template_masked, studio.notice);
+    switch (studio.takeSemanticCommand().?) {
+        .duplicate_item => |target| try std.testing.expectEqual(EditScope.shared_template, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
 }
 
 test "morph duplication allows only an unmodified current-state birth" {
@@ -5272,7 +5772,7 @@ test "identified template delete and foreground color emit local targets" {
     }
 }
 
-test "template background insertion is unavailable locally but allowed shared" {
+test "template background color emits local and shared targets" {
     var items = [_]slides.SlideItem{testItem(90, .textbox, 100, 100, 300, 100)};
     items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
     items[0].id = "hero";
@@ -5280,8 +5780,13 @@ test "template background insertion is unavailable locally but allowed shared" {
     var studio: Studio = .{ .enabled = true, .selected_identity = 90 };
 
     _ = studio.update(&items, &.{}, viewport, .{ .background_color = .blue });
-    try std.testing.expect(studio.takeSemanticCommand() == null);
-    try std.testing.expectEqual(Notice.template_background_local_unsupported, studio.notice);
+    switch (studio.takeSemanticCommand().?) {
+        .set_background => |command| {
+            try std.testing.expectEqual(PaletteColor.blue, command.color);
+            try std.testing.expectEqual(EditScope.local_instance, command.target.edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
 
     _ = studio.update(&items, &.{}, viewport, .{ .background_color = .blue, .allow_shared_edit = true });
     switch (studio.takeSemanticCommand().?) {
@@ -5293,7 +5798,47 @@ test "template background insertion is unavailable locally but allowed shared" {
     }
 }
 
-test "idless template semantic actions need IDs and shared delete stays guarded" {
+test "background clear emits direct local and shared targets and stays base-scene only" {
+    var items = [_]slides.SlideItem{testItem(901, .textbox, 100, 100, 300, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 901 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .clear_background_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .clear_background => |target| try std.testing.expectEqual(EditScope.direct, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[0].id = "hero";
+    items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
+    items[0].shared_template_values = .{ .position = items[0].position, .size = items[0].size, .background_color = .blue };
+    _ = studio.update(&items, &.{}, viewport, .{ .clear_background_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .clear_background => |target| try std.testing.expectEqual(EditScope.local_instance, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    _ = studio.update(&items, &.{}, viewport, .{ .clear_background_pressed = true, .allow_shared_edit = true });
+    switch (studio.takeSemanticCommand().?) {
+        .clear_background => |target| try std.testing.expectEqual(EditScope.shared_template, target.edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.active_morph_state = 0;
+    studio.morph_state_count = 1;
+    _ = studio.update(&items, &.{}, viewport, .{ .clear_background_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.base_scene_only, studio.notice);
+
+    studio.active_morph_state = null;
+    const layout = uiLayout(viewport);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.clear_background),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .clear_background);
+}
+
+test "idless template semantic actions need IDs but Alt can delete shared" {
     var items = [_]slides.SlideItem{testItem(91, .textbox, 100, 100, 300, 100)};
     items[0].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 99, .patchable = true };
     const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
@@ -5304,8 +5849,13 @@ test "idless template semantic actions need IDs and shared delete stays guarded"
     try std.testing.expectEqual(Notice.local_override_needs_unique_id, studio.notice);
 
     _ = studio.update(&items, &.{}, viewport, .{ .delete_pressed = true, .allow_shared_edit = true });
-    try std.testing.expect(studio.takeSemanticCommand() == null);
-    try std.testing.expectEqual(Notice.shared_template_delete_unsupported, studio.notice);
+    switch (studio.takeSemanticCommand().?) {
+        .delete_item => |target| {
+            try std.testing.expectEqual(EditScope.shared_template, target.edit_scope);
+            try std.testing.expectEqual(@as(usize, 99), target.source.line_offset);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
 }
 
 test "promotion is offered only for direct base box items" {

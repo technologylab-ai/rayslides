@@ -44,6 +44,7 @@ pub const PatchResult = struct {
 
 pub const PatchError = error{
     AmbiguousSlideTemplateLayout,
+    AmbiguousSlideTemplateDependency,
     CannotDeleteOnlySlide,
     DuplicateAttribute,
     InvalidAttribute,
@@ -65,6 +66,7 @@ pub const PatchError = error{
     SourceTooLarge,
     UnsupportedItemDuplication,
     UnsupportedSlideTemplateOverride,
+    UnsupportedSharedTemplateDeletion,
     UnsupportedSlidePromotion,
     UnsafeSlideGlobalDirective,
 };
@@ -631,6 +633,53 @@ pub fn patchSlideTemplateOverrideText(
     return patchItemText(allocator, source, override_offset, text_value);
 }
 
+/// Add a literal, instance-local fill override for one inherited template
+/// item. The emitted syntax is the parser's canonical `@set <id> bg=<value>`;
+/// `background_literal` must be `#rrggbbaa` or `none`.
+pub fn insertSlideTemplateBackgroundOverride(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    item_id: []const u8,
+    background_literal: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateLiteralPatch(.{ .key = "bg", .value = background_literal });
+    if (!isLiteralItemId(item_id)) return error.InvalidLiteralValue;
+
+    const directive = try std.fmt.allocPrint(
+        allocator,
+        "@set {s} bg={s}",
+        .{ item_id, background_literal },
+    );
+    defer allocator.free(directive);
+    return insertSlideTemplateOverride(allocator, source, slide_offset, directive);
+}
+
+/// Patch the fill on the parser-effective instance-local mutation for an
+/// inherited template item. The same slide, target-ID, and latest-mutation
+/// provenance checks as every scoped template override remain in force.
+pub fn patchSlideTemplateBackgroundOverride(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    override_offset: usize,
+    item_id: []const u8,
+    background_literal: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const patches = [_]LiteralAttributePatch{.{
+        .key = "bg",
+        .value = background_literal,
+    }};
+    return patchSlideTemplateOverrideAttributes(
+        allocator,
+        source,
+        slide_offset,
+        override_offset,
+        item_id,
+        &patches,
+    );
+}
+
 /// Find the end of a slide's base scene: its first morph state, next slide
 /// boundary, or EOF. This is where ordinary new items should be inserted.
 pub fn slideItemInsertionOffset(source: []const u8, slide_offset: usize) PatchError!usize {
@@ -1150,6 +1199,86 @@ pub fn deleteItemCascadingMorphMutations(
         }
         cursor = line.full_end;
     }
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+/// Delete one item from the exact shared slide-template definition used by a
+/// representative `@popslide` instance, together with every instance-local or
+/// morph-state mutation that depends on that item.
+///
+/// The representative instance is resolved source-order-wise to the latest
+/// preceding literal `@pushslide` of the same name. Only later instances still
+/// bound to that exact definition are visited; the first same-name definition
+/// shadows it and ends the dependency window. The selected definition must be
+/// a direct, literal capture rather than a generated or nested/captured slide.
+/// Pass a stable `item_id` to remove dependent mutations. An id-less shared
+/// item may pass null: its exact directive is still deleted, while mutation
+/// matching is unnecessary because it cannot be targeted. Dynamic structural
+/// directives, duplicate IDs, locally colliding IDs, and nested template
+/// captures make ownership ambiguous and reject the complete operation before
+/// any source bytes are changed.
+pub fn deleteSharedSlideTemplateItem(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    instance_slide_offset: usize,
+    shared_directive_offset: usize,
+    item_id: ?[]const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (item_id) |id| {
+        if (!isLiteralItemId(id)) return error.InvalidLiteralValue;
+    }
+
+    const resolved = try resolveSlideTemplateDefinitionForInstance(source, instance_slide_offset);
+    try validateDirectSharedTemplateItem(
+        source,
+        resolved.definition,
+        shared_directive_offset,
+        item_id,
+    );
+
+    const shared_line = directiveLine(source, shared_directive_offset) catch
+        return error.UnsupportedSharedTemplateDeletion;
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    try appendItemDeletionEdits(allocator, source, shared_line, &edits);
+
+    var cursor = resolved.definition.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            const name = directiveName(text);
+
+            if (std.mem.eql(u8, name, "@pushslide")) {
+                if (hasPotentialLetExpansion(text)) {
+                    return error.AmbiguousSlideTemplateDependency;
+                }
+                const pushed_name = directiveContextName(text, name.len) orelse
+                    return error.AmbiguousSlideTemplateDependency;
+                if (std.mem.eql(u8, pushed_name, resolved.name)) break;
+            } else if (std.mem.eql(u8, name, "@popslide")) {
+                if (hasPotentialLetExpansion(text)) {
+                    return error.AmbiguousSlideTemplateDependency;
+                }
+                const popped_name = directiveContextName(text, name.len) orelse
+                    return error.AmbiguousSlideTemplateDependency;
+                if (std.mem.eql(u8, popped_name, resolved.name)) {
+                    const end = try appendSharedTemplateInstanceDependencyEdits(
+                        allocator,
+                        source,
+                        line,
+                        item_id,
+                        &edits,
+                    );
+                    cursor = end;
+                    continue;
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+
     sortEditsByPosition(edits.items);
     return applyEdits(allocator, source, edits.items);
 }
@@ -1735,6 +1864,246 @@ const SlideTemplateInstanceBaseRegion = struct {
     end: usize,
 };
 
+const ResolvedSlideTemplateDefinition = struct {
+    name: []const u8,
+    definition: DirectiveLine,
+};
+
+fn resolveSlideTemplateDefinitionForInstance(
+    source: []const u8,
+    instance_slide_offset: usize,
+) PatchError!ResolvedSlideTemplateDefinition {
+    const instance = directiveLine(source, instance_slide_offset) catch
+        return error.UnsupportedSharedTemplateDeletion;
+    const instance_text = source[instance.start..instance.content_end];
+    const instance_directive = directiveName(instance_text);
+    if (!std.mem.eql(u8, instance_directive, "@popslide") or
+        hasPotentialLetExpansion(instance_text))
+    {
+        return error.UnsupportedSharedTemplateDeletion;
+    }
+    const template_name = directiveContextName(instance_text, instance_directive.len) orelse
+        return error.UnsupportedSharedTemplateDeletion;
+    if (!isReusableName(template_name)) return error.UnsupportedSharedTemplateDeletion;
+
+    var latest: ?DirectiveLine = null;
+    var resolution_ambiguous = false;
+    var cursor = sourceStart(source);
+    while (cursor < instance.start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > instance.start) return error.UnsupportedSharedTemplateDeletion;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@pushslide")) {
+                if (hasPotentialLetExpansion(text)) {
+                    // A generated name after the last known matching
+                    // definition may have shadowed it.
+                    if (latest != null) resolution_ambiguous = true;
+                } else if (directiveContextName(text, name.len)) |candidate| {
+                    if (std.mem.eql(u8, candidate, template_name)) {
+                        latest = line;
+                        resolution_ambiguous = false;
+                    }
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (cursor != instance.start or latest == null or resolution_ambiguous) {
+        return error.AmbiguousSlideTemplateDependency;
+    }
+    return .{ .name = template_name, .definition = latest.? };
+}
+
+fn validateDirectSharedTemplateItem(
+    source: []const u8,
+    definition: DirectiveLine,
+    shared_directive_offset: usize,
+    item_id: ?[]const u8,
+) PatchError!void {
+    const definition_text = source[definition.start..definition.content_end];
+    if (!std.mem.eql(u8, directiveName(definition_text), "@pushslide") or
+        hasPotentialLetExpansion(definition_text))
+    {
+        return error.UnsupportedSharedTemplateDeletion;
+    }
+
+    // @pushslide resets the parser's in-progress slide. With no intervening
+    // rendered anchor, bytes after the previous @pushslide form this direct
+    // definition's complete capture region. A @slide/@popslide here means the
+    // definition captures another authored or cloned slide and is deliberately
+    // outside this exact source primitive.
+    var capture_start = sourceStart(source);
+    var cursor = sourceStart(source);
+    while (cursor < definition.start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > definition.start) return error.UnsupportedSharedTemplateDeletion;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            if (std.mem.eql(u8, directiveName(text), "@pushslide")) capture_start = line.full_end;
+        }
+        cursor = line.full_end;
+    }
+    if (cursor != definition.start or shared_directive_offset < capture_start or
+        shared_directive_offset >= definition.start)
+    {
+        return error.UnsupportedSharedTemplateDeletion;
+    }
+    _ = itemOwnedAnimationStart(source, shared_directive_offset) catch
+        return error.UnsupportedSharedTemplateDeletion;
+
+    var matching_ids: usize = 0;
+    var selected_found = false;
+    cursor = capture_start;
+    while (cursor < definition.start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > definition.start) return error.UnsupportedSharedTemplateDeletion;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            const name = directiveName(text);
+
+            if (std.mem.eql(u8, name, "@slide") or
+                std.mem.eql(u8, name, "@popslide") or
+                isMorphStateDirective(name) or
+                isMorphMutationDirective(name))
+            {
+                return error.UnsupportedSharedTemplateDeletion;
+            }
+            if (hasPotentialLetExpansion(text) and
+                (directiveEmitsSlideItem(name) or isAnimationDirective(name)))
+            {
+                return error.UnsupportedSharedTemplateDeletion;
+            }
+
+            if (directiveEmitsSlideItem(name)) {
+                // Malformed/dynamic identity tokens such as `id=` or a
+                // generated @pop name cannot be treated as an id-less item:
+                // the parser may retain an earlier duplicate id token.
+                if (directiveHasDynamicIdentity(text, name)) {
+                    return error.UnsupportedSharedTemplateDeletion;
+                }
+                const candidate_id = literalEmittedItemId(text, name);
+                if (item_id) |sought| {
+                    if (candidate_id != null and std.mem.eql(u8, candidate_id.?, sought)) {
+                        matching_ids += 1;
+                        if (cursor == shared_directive_offset) selected_found = true;
+                    } else if (cursor == shared_directive_offset) {
+                        return error.UnsupportedSharedTemplateDeletion;
+                    }
+                } else if (cursor == shared_directive_offset) {
+                    if (candidate_id != null) return error.UnsupportedSharedTemplateDeletion;
+                    selected_found = true;
+                }
+            } else if (cursor == shared_directive_offset) {
+                return error.UnsupportedSharedTemplateDeletion;
+            }
+        } else if (cursor == shared_directive_offset) {
+            return error.UnsupportedSharedTemplateDeletion;
+        }
+        cursor = line.full_end;
+    }
+    if (!selected_found or (item_id != null and matching_ids != 1)) {
+        return error.AmbiguousSlideTemplateDependency;
+    }
+}
+
+fn appendSharedTemplateInstanceDependencyEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    instance: DirectiveLine,
+    item_id: ?[]const u8,
+    edits: *std.ArrayList(Edit),
+) (std.mem.Allocator.Error || PatchError)!usize {
+    var cursor = instance.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            const name = directiveName(text);
+            if (isSlideBoundaryDirective(name)) {
+                // A @pushslide directly closes this instance by capturing it
+                // as another reusable definition. Deleting the inherited item
+                // would then have transitive dependencies outside this exact
+                // definition, so decline instead of leaving them dangling.
+                if (std.mem.eql(u8, name, "@pushslide")) {
+                    return error.UnsupportedSharedTemplateDeletion;
+                }
+                return cursor;
+            }
+
+            if (item_id == null) {
+                cursor = line.full_end;
+                continue;
+            } else if (directiveEmitsSlideItem(name)) {
+                // A let-expanded item can introduce or replace id= even when
+                // no identity token is visible in the physical source. Treat
+                // every generated instance-local item as a possible collision
+                // with the shared item being removed.
+                if (hasPotentialLetExpansion(text) or directiveHasDynamicIdentity(text, name)) {
+                    return error.AmbiguousSlideTemplateDependency;
+                }
+                if (literalEmittedItemId(text, name)) |candidate_id| {
+                    if (std.mem.eql(u8, candidate_id, item_id.?)) {
+                        return error.AmbiguousSlideTemplateDependency;
+                    }
+                }
+            } else if (isMorphMutationDirective(name)) {
+                const target = directiveContextName(text, name.len) orelse
+                    return error.AmbiguousSlideTemplateDependency;
+                if (!isLiteralItemId(target)) return error.AmbiguousSlideTemplateDependency;
+                if (std.mem.eql(u8, target, item_id.?)) {
+                    if (hasPotentialLetExpansion(text)) {
+                        return error.UnsupportedSharedTemplateDeletion;
+                    }
+                    const animation_start = itemOwnedAnimationStart(source, cursor) catch
+                        return error.UnsupportedSharedTemplateDeletion;
+                    if (animation_start != cursor) return error.UnsupportedSharedTemplateDeletion;
+                    try edits.append(allocator, .{
+                        .start = cursor,
+                        .end = line.full_end,
+                        .replacement = "",
+                    });
+                    try appendBodyDeletionEdits(allocator, source, line.full_end, edits);
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+    return source.len;
+}
+
+fn literalEmittedItemId(line: []const u8, name: []const u8) ?[]const u8 {
+    if (!directiveEmitsSlideItem(name)) return null;
+    if (effectiveLiteralId(line, name.len)) |id| return id;
+    if (std.mem.eql(u8, name, "@pop")) {
+        const component_name = directiveContextName(line, name.len) orelse return null;
+        if (isLiteralItemId(component_name)) return component_name;
+    }
+    return null;
+}
+
+fn directiveHasDynamicIdentity(line: []const u8, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "@pop")) {
+        const component_name = directiveContextName(line, name.len) orelse return true;
+        if (!isLiteralItemId(component_name)) return true;
+    }
+
+    var cursor = name.len;
+    while (cursor < line.len) {
+        while (cursor < line.len and isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+        if (cursor == line.len) break;
+        const token_start = cursor;
+        while (cursor < line.len and !isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+        const token = line[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals];
+        if (std.mem.eql(u8, key, "text")) break;
+        if (std.mem.eql(u8, key, "id") and !isLiteralItemId(token[equals + 1 ..])) return true;
+    }
+    return false;
+}
+
 fn slideTemplateInstanceBaseRegion(
     source: []const u8,
     slide_offset: usize,
@@ -2123,12 +2492,14 @@ fn isLiteralItemId(id: []const u8) bool {
 
 fn isColorAttribute(key: []const u8) bool {
     return std.mem.eql(u8, key, "color") or
+        std.mem.eql(u8, key, "bg") or
         std.mem.eql(u8, key, "bullet_color") or
         std.mem.eql(u8, key, "shadow");
 }
 
 fn validColorLiteral(key: []const u8, value: []const u8) bool {
-    if (std.mem.eql(u8, key, "shadow") and std.mem.eql(u8, value, "none")) return true;
+    if ((std.mem.eql(u8, key, "shadow") or std.mem.eql(u8, key, "bg")) and
+        std.mem.eql(u8, value, "none")) return true;
     if (value.len != 9 or value[0] != '#') return false;
     for (value[1..]) |byte| {
         if (!std.ascii.isHex(byte)) return false;
@@ -4227,6 +4598,310 @@ test "cascading semantic deletion removes later morph mutations only on current 
     try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
     try std.testing.expectEqual(@as(usize, 2), deck.slides.items.len);
     try std.testing.expectEqualStrings("remove", deck.slides.items[1].items.?.items[0].id.?);
+}
+
+test "shared template deletion owns item animation body and exact instance dependencies" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@anim(fade) duration=0.4\r\n" ++
+        "ignored animation body\r\n" ++
+        "# retained animation note\r\n" ++
+        "@box id=hero x=10 y=20 w=300 h=100\r\n" ++
+        "Shared hero body\r\n" ++
+        "# retained shared note\r\n" ++
+        "@box id=keep x=0 y=0 w=10 h=10 text=Keep\r\n" ++
+        "@pushslide layout\r\n" ++
+        "@popslide layout\r\n" ++
+        "@set hero bg=#10203040\r\n" ++
+        "Local hero body\r\n" ++
+        "# retained local note\r\n" ++
+        "@set keep x=20\r\n" ++
+        "@state(morph)\r\n" ++
+        "@hide hero\r\n" ++
+        "@show keep\r\n" ++
+        "@slide\r\n" ++
+        "@popslide layout\r\n" ++
+        "@state(morph)\r\n" ++
+        "@set hero x=500\r\n" ++
+        "Morph hero body\r\n" ++
+        "@slide\r\n" ++
+        "@pushslide reset\r\n" ++
+        "@box id=hero x=900 y=20 w=300 h=100 text=Shadow hero\r\n" ++
+        "@pushslide layout\r\n" ++
+        "@popslide layout\r\n" ++
+        "@set hero x=1000\r\n";
+    const expected =
+        "\xEF\xBB\xBF# retained animation note\r\n" ++
+        "# retained shared note\r\n" ++
+        "@box id=keep x=0 y=0 w=10 h=10 text=Keep\r\n" ++
+        "@pushslide layout\r\n" ++
+        "@popslide layout\r\n" ++
+        "# retained local note\r\n" ++
+        "@set keep x=20\r\n" ++
+        "@state(morph)\r\n" ++
+        "@show keep\r\n" ++
+        "@slide\r\n" ++
+        "@popslide layout\r\n" ++
+        "@state(morph)\r\n" ++
+        "@slide\r\n" ++
+        "@pushslide reset\r\n" ++
+        "@box id=hero x=900 y=20 w=300 h=100 text=Shadow hero\r\n" ++
+        "@pushslide layout\r\n" ++
+        "@popslide layout\r\n" ++
+        "@set hero x=1000\r\n";
+    const representative = std.mem.indexOf(u8, source, "@popslide layout").?;
+    const shared = std.mem.indexOf(u8, source, "@box id=hero x=10").?;
+    const result = try deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        source,
+        representative,
+        shared,
+        "hero",
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.source, "\xEF\xBB\xBF"));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    // The same ID belonging to the later, shadowing definition survives.
+    const final_slide = deck.slides.items[deck.slides.items.len - 1];
+    try std.testing.expectEqualStrings("hero", final_slide.items.?.items[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 1000), final_slide.items.?.items[0].position.x, 0.0001);
+}
+
+test "shared template deletion rejects dynamic nested and colliding ownership" {
+    const dynamic_item =
+        "@let attrs=id=hero x=0 y=0\n" ++
+        "@box $attrs$\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n";
+    try std.testing.expectError(error.UnsupportedSharedTemplateDeletion, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        dynamic_item,
+        std.mem.indexOf(u8, dynamic_item, "@popslide").?,
+        std.mem.indexOf(u8, dynamic_item, "@box").?,
+        "hero",
+    ));
+
+    const dynamic_shadow =
+        "@box id=hero\n" ++
+        "@pushslide layout\n" ++
+        "@let generated=layout\n" ++
+        "@pushslide $generated$\n" ++
+        "@popslide layout\n";
+    try std.testing.expectError(error.AmbiguousSlideTemplateDependency, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        dynamic_shadow,
+        std.mem.indexOf(u8, dynamic_shadow, "@popslide").?,
+        std.mem.indexOf(u8, dynamic_shadow, "@box").?,
+        "hero",
+    ));
+
+    const nested_capture =
+        "@box id=hero\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@pushslide derived\n" ++
+        "@popslide derived\n";
+    try std.testing.expectError(error.UnsupportedSharedTemplateDeletion, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        nested_capture,
+        std.mem.indexOf(u8, nested_capture, "@popslide layout").?,
+        std.mem.indexOf(u8, nested_capture, "@box").?,
+        "hero",
+    ));
+
+    const duplicate_definition =
+        "@box id=hero text=One\n" ++
+        "@box id=hero text=Two\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n";
+    try std.testing.expectError(error.AmbiguousSlideTemplateDependency, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        duplicate_definition,
+        std.mem.indexOf(u8, duplicate_definition, "@popslide").?,
+        std.mem.indexOf(u8, duplicate_definition, "@box").?,
+        "hero",
+    ));
+
+    const local_collision =
+        "@box id=hero text=Shared\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@box id=hero text=Local\n";
+    try std.testing.expectError(error.AmbiguousSlideTemplateDependency, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        local_collision,
+        std.mem.indexOf(u8, local_collision, "@popslide").?,
+        std.mem.indexOf(u8, local_collision, "@box").?,
+        "hero",
+    ));
+
+    const malformed_duplicate_id =
+        "@box id=hero id= text=Not safely idless\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n";
+    try std.testing.expectError(error.UnsupportedSharedTemplateDeletion, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        malformed_duplicate_id,
+        std.mem.indexOf(u8, malformed_duplicate_id, "@popslide").?,
+        std.mem.indexOf(u8, malformed_duplicate_id, "@box").?,
+        null,
+    ));
+
+    const unsafe_animation_dependency =
+        "@box id=hero text=Shared\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@anim fade\n" ++
+        "@set hero x=10\n";
+    try std.testing.expectError(error.UnsupportedSharedTemplateDeletion, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        unsafe_animation_dependency,
+        std.mem.indexOf(u8, unsafe_animation_dependency, "@popslide").?,
+        std.mem.indexOf(u8, unsafe_animation_dependency, "@box").?,
+        "hero",
+    ));
+}
+
+test "failed shared deletion preserves let-expanded instance item source" {
+    const box_source =
+        "@box id=hero text=Shared\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@let attrs=id=hero x=100\n" ++
+        "@box $attrs$ text=Generated local box\n";
+    const box_input = try std.testing.allocator.dupe(u8, box_source);
+    defer std.testing.allocator.free(box_input);
+    const box_before = try std.testing.allocator.dupe(u8, box_input);
+    defer std.testing.allocator.free(box_before);
+    try std.testing.expectError(error.AmbiguousSlideTemplateDependency, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        box_input,
+        std.mem.indexOf(u8, box_input, "@popslide").?,
+        std.mem.indexOf(u8, box_input, "@box id=hero").?,
+        "hero",
+    ));
+    try std.testing.expectEqualStrings(box_before, box_input);
+
+    const pop_source =
+        "@push card x=10 y=10 text=Card\n" ++
+        "@box id=hero text=Shared\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@let attrs=id=hero x=200\n" ++
+        "@pop card $attrs$\n";
+    const pop_input = try std.testing.allocator.dupe(u8, pop_source);
+    defer std.testing.allocator.free(pop_input);
+    const pop_before = try std.testing.allocator.dupe(u8, pop_input);
+    defer std.testing.allocator.free(pop_before);
+    try std.testing.expectError(error.AmbiguousSlideTemplateDependency, deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        pop_input,
+        std.mem.indexOf(u8, pop_input, "@popslide").?,
+        std.mem.indexOf(u8, pop_input, "@box id=hero").?,
+        "hero",
+    ));
+    try std.testing.expectEqualStrings(pop_before, pop_input);
+}
+
+test "shared template deletion supports an exact idless item" {
+    const source =
+        "@box x=10 y=20 text=Untargetable\n" ++
+        "@box id=keep text=Keep\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n";
+    const result = try deleteSharedSlideTemplateItem(
+        std.testing.allocator,
+        source,
+        std.mem.indexOf(u8, source, "@popslide").?,
+        std.mem.indexOf(u8, source, "@box x=10").?,
+        null,
+    );
+    try expectSourceResult(
+        result,
+        source,
+        "@box id=keep text=Keep\n@pushslide layout\n@popslide layout\n",
+    );
+}
+
+test "scoped template background overrides insert patch clear and reparse" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@box id=hero bg=#01020304 text=Hero\r\n" ++
+        "@pushslide layout\r\n" ++
+        "@popslide layout\r\n" ++
+        "@set hero x=10\r\n";
+    const slide_offset = std.mem.indexOf(u8, source, "@popslide").?;
+    const inserted = try insertSlideTemplateBackgroundOverride(
+        std.testing.allocator,
+        source,
+        slide_offset,
+        "hero",
+        "#A0B0C0D0",
+    );
+    defer inserted.deinit(std.testing.allocator);
+    const inserted_line = std.mem.indexOf(u8, inserted.source, "@set hero bg=#A0B0C0D0").?;
+    try std.testing.expectEqualStrings(
+        "\xEF\xBB\xBF@box id=hero bg=#01020304 text=Hero\r\n" ++
+            "@pushslide layout\r\n" ++
+            "@popslide layout\r\n" ++
+            "@set hero x=10\r\n" ++
+            "@set hero bg=#A0B0C0D0\r\n",
+        inserted.source,
+    );
+
+    var inserted_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer inserted_arena.deinit();
+    const inserted_deck = try slides.SlideShow.new(inserted_arena.allocator());
+    const inserted_context = try parser.constructSlidesFromBuf(
+        inserted.source,
+        inserted_deck,
+        inserted_arena.allocator(),
+    );
+    defer inserted_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), inserted_context.parser_errors.items.len);
+    const fill = inserted_deck.slides.items[0].items.?.items[0].background_color.?;
+    try std.testing.expectEqual(@as(u8, 0xA0), fill.r);
+    try std.testing.expectEqual(@as(u8, 0xD0), fill.a);
+
+    const cleared = try patchSlideTemplateBackgroundOverride(
+        std.testing.allocator,
+        inserted.source,
+        slide_offset,
+        inserted_line,
+        "hero",
+        "none",
+    );
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, cleared.source, "@set hero bg=none") != null);
+
+    var cleared_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer cleared_arena.deinit();
+    const cleared_deck = try slides.SlideShow.new(cleared_arena.allocator());
+    const cleared_context = try parser.constructSlidesFromBuf(
+        cleared.source,
+        cleared_deck,
+        cleared_arena.allocator(),
+    );
+    defer cleared_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cleared_context.parser_errors.items.len);
+    try std.testing.expect(cleared_deck.slides.items[0].items.?.items[0].background_color == null);
+
+    try std.testing.expectError(error.InvalidColorLiteral, insertSlideTemplateBackgroundOverride(
+        std.testing.allocator,
+        source,
+        slide_offset,
+        "hero",
+        "#abc",
+    ));
 }
 
 test "deletes and replaces final directives without a terminator" {

@@ -833,10 +833,17 @@ pub fn main(init: std.process.Init) anyerror!void {
                     },
                     .edit_text => |target| {
                         const initial = studioItemByIdentity(studio_items, target.item_identity) orelse null;
+                        const initial_text = if (initial) |item|
+                            if (target.edit_scope == .shared_template)
+                                if (item.sharedTemplateValues()) |shared| shared.text orelse "" else ""
+                            else
+                                item.text orelse ""
+                        else
+                            "";
                         pending_semantic_command = command;
                         property_prompt.begin(
                             if (target.edit_scope == .shared_template) .shared_text else .text,
-                            if (initial) |item| item.text orelse "" else "",
+                            initial_text,
                         );
                     },
                     .promote_to_reusable => |target| {
@@ -1023,6 +1030,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
 
         if (semantic_to_apply) |command| {
+            const customized_shared_property = semanticCommandTargetsCustomizedSharedProperty(command, studio_items);
             const duplicated_identity: ?usize = switch (command) {
                 .duplicate_item => |target| target.item_identity + 1,
                 else => null,
@@ -1047,12 +1055,14 @@ pub fn main(init: std.process.Init) anyerror!void {
                 }
                 studio_mode.markSourceChanged();
                 if (duplicated_identity) |identity| studio_mode.selected_identity = identity;
-                studio_mode.setNotice(.none);
+                studio_mode.setNotice(if (customized_shared_property) .shared_template_customized else .none);
             } else |err| {
                 studio_mode.setNotice(switch (err) {
                     error.AmbiguousSlideTemplateLayout,
+                    error.AmbiguousSlideTemplateDependency,
                     error.UnsafeSlideGlobalDirective,
                     error.UnsupportedSlideTemplateOverride,
+                    error.UnsupportedSharedTemplateDeletion,
                     error.UnsupportedItemDuplication,
                     error.TemplateInstanceDuplicationUnsupported,
                     error.MorphItemDuplicationUnsupported,
@@ -1714,6 +1724,18 @@ fn studioItemByIdentity(items: []const slides.SlideItem, identity: usize) ?*cons
     return null;
 }
 
+fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticCommand, items: []const slides.SlideItem) bool {
+    const target: studio.CommandTarget = switch (command) {
+        .edit_text => |value| value,
+        .set_foreground, .set_background => |value| value.target,
+        .clear_background => |value| value,
+        else => return false,
+    };
+    if (target.edit_scope != .shared_template) return false;
+    const item = studioItemByIdentity(items, target.item_identity) orelse return false;
+    return item.instance_source != null;
+}
+
 fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult) !void {
     const before = try G.allocator.dupe(u8, G.editor_memory[0..G.source_len]);
     errdefer G.allocator.free(before);
@@ -1800,6 +1822,8 @@ fn applyStudioGeometryEdit(
     morph_state: ?usize,
     items: []const slides.SlideItem,
 ) !void {
+    const source_after_position = command.source_after_position orelse command.after_position;
+    const source_after_size = command.source_after_size orelse command.after_size;
     var source_ref = command.source;
     if (morph_state) |state_index| {
         const slide = slide_opt orelse return error.NoStudioSlide;
@@ -1813,13 +1837,13 @@ fn applyStudioGeometryEdit(
                     try std.fmt.bufPrint(
                         &directive_buffer,
                         "@set {s} x={d} y={d} w={d} h={d}",
-                        .{ id, command.after_position.x, command.after_position.y, command.after_size.x, command.after_size.y },
+                        .{ id, source_after_position.x, source_after_position.y, source_after_size.x, source_after_size.y },
                     )
                 else
                     try std.fmt.bufPrint(
                         &directive_buffer,
                         "@set {s} x={d} y={d}",
-                        .{ id, command.after_position.x, command.after_position.y },
+                        .{ id, source_after_position.x, source_after_position.y },
                     );
                 const insertion_offset = try source_editor.morphStateEndOffset(
                     G.editor_memory[0..G.source_len],
@@ -1846,10 +1870,10 @@ fn applyStudioGeometryEdit(
                     instance_source.line_offset,
                     id,
                     .{
-                        .x = command.after_position.x,
-                        .y = command.after_position.y,
-                        .w = if (command.resized) command.after_size.x else null,
-                        .h = if (command.resized) command.after_size.y else null,
+                        .x = source_after_position.x,
+                        .y = source_after_position.y,
+                        .w = if (command.resized) source_after_size.x else null,
+                        .h = if (command.resized) source_after_size.y else null,
                     },
                 ));
             }
@@ -1860,17 +1884,18 @@ fn applyStudioGeometryEdit(
             try std.fmt.bufPrint(
                 &directive_buffer,
                 "@set {s} x={d} y={d} w={d} h={d}",
-                .{ id, command.after_position.x, command.after_position.y, command.after_size.x, command.after_size.y },
+                .{ id, source_after_position.x, source_after_position.y, source_after_size.x, source_after_size.y },
             )
         else
             try std.fmt.bufPrint(
                 &directive_buffer,
                 "@set {s} x={d} y={d}",
-                .{ id, command.after_position.x, command.after_position.y },
+                .{ id, source_after_position.x, source_after_position.y },
             );
         return insertStudioTemplateOverride(history, slide, directive);
     } else if (command.edit_scope == .shared_template) {
         const item = studioItemByIdentity(items, command.item_identity) orelse return error.StudioItemMissing;
+        if (item.instance_source != null and command.source_after_position == null) return error.SharedTemplateTargetMissing;
         source_ref = item.source;
     }
     if (source_ref.scope == .none or !source_ref.patchable) return error.StudioItemHasNoPatchableSource;
@@ -1880,10 +1905,10 @@ fn applyStudioGeometryEdit(
         G.editor_memory[0..G.source_len],
         source_ref.line_offset,
         .{
-            .x = command.after_position.x,
-            .y = command.after_position.y,
-            .w = if (command.resized) command.after_size.x else null,
-            .h = if (command.resized) command.after_size.y else null,
+            .x = source_after_position.x,
+            .y = source_after_position.y,
+            .w = if (command.resized) source_after_size.x else null,
+            .h = if (command.resized) source_after_size.y else null,
         },
     ));
 }
@@ -1928,11 +1953,13 @@ fn planStudioGeometryBatchEdits(
 
     for (batch.slice(), 0..) |command, index| {
         const item = studioItemByIdentity(items, command.item_identity) orelse return error.StudioItemMissing;
+        const source_after_position = command.source_after_position orelse command.after_position;
+        const source_after_size = command.source_after_size orelse command.after_size;
         const geometry: source_editor.GeometryPatch = .{
-            .x = command.after_position.x,
-            .y = command.after_position.y,
-            .w = if (command.resized) command.after_size.x else null,
-            .h = if (command.resized) command.after_size.y else null,
+            .x = source_after_position.x,
+            .y = source_after_position.y,
+            .w = if (command.resized) source_after_size.x else null,
+            .h = if (command.resized) source_after_size.y else null,
         };
 
         var source_ref = command.source;
@@ -1946,13 +1973,13 @@ fn planStudioGeometryBatchEdits(
                         try std.fmt.bufPrint(
                             &snippet_buffers[index],
                             "@set {s} x={d} y={d} w={d} h={d}",
-                            .{ id, command.after_position.x, command.after_position.y, command.after_size.x, command.after_size.y },
+                            .{ id, source_after_position.x, source_after_position.y, source_after_size.x, source_after_size.y },
                         )
                     else
                         try std.fmt.bufPrint(
                             &snippet_buffers[index],
                             "@set {s} x={d} y={d}",
-                            .{ id, command.after_position.x, command.after_position.y },
+                            .{ id, source_after_position.x, source_after_position.y },
                         );
                     edits[index] = .{ .insert = .{
                         .insertion_offset = try source_editor.morphStateEndOffset(
@@ -1989,13 +2016,13 @@ fn planStudioGeometryBatchEdits(
                     try std.fmt.bufPrint(
                         &snippet_buffers[index],
                         "@set {s} x={d} y={d} w={d} h={d}",
-                        .{ id, command.after_position.x, command.after_position.y, command.after_size.x, command.after_size.y },
+                        .{ id, source_after_position.x, source_after_position.y, source_after_size.x, source_after_size.y },
                     )
                 else
                     try std.fmt.bufPrint(
                         &snippet_buffers[index],
                         "@set {s} x={d} y={d}",
-                        .{ id, command.after_position.x, command.after_position.y },
+                        .{ id, source_after_position.x, source_after_position.y },
                     );
                 edits[index] = .{ .insert = .{
                     .insertion_offset = try source_editor.slideTemplateOverrideInsertionOffset(
@@ -2008,11 +2035,8 @@ fn planStudioGeometryBatchEdits(
                 continue;
             },
             .shared_template => {
-                // A shared transform based on instance-local effective geometry
-                // would bake that local delta into every instance. Studio
-                // rejects this too; retain the invariant at the persistence
-                // boundary so a future caller cannot bypass it.
-                if (item.instance_source != null) return error.SharedTemplateItemHasLocalOverride;
+                if (item.sharedTemplateValues() == null) return error.SharedTemplateValuesMissing;
+                if (item.instance_source != null and command.source_after_position == null) return error.SharedTemplateTargetMissing;
                 source_ref = item.source;
             },
             .direct => {},
@@ -2107,6 +2131,71 @@ test "Studio group planner mixes existing and missing local overrides with a dir
     const untouched = reparsed.slides.items[1].items.?.items;
     try std.testing.expectApproxEqAbs(@as(f32, 10), untouched[0].position.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 40), untouched[1].position.x, 0.0001);
+}
+
+test "Studio planner persists shared authored geometry while a local override stays masked" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@box id=hero x=10 y=20 w=300 h=120 text=Hero\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@set hero x=100 y=120\n" ++
+        "@popslide layout\n";
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const first_slide = slideshow.slides.items[0];
+    const item = first_slide.items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 100), item.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), item.sharedTemplateValues().?.position.x, 0.0001);
+
+    var batch = studio.GeometryBatchCommand{ .count = 1 };
+    batch.commands[0] = .{
+        .item_identity = item.identity,
+        .source = item.source,
+        .edit_scope = .shared_template,
+        .before_position = item.position,
+        .before_size = item.size,
+        .after_position = .{ .x = 120, .y = 120 },
+        .after_size = item.size,
+        .source_after_position = .{ .x = 30, .y = 20 },
+        .source_after_size = item.sharedTemplateValues().?.size,
+        .resized = false,
+    };
+
+    var edits: [studio.max_selection_items]source_editor.GeometrySourceEdit = undefined;
+    var snippets: [studio.max_selection_items][512]u8 = undefined;
+    const planned = try planStudioGeometryBatchEdits(
+        source,
+        batch,
+        first_slide,
+        null,
+        first_slide.items.?.items,
+        &edits,
+        &snippets,
+    );
+    const patch = try source_editor.applyGeometryEdits(allocator, source, planned);
+    defer patch.deinit(allocator);
+
+    var reparsed_arena = std.heap.ArenaAllocator.init(allocator);
+    defer reparsed_arena.deinit();
+    const reparsed = try slides.SlideShow.new(reparsed_arena.allocator());
+    const reparsed_context = try parser.constructSlidesFromBuf(patch.source, reparsed, reparsed_arena.allocator());
+    defer reparsed_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reparsed_context.parser_errors.items.len);
+
+    const customized = reparsed.slides.items[0].items.?.items[0];
+    const ordinary = reparsed.slides.items[1].items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 100), customized.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), customized.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 30), customized.sharedTemplateValues().?.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 30), ordinary.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), ordinary.position.y, 0.0001);
 }
 
 fn colorLiteral(buffer: *[9]u8, color: rl.Color) []const u8 {
@@ -2491,7 +2580,13 @@ fn applyStudioSemanticEdit(
 
             var id_buffer: [64]u8 = undefined;
             const id = try nextStudioItemId(&id_buffer);
-            const geometry = studio.itemGeometry(item.*, resolved_bounds);
+            const geometry = if (target.edit_scope == .shared_template)
+                if (item.sharedTemplateValues()) |shared|
+                    studio.Geometry{ .position = shared.position, .size = shared.size }
+                else
+                    return error.SharedTemplateValuesMissing
+            else
+                studio.itemGeometry(item.*, resolved_bounds);
             try recordStudioPatch(history, try source_editor.duplicateItem(
                 G.allocator,
                 G.editor_memory[0..G.source_len],
@@ -2514,7 +2609,15 @@ fn applyStudioSemanticEdit(
             } else {
                 switch (target.edit_scope) {
                     .direct => try deleteStudioItem(history, item, target.source.line_offset),
-                    .shared_template => try deleteStudioItem(history, item, item.source.line_offset),
+                    .shared_template => {
+                        try recordStudioPatch(history, try source_editor.deleteSharedSlideTemplateItem(
+                            G.allocator,
+                            G.editor_memory[0..G.source_len],
+                            slide.pos_in_editor,
+                            item.source.line_offset,
+                            item.id,
+                        ));
+                    },
                     .local_instance => {
                         const id = item.id orelse return error.TemplateInstanceItemNeedsId;
                         const directive = try std.fmt.allocPrint(G.allocator, "@hide {s}", .{id});
@@ -2544,34 +2647,22 @@ fn applyStudioSemanticEdit(
             try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "color", color);
         },
         .set_background => |change| {
-            if (morph_state != null) return error.MorphBackgroundUnsupported;
-            if (change.target.edit_scope == .local_instance) return error.TemplateInstanceBackgroundUnsupported;
             const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
-            const geometry = studio.itemGeometry(item.*, resolved_bounds);
             var color_buffer: [9]u8 = undefined;
             const color = colorLiteral(&color_buffer, studio.paletteColor(change.color));
-            var id_buffer: [64]u8 = undefined;
-            const id = try nextStudioItemId(&id_buffer);
-            const directive = try std.fmt.allocPrint(
-                G.allocator,
-                "@box id={s} x={d} y={d} w={d} h={d} color={s}",
-                .{ id, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y, color },
+            try applyStudioLiteralAttribute(
+                history,
+                slide,
+                morph_state,
+                item,
+                change.target.edit_scope,
+                "bg",
+                color,
             );
-            defer G.allocator.free(directive);
-            const source_ref = if (change.target.edit_scope == .shared_template)
-                item.source
-            else
-                change.target.source;
-            const insertion_offset = try source_editor.itemInsertionOffsetBeforeAnimations(
-                G.editor_memory[0..G.source_len],
-                source_ref.line_offset,
-            );
-            try recordStudioPatch(history, try source_editor.insertDirectiveAt(
-                G.allocator,
-                G.editor_memory[0..G.source_len],
-                insertion_offset,
-                directive,
-            ));
+        },
+        .clear_background => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "bg", "none");
         },
         .promote_to_reusable => |target| {
             if (morph_state != null) return error.MorphPromotionUnsupported;
