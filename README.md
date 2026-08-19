@@ -270,6 +270,27 @@ with the large-deck flag to verify that the next HUD event is a selective
 deterministic query, and `--diagnostics-window=WIDTHxHEIGHT` requests an exact
 Studio client size (minimum 900×506). Together they make compact/default/large
 navigation screenshots reproducible without synthesizing global key input.
+`--no-startup-banner` suppresses the four-second launch banner for unattended
+captures, kiosk launches, and other cases that need the first frame to contain
+only the deck and Studio chrome.
+
+The repository includes an opt-in visual and performance baseline harness for
+compact Properties, the default command palette, large precision mode, and a
+real one-slide incremental rebuild in a synthetic 160-slide deck. On this Mac,
+the following command moves each short-lived window to Aerospace workspace 12,
+verifies that exact process window is both on workspace 12 and floating, then
+releases an in-app capture gate:
+
+```sh
+zig build -Doptimize=ReleaseSafe studio-baselines -- --workspace 12
+```
+
+Use `studio-baselines-update` with the same arguments only after deliberately
+reviewing a visual or performance change. Actual captures, amplified failure
+diffs, reports, and logs are written below `zig-out/studio-baselines`; approved
+PNG and JSON references live in `tests/studio_baselines`. The harness requires
+Python Pillow. See [the baseline notes](tests/studio_baselines/README.md) for
+tolerances and individual-scenario commands.
 
 Studio edits the `.sld` document rather than maintaining a separate opaque
 scene. It changes only the source owned by the selected object and preserves

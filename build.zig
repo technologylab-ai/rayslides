@@ -56,4 +56,20 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    const baseline_self_test_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "self-test" });
+    const baseline_self_test_step = b.step("studio-baseline-test", "Test the Studio visual/performance baseline harness");
+    baseline_self_test_step.dependOn(&baseline_self_test_cmd.step);
+
+    const baseline_check_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "check", "--binary" });
+    baseline_check_cmd.addArtifactArg(exe);
+    if (b.args) |args| baseline_check_cmd.addArgs(args);
+    const baseline_check_step = b.step("studio-baselines", "Capture and compare opt-in Studio visual/performance baselines");
+    baseline_check_step.dependOn(&baseline_check_cmd.step);
+
+    const baseline_update_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "update", "--binary" });
+    baseline_update_cmd.addArtifactArg(exe);
+    if (b.args) |args| baseline_update_cmd.addArgs(args);
+    const baseline_update_step = b.step("studio-baselines-update", "Capture and replace Studio visual/performance baselines");
+    baseline_update_step.dependOn(&baseline_update_cmd.step);
 }

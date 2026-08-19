@@ -779,6 +779,9 @@ const FrameDiagnostics = struct {
     last_rebuild_mode: renderer.SlideshowRenderer.RebuildMode = .full,
     last_rebuilt_slide_count: usize = 0,
     last_rebuild_total_slide_count: usize = 0,
+    last_full_rebuild_ms: f64 = 0,
+    last_partial_rebuild_ms: f64 = 0,
+    last_unchanged_rebuild_ms: f64 = 0,
     full_rebuild_count: usize = 0,
     partial_rebuild_count: usize = 0,
     unchanged_rebuild_count: usize = 0,
@@ -826,9 +829,18 @@ const FrameDiagnostics = struct {
         self.last_rebuilt_slide_count = result.rebuilt_slide_count;
         self.last_rebuild_total_slide_count = result.total_slide_count;
         switch (result.mode) {
-            .full => self.full_rebuild_count += 1,
-            .partial => self.partial_rebuild_count += 1,
-            .unchanged => self.unchanged_rebuild_count += 1,
+            .full => {
+                self.full_rebuild_count += 1;
+                self.last_full_rebuild_ms = self.last_pre_render_ms;
+            },
+            .partial => {
+                self.partial_rebuild_count += 1;
+                self.last_partial_rebuild_ms = self.last_pre_render_ms;
+            },
+            .unchanged => {
+                self.unchanged_rebuild_count += 1;
+                self.last_unchanged_rebuild_ms = self.last_pre_render_ms;
+            },
         }
         log.debug(
             "render graph rebuild #{d}: {s} {d}/{d} slides, {d:.1} ms, slideshow arena {d:.1} KiB",
@@ -1012,6 +1024,97 @@ fn frameDiagnosticsPlacement(viewport: studio.Viewport, fallback_origin: rl.Vect
     return .{ .overlay = fallback_origin };
 }
 
+fn validDiagnosticScenarioName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |char| {
+        if (!std.ascii.isAlphanumeric(char) and char != '-' and char != '_') return false;
+    }
+    return true;
+}
+
+fn captureDiagnosticScreenshot(path: []const u8, logical_size: ?WindowDimensions) !WindowDimensions {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const sentinel_path = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{path});
+    var image = try rl.loadImageFromScreen();
+    defer rl.unloadImage(image);
+    if (logical_size) |size| {
+        if (image.width != size.width or image.height != size.height) image.resize(size.width, size.height);
+    }
+    if (!image.exportToFile(sentinel_path)) return error.DiagnosticScreenshotFailed;
+    return .{ .width = image.width, .height = image.height };
+}
+
+fn formatDiagnosticCaptureReport(
+    buffer: []u8,
+    scenario: []const u8,
+    diagnostics: FrameDiagnostics,
+    capture_size: WindowDimensions,
+) ![]const u8 {
+    if (!validDiagnosticScenarioName(scenario)) return error.InvalidDiagnosticScenario;
+    return std.fmt.bufPrint(
+        buffer,
+        "{{\n" ++
+            "  \"schema\": 1,\n" ++
+            "  \"scenario\": \"{s}\",\n" ++
+            "  \"capture\": {{ \"width\": {d}, \"height\": {d} }},\n" ++
+            "  \"deck\": {{ \"slides\": {d}, \"active_items\": {d}, \"render_fragments\": {d} }},\n" ++
+            "  \"render\": {{\n" ++
+            "    \"events\": {d}, \"last_mode\": \"{s}\", \"last_rebuilt\": {d}, \"total_slides\": {d},\n" ++
+            "    \"full_count\": {d}, \"partial_count\": {d}, \"unchanged_count\": {d},\n" ++
+            "    \"last_full_ms\": {d:.3}, \"last_partial_ms\": {d:.3}, \"last_unchanged_ms\": {d:.3}\n" ++
+            "  }},\n" ++
+            "  \"studio\": {{ \"prepare_ms\": {d:.3}, \"document_cache_builds\": {d}, \"scene_cache_builds\": {d}, \"composition_cache_builds\": {d} }},\n" ++
+            "  \"frame\": {{ \"latest_ms\": {d:.3}, \"sampled_peak_ms\": {d:.3}, \"sampled_slow_frames\": {d} }},\n" ++
+            "  \"parser_arena_bytes\": {d}\n" ++
+            "}}\n",
+        .{
+            scenario,
+            capture_size.width,
+            capture_size.height,
+            diagnostics.studio_slide_count,
+            diagnostics.studio_item_count,
+            diagnostics.studio_render_fragment_count,
+            diagnostics.pre_render_count,
+            @tagName(diagnostics.last_rebuild_mode),
+            diagnostics.last_rebuilt_slide_count,
+            diagnostics.last_rebuild_total_slide_count,
+            diagnostics.full_rebuild_count,
+            diagnostics.partial_rebuild_count,
+            diagnostics.unchanged_rebuild_count,
+            diagnostics.last_full_rebuild_ms,
+            diagnostics.last_partial_rebuild_ms,
+            diagnostics.last_unchanged_rebuild_ms,
+            diagnostics.last_studio_prepare_ms,
+            diagnostics.studio_document_cache_builds,
+            diagnostics.studio_scene_cache_builds,
+            diagnostics.studio_composition_cache_builds,
+            diagnostics.latest_frame_ms,
+            diagnostics.sampled_peak_ms,
+            diagnostics.sampled_slow_frames,
+            diagnostics.slideshow_arena_bytes,
+        },
+    );
+}
+
+fn writeDiagnosticCaptureReport(
+    io: std.Io,
+    path: []const u8,
+    scenario: []const u8,
+    diagnostics: FrameDiagnostics,
+    capture_size: WindowDimensions,
+) !void {
+    var report_buffer: [4096]u8 = undefined;
+    const report = try formatDiagnosticCaptureReport(&report_buffer, scenario, diagnostics, capture_size);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = report });
+}
+
+fn diagnosticCaptureGateIsOpen(io: std.Io, path: ?[]const u8) bool {
+    const gate_path = path orelse return true;
+    const gate = std.Io.Dir.cwd().openFile(io, gate_path, .{}) catch return false;
+    gate.close(io);
+    return true;
+}
+
 test "frame diagnostics rolls peak and slow-frame counts" {
     var diagnostics = FrameDiagnostics{};
     diagnostics.observeFrame(1.0);
@@ -1039,6 +1142,30 @@ test "frame diagnostics use the free Studio toolbar span without overlapping con
     try std.testing.expect(frameDiagnosticsPlacement(compact.viewport, .zero()) == .hidden);
 }
 
+test "diagnostic capture report is valid structured JSON" {
+    var diagnostics = FrameDiagnostics{
+        .last_rebuild_mode = .partial,
+        .last_rebuilt_slide_count = 1,
+        .last_rebuild_total_slide_count = 160,
+        .last_full_rebuild_ms = 6.5,
+        .last_partial_rebuild_ms = 0.3,
+        .full_rebuild_count = 1,
+        .partial_rebuild_count = 1,
+        .pre_render_count = 2,
+        .studio_slide_count = 160,
+        .studio_item_count = 7,
+        .studio_render_fragment_count = 13,
+    };
+    diagnostics.recordStudioPrepare(0.00002, 2, 2, 2, false, 160, 7, 13);
+    var buffer: [4096]u8 = undefined;
+    const report = try formatDiagnosticCaptureReport(&buffer, "incremental-160", diagnostics, .{ .width = 1600, .height = 900 });
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, report, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("incremental-160", parsed.value.object.get("scenario").?.string);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("render").?.object.get("last_rebuilt").?.integer);
+    try std.testing.expect(!validDiagnosticScenarioName("bad/name"));
+}
+
 pub fn main(init: std.process.Init) anyerror!void {
     const gpa = init.gpa;
     const io = init.io;
@@ -1049,6 +1176,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var crowd_host_buffer: [256]u8 = undefined;
     crowd_options.host = defaultCrowdHost(&crowd_host_buffer);
     var launch_studio = false;
+    var suppress_startup_banner = false;
     var diagnostics_enabled = false;
     var diagnostics_command_palette = false;
     var diagnostics_command_tooltip = false;
@@ -1056,6 +1184,17 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_large_deck_count: ?usize = null;
     var diagnostics_incremental_edit_slide: ?usize = null;
     var diagnostics_window_size: ?WindowDimensions = null;
+    var diagnostics_capture_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var diagnostics_capture_path: ?[]const u8 = null;
+    var diagnostics_report_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var diagnostics_report_path: ?[]const u8 = null;
+    var diagnostics_capture_scenario_buffer: [64]u8 = undefined;
+    var diagnostics_capture_scenario: []const u8 = "manual";
+    var diagnostics_capture_gate_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var diagnostics_capture_gate_path: ?[]const u8 = null;
+    var diagnostics_capture_settle_frames: usize = 90;
+    var diagnostics_exit_after_capture = false;
+    var diagnostics_hide_hud = false;
     var diagnostics_select_buffer: [128]u8 = undefined;
     var diagnostics_select_id: ?[]const u8 = null;
     var diagnostics_find_slide_buffer: [studio.max_panel_search_bytes]u8 = undefined;
@@ -1077,6 +1216,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                 crowd_options.enabled = false;
             } else if (std.mem.eql(u8, arg, "--studio")) {
                 launch_studio = true;
+            } else if (std.mem.eql(u8, arg, "--no-startup-banner")) {
+                suppress_startup_banner = true;
             } else if (std.mem.eql(u8, arg, "--diagnostics")) {
                 diagnostics_enabled = true;
             } else if (std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
@@ -1110,6 +1251,45 @@ pub fn main(init: std.process.Init) anyerror!void {
                 launch_studio = true;
                 diagnostics_window_size = parseDiagnosticWindowSize(arg["--diagnostics-window=".len..]) orelse
                     std.process.fatal("Invalid diagnostics window size; use WIDTHxHEIGHT (minimum 900x506)", .{});
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-capture=")) {
+                diagnostics_capture_path = std.fmt.bufPrint(
+                    &diagnostics_capture_path_buffer,
+                    "{s}",
+                    .{arg["--diagnostics-capture=".len..]},
+                ) catch std.process.fatal("Diagnostics capture path is too long", .{});
+                launch_studio = true;
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-report=")) {
+                diagnostics_report_path = std.fmt.bufPrint(
+                    &diagnostics_report_path_buffer,
+                    "{s}",
+                    .{arg["--diagnostics-report=".len..]},
+                ) catch std.process.fatal("Diagnostics report path is too long", .{});
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-capture-scenario=")) {
+                const scenario = arg["--diagnostics-capture-scenario=".len..];
+                if (!validDiagnosticScenarioName(scenario)) return error.InvalidDiagnosticScenario;
+                diagnostics_capture_scenario = std.fmt.bufPrint(
+                    &diagnostics_capture_scenario_buffer,
+                    "{s}",
+                    .{scenario},
+                ) catch return error.InvalidDiagnosticScenario;
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-capture-settle=")) {
+                diagnostics_capture_settle_frames = std.fmt.parseInt(
+                    usize,
+                    arg["--diagnostics-capture-settle=".len..],
+                    10,
+                ) catch return error.InvalidDiagnosticCaptureSettle;
+                if (diagnostics_capture_settle_frames == 0 or diagnostics_capture_settle_frames > 600)
+                    return error.InvalidDiagnosticCaptureSettle;
+            } else if (std.mem.startsWith(u8, arg, "--diagnostics-capture-gate=")) {
+                diagnostics_capture_gate_path = std.fmt.bufPrint(
+                    &diagnostics_capture_gate_buffer,
+                    "{s}",
+                    .{arg["--diagnostics-capture-gate=".len..]},
+                ) catch std.process.fatal("Diagnostics capture gate path is too long", .{});
+            } else if (std.mem.eql(u8, arg, "--diagnostics-exit-after-capture")) {
+                diagnostics_exit_after_capture = true;
+            } else if (std.mem.eql(u8, arg, "--diagnostics-hide-hud")) {
+                diagnostics_hide_hud = true;
             } else if (std.mem.startsWith(u8, arg, "--diagnostics-select=")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
@@ -1136,6 +1316,9 @@ pub fn main(init: std.process.Init) anyerror!void {
         log.debug("loading... {s}", .{selected});
         break :blk try std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{selected});
     };
+
+    if ((diagnostics_report_path != null or diagnostics_exit_after_capture) and diagnostics_capture_path == null)
+        return error.DiagnosticCapturePathRequired;
 
     const starts_in_studio = launch_studio or slideshow_to_load == null;
     const windowWidth: i32 = 1280;
@@ -1184,12 +1367,14 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     rl.setTargetFPS(60);
     var beast_mode: bool = false;
-    var frame_diagnostics = FrameDiagnostics{ .enabled = diagnostics_enabled };
+    var frame_diagnostics = FrameDiagnostics{ .enabled = diagnostics_enabled and !diagnostics_hide_hud };
     var diagnostics_selection_pending = diagnostics_select_id;
     var diagnostics_command_palette_pending = diagnostics_command_palette;
     var diagnostics_precision_view_pending = diagnostics_precision_view;
     var diagnostics_find_slide_pending = diagnostics_find_slide_query;
     var diagnostics_incremental_edit_pending = diagnostics_incremental_edit_slide;
+    var diagnostics_capture_stable_frames: usize = 0;
+    var diagnostics_capture_complete = false;
 
     // Main game loop
     var is_pre_rendered: bool = false;
@@ -1198,6 +1383,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var laser_pointer: LaserPointer = try .init(gpa);
     defer laser_pointer.deinit();
     var banner: Banner = try .init(screenWidth, screenHeight);
+    if (suppress_startup_banner) banner.show = false;
     defer banner.deinit();
     var studio_mode: studio.Studio = .{
         .enabled = starts_in_studio,
@@ -1226,6 +1412,20 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     while (true) {
         frame_diagnostics.observeFrame(rl.getTime());
+        // Window managers may tile a just-launched diagnostic process while
+        // moving it to the requested QA workspace. Baseline capture is the
+        // one mode where the CLI dimensions are a strict test contract, so
+        // restore them until the floating window agrees.
+        if (diagnostics_capture_path != null) {
+            if (diagnostics_window_size) |dimensions| {
+                if (rl.getScreenWidth() != dimensions.width or rl.getScreenHeight() != dimensions.height) {
+                    rl.setWindowSize(dimensions.width, dimensions.height);
+                    screenWidth = dimensions.width;
+                    screenHeight = dimensions.height;
+                    diagnostics_capture_stable_frames = 0;
+                }
+            }
+        }
         const window_close_now = rl.windowShouldClose();
         const window_close_requested = window_close_now and !window_close_seen;
         window_close_seen = window_close_now;
@@ -2223,6 +2423,41 @@ pub fn main(init: std.process.Init) anyerror!void {
                 }
             }
         }
+
+        if (!diagnostics_capture_complete) {
+            if (diagnostics_capture_path) |capture_path| {
+                const expected_rebuild_events: usize = if (diagnostics_incremental_edit_slide != null) 2 else 1;
+                const capture_ready = is_pre_rendered and
+                    diagnosticCaptureGateIsOpen(io, diagnostics_capture_gate_path) and
+                    diagnostics_incremental_edit_pending == null and
+                    frame_diagnostics.pre_render_count >= expected_rebuild_events and
+                    !source_graph_reparsed_this_frame;
+                if (capture_ready) {
+                    diagnostics_capture_stable_frames += 1;
+                } else {
+                    diagnostics_capture_stable_frames = 0;
+                }
+                if (diagnostics_capture_stable_frames >= diagnostics_capture_settle_frames) {
+                    const capture_size = try captureDiagnosticScreenshot(capture_path, diagnostics_window_size);
+                    if (diagnostics_report_path) |report_path| {
+                        try writeDiagnosticCaptureReport(
+                            io,
+                            report_path,
+                            diagnostics_capture_scenario,
+                            frame_diagnostics,
+                            capture_size,
+                        );
+                    }
+                    diagnostics_capture_complete = true;
+                    log.info("diagnostics captured {s} at {d}x{d}", .{
+                        diagnostics_capture_scenario,
+                        capture_size.width,
+                        capture_size.height,
+                    });
+                }
+            }
+        }
+        if (diagnostics_capture_complete and diagnostics_exit_after_capture) break;
 
         releaseDeferredInlineCloseLatch(
             &window_close_seen,

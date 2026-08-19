@@ -233,12 +233,30 @@ local and morph edits, exact shared-definition dependency fan-out, structural
 fallback, Crowd lifetime across arena replacement, unchanged pointer identity,
 and induced allocation failure after one replacement has already been built.
 
+## Completed tranche: Automated visual and performance baselines
+
+- [x] Capture normalized compact (900×506), default (1600×900), and large
+  (2560×1440) Studio frames through an application-owned screenshot path.
+- [x] Cover docked Properties, the command palette, precision rulers/guides,
+  the slide picker, Library, Objects, morph strip, and a 160-slide stress deck.
+- [x] Record structured render, frame, cache, deck, and arena metrics beside
+  every PNG, including a real `partial 1/160` source-edit rebuild.
+- [x] Compare images with bounded rasterization tolerance, emit amplified diff
+  artifacts, and reject rebuild-mode/count or conservative timing regressions.
+- [x] Gate capture until the requested Aerospace process window is proven to
+  be on workspace 12 and floating; abort rather than measure an unverified or
+  tiled window, and quit every diagnostic process after capture.
+- [x] Add an explicit `--no-startup-banner` launch option so unattended QA is
+  independent from transient four-second startup timing.
+
+The ReleaseSafe reference run rebuilt 24-slide graphs in roughly 0.8–0.9 ms;
+the 160-slide scenario measured about 6.3 ms full and 0.3 ms partial. A second
+complete capture pass matched every approved image and metric envelope.
+
 ## Planned tranches
 
 ### Release and resilience confidence
 
-- Add automated performance and screenshot baselines for compact, default,
-  large, and synthetic-deck Studio configurations.
 - Extend application-boundary tests around document reload, Save As, recovery,
   and source-edit failure injection, including allocation-failure history paths.
 - Add a repeatable macOS release QA checklist covering input focus, multiple
