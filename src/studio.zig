@@ -202,10 +202,14 @@ pub fn itemGeometry(item: slides.SlideItem, resolved_bounds: []const ResolvedBou
     };
 }
 
-fn isSelectable(item: slides.SlideItem, resolved_bounds: []const ResolvedBounds) bool {
+fn isConcreteVisibleItem(item: slides.SlideItem, resolved_bounds: []const ResolvedBounds) bool {
     const geometry = itemGeometry(item, resolved_bounds);
     return item.kind != .background and item.visible and item.opacity > 0 and
         geometry.size.x > 0 and geometry.size.y > 0;
+}
+
+fn isSelectable(item: slides.SlideItem, resolved_bounds: []const ResolvedBounds) bool {
+    return !item.locked and isConcreteVisibleItem(item, resolved_bounds);
 }
 
 /// Returns the item index at `logical_point`, searching in reverse paint order.
@@ -536,6 +540,10 @@ pub const Notice = enum {
     property_unavailable,
     base_scene_only,
     structural_source_locked,
+    layer_selection_unsupported,
+    copy_selection_unsupported,
+    clipboard_empty,
+    locked_item,
     library_name_conflict,
     library_entry_in_use,
     library_delete_unsupported,
@@ -591,6 +599,46 @@ pub const CommandTarget = struct {
     item_identity: usize,
     source: slides.SourceRef,
     edit_scope: EditScope = .direct,
+};
+
+pub const LayerAction = enum {
+    back,
+    down,
+    up,
+    front,
+};
+
+pub const LayerCommand = struct {
+    targets: [max_selection_items]CommandTarget = undefined,
+    count: usize = 0,
+    action: LayerAction,
+
+    pub fn slice(self: *const LayerCommand) []const CommandTarget {
+        return self.targets[0..self.count];
+    }
+};
+
+pub const CopyItemsCommand = struct {
+    targets: [max_selection_items]CommandTarget = undefined,
+    count: usize = 0,
+
+    pub fn slice(self: *const CopyItemsCommand) []const CommandTarget {
+        return self.targets[0..self.count];
+    }
+};
+
+pub const PasteItemsCommand = struct {
+    offset: rl.Vector2 = .{ .x = 20, .y = 20 },
+};
+
+pub const SetLockedCommand = struct {
+    targets: [max_selection_items]CommandTarget = undefined,
+    count: usize = 0,
+    locked: bool,
+
+    pub fn slice(self: *const SetLockedCommand) []const CommandTarget {
+        return self.targets[0..self.count];
+    }
 };
 
 pub const AddItemCommand = struct {
@@ -680,6 +728,10 @@ pub const SemanticCommand = union(enum) {
     /// Removes an item's authored fill (`bg=none`). This remains a distinct
     /// intention so integrations never have to overload a palette color.
     clear_background: CommandTarget,
+    reorder_items: LayerCommand,
+    copy_items: CopyItemsCommand,
+    paste_items: PasteItemsCommand,
+    set_locked: SetLockedCommand,
     promote_to_reusable: CommandTarget,
     select_morph_scene: MorphSceneCommand,
     new_slide: void,
@@ -723,6 +775,8 @@ pub const UiLayout = struct {
     clear_background: rl.Rectangle,
     align_buttons: [6]rl.Rectangle,
     distribute_buttons: [2]rl.Rectangle,
+    layer_buttons: [4]rl.Rectangle,
+    lock_item: rl.Rectangle,
 };
 
 pub const organizer_action_count = 6;
@@ -966,7 +1020,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .x = viewport.slide_top_left.x + viewport.slide_size.x - property_width - margin,
         .y = viewport.slide_top_left.y + margin,
         .width = property_width,
-        .height = 330,
+        .height = 400,
     };
     const action_y = properties.y + 38;
     const action_gap: f32 = 4;
@@ -1013,6 +1067,22 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .{ .x = properties.x + 12, .y = distribute_y, .width = distribute_width, .height = 28 },
         .{ .x = properties.x + 12 + distribute_width + distribute_gap, .y = distribute_y, .width = distribute_width, .height = 28 },
     };
+    var layer_buttons: [4]rl.Rectangle = undefined;
+    const layer_y = properties.y + 354;
+    const layer_width: f32 = 40;
+    const layer_gap: f32 = 4;
+    for (&layer_buttons, 0..) |*button, index| button.* = .{
+        .x = properties.x + 12 + @as(f32, @floatFromInt(index)) * (layer_width + layer_gap),
+        .y = layer_y,
+        .width = layer_width,
+        .height = 28,
+    };
+    const lock_item: rl.Rectangle = .{
+        .x = properties.x + properties.width - 72,
+        .y = layer_y,
+        .width = 60,
+        .height = 28,
+    };
     return .{
         .toolbar = toolbar,
         .tool_buttons = tool_buttons,
@@ -1031,6 +1101,8 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .clear_background = clear_background,
         .align_buttons = align_buttons,
         .distribute_buttons = distribute_buttons,
+        .layer_buttons = layer_buttons,
+        .lock_item = lock_item,
     };
 }
 
@@ -1059,6 +1131,10 @@ pub const FrameInput = struct {
     disable_snapping: bool = false,
     align_action: ?AlignAction = null,
     distribute_action: ?DistributionAction = null,
+    layer_action: ?LayerAction = null,
+    copy_pressed: bool = false,
+    paste_pressed: bool = false,
+    toggle_lock_pressed: bool = false,
     toggle_selection: bool = false,
     select_all_pressed: bool = false,
     allow_shared_edit: bool = false,
@@ -1126,15 +1202,24 @@ pub const FrameInput = struct {
             .disable_snapping = shortcut_modifier,
             .toggle_selection = shift,
             .select_all_pressed = shortcut_modifier and rl.isKeyPressed(.a),
+            .layer_action = if (shortcut_modifier and rl.isKeyPressed(.left_bracket))
+                if (shift) .back else .down
+            else if (shortcut_modifier and rl.isKeyPressed(.right_bracket))
+                if (shift) .front else .up
+            else
+                null,
+            .copy_pressed = shortcut_modifier and rl.isKeyPressed(.c),
+            .paste_pressed = shortcut_modifier and rl.isKeyPressed(.v),
+            .toggle_lock_pressed = shortcut_modifier and rl.isKeyPressed(.l),
             .allow_shared_edit = alt,
             .choose_tool = choose_tool,
             .delete_pressed = !shortcut_modifier and rl.isKeyPressed(.backspace),
             .edit_text_pressed = rl.isKeyPressed(.enter),
             .promote_pressed = !shortcut_modifier and rl.isKeyPressed(.p),
             .new_slide_pressed = shortcut_modifier and rl.isKeyPressed(.n),
-            .cycle_morph_scene = if (rl.isKeyPressed(.left_bracket))
+            .cycle_morph_scene = if (!shortcut_modifier and rl.isKeyPressed(.left_bracket))
                 -1
-            else if (rl.isKeyPressed(.right_bracket))
+            else if (!shortcut_modifier and rl.isKeyPressed(.right_bracket))
                 1
             else
                 0,
@@ -1424,6 +1509,47 @@ pub const Studio = struct {
         return itemIndexByIdentity(items, identity);
     }
 
+    pub fn isItemLocked(_: Studio, item: slides.SlideItem) bool {
+        return item.locked;
+    }
+
+    /// Rebinds Studio selection to the fresh IDs returned by a structural
+    /// paste after its source rewrite/reparse has completed.
+    pub fn selectItemsByIds(self: *Studio, items: []const slides.SlideItem, ids: []const []const u8) void {
+        self.clearSelectionState();
+        self.notice = .none;
+        for (ids) |id| {
+            if (self.selectionCount() >= max_selection_items) {
+                self.notice = .selection_capacity_reached;
+                break;
+            }
+            var match: ?usize = null;
+            for (items, 0..) |item, index| {
+                const item_id = item.id orelse continue;
+                if (!std.mem.eql(u8, item_id, id)) continue;
+                if (match != null) {
+                    match = null;
+                    break;
+                }
+                match = index;
+            }
+            const index = match orelse continue;
+            // Structural rebinds may intentionally retain a freshly locked
+            // selection for read-only copy and explicit unlock. Ordinary hit
+            // testing/select-all still exclude locked items.
+            if (items[index].kind == .background) continue;
+            if (self.selected_identity == null) {
+                self.setSingleSelection(items[index]);
+            } else if (!self.isIdentitySelected(items[index].identity)) {
+                self.additional_selection[self.additional_selection_count] = .{
+                    .identity = items[index].identity,
+                    .source = sourceForSelection(items[index]),
+                };
+                self.additional_selection_count += 1;
+            }
+        }
+    }
+
     pub fn selectedGeometry(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds) ?Geometry {
         const index = self.selectedIndex(items) orelse return null;
         if (self.interaction != .idle) return self.preview;
@@ -1493,6 +1619,16 @@ pub const Studio = struct {
         };
     }
 
+    fn lockBadgeRect(viewport: Viewport, geometry: Geometry) ?rl.Rectangle {
+        const rect = geometryToScreenRect(viewport, geometry) orelse return null;
+        return .{
+            .x = rect.x + 4,
+            .y = rect.y + 4,
+            .width = 48,
+            .height = 20,
+        };
+    }
+
     /// Updates Studio and mutates item geometry for immediate preview. A
     /// non-null return value represents one completed, undoable edit.
     pub fn update(
@@ -1524,6 +1660,26 @@ pub const Studio = struct {
         if (!self.enabled) return null;
 
         self.validateSelection(items, resolved_bounds);
+
+        if (input.paste_pressed) {
+            if (self.interaction != .idle) self.cancelInteraction(items);
+            self.tool = .select;
+            self.notice = .none;
+            self.pending_semantic_command = .{ .paste_items = .{} };
+            return null;
+        }
+        if (input.copy_pressed) {
+            _ = self.emitCopyItems(items);
+            return null;
+        }
+        if (input.layer_action) |action| {
+            _ = self.emitLayerCommand(items, action);
+            return null;
+        }
+        if (input.toggle_lock_pressed) {
+            _ = self.emitSelectedLockCommand(items, input.allow_shared_edit);
+            return null;
+        }
 
         if (input.select_all_pressed) {
             self.selectAll(items, resolved_bounds);
@@ -1610,6 +1766,13 @@ pub const Studio = struct {
             self.pending_geometry_command = null;
             return command;
         }
+        if (input.pointer_pressed and self.handleLockedBadgeClick(
+            items,
+            resolved_bounds,
+            viewport,
+            input.pointer_screen,
+            input.allow_shared_edit,
+        )) return null;
 
         const pointer_logical = screenToLogical(viewport, input.pointer_screen);
 
@@ -1628,6 +1791,10 @@ pub const Studio = struct {
                 if (self.resizeHandleRect(viewport, selected_geometry)) |handle| {
                     if (pointInRectangle(input.pointer_screen, handle)) {
                         const selected_index = self.selectedIndex(items) orelse return null;
+                        if (items[selected_index].locked) {
+                            self.notice = .locked_item;
+                            return null;
+                        }
                         const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
                         if (!sharedResizeSupported(items[selected_index], edit_scope)) {
                             self.notice = .shared_template_auto_size;
@@ -1671,6 +1838,10 @@ pub const Studio = struct {
                 if (self.resizeHandleRect(viewport, selected_geometry)) |handle| {
                     if (pointInRectangle(input.pointer_screen, handle)) {
                         const selected_index = self.selectedIndex(items) orelse return null;
+                        if (items[selected_index].locked) {
+                            self.notice = .locked_item;
+                            return null;
+                        }
                         const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
                         if (!sharedResizeSupported(items[selected_index], edit_scope)) {
                             self.notice = .shared_template_auto_size;
@@ -1726,6 +1897,10 @@ pub const Studio = struct {
                 return null;
             }
             const selected_index = self.selectedIndex(items) orelse return null;
+            if (items[selected_index].locked) {
+                self.notice = .locked_item;
+                return null;
+            }
             const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
             return self.applyNudge(items, resolved_bounds, input.nudge, edit_scope);
         }
@@ -1749,6 +1924,10 @@ pub const Studio = struct {
         if (self.interaction != .idle) self.cancelInteraction(items);
         if (self.selectionCount() > 1) {
             self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        if (items[index].locked) {
+            self.notice = .locked_item;
             return true;
         }
         const item = items[index];
@@ -1795,6 +1974,10 @@ pub const Studio = struct {
             self.notice = .multi_selection_property_unsupported;
             return true;
         }
+        if (items[index].locked) {
+            self.notice = .locked_item;
+            return true;
+        }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         if (kind == .edit_text and items[index].kind != .textbox and items[index].kind != .crowd) {
             self.notice = .property_unavailable;
@@ -1834,6 +2017,10 @@ pub const Studio = struct {
             self.notice = .multi_selection_property_unsupported;
             return true;
         }
+        if (items[index].locked) {
+            self.notice = .locked_item;
+            return true;
+        }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         if (!background and items[index].kind != .textbox) {
             self.notice = .property_unavailable;
@@ -1865,6 +2052,10 @@ pub const Studio = struct {
             self.notice = .multi_selection_property_unsupported;
             return true;
         }
+        if (items[index].locked) {
+            self.notice = .locked_item;
+            return true;
+        }
         if (self.active_morph_state != null) {
             self.notice = .base_scene_only;
             return true;
@@ -1874,6 +2065,142 @@ pub const Studio = struct {
             .clear_background = self.selectedTarget(items, edit_scope) orelse return true,
         };
         return true;
+    }
+
+    fn structuralTarget(
+        self: *Studio,
+        items: []const slides.SlideItem,
+        item_index: usize,
+        copy_only: bool,
+    ) ?CommandTarget {
+        const item = items[item_index];
+        if ((!copy_only and item.locked) or item.kind == .crowd or item.kind == .background or !item.source.patchable) return null;
+        if (itemIndexByUniqueSource(items, item.source) != item_index) return null;
+        if (copy_only) {
+            if (self.active_morph_state != null or item.source.scope != .direct) return null;
+        } else if (self.active_morph_state) |state_index| {
+            if (item.creation_morph_state == null or item.creation_morph_state.? != state_index or
+                item.source.scope != .morph_item) return null;
+        } else if (item.source.scope != .direct and item.source.scope != .component_instance) {
+            return null;
+        }
+        return .{
+            .item_identity = item.identity,
+            .source = item.source,
+            .edit_scope = .direct,
+        };
+    }
+
+    fn emitLayerCommand(self: *Studio, items: []slides.SlideItem, action: LayerAction) bool {
+        if (self.selectionCount() == 0) return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        var command = LayerCommand{ .action = action };
+        // Paint order, rather than primary-selection order, preserves the
+        // relative order of a multi-selection at its new layer destination.
+        for (items, 0..) |item, item_index| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            const target = self.structuralTarget(items, item_index, false) orelse {
+                self.notice = if (item.locked) .locked_item else .layer_selection_unsupported;
+                return true;
+            };
+            command.targets[command.count] = target;
+            command.count += 1;
+        }
+        if (command.count != self.selectionCount()) {
+            self.notice = .layer_selection_unsupported;
+            return true;
+        }
+        self.notice = .none;
+        self.pending_semantic_command = .{ .reorder_items = command };
+        return true;
+    }
+
+    fn emitCopyItems(self: *Studio, items: []slides.SlideItem) bool {
+        if (self.selectionCount() == 0) return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        var command = CopyItemsCommand{};
+        for (items, 0..) |item, item_index| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            const target = self.structuralTarget(items, item_index, true) orelse {
+                self.notice = .copy_selection_unsupported;
+                return true;
+            };
+            command.targets[command.count] = target;
+            command.count += 1;
+        }
+        if (command.count != self.selectionCount()) {
+            self.notice = .copy_selection_unsupported;
+            return true;
+        }
+        self.notice = .none;
+        self.pending_semantic_command = .{ .copy_items = command };
+        return true;
+    }
+
+    fn emitSelectedLockCommand(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+    ) bool {
+        if (self.selectionCount() == 0) return false;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        var all_locked = true;
+        for (0..self.selectionCount()) |selection_index| {
+            const identity = self.selectedIdentityAt(selection_index) orelse return true;
+            const item_index = itemIndexByIdentity(items, identity) orelse return true;
+            if (!items[item_index].locked) all_locked = false;
+        }
+        var command = SetLockedCommand{ .locked = !all_locked };
+        for (items, 0..) |item, item_index| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return true;
+            command.targets[command.count] = .{
+                .item_identity = item.identity,
+                .source = self.commandSource(item, edit_scope),
+                .edit_scope = edit_scope,
+            };
+            command.count += 1;
+        }
+        if (command.count != self.selectionCount()) return true;
+        self.pending_semantic_command = .{ .set_locked = command };
+        return true;
+    }
+
+    fn handleLockedBadgeClick(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        pointer: rl.Vector2,
+        allow_shared_edit: bool,
+    ) bool {
+        if (!viewport.containsScreenPoint(pointer)) return false;
+        var item_index = items.len;
+        while (item_index > 0) {
+            item_index -= 1;
+            const item = items[item_index];
+            if (!item.locked or !isConcreteVisibleItem(item, resolved_bounds)) continue;
+            const badge = lockBadgeRect(viewport, itemGeometry(item, resolved_bounds)) orelse continue;
+            if (!pointInRectangle(pointer, badge)) continue;
+            const already_selected = self.selected_identity != null and self.selected_identity.? == item.identity and
+                self.selectionCount() == 1;
+            self.setSingleSelection(item);
+            if (!already_selected) {
+                self.notice = .locked_item;
+                return true;
+            }
+            const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return true;
+            var command = SetLockedCommand{ .locked = false };
+            command.targets[0] = .{
+                .item_identity = item.identity,
+                .source = self.commandSource(item, edit_scope),
+                .edit_scope = edit_scope,
+            };
+            command.count = 1;
+            self.pending_semantic_command = .{ .set_locked = command };
+            return true;
+        }
+        return false;
     }
 
     fn emitAddCommand(self: *Studio, pointer: rl.Vector2, workspace: Workspace) void {
@@ -2333,6 +2660,12 @@ pub const Studio = struct {
                 return true;
             }
         }
+        for (layout.layer_buttons, 0..) |button, index| {
+            if (pointInRectangle(pointer, button))
+                return self.emitLayerCommand(items, @enumFromInt(index));
+        }
+        if (pointInRectangle(pointer, layout.lock_item))
+            return self.emitSelectedLockCommand(items, allow_shared_edit);
         // Clicking empty property-panel space must never reach the canvas.
         return true;
     }
@@ -2510,7 +2843,12 @@ pub const Studio = struct {
                 self.clearSelectionState();
                 return;
             };
-            if (!isSelectable(items[selected_index], resolved_bounds)) {
+            if (items[selected_index].locked) {
+                if (!isConcreteVisibleItem(items[selected_index], resolved_bounds)) {
+                    self.clearSelectionState();
+                    return;
+                }
+            } else if (!isSelectable(items[selected_index], resolved_bounds)) {
                 if (self.interaction != .idle) self.cancelInteraction(items);
                 self.clearSelectionState();
                 return;
@@ -2525,7 +2863,9 @@ pub const Studio = struct {
                 else
                     itemIndexByIdentity(items, member.identity);
                 const valid_index = rebound_index orelse continue;
-                if (!isSelectable(items[valid_index], resolved_bounds)) continue;
+                if (items[valid_index].locked) {
+                    if (!isConcreteVisibleItem(items[valid_index], resolved_bounds)) continue;
+                } else if (!isSelectable(items[valid_index], resolved_bounds)) continue;
                 const rebound_identity = items[valid_index].identity;
                 if (self.selected_identity != null and rebound_identity == self.selected_identity.?) continue;
                 var duplicate = false;
@@ -2761,6 +3101,10 @@ pub const Studio = struct {
         for (0..count) |selection_index| {
             const identity = self.selectedIdentityAt(selection_index) orelse return null;
             const item_index = itemIndexByIdentity(items, identity) orelse return null;
+            if (items[item_index].locked) {
+                self.notice = .locked_item;
+                return null;
+            }
             const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return null;
             const geometry = itemGeometry(items[item_index], resolved_bounds);
             output[selection_index] = .{
@@ -3190,6 +3534,10 @@ pub const Studio = struct {
         }
         const index = self.selectedIndex(items) orelse return null;
         if (self.interaction != .idle) self.cancelInteraction(items);
+        if (items[index].locked) {
+            self.notice = .locked_item;
+            return null;
+        }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return null;
         const before = itemGeometry(items[index], resolved_bounds);
         const separate_source_geometry = edit_scope == .shared_template and items[index].instance_source != null;
@@ -3391,6 +3739,14 @@ pub const Studio = struct {
 
         if (self.grid_snapping) self.drawLogicalGrid(viewport);
 
+        for (items) |item| {
+            if (!item.locked or !isConcreteVisibleItem(item, resolved_bounds)) continue;
+            const badge = lockBadgeRect(viewport, itemGeometry(item, resolved_bounds)) orelse continue;
+            rl.drawRectangleRec(badge, .{ .r = 111, .g = 42, .b = 57, .a = 240 });
+            rl.drawRectangleLinesEx(badge, 1, .{ .r = 255, .g = 112, .b = 132, .a = 255 });
+            rl.drawText("LOCK", @intFromFloat(badge.x + 7), @intFromFloat(badge.y + 4), 11, .white);
+        }
+
         if (self.interaction != .idle) {
             self.drawSnapGuides(viewport);
             const original_geometry = if (self.group_drag_count > 1) self.group_bounds_before else self.drag.before;
@@ -3425,7 +3781,7 @@ pub const Studio = struct {
             if (geometryToScreenRect(viewport, geometry)) |rect| {
                 const selected_index = self.selectedIndex(items);
                 const accent: rl.Color = if (selected_index) |index|
-                    if (!self.itemEditableInScene(items[index]))
+                    if (items[index].locked or !self.itemEditableInScene(items[index]))
                         .{ .r = 255, .g = 112, .b = 112, .a = 255 }
                     else if (self.active_morph_state == null and items[index].source.scope == .slide_template)
                         .{ .r = 247, .g = 164, .b = 29, .a = 255 }
@@ -3435,7 +3791,7 @@ pub const Studio = struct {
                     .{ .r = 80, .g = 215, .b = 255, .a = 255 };
                 rl.drawRectangleLinesEx(rect, 3, accent);
                 if (selected_index) |index| {
-                    if (self.selectionCount() == 1 and self.itemEditableInScene(items[index])) {
+                    if (self.selectionCount() == 1 and !items[index].locked and self.itemEditableInScene(items[index])) {
                         if (self.resizeHandleRect(viewport, geometry)) |handle| {
                             rl.drawRectangleRec(handle, accent);
                             rl.drawRectangleLinesEx(handle, 1, .white);
@@ -3458,7 +3814,10 @@ pub const Studio = struct {
         }
 
         self.drawToolbar(viewport);
-        if (self.selected_identity != null) self.drawProperties(viewport);
+        if (self.selected_identity != null) {
+            const selected_locked = if (self.selectedIndex(items)) |index| items[index].locked else false;
+            self.drawProperties(viewport, selected_locked);
+        }
         self.drawStatus(items, resolved_bounds, viewport);
     }
 
@@ -3728,7 +4087,7 @@ pub const Studio = struct {
         drawActionButton(layout.scene_next, ">");
     }
 
-    fn drawProperties(self: Studio, viewport: Viewport) void {
+    fn drawProperties(self: Studio, viewport: Viewport, selected_locked: bool) void {
         const layout = uiLayout(viewport);
         drawStudioPanel(layout.properties);
         rl.drawText("PROPERTIES", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 11), 15, .white);
@@ -3753,6 +4112,10 @@ pub const Studio = struct {
         rl.drawText("DISTRIBUTE", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 266), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
         const distribute_labels = [_][:0]const u8{ "H EQUAL GAP", "V EQUAL GAP" };
         for (layout.distribute_buttons, distribute_labels) |button, label| drawCompactButton(button, label);
+        rl.drawText("LAYER", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 332), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+        const layer_labels = [_][:0]const u8{ "Back", "Down", "Up", "Front" };
+        for (layout.layer_buttons, layer_labels) |button, label| drawCompactButton(button, label);
+        drawCompactButton(layout.lock_item, if (selected_locked) "Unlock" else "Lock");
     }
 
     fn drawStatus(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
@@ -3817,6 +4180,10 @@ pub const Studio = struct {
             .property_unavailable => "That property does not apply to this kind of item",
             .base_scene_only => "That action is available in the BASE scene",
             .structural_source_locked => "Slide structure is source-scoped here; no changes were made",
+            .layer_selection_unsupported => "Layer changes need literal direct items in this scene; nothing moved",
+            .copy_selection_unsupported => "Copy needs literal direct box items; nothing was copied",
+            .clipboard_empty => "Copy one or more items before pasting",
+            .locked_item => "Unlock this item before editing it",
             .library_name_conflict => "That library name is already defined",
             .library_entry_in_use => "Cannot delete: later source instances still use this reusable",
             .library_delete_unsupported => "Slide-template deletion is not source-safe yet",
@@ -6372,6 +6739,263 @@ test "Alt Shift arrows nudge a shared item but reorder with no canvas selection"
         else => return error.UnexpectedSemanticCommand,
     }
     try expectVector(.{ .x = 110, .y = 100 }, items[0].position);
+}
+
+test "layer commands preserve selected paint order and reject unsafe members atomically" {
+    var items = [_]slides.SlideItem{
+        testItem(201, .textbox, 100, 100, 100, 80),
+        testItem(202, .textbox, 300, 100, 100, 80),
+        testItem(203, .textbox, 500, 100, 100, 80),
+    };
+    for (&items, 0..) |*item, index| item.source = .{
+        .scope = .direct,
+        .line_number = index + 1,
+        .line_offset = (index + 1) * 100,
+        .patchable = true,
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 203, 201 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .layer_action = .front });
+    switch (studio.takeSemanticCommand().?) {
+        .reorder_items => |command| {
+            try std.testing.expectEqual(LayerAction.front, command.action);
+            try std.testing.expectEqual(@as(usize, 2), command.count);
+            try std.testing.expectEqual(@as(usize, 201), command.targets[0].item_identity);
+            try std.testing.expectEqual(@as(usize, 203), command.targets[1].item_identity);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[2].source.scope = .slide_template;
+    _ = studio.update(&items, &.{}, viewport, .{ .layer_action = .down });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.layer_selection_unsupported, studio.notice);
+}
+
+test "layer commands allow a unique component instance and current morph birth" {
+    var items = [_]slides.SlideItem{testItem(204, .textbox, 100, 100, 100, 80)};
+    items[0].source = .{ .scope = .component_instance, .line_number = 4, .line_offset = 40, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 204 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .layer_action = .up });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .reorder_items);
+
+    items[0].source.scope = .morph_item;
+    items[0].creation_morph_state = 0;
+    studio.active_morph_state = 0;
+    studio.morph_state_count = 1;
+    _ = studio.update(&items, &.{}, viewport, .{ .layer_action = .back });
+    switch (studio.takeSemanticCommand().?) {
+        .reorder_items => |command| try std.testing.expectEqual(LayerAction.back, command.action),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "copy emits literal direct items in paint order and paste is one offset intention" {
+    var items = [_]slides.SlideItem{
+        testItem(205, .textbox, 100, 100, 100, 80),
+        testItem(206, .img, 300, 100, 100, 80),
+    };
+    items[0].id = "one";
+    items[1].id = "two";
+    items[0].source = .{ .scope = .direct, .line_number = 1, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .direct, .line_number = 2, .line_offset = 20, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 206, 205 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .copy_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .copy_items => |command| {
+            try std.testing.expectEqual(@as(usize, 2), command.count);
+            try std.testing.expectEqual(@as(usize, 205), command.targets[0].item_identity);
+            try std.testing.expectEqual(@as(usize, 206), command.targets[1].item_identity);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.setNotice(.clipboard_empty);
+    try std.testing.expectEqual(Notice.clipboard_empty, studio.notice);
+    _ = studio.update(&items, &.{}, viewport, .{ .paste_pressed = true });
+    try std.testing.expectEqual(Notice.none, studio.notice);
+    switch (studio.takeSemanticCommand().?) {
+        .paste_items => |command| try expectVector(.{ .x = 20, .y = 20 }, command.offset),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[1].source.scope = .component_instance;
+    _ = studio.update(&items, &.{}, viewport, .{ .copy_pressed = true });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.copy_selection_unsupported, studio.notice);
+
+    items[0].locked = true;
+    studio.setSingleSelection(items[0]);
+    _ = studio.update(&items, &.{}, viewport, .{ .copy_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .copy_items => |command| try std.testing.expectEqual(@as(usize, 205), command.targets[0].item_identity),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "paste integration can select all new IDs in requested order" {
+    var items = [_]slides.SlideItem{
+        testItem(207, .textbox, 100, 100, 100, 80),
+        testItem(208, .textbox, 300, 100, 100, 80),
+        testItem(209, .textbox, 500, 100, 100, 80),
+    };
+    items[0].id = "old";
+    items[1].id = "paste-b";
+    items[2].id = "paste-a";
+    // Source rewrites may intentionally retain a newly locked selection so
+    // the user can copy or unlock it without hunting for the badge again.
+    items[2].locked = true;
+    var studio: Studio = .{ .enabled = true, .selected_identity = 207 };
+
+    studio.selectItemsByIds(&items, &.{ "paste-a", "paste-b" });
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 209), studio.selectedIdentityAt(0));
+    try std.testing.expectEqual(@as(?usize, 208), studio.selectedIdentityAt(1));
+}
+
+test "lock commands use direct local shared and morph targets" {
+    var items = [_]slides.SlideItem{testItem(210, .textbox, 100, 100, 100, 80)};
+    items[0].id = "hero";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 210 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .toggle_lock_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .set_locked => |command| {
+            try std.testing.expect(command.locked);
+            try std.testing.expectEqual(EditScope.direct, command.targets[0].edit_scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[0].source = .{ .scope = .slide_template, .line_number = 4, .line_offset = 40, .patchable = true };
+    items[0].shared_template_values = .{ .position = items[0].position, .size = items[0].size };
+    _ = studio.update(&items, &.{}, viewport, .{ .toggle_lock_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .set_locked => |command| try std.testing.expectEqual(EditScope.local_instance, command.targets[0].edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+    _ = studio.update(&items, &.{}, viewport, .{ .toggle_lock_pressed = true, .allow_shared_edit = true });
+    switch (studio.takeSemanticCommand().?) {
+        .set_locked => |command| try std.testing.expectEqual(EditScope.shared_template, command.targets[0].edit_scope),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[0].source = .{ .scope = .morph_item, .line_number = 8, .line_offset = 80, .patchable = true };
+    items[0].creation_morph_state = 0;
+    items[0].shared_template_values = null;
+    studio.active_morph_state = 0;
+    studio.morph_state_count = 1;
+    _ = studio.update(&items, &.{}, viewport, .{ .toggle_lock_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .set_locked => |command| {
+            try std.testing.expect(command.locked);
+            try std.testing.expectEqual(slides.SourceScope.morph_item, command.targets[0].source.scope);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "locked items are skipped by canvas selection select-all snapping and atomic groups" {
+    var items = [_]slides.SlideItem{
+        testItem(211, .textbox, 100, 100, 100, 80),
+        testItem(212, .textbox, 300, 100, 100, 80),
+    };
+    items[0].source = .{ .scope = .direct, .line_number = 1, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .direct, .line_number = 2, .line_offset = 20, .patchable = true };
+    items[1].locked = true;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+
+    try std.testing.expect(hitTest(&items, &.{}, .{ .x = 320, .y = 120 }) == null);
+    _ = studio.update(&items, &.{}, viewport, .{ .select_all_pressed = true });
+    try std.testing.expectEqual(@as(usize, 1), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 211), studio.selected_identity);
+
+    const snapped = snapGeometry(
+        .{ .position = .{ .x = 196, .y = 100 }, .size = .{ .x = 100, .y = 80 } },
+        .moving,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        20,
+        8,
+        null,
+        true,
+        211,
+        &items,
+        &.{},
+    );
+    try std.testing.expect(snapped.guides.vertical == null);
+
+    setTestSelection(&studio, &items, &.{ 211, 212 });
+    _ = studio.update(&items, &.{}, viewport, .{ .layer_action = .front });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+    try std.testing.expectEqual(Notice.locked_item, studio.notice);
+}
+
+test "locked badge unlocks topmost item and property panels win overlapping clicks" {
+    var items = [_]slides.SlideItem{
+        testItem(213, .textbox, 100, 100, 100, 80),
+        testItem(214, .textbox, 100, 100, 100, 80),
+    };
+    items[0].id = "under";
+    items[1].id = "top";
+    items[0].locked = true;
+    items[1].locked = true;
+    items[0].source = .{ .scope = .direct, .line_number = 1, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .direct, .line_number = 2, .line_offset = 20, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+
+    const badge = Studio.lockBadgeRect(viewport, itemGeometry(items[1], &.{})).?;
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(badge),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(@as(?usize, 214), studio.selected_identity);
+    _ = studio.update(&items, &.{}, viewport, .{});
+    try std.testing.expectEqual(@as(?usize, 214), studio.selected_identity);
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 10, .y = 0 } }) == null);
+    try expectVector(.{ .x = 100, .y = 100 }, items[1].position);
+    try std.testing.expectEqual(Notice.locked_item, studio.notice);
+
+    _ = studio.update(&items, &.{}, viewport, .{ .copy_pressed = true });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .copy_items);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(badge),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_locked => |command| {
+            try std.testing.expect(!command.locked);
+            try std.testing.expectEqual(@as(usize, 214), command.targets[0].item_identity);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(@as(?usize, 214), studio.selected_identity);
+
+    // Put a locked badge beneath the visible properties panel. The panel
+    // button must consume the click before canvas badge handling.
+    const layout = uiLayout(viewport);
+    items[0].position = .{ .x = layout.layer_buttons[2].x - 4, .y = layout.layer_buttons[2].y - 4 };
+    items[1].locked = false;
+    studio.setSingleSelection(items[1]);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(layout.layer_buttons[2]),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .reorder_items);
 }
 
 fn rectangleCenter(rect: rl.Rectangle) rl.Vector2 {

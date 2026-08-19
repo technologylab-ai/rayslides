@@ -90,6 +90,11 @@ const StudioHistory = struct {
 
     /// Takes ownership of both source snapshots.
     fn record(self: *StudioHistory, before: []u8, after: []u8, before_slide: i32, after_slide: i32) !void {
+        // Reserve before mutating redo ownership. If allocation fails, the
+        // caller can roll the source back without silently losing redo.
+        if (self.undo_stack.items.len < max_entries) {
+            try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
+        }
         self.clearStack(&self.redo_stack);
         if (self.undo_stack.items.len == max_entries) {
             const oldest = self.undo_stack.orderedRemove(0);
@@ -121,6 +126,81 @@ const StudioHistory = struct {
         errdefer self.redo_stack.append(self.allocator, entry) catch {};
         try self.undo_stack.append(self.allocator, entry);
         return .{ .source = entry.after, .slide = entry.after_slide };
+    }
+};
+
+const StudioClipboardItem = struct {
+    snippet: []u8,
+    position: rl.Vector2,
+};
+
+/// Internal authoring clipboard. Source snippets are captured eagerly so a
+/// later reparse cannot invalidate their offsets, and every paste still goes
+/// through the source editor's validation before entering the document.
+const StudioClipboard = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(StudioClipboardItem) = .empty,
+    paste_generation: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) StudioClipboard {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *StudioClipboard) void {
+        self.clear();
+        self.items.deinit(self.allocator);
+    }
+
+    fn clear(self: *StudioClipboard) void {
+        for (self.items.items) |item| self.allocator.free(item.snippet);
+        self.items.clearRetainingCapacity();
+        self.paste_generation = 0;
+    }
+};
+
+const StudioSelectionIds = struct {
+    allocator: std.mem.Allocator,
+    values: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) StudioSelectionIds {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *StudioSelectionIds) void {
+        self.clear();
+        self.values.deinit(self.allocator);
+    }
+
+    fn clear(self: *StudioSelectionIds) void {
+        for (self.values.items) |value| self.allocator.free(value);
+        self.values.clearRetainingCapacity();
+    }
+
+    fn appendCopy(self: *StudioSelectionIds, value: []const u8) !void {
+        if (self.values.items.len >= studio.max_selection_items) return error.SelectionCapacityReached;
+        const owned = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned);
+        try self.values.append(self.allocator, owned);
+    }
+
+    fn appendNextUnique(self: *StudioSelectionIds) !void {
+        var serial = G.source_len + self.values.items.len + 1;
+        var buffer: [96]u8 = undefined;
+        while (true) : (serial += 1) {
+            const candidate = try std.fmt.bufPrint(&buffer, "studio_{d}", .{serial});
+            var needle_buffer: [112]u8 = undefined;
+            const needle = try std.fmt.bufPrint(&needle_buffer, "id={s}", .{candidate});
+            if (std.mem.indexOf(u8, G.editor_memory[0..G.source_len], needle) != null) continue;
+            var duplicate = false;
+            for (self.values.items) |existing| {
+                if (std.mem.eql(u8, existing, candidate)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            return self.appendCopy(candidate);
+        }
     }
 };
 
@@ -547,6 +627,8 @@ pub fn main(init: std.process.Init) anyerror!void {
     var pending_semantic_command: ?studio.SemanticCommand = null;
     var studio_history = StudioHistory.init(gpa);
     defer studio_history.deinit();
+    var studio_clipboard = StudioClipboard.init(gpa);
+    defer studio_clipboard.deinit();
     var studio_bounds = std.ArrayList(studio.ResolvedBounds).empty;
     defer studio_bounds.deinit(gpa);
     var studio_slide_summaries = std.ArrayList(studio.SlideSummary).empty;
@@ -902,6 +984,30 @@ pub fn main(init: std.process.Init) anyerror!void {
                             studio_mode.setNotice(.edit_failed);
                         }
                     },
+                    .copy_items => |copy| {
+                        if (current_slide) |slide| {
+                            if (captureStudioClipboard(
+                                &studio_clipboard,
+                                copy,
+                                slide,
+                                studio_mode.active_morph_state,
+                                studio_items,
+                                studio_bounds.items,
+                            )) |_| {
+                                studio_mode.setNotice(.none);
+                            } else |err| {
+                                studio_mode.setNotice(switch (err) {
+                                    error.UnsupportedClipboardItem,
+                                    error.InvalidItemScene,
+                                    => .copy_selection_unsupported,
+                                    else => .edit_failed,
+                                });
+                                log.err("Studio copy failed: {any}", .{err});
+                            }
+                        } else {
+                            studio_mode.setNotice(.edit_failed);
+                        }
+                    },
                     .select_slide => |slide_index| studio_slide_to_select = slide_index,
                     .select_morph_scene => {},
                     else => semantic_to_apply = command,
@@ -1031,10 +1137,9 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         if (semantic_to_apply) |command| {
             const customized_shared_property = semanticCommandTargetsCustomizedSharedProperty(command, studio_items);
-            const duplicated_identity: ?usize = switch (command) {
-                .duplicate_item => |target| target.item_identity + 1,
-                else => null,
-            };
+            var selection_ids = StudioSelectionIds.init(gpa);
+            defer selection_ids.deinit();
+            var semantic_source_changed = false;
             if (applyStudioSemanticEdit(
                 &studio_history,
                 command,
@@ -1045,18 +1150,32 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_bounds.items,
                 frame_studio_catalog,
                 studio_library_catalog_indices.items,
-            )) |new_slide_index| {
-                studio_mode.selected_identity = null;
-                studio_mode.selected_source = null;
-                if (new_slide_index) |slide_index| {
-                    studio_history.setLatestAfterSlide(slide_index);
-                    G.current_slide = @intCast(slide_index);
-                    studio_mode.active_morph_state = null;
+                &studio_clipboard,
+                &selection_ids,
+            )) |result| {
+                semantic_source_changed = result.source_changed;
+                if (result.source_changed) {
+                    if (result.slide_index) |slide_index| {
+                        studio_history.setLatestAfterSlide(slide_index);
+                        G.current_slide = @intCast(slide_index);
+                        studio_mode.active_morph_state = null;
+                    }
+                    studio_mode.markSourceChanged();
+                    var id_views: [studio.max_selection_items][]const u8 = undefined;
+                    if (selection_ids.values.items.len > 0) {
+                        for (selection_ids.values.items, 0..) |id, index| id_views[index] = id;
+                    }
+                    // Reparse invalidates every runtime identity. Rebind stable
+                    // IDs when available and always clear the complete old
+                    // group, including additional-selection state, when not.
+                    studio_mode.selectItemsByIds(
+                        currentStudioSceneItems(&studio_mode),
+                        id_views[0..selection_ids.values.items.len],
+                    );
                 }
-                studio_mode.markSourceChanged();
-                if (duplicated_identity) |identity| studio_mode.selected_identity = identity;
                 studio_mode.setNotice(if (customized_shared_property) .shared_template_customized else .none);
             } else |err| {
+                semantic_source_changed = true;
                 studio_mode.setNotice(switch (err) {
                     error.AmbiguousSlideTemplateLayout,
                     error.AmbiguousSlideTemplateDependency,
@@ -1066,7 +1185,13 @@ pub fn main(init: std.process.Init) anyerror!void {
                     error.UnsupportedItemDuplication,
                     error.TemplateInstanceDuplicationUnsupported,
                     error.MorphItemDuplicationUnsupported,
+                    error.AmbiguousItemLayer,
+                    error.InvalidItemScene,
+                    error.UnsupportedItemLayerMove,
+                    error.UnsupportedClipboardItem,
                     => .structural_source_locked,
+                    error.StudioClipboardEmpty => .clipboard_empty,
+                    error.LockedLayerBarrier => .locked_item,
                     error.NameCollision => .library_name_conflict,
                     error.SlideTemplateNameCollision => .library_name_conflict,
                     error.LiveUses => .library_entry_in_use,
@@ -1078,9 +1203,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                 log.err("Studio property edit failed: {any}", .{err});
                 reparseEditorSource() catch {};
             }
-            studio_mode.dirty = editorSourceDirty();
-            is_pre_rendered = false;
-            source_graph_reparsed_this_frame = true;
+            if (semantic_source_changed) {
+                studio_mode.dirty = editorSourceDirty();
+                is_pre_rendered = false;
+                source_graph_reparsed_this_frame = true;
+            }
         }
 
         if (!source_graph_reparsed_this_frame and studio_mode.capturesInput() and !property_prompt.active and shortcutModifierDown() and rl.isKeyPressed(.z)) {
@@ -1725,6 +1852,14 @@ fn studioItemByIdentity(items: []const slides.SlideItem, identity: usize) ?*cons
 }
 
 fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticCommand, items: []const slides.SlideItem) bool {
+    if (command == .set_locked) {
+        for (command.set_locked.slice()) |target| {
+            if (target.edit_scope != .shared_template) continue;
+            const item = studioItemByIdentity(items, target.item_identity) orelse continue;
+            if (item.instance_source != null) return true;
+        }
+        return false;
+    }
     const target: studio.CommandTarget = switch (command) {
         .edit_text => |value| value,
         .set_foreground, .set_background => |value| value.target,
@@ -1734,6 +1869,89 @@ fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticComman
     if (target.edit_scope != .shared_template) return false;
     const item = studioItemByIdentity(items, target.item_identity) orelse return false;
     return item.instance_source != null;
+}
+
+fn layerCommandSelects(command: studio.LayerCommand, identity: usize) bool {
+    for (command.slice()) |target| {
+        if (target.item_identity == identity) return true;
+    }
+    return false;
+}
+
+/// A locked item is a structural barrier as well as an interaction guard.
+/// Refuse the whole batch when its requested paint-order move would cross one.
+fn layerCommandCrossesLocked(command: studio.LayerCommand, items: []const slides.SlideItem) bool {
+    if (command.count == 0) return false;
+    switch (command.action) {
+        .front => {
+            var seen_selected = false;
+            for (items) |item| {
+                if (layerCommandSelects(command, item.identity)) seen_selected = true else if (seen_selected and item.locked) return true;
+            }
+        },
+        .back => {
+            var seen_selected = false;
+            var index = items.len;
+            while (index > 0) {
+                index -= 1;
+                const item = items[index];
+                if (layerCommandSelects(command, item.identity)) seen_selected = true else if (seen_selected and item.locked) return true;
+            }
+        },
+        .up => {
+            var index: usize = 0;
+            while (index < items.len) {
+                if (!layerCommandSelects(command, items[index].identity)) {
+                    index += 1;
+                    continue;
+                }
+                while (index < items.len and layerCommandSelects(command, items[index].identity)) : (index += 1) {}
+                if (index < items.len and items[index].locked) return true;
+            }
+        },
+        .down => {
+            var index = items.len;
+            while (index > 0) {
+                if (!layerCommandSelects(command, items[index - 1].identity)) {
+                    index -= 1;
+                    continue;
+                }
+                while (index > 0 and layerCommandSelects(command, items[index - 1].identity)) : (index -= 1) {}
+                if (index > 0 and items[index - 1].locked) return true;
+            }
+        },
+    }
+    return false;
+}
+
+test "Studio layer batches cannot cross locked paint-order barriers" {
+    const items = [_]slides.SlideItem{
+        .{ .identity = 1, .kind = .textbox },
+        .{ .identity = 2, .kind = .textbox, .locked = true },
+        .{ .identity = 3, .kind = .textbox },
+        .{ .identity = 4, .kind = .textbox },
+    };
+    const target_one: studio.CommandTarget = .{ .item_identity = 1, .source = .{} };
+    const target_three: studio.CommandTarget = .{ .item_identity = 3, .source = .{} };
+
+    var command = studio.LayerCommand{ .action = .front };
+    command.targets[0] = target_one;
+    command.count = 1;
+    try std.testing.expect(layerCommandCrossesLocked(command, &items));
+
+    command.targets[0] = target_three;
+    try std.testing.expect(!layerCommandCrossesLocked(command, &items));
+    command.action = .down;
+    try std.testing.expect(layerCommandCrossesLocked(command, &items));
+
+    command.targets[0] = target_one;
+    command.action = .up;
+    try std.testing.expect(layerCommandCrossesLocked(command, &items));
+
+    command.targets[1] = target_three;
+    command.count = 2;
+    command.action = .front;
+    try std.testing.expect(layerCommandCrossesLocked(command, &items));
 }
 
 fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult) !void {
@@ -1966,7 +2184,17 @@ fn planStudioGeometryBatchEdits(
         if (morph_state) |state_index| {
             const slide = slide_opt orelse return error.NoStudioSlide;
             switch (morphItemEditTarget(slide, state_index, item)) {
-                .patch => |patch_source| source_ref = patch_source,
+                .patch => |patch_source| {
+                    if (item.state_source_state != null and item.state_source_state.? == state_index) {
+                        try source_editor.validateMorphMutationTarget(
+                            source,
+                            slide.morph_states.items[state_index].source.line_offset,
+                            patch_source.line_offset,
+                            item.id orelse return error.MorphItemNeedsId,
+                        );
+                    }
+                    source_ref = patch_source;
+                },
                 .insert_local => {
                     const id = item.id orelse return error.MorphItemNeedsId;
                     const snippet = if (command.resized)
@@ -2375,6 +2603,62 @@ fn studioItemInsertionOffset(slide: *const slides.Slide, morph_state: ?usize) !u
     return source_editor.slideItemInsertionOffset(G.editor_memory[0..G.source_len], slide.pos_in_editor);
 }
 
+fn studioItemSceneAnchor(slide: *const slides.Slide, morph_state: ?usize) !source_editor.ItemSceneAnchor {
+    if (morph_state) |state_index| {
+        if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+        return .{ .morph_state = slide.morph_states.items[state_index].source.line_offset };
+    }
+    return .{ .base_slide = slide.pos_in_editor };
+}
+
+fn captureStudioClipboard(
+    clipboard: *StudioClipboard,
+    command: studio.CopyItemsCommand,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+    resolved_bounds: []const studio.ResolvedBounds,
+) !void {
+    if (command.count == 0 or command.count > studio.max_selection_items) return error.InvalidStudioClipboardBatch;
+    const scene = try studioItemSceneAnchor(slide, morph_state);
+
+    var captured = std.ArrayList(StudioClipboardItem).empty;
+    defer captured.deinit(clipboard.allocator);
+    errdefer for (captured.items) |item| clipboard.allocator.free(item.snippet);
+
+    for (command.slice()) |target| {
+        const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+        const snippet = try source_editor.captureItemSnippet(
+            clipboard.allocator,
+            G.editor_memory[0..G.source_len],
+            scene,
+            target.source.line_offset,
+        );
+        errdefer clipboard.allocator.free(snippet);
+        try captured.append(clipboard.allocator, .{
+            .snippet = snippet,
+            .position = studio.itemGeometry(item.*, resolved_bounds).position,
+        });
+    }
+
+    // Allocate before clearing so a failed copy never destroys the previous
+    // valid clipboard. Once capacity is secured, ownership moves as a unit.
+    try clipboard.items.ensureTotalCapacity(clipboard.allocator, captured.items.len);
+    clipboard.clear();
+    for (captured.items) |item| clipboard.items.appendAssumeCapacity(item);
+    captured.items.len = 0;
+}
+
+fn currentStudioSceneItems(studio_mode: *const studio.Studio) []const slides.SlideItem {
+    if (G.current_slide < 0 or G.current_slide >= G.slideshow.slides.items.len) return &.{};
+    const slide = G.slideshow.slides.items[@intCast(G.current_slide)];
+    if (studio_mode.active_morph_state) |state_index| {
+        if (state_index >= slide.morph_states.items.len) return &.{};
+        return slide.morph_states.items[state_index].items.items;
+    }
+    return if (slide.items) |items| items.items else &.{};
+}
+
 fn insertStudioSnippet(
     history: *StudioHistory,
     slide: *const slides.Slide,
@@ -2506,6 +2790,102 @@ fn applyStudioText(
     ));
 }
 
+fn applyStudioLockEdit(
+    history: *StudioHistory,
+    command: studio.SetLockedCommand,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+) !void {
+    if (command.count == 0 or command.count > studio.max_selection_items) return error.InvalidStudioLockBatch;
+    const source = G.editor_memory[0..G.source_len];
+    const value = if (command.locked) "true" else "false";
+    var edits: [studio.max_selection_items]source_editor.LiteralSourceEdit = undefined;
+    var patches: [studio.max_selection_items][1]source_editor.LiteralAttributePatch = undefined;
+    var snippets: [studio.max_selection_items]?[]u8 = @splat(null);
+    defer for (snippets[0..command.count]) |snippet| if (snippet) |owned| G.allocator.free(owned);
+
+    for (command.slice(), 0..) |target, index| {
+        const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+        patches[index][0] = .{ .key = "locked", .value = value };
+        var source_ref = item.source;
+
+        if (morph_state) |state_index| {
+            if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            switch (morphItemEditTarget(slide, state_index, item)) {
+                .patch => |patch_source| {
+                    if (item.state_source_state != null and item.state_source_state.? == state_index) {
+                        try source_editor.validateMorphMutationTarget(
+                            source,
+                            slide.morph_states.items[state_index].source.line_offset,
+                            patch_source.line_offset,
+                            item.id orelse return error.MorphItemNeedsId,
+                        );
+                    }
+                    source_ref = patch_source;
+                },
+                .insert_local => {
+                    const id = item.id orelse return error.MorphItemNeedsId;
+                    snippets[index] = try std.fmt.allocPrint(G.allocator, "@set {s} locked={s}", .{ id, value });
+                    edits[index] = .{ .insert = .{
+                        .insertion_offset = try source_editor.morphStateEndOffset(
+                            source,
+                            slide.morph_states.items[state_index].source.line_offset,
+                        ),
+                        .snippet = snippets[index].?,
+                    } };
+                    continue;
+                },
+            }
+        } else switch (target.edit_scope) {
+            .local_instance => {
+                const id = item.id orelse return error.TemplateInstanceItemNeedsId;
+                if (item.instance_source) |instance_source| {
+                    if (instance_source.patchable) {
+                        try source_editor.validateSlideTemplateOverrideTarget(
+                            source,
+                            slide.pos_in_editor,
+                            instance_source.line_offset,
+                            id,
+                        );
+                        source_ref = instance_source;
+                        edits[index] = .{ .patch = .{
+                            .directive_offset = source_ref.line_offset,
+                            .patches = patches[index][0..],
+                        } };
+                        continue;
+                    }
+                }
+                snippets[index] = try std.fmt.allocPrint(G.allocator, "@set {s} locked={s}", .{ id, value });
+                edits[index] = .{ .insert = .{
+                    .insertion_offset = try source_editor.slideTemplateOverrideInsertionOffset(
+                        source,
+                        slide.pos_in_editor,
+                        snippets[index].?,
+                    ),
+                    .snippet = snippets[index].?,
+                } };
+                continue;
+            },
+            .shared_template => source_ref = item.source,
+            .direct => source_ref = target.source,
+        }
+
+        if (source_ref.scope == .none or !source_ref.patchable) return error.StudioItemHasNoPatchableSource;
+        edits[index] = .{ .patch = .{
+            .directive_offset = source_ref.line_offset,
+            .patches = patches[index][0..],
+        } };
+    }
+
+    return recordStudioPatch(history, try source_editor.applyLiteralEdits(G.allocator, source, edits[0..command.count]));
+}
+
+const StudioSemanticEditResult = struct {
+    source_changed: bool = true,
+    slide_index: ?usize = null,
+};
+
 fn applyStudioSemanticEdit(
     history: *StudioHistory,
     command: studio.SemanticCommand,
@@ -2516,7 +2896,9 @@ fn applyStudioSemanticEdit(
     resolved_bounds: []const studio.ResolvedBounds,
     catalog_opt: ?studio_catalog.Catalog,
     catalog_indices: []const usize,
-) !?usize {
+    clipboard: *StudioClipboard,
+    selection_ids: *StudioSelectionIds,
+) !StudioSemanticEditResult {
     const slide = slide_opt orelse return error.NoStudioSlide;
     switch (command) {
         .add_item => |add| {
@@ -2587,6 +2969,7 @@ fn applyStudioSemanticEdit(
                     return error.SharedTemplateValuesMissing
             else
                 studio.itemGeometry(item.*, resolved_bounds);
+            try selection_ids.appendCopy(id);
             try recordStudioPatch(history, try source_editor.duplicateItem(
                 G.allocator,
                 G.editor_memory[0..G.source_len],
@@ -2664,6 +3047,75 @@ fn applyStudioSemanticEdit(
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
             try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "bg", "none");
         },
+        .reorder_items => |layer| {
+            if (layer.count == 0 or layer.count > studio.max_selection_items) return error.InvalidStudioLayerBatch;
+            if (layerCommandCrossesLocked(layer, items)) return error.LockedLayerBarrier;
+            const scene = try studioItemSceneAnchor(slide, morph_state);
+            var offsets: [studio.max_selection_items]usize = undefined;
+            var all_have_ids = true;
+            for (layer.slice(), 0..) |target, index| {
+                const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+                offsets[index] = target.source.line_offset;
+                if (item.id) |id| {
+                    try selection_ids.appendCopy(id);
+                } else {
+                    all_have_ids = false;
+                }
+            }
+            if (!all_have_ids) selection_ids.clear();
+            const move: source_editor.LayerMove = switch (layer.action) {
+                .back => .to_back,
+                .down => .backward,
+                .up => .forward,
+                .front => .to_front,
+            };
+            const patch = source_editor.reorderItemsLayer(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                scene,
+                offsets[0..layer.count],
+                move,
+            ) catch |err| switch (err) {
+                error.NoLayerChange => return .{ .source_changed = false },
+                else => return err,
+            };
+            try recordStudioPatch(history, patch);
+        },
+        .copy_items => return error.NonSourceStudioCommand,
+        .paste_items => |paste| {
+            if (clipboard.items.items.len == 0) return error.StudioClipboardEmpty;
+            if (clipboard.items.items.len > studio.max_selection_items) return error.InvalidStudioClipboardBatch;
+            const scene = try studioItemSceneAnchor(slide, morph_state);
+            const generation: f32 = @floatFromInt(clipboard.paste_generation + 1);
+            var paste_items: [studio.max_selection_items]source_editor.CapturedPasteItem = undefined;
+            for (clipboard.items.items, 0..) |clipboard_item, index| {
+                try selection_ids.appendNextUnique();
+                paste_items[index] = .{
+                    .snippet = clipboard_item.snippet,
+                    .new_id = selection_ids.values.items[index],
+                    .placement = .{
+                        .x = clipboard_item.position.x + paste.offset.x * generation,
+                        .y = clipboard_item.position.y + paste.offset.y * generation,
+                    },
+                };
+            }
+            try recordStudioPatch(history, try source_editor.pasteCapturedItems(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                scene,
+                paste_items[0..clipboard.items.items.len],
+            ));
+            clipboard.paste_generation += 1;
+        },
+        .set_locked => |lock| {
+            var all_have_ids = true;
+            for (lock.slice()) |target| {
+                const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+                if (item.id) |id| try selection_ids.appendCopy(id) else all_have_ids = false;
+            }
+            if (!all_have_ids) selection_ids.clear();
+            try applyStudioLockEdit(history, lock, slide, morph_state, items);
+        },
         .promote_to_reusable => |target| {
             if (morph_state != null) return error.MorphPromotionUnsupported;
             const name = prompted_text orelse return error.StudioPromptMissing;
@@ -2687,13 +3139,13 @@ fn applyStudioSemanticEdit(
                 target.pos_in_editor,
                 name,
             ));
-            return slide_index;
+            return .{ .slide_index = slide_index };
         },
         .rename_library_entry => |workspace_index| {
             const entry = studioLibraryEntry(catalog_opt, catalog_indices, workspace_index) orelse
                 return error.StudioLibraryEntryMissing;
             const new_name = prompted_text orelse return error.StudioPromptMissing;
-            if (std.mem.eql(u8, entry.name, new_name)) return null;
+            if (std.mem.eql(u8, entry.name, new_name)) return .{ .source_changed = false };
             try recordStudioCatalogPatch(history, try studio_catalog.renameDefinition(
                 G.allocator,
                 G.editor_memory[0..G.source_len],
@@ -2745,7 +3197,7 @@ fn applyStudioSemanticEdit(
                 G.editor_memory[0..G.source_len],
                 slide.pos_in_editor,
             ));
-            return @intCast(@as(usize, @intCast(G.current_slide)) + 1);
+            return .{ .slide_index = @intCast(@as(usize, @intCast(G.current_slide)) + 1) };
         },
         .select_slide => return error.NonSourceStudioCommand,
         .duplicate_slide => |slide_index| {
@@ -2756,7 +3208,7 @@ fn applyStudioSemanticEdit(
                 G.editor_memory[0..G.source_len],
                 target.pos_in_editor,
             ));
-            return slide_index + 1;
+            return .{ .slide_index = slide_index + 1 };
         },
         .delete_slide => |slide_index| {
             if (slide_index >= G.slideshow.slides.items.len) return error.NoStudioSlide;
@@ -2767,7 +3219,7 @@ fn applyStudioSemanticEdit(
                 G.editor_memory[0..G.source_len],
                 target.pos_in_editor,
             ));
-            return if (slide_index + 1 < slide_count) slide_index else slide_index - 1;
+            return .{ .slide_index = if (slide_index + 1 < slide_count) slide_index else slide_index - 1 };
         },
         .move_slide => |move| {
             if (move.slide_index >= G.slideshow.slides.items.len) return error.NoStudioSlide;
@@ -2782,10 +3234,10 @@ fn applyStudioSemanticEdit(
                 target.pos_in_editor,
                 direction,
             ));
-            return switch (move.direction) {
+            return .{ .slide_index = switch (move.direction) {
                 .up => move.slide_index - 1,
                 .down => move.slide_index + 1,
-            };
+            } };
         },
         .new_slide_from_template => {
             const name = prompted_text orelse return error.StudioPromptMissing;
@@ -2802,11 +3254,11 @@ fn applyStudioSemanticEdit(
                 insertion_offset,
                 directive,
             ));
-            return @intCast(@as(usize, @intCast(G.current_slide)) + 1);
+            return .{ .slide_index = @intCast(@as(usize, @intCast(G.current_slide)) + 1) };
         },
         .select_morph_scene => {},
     }
-    return null;
+    return .{};
 }
 
 fn undoStudioEdit(history: *StudioHistory) !bool {

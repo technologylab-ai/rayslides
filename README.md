@@ -87,8 +87,33 @@ Gap** distribute three or more objects with equal spacing. Group changes are
 written atomically as one undoable source edit. Resize, text, color, promotion,
 duplication, and deletion remain single-object operations for now; Studio
 refuses them for a group instead of silently changing only its primary item.
+The **Layer** controls move one or several selected objects backward, forward,
+to the back, or to the front while preserving the group's internal paint
+order. A layer change is also one atomic source edit.
 <kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new slide immediately after the
 current one. <kbd>Esc</kbd> cancels an active drag or tool, then leaves Studio.
+
+<kbd>Cmd/Ctrl-C</kbd> copies selected authored boxes to Studio's internal object
+clipboard; <kbd>Cmd/Ctrl-V</kbd> pastes fresh objects into the current base or
+morph scene. Every pasted object receives a unique `id=`, is offset by 20
+logical pixels on each successive paste, and the entire paste is one undoable
+edit. Auto-sized images retain automatic sizing. The initial safe clipboard
+scope is deliberately narrow: copy accepts literal direct `@box` items in the
+base scene, while generated items, reusable instances, inherited template
+objects, backgrounds, and Crowdplay panels are refused without changing the
+source. Clipboard snippets remain source-faithful rather than materializing
+inherited defaults, so pasting onto a slide with different font or color
+defaults may intentionally adopt that destination's appearance.
+
+**Lock** writes `locked=true` on selected objects. Locked objects remain in the
+rendered deck but are excluded from normal clicking, select-all, snapping,
+geometry, properties, and layer mutations. Click the visible **LOCK** badge to
+select one for read-only copying; click it again, use **Unlock**, or press
+<kbd>Cmd/Ctrl-L</kbd> to write `locked=false`. Locks follow the same ownership
+rules as other properties, including instance-local and morph-state `@set`
+overrides; hold <kbd>Alt</kbd> for an intentional shared-template lock change.
+A locked object is also a layer barrier, so a batch move that would cross it is
+refused atomically.
 
 The Studio sidebar is a deck organizer and source-aware library. Its slide
 cards contain live rendered thumbnails and can select, add, duplicate, delete,
@@ -153,6 +178,11 @@ scoped, so a library item can only be placed after its definition.
 | Hold <kbd>Cmd/Ctrl</kbd> while dragging | Temporarily bypass smart guides and grid snapping |
 | <kbd>Shift</kbd> + click | Add or remove an object from the current selection |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>A</kbd> | Select every editable object in the current scene |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>C</kbd> | Copy the selected direct boxes to Studio's object clipboard |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>V</kbd> | Paste clipboard objects, offset by another 20 pixels |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>[</kbd> / <kbd>]</kbd> | Move the selection one layer down / up |
+| <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>[</kbd> / <kbd>]</kbd> | Move the selection to the back / front |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>L</kbd> | Lock or unlock the selected objects |
 | <kbd>Backspace</kbd> | Delete the selected object |
 | Hold <kbd>Alt</kbd> while editing a template item | Edit its shared definition instead of this instance |
 | <kbd>Enter</kbd> | Edit the selected object's text |
@@ -175,10 +205,14 @@ state. Editing an inherited, named item creates or updates a state-local `@set`;
 deleting it creates `@hide`. Items born in the active state are edited at their
 own directive. Background creation and reusable promotion remain base-scene
 operations because they change structural layout rather than one morph state.
-Structural edits are also undoable. If a source layout cannot be moved or
-duplicated unambiguously—most notably a reusable definition, global font/color
-default, or unusual slide-template definition inside a rendered slide—Studio
-refuses the edit and leaves the source intact.
+Structural edits are also undoable. Layer changes support literal direct boxes,
+direct component instances, and objects born in the active morph state, but do
+not reorder inherited slide-template content. Items separated by a mutation,
+definition, global default, or another source-ownership boundary cannot cross
+it. Full-slide `@bg` items are pinned layer boundaries, so **Back** cannot hide
+ordinary content underneath the slide background. If a layout cannot be moved,
+copied, or duplicated unambiguously, Studio refuses the whole operation and
+leaves the source intact.
 
 Object duplication is also source-aware: it copies the complete item body and
 owned reveal animation, assigns a fresh stable `id=`, offsets the clone by 20
@@ -356,12 +390,12 @@ that `@popslide` instance, and subsequent morph states inherit it before
 applying their own mutations. Targets must uniquely identify inherited
 template items; ordinary direct slides still require an `@state(morph)` before
 using these mutation directives. Studio writes this syntax automatically for
-local geometry, text, foreground-color, and deletion edits. Holding
-<kbd>Alt</kbd> explicitly edits an uncustomized shared template item instead.
-Once an instance has a local override, Studio asks you to use an uncustomized
-instance for shared edits so effective local values cannot accidentally be
-written into the global definition. Shared template deletion is not yet
-offered because existing local and morph mutations may depend on that item.
+local geometry, text, colors, backgrounds, locking, and deletion. Holding
+<kbd>Alt</kbd> explicitly edits the shared template item instead, including from
+a customized instance: Studio keeps the shared authored value layer separate
+from effective local values. Shared deletion removes source-resolved local and
+morph mutations together; ambiguous or generated dependencies are refused
+atomically.
 
 For nested reusable elements, give `@pop` an explicit `id=` when local slide
 overrides refer to it. That ID remains stable if the reusable definition is

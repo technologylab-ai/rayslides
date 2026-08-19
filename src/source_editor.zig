@@ -16,6 +16,29 @@ pub const DuplicateItemPlacement = struct {
     y: f32,
 };
 
+/// Exact authored scene containing items that may be reordered or receive a
+/// clipboard paste. Offsets always refer to the original source buffer.
+pub const ItemSceneAnchor = union(enum) {
+    base_slide: usize,
+    morph_state: usize,
+};
+
+pub const LayerMove = enum {
+    to_back,
+    backward,
+    forward,
+    to_front,
+};
+
+/// One already-captured item to paste. The snippet is borrowed for the call;
+/// the result owns its rewritten copy. Every caller-supplied ID must be unique
+/// across both the destination document and this batch.
+pub const CapturedPasteItem = struct {
+    snippet: []const u8,
+    new_id: []const u8,
+    placement: DuplicateItemPlacement,
+};
+
 /// One source operation in an atomic geometry rewrite. Every offset refers to
 /// the original, unmodified source buffer. Insertions at the same offset are
 /// emitted in caller order. Snippet bytes are borrowed only for the duration
@@ -24,6 +47,20 @@ pub const GeometrySourceEdit = union(enum) {
     patch: struct {
         directive_offset: usize,
         geometry: GeometryPatch,
+    },
+    insert: struct {
+        insertion_offset: usize,
+        snippet: []const u8,
+    },
+};
+
+/// One literal attribute operation in an atomic rewrite. All offsets refer to
+/// the original source. Patch slices and insertion snippets are borrowed only
+/// for the duration of `applyLiteralEdits`.
+pub const LiteralSourceEdit = union(enum) {
+    patch: struct {
+        directive_offset: usize,
+        patches: []const LiteralAttributePatch,
     },
     insert: struct {
         insertion_offset: usize,
@@ -45,6 +82,7 @@ pub const PatchResult = struct {
 pub const PatchError = error{
     AmbiguousSlideTemplateLayout,
     AmbiguousSlideTemplateDependency,
+    AmbiguousItemLayer,
     CannotDeleteOnlySlide,
     DuplicateAttribute,
     InvalidAttribute,
@@ -55,16 +93,20 @@ pub const PatchError = error{
     InvalidInsertionOffset,
     InvalidLiteralValue,
     InvalidMorphStateOffset,
+    InvalidItemScene,
     InvalidReusableName,
     InvalidSlideOffset,
     InvalidSnippet,
     ItemIdCollision,
     NoAdjacentSlide,
+    NoLayerChange,
     NotPromotableDirective,
     OverlappingSourceEdits,
     SlideTemplateNameCollision,
     SourceTooLarge,
     UnsupportedItemDuplication,
+    UnsupportedClipboardItem,
+    UnsupportedItemLayerMove,
     UnsupportedSlideTemplateOverride,
     UnsupportedSharedTemplateDeletion,
     UnsupportedSlidePromotion,
@@ -213,6 +255,179 @@ pub fn applyGeometryEdits(
         .source = working.?,
         .byte_delta = try signedLengthDelta(working.?.len, source.len),
     };
+}
+
+/// Apply literal attribute patches and already-scoped directive insertions as
+/// one source transaction. Every offset is resolved against the original
+/// buffer. The complete batch is preflighted before allocation of the output;
+/// edits then run from high offsets to low offsets. A patch and insertions may
+/// share a directive start, in which case the patch is applied first and the
+/// inserted snippets retain caller order before the patched directive.
+pub fn applyLiteralEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: []const LiteralSourceEdit,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateLiteralSourceEdits(source, edits);
+
+    var order = try allocator.alloc(usize, edits.len);
+    defer allocator.free(order);
+    for (order, 0..) |*entry, index| entry.* = index;
+    sortLiteralSourceEditOrder(edits, order);
+
+    var working: ?[]u8 = try allocator.dupe(u8, source);
+    errdefer if (working) |owned| allocator.free(owned);
+
+    var group_start: usize = 0;
+    while (group_start < order.len) {
+        const offset = literalSourceEditOffset(edits[order[group_start]]);
+        var group_end = group_start + 1;
+        while (group_end < order.len and literalSourceEditOffset(edits[order[group_end]]) == offset) {
+            group_end += 1;
+        }
+
+        var insertion_start = group_start;
+        if (edits[order[group_start]] == .patch) {
+            const patch = edits[order[group_start]].patch;
+            const next = try patchLiteralAttributes(
+                allocator,
+                working.?,
+                patch.directive_offset,
+                patch.patches,
+            );
+            allocator.free(working.?);
+            working = next.source;
+            insertion_start += 1;
+        }
+        if (insertion_start < group_end) {
+            const next = try insertLiteralSnippetGroupAt(
+                allocator,
+                working.?,
+                offset,
+                edits,
+                order[insertion_start..group_end],
+            );
+            allocator.free(working.?);
+            working = next.source;
+        }
+        group_start = group_end;
+    }
+
+    return .{
+        .source = working.?,
+        .byte_delta = try signedLengthDelta(working.?.len, source.len),
+    };
+}
+
+fn validateLiteralSourceEdits(source: []const u8, edits: []const LiteralSourceEdit) PatchError!void {
+    for (edits, 0..) |edit, index| {
+        switch (edit) {
+            .patch => |patch| {
+                const line = try directiveLine(source, patch.directive_offset);
+                var affected_end = line.full_end;
+                for (patch.patches, 0..) |attribute, attribute_index| {
+                    try validateLiteralPatch(attribute);
+                    for (patch.patches[0..attribute_index]) |previous| {
+                        if (std.mem.eql(u8, attribute.key, previous.key)) return error.DuplicateAttribute;
+                    }
+                    if (std.mem.eql(u8, attribute.key, "text")) {
+                        affected_end = itemBodyEndOffset(source, line.full_end);
+                    }
+                }
+                for (edits[0..index]) |earlier| switch (earlier) {
+                    .patch => |other| {
+                        const other_line = try directiveLine(source, other.directive_offset);
+                        var other_end = other_line.full_end;
+                        for (other.patches) |attribute| {
+                            if (std.mem.eql(u8, attribute.key, "text")) {
+                                other_end = itemBodyEndOffset(source, other_line.full_end);
+                            }
+                        }
+                        if (line.start < other_end and other_line.start < affected_end) {
+                            return error.OverlappingSourceEdits;
+                        }
+                    },
+                    .insert => |insert| {
+                        if (insert.insertion_offset > line.start and insert.insertion_offset < affected_end) {
+                            return error.OverlappingSourceEdits;
+                        }
+                    },
+                };
+                for (edits[index + 1 ..]) |later| switch (later) {
+                    .insert => |insert| {
+                        if (insert.insertion_offset > line.start and insert.insertion_offset < affected_end) {
+                            return error.OverlappingSourceEdits;
+                        }
+                    },
+                    .patch => {},
+                };
+            },
+            .insert => |insert| {
+                try validateSnippet(insert.snippet);
+                if (!isPhysicalLineBoundary(source, insert.insertion_offset)) {
+                    return error.InvalidInsertionOffset;
+                }
+            },
+        }
+    }
+}
+
+fn literalSourceEditOffset(edit: LiteralSourceEdit) usize {
+    return switch (edit) {
+        .patch => |patch| patch.directive_offset,
+        .insert => |insert| insert.insertion_offset,
+    };
+}
+
+fn literalSourceEditComesFirst(
+    edits: []const LiteralSourceEdit,
+    left_index: usize,
+    right_index: usize,
+) bool {
+    const left_offset = literalSourceEditOffset(edits[left_index]);
+    const right_offset = literalSourceEditOffset(edits[right_index]);
+    if (left_offset != right_offset) return left_offset > right_offset;
+    const left_is_patch = edits[left_index] == .patch;
+    const right_is_patch = edits[right_index] == .patch;
+    if (left_is_patch != right_is_patch) return left_is_patch;
+    return left_index < right_index;
+}
+
+fn sortLiteralSourceEditOrder(edits: []const LiteralSourceEdit, order: []usize) void {
+    var index: usize = 1;
+    while (index < order.len) : (index += 1) {
+        var moving = index;
+        while (moving > 0 and literalSourceEditComesFirst(edits, order[moving], order[moving - 1])) : (moving -= 1) {
+            std.mem.swap(usize, &order[moving], &order[moving - 1]);
+        }
+    }
+}
+
+fn insertLiteralSnippetGroupAt(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    insertion_offset: usize,
+    edits: []const LiteralSourceEdit,
+    insertion_order: []const usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (!isPhysicalLineBoundary(source, insertion_offset)) return error.InvalidInsertionOffset;
+    const newline = lineEndingNear(source, insertion_offset);
+    const needs_separator = insertion_offset == source.len and
+        source.len > 0 and
+        !(source.len == utf8_bom.len and std.mem.eql(u8, source, utf8_bom)) and
+        source[source.len - 1] != '\n';
+
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, source[0..insertion_offset]);
+    if (needs_separator) try output.appendSlice(allocator, newline);
+    for (insertion_order) |edit_index| {
+        const snippet = edits[edit_index].insert.snippet;
+        try appendNormalizedLines(allocator, &output, std.mem.trimEnd(u8, snippet, "\n"), newline);
+        try output.appendSlice(allocator, newline);
+    }
+    try output.appendSlice(allocator, source[insertion_offset..]);
+    return finishResult(allocator, &output, source.len);
 }
 
 fn validateGeometrySourceEdits(source: []const u8, edits: []const GeometrySourceEdit) PatchError!void {
@@ -579,7 +794,73 @@ pub fn validateSlideTemplateOverrideGeometryTarget(
     override_offset: usize,
     item_id: []const u8,
 ) PatchError!void {
+    return validateSlideTemplateOverrideTarget(source, slide_offset, override_offset, item_id);
+}
+
+/// Validate an existing parser-effective instance-local mutation as a generic
+/// literal attribute target. This is the scoped preflight counterpart used by
+/// atomic literal batches: a stale or forged offset cannot escape the selected
+/// literal @popslide base region or target another item.
+pub fn validateSlideTemplateOverrideTarget(
+    source: []const u8,
+    slide_offset: usize,
+    override_offset: usize,
+    item_id: []const u8,
+) PatchError!void {
     return validateSlideTemplateOverrideLocation(source, slide_offset, override_offset, item_id);
+}
+
+/// Validate the parser-effective mutation for one item inside one exact morph
+/// state. Callers planning an atomic literal batch pass the state that owns the
+/// item's state_source, preventing a stale offset from patching another state,
+/// slide, or target ID.
+pub fn validateMorphMutationTarget(
+    source: []const u8,
+    state_offset: usize,
+    mutation_offset: usize,
+    item_id: []const u8,
+) PatchError!void {
+    if (!isLiteralItemId(item_id)) return error.InvalidLiteralValue;
+    const state = directiveLine(source, state_offset) catch return error.InvalidMorphStateOffset;
+    if (!isMorphStateDirective(directiveName(source[state.start..state.content_end]))) {
+        return error.InvalidMorphStateOffset;
+    }
+    const scene = resolveDirectMorphItemScene(source, state_offset) catch
+        return error.InvalidMorphStateOffset;
+    const state_end = scene.end;
+    if (mutation_offset < state.full_end or mutation_offset >= state_end) {
+        return error.InvalidMorphStateOffset;
+    }
+    const mutation = directiveLine(source, mutation_offset) catch return error.InvalidMorphStateOffset;
+    const text = source[mutation.start..mutation.content_end];
+    const name = directiveName(text);
+    if (!isMorphMutationDirective(name) or hasPotentialLetExpansion(text)) {
+        return error.InvalidMorphStateOffset;
+    }
+    const target = validateSlideTemplateOverrideDirectiveLine(text) catch
+        return error.InvalidMorphStateOffset;
+    if (!std.mem.eql(u8, target, item_id)) return error.InvalidMorphStateOffset;
+
+    var latest: ?usize = null;
+    var cursor = state.full_end;
+    while (cursor < state_end) {
+        const line = physicalLineAt(source, cursor);
+        const candidate = source[cursor..line.content_end];
+        // A substituted physical line may become a later mutation or may
+        // rewrite its target. Without evaluating the complete @let history we
+        // cannot prove that this offset is parser-effective.
+        if (hasPotentialLetExpansion(candidate)) return error.InvalidMorphStateOffset;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const candidate_name = directiveName(candidate);
+            if (isMorphMutationDirective(candidate_name)) {
+                const candidate_target = validateSlideTemplateOverrideDirectiveLine(candidate) catch
+                    return error.InvalidMorphStateOffset;
+                if (std.mem.eql(u8, candidate_target, item_id)) latest = cursor;
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (latest != mutation_offset) return error.InvalidMorphStateOffset;
 }
 
 /// Patch attributes on an already-authored instance-local override.
@@ -1130,6 +1411,248 @@ pub fn duplicateItem(
     }
     try insertion.appendSlice(allocator, cloned.source);
     return replaceRange(allocator, source, item_end, item_end, insertion.items);
+}
+
+/// Reorder one or more complete authored items inside one exact direct base or
+/// current morph-state scene. Selected relative order is stable. Any source
+/// directive between renderer-adjacent item units is a hard barrier, so a move
+/// can never cross a mutation, global default, slide, template, or state edge.
+pub fn reorderItemsLayer(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    directive_offsets: []const usize,
+    move: LayerMove,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const range = try resolveItemScene(source, scene);
+    var units = std.ArrayList(ItemSourceUnit).empty;
+    defer units.deinit(allocator);
+    try collectSceneItemUnits(allocator, source, range, &units);
+    if (directive_offsets.len == 0 or units.items.len == 0) return error.UnsupportedItemLayerMove;
+
+    var selected = try allocator.alloc(bool, units.items.len);
+    defer allocator.free(selected);
+    @memset(selected, false);
+    for (directive_offsets, 0..) |offset, offset_index| {
+        for (directive_offsets[0..offset_index]) |previous| {
+            if (previous == offset) return error.AmbiguousItemLayer;
+        }
+        var found: ?usize = null;
+        for (units.items, 0..) |unit, unit_index| {
+            if (unit.directive_offset == offset) {
+                found = unit_index;
+                break;
+            }
+        }
+        if (found == null) return error.UnsupportedItemLayerMove;
+        selected[found.?] = true;
+    }
+
+    // Physical adjacency defines independently reorderable layer segments.
+    // Comments/body/blank lines already belong to the preceding unit, while
+    // pending @anim belongs to the next. A mutation or pinned @bg therefore
+    // creates a gap that no selected batch may cross.
+    var segment_start = selectedIndex(selected) orelse return error.UnsupportedItemLayerMove;
+    while (segment_start > 0 and units.items[segment_start - 1].end == units.items[segment_start].start) {
+        segment_start -= 1;
+    }
+    var segment_end = segment_start + 1;
+    while (segment_end < units.items.len and units.items[segment_end - 1].end == units.items[segment_end].start) {
+        segment_end += 1;
+    }
+    for (selected, 0..) |is_selected, index| {
+        if (is_selected and (index < segment_start or index >= segment_end)) {
+            return error.UnsupportedItemLayerMove;
+        }
+    }
+
+    var order = try allocator.alloc(usize, segment_end - segment_start);
+    defer allocator.free(order);
+    for (order, 0..) |*entry, index| entry.* = segment_start + index;
+    switch (move) {
+        .to_back => {
+            var output: usize = 0;
+            for (segment_start..segment_end) |index| if (selected[index]) {
+                order[output] = index;
+                output += 1;
+            };
+            for (segment_start..segment_end) |index| if (!selected[index]) {
+                order[output] = index;
+                output += 1;
+            };
+        },
+        .backward => {
+            var index: usize = 1;
+            while (index < order.len) : (index += 1) {
+                if (selected[order[index]] and !selected[order[index - 1]]) {
+                    std.mem.swap(usize, &order[index], &order[index - 1]);
+                }
+            }
+        },
+        .forward => {
+            var index = order.len - 1;
+            while (index > 0) : (index -= 1) {
+                if (selected[order[index - 1]] and !selected[order[index]]) {
+                    std.mem.swap(usize, &order[index - 1], &order[index]);
+                }
+            }
+        },
+        .to_front => {
+            var output: usize = 0;
+            for (segment_start..segment_end) |index| if (!selected[index]) {
+                order[output] = index;
+                output += 1;
+            };
+            for (segment_start..segment_end) |index| if (selected[index]) {
+                order[output] = index;
+                output += 1;
+            };
+        },
+    }
+
+    var changed = false;
+    for (order, 0..) |unit_index, index| {
+        if (unit_index != segment_start + index) {
+            changed = true;
+            break;
+        }
+    }
+    if (!changed) return error.NoLayerChange;
+
+    const first = units.items[segment_start].start;
+    const last = units.items[segment_end - 1].end;
+    const newline = lineEndingNear(source, first);
+    var replacement = std.ArrayList(u8).empty;
+    defer replacement.deinit(allocator);
+    for (order, 0..) |unit_index, output_index| {
+        const unit = units.items[unit_index];
+        try replacement.appendSlice(allocator, source[unit.start..unit.end]);
+        if (output_index + 1 < order.len and
+            (replacement.items.len == 0 or replacement.items[replacement.items.len - 1] != '\n'))
+        {
+            try replacement.appendSlice(allocator, newline);
+        }
+    }
+    return replaceRange(allocator, source, first, last, replacement.items);
+}
+
+fn selectedIndex(selected: []const bool) ?usize {
+    for (selected, 0..) |value, index| {
+        if (value) return index;
+    }
+    return null;
+}
+
+pub fn reorderItemLayer(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    directive_offset: usize,
+    move: LayerMove,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const offsets = [_]usize{directive_offset};
+    return reorderItemsLayer(allocator, source, scene, &offsets, move);
+}
+
+/// Capture one complete literal direct box unit for a future paste. The caller
+/// owns the returned bytes. Capture reuses the same scene/ownership proof as
+/// layer operations, but deliberately excludes backgrounds, crowd panels,
+/// component/template instances, generated source, and mutations.
+pub fn captureItemSnippet(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    directive_offset: usize,
+) (std.mem.Allocator.Error || PatchError)![]u8 {
+    const range = try resolveItemScene(source, scene);
+    var units = std.ArrayList(ItemSourceUnit).empty;
+    defer units.deinit(allocator);
+    try collectSceneItemUnits(allocator, source, range, &units);
+    for (units.items) |unit| {
+        if (unit.directive_offset != directive_offset) continue;
+        const line = try directiveLine(source, directive_offset);
+        if (!std.mem.eql(u8, directiveName(source[line.start..line.content_end]), "@box")) {
+            return error.UnsupportedClipboardItem;
+        }
+        const snippet = source[unit.start..unit.end];
+        _ = try validateCapturedItemSnippet(snippet);
+        return allocator.dupe(u8, snippet);
+    }
+    return error.UnsupportedClipboardItem;
+}
+
+/// Paste an ordered batch of independently revalidated captured box snippets
+/// at the front of one direct/current-state scene. Every clone receives the
+/// caller's unique ID and x/y, plus canonical `locked=false`; omitted w/h on
+/// automatic images remain omitted. One insertion produces one PatchResult.
+pub fn pasteCapturedItems(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    destination_scene: ItemSceneAnchor,
+    items: []const CapturedPasteItem,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const range = try resolveItemScene(source, destination_scene);
+    try validatePasteDestination(source, range);
+    try validateNoDynamicItemIdentities(source);
+    if (items.len == 0) return error.UnsupportedClipboardItem;
+
+    for (items, 0..) |item, index| {
+        if (!isLiteralItemId(item.new_id)) return error.InvalidLiteralValue;
+        if (hasLiteralItemId(source, item.new_id)) return error.ItemIdCollision;
+        for (items[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.new_id, item.new_id)) return error.ItemIdCollision;
+        }
+        const item_offset = try validateCapturedItemSnippet(item.snippet);
+        if (range.kind == .morph and capturedSnippetHasAnimation(item.snippet, item_offset)) {
+            return error.UnsupportedClipboardItem;
+        }
+        try validateCoordinate(item.placement.x);
+        try validateCoordinate(item.placement.y);
+    }
+
+    const newline = lineEndingNear(source, range.end);
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(allocator);
+    for (items) |item| {
+        const directive_offset = try validateCapturedItemSnippet(item.snippet);
+        var x_buffer: [64]u8 = undefined;
+        var y_buffer: [64]u8 = undefined;
+        const patches = [_]LiteralAttributePatch{
+            .{ .key = "id", .value = item.new_id },
+            .{ .key = "x", .value = try formatCoordinate(&x_buffer, item.placement.x) },
+            .{ .key = "y", .value = try formatCoordinate(&y_buffer, item.placement.y) },
+            .{ .key = "locked", .value = "false" },
+        };
+        const canonical = try patchLiteralAttributes(
+            allocator,
+            item.snippet,
+            directive_offset,
+            &patches,
+        );
+        defer canonical.deinit(allocator);
+        try appendSourceWithLineEnding(allocator, &payload, canonical.source, newline);
+        if (payload.items.len == 0 or payload.items[payload.items.len - 1] != '\n') {
+            try payload.appendSlice(allocator, newline);
+        }
+    }
+
+    var insertion = std.ArrayList(u8).empty;
+    defer insertion.deinit(allocator);
+    if (range.end == source.len and source.len > sourceStart(source) and source[source.len - 1] != '\n') {
+        try insertion.appendSlice(allocator, newline);
+    }
+    try insertion.appendSlice(allocator, payload.items);
+    return replaceRange(allocator, source, range.end, range.end, insertion.items);
+}
+
+pub fn pasteCapturedItem(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    destination_scene: ItemSceneAnchor,
+    item: CapturedPasteItem,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const items = [_]CapturedPasteItem{item};
+    return pasteCapturedItems(allocator, source, destination_scene, &items);
 }
 
 /// Delete exactly the physical directive line beginning at `directive_offset`,
@@ -2190,8 +2713,12 @@ fn validateSlideTemplateOverrideLocation(
     var cursor = region.anchor.full_end;
     while (cursor < region.end) {
         const candidate_line = physicalLineAt(source, cursor);
+        const candidate = source[cursor..candidate_line.content_end];
+        // A let-expanded physical line can introduce a later override or
+        // rewrite its target. Reject the whole provenance check rather than
+        // bless an offset whose parser-effective ownership is ambiguous.
+        if (hasPotentialLetExpansion(candidate)) return error.UnsupportedSlideTemplateOverride;
         if (cursor < candidate_line.content_end and source[cursor] == '@') {
-            const candidate = source[cursor..candidate_line.content_end];
             const candidate_name = directiveName(candidate);
             if (isMorphMutationDirective(candidate_name)) {
                 if (directiveContextName(candidate, candidate_name.len)) |candidate_target| {
@@ -2315,6 +2842,301 @@ fn itemBodyEndOffset(source: []const u8, body_start: usize) usize {
         cursor = line.full_end;
     }
     return source.len;
+}
+
+const ItemSceneKind = enum { base, template_base, morph };
+
+const ItemSceneRange = struct {
+    start: usize,
+    end: usize,
+    kind: ItemSceneKind,
+};
+
+const ItemSourceUnit = struct {
+    start: usize,
+    end: usize,
+    directive_offset: usize,
+};
+
+fn resolveItemScene(source: []const u8, anchor: ItemSceneAnchor) PatchError!ItemSceneRange {
+    return switch (anchor) {
+        .base_slide => |slide_offset| resolveDirectBaseItemScene(source, slide_offset),
+        .morph_state => |state_offset| resolveDirectMorphItemScene(source, state_offset),
+    };
+}
+
+fn resolveDirectBaseItemScene(source: []const u8, slide_offset: usize) PatchError!ItemSceneRange {
+    if (directiveLine(source, slide_offset)) |line| {
+        const name = directiveName(source[line.start..line.content_end]);
+        if (std.mem.eql(u8, name, "@slide") or std.mem.eql(u8, name, "@popslide")) {
+            const end = findSlideBoundary(source, slide_offset, true) catch return error.InvalidItemScene;
+            if (itemSceneEndsAtTemplateCapture(source, end)) return error.InvalidItemScene;
+            return .{
+                .start = line.full_end,
+                .end = end,
+                .kind = if (std.mem.eql(u8, name, "@popslide")) .template_base else .base,
+            };
+        }
+        if (slide_offset != 0 or hasExplicitSlideBoundary(source)) return error.InvalidItemScene;
+    } else |_| {
+        if (slide_offset != 0 or hasExplicitSlideBoundary(source)) return error.InvalidItemScene;
+    }
+    return .{
+        .start = sourceStart(source),
+        .end = findSlideBoundary(source, 0, true) catch return error.InvalidItemScene,
+        .kind = .base,
+    };
+}
+
+fn resolveDirectMorphItemScene(source: []const u8, state_offset: usize) PatchError!ItemSceneRange {
+    const state = directiveLine(source, state_offset) catch return error.InvalidItemScene;
+    if (!isMorphStateDirective(directiveName(source[state.start..state.content_end]))) {
+        return error.InvalidItemScene;
+    }
+
+    const Owner = enum { implicit, direct, template_instance, template_definition };
+    var owner: Owner = .implicit;
+    var cursor = sourceStart(source);
+    while (cursor < state.start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > state.start) return error.InvalidItemScene;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (std.mem.eql(u8, name, "@slide")) {
+                owner = .direct;
+            } else if (std.mem.eql(u8, name, "@popslide")) {
+                owner = .template_instance;
+            } else if (std.mem.eql(u8, name, "@pushslide")) {
+                owner = .template_definition;
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (cursor != state.start or owner == .template_definition) {
+        return error.InvalidItemScene;
+    }
+    const end = morphStateEndOffset(source, state_offset) catch return error.InvalidItemScene;
+    if (itemSceneEndsAtTemplateCapture(source, end)) return error.InvalidItemScene;
+    return .{
+        .start = state.full_end,
+        .end = end,
+        .kind = .morph,
+    };
+}
+
+fn itemSceneEndsAtTemplateCapture(source: []const u8, end: usize) bool {
+    if (end >= source.len or source[end] != '@') return false;
+    const line = directiveLine(source, end) catch return true;
+    return std.mem.eql(u8, directiveName(source[line.start..line.content_end]), "@pushslide");
+}
+
+fn collectSceneItemUnits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    range: ItemSceneRange,
+    units: *std.ArrayList(ItemSourceUnit),
+) (std.mem.Allocator.Error || PatchError)!void {
+    validateNoDanglingAnimation(source, range.start, range.end) catch
+        return error.UnsupportedItemLayerMove;
+    var cursor = range.start;
+    while (cursor < range.end) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > range.end) return error.InvalidItemScene;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            const name = directiveName(text);
+            if (isAnimationDirective(name)) {
+                // Ownership is attached when the following item is visited.
+            } else if (std.mem.eql(u8, name, "@bg")) {
+                // Backgrounds are a pinned floor. Excluding their owned unit
+                // leaves a physical gap between reorderable layer segments;
+                // it also makes selecting @bg itself unsupported.
+            } else if (directiveEmitsSlideItem(name)) {
+                if (hasPotentialLetExpansion(text) or directiveHasDynamicIdentity(text, name)) {
+                    return error.UnsupportedItemLayerMove;
+                }
+                if (std.mem.eql(u8, name, "@pop")) {
+                    const component = directiveContextName(text, name.len) orelse
+                        return error.UnsupportedItemLayerMove;
+                    if (!isReusableName(component)) return error.UnsupportedItemLayerMove;
+                }
+                const owned_start = itemOwnedAnimationStart(source, cursor) catch
+                    return error.UnsupportedItemLayerMove;
+                if (owned_start < range.start) return error.UnsupportedItemLayerMove;
+                const end = itemBodyEndOffset(source, line.full_end);
+                if (end > range.end) return error.InvalidItemScene;
+                if (hasPotentialLetExpansion(source[owned_start..end])) {
+                    return error.UnsupportedItemLayerMove;
+                }
+                try units.append(allocator, .{
+                    .start = owned_start,
+                    .end = end,
+                    .directive_offset = cursor,
+                });
+            } else if (!((range.kind == .morph or range.kind == .template_base) and
+                isMorphMutationDirective(name)))
+            {
+                return error.UnsupportedItemLayerMove;
+            }
+        }
+        cursor = line.full_end;
+    }
+}
+
+fn validatePasteDestination(source: []const u8, range: ItemSceneRange) PatchError!void {
+    var pending_animation = false;
+    var cursor = range.start;
+    while (cursor < range.end) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > range.end) return error.InvalidItemScene;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            const name = directiveName(text);
+            if (isAnimationDirective(name)) {
+                if (hasPotentialLetExpansion(text)) return error.UnsupportedClipboardItem;
+                pending_animation = true;
+            } else if (directiveEmitsSlideItem(name)) {
+                pending_animation = false;
+            } else if ((range.kind == .morph or range.kind == .template_base) and
+                isMorphMutationDirective(name))
+            {
+                if (pending_animation) return error.UnsupportedClipboardItem;
+            } else {
+                return error.UnsupportedClipboardItem;
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (pending_animation) return error.UnsupportedClipboardItem;
+}
+
+fn validateNoDynamicItemIdentities(source: []const u8) PatchError!void {
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[cursor..line.content_end];
+        // A generated physical line can become an item directive after @let
+        // expansion, so global ID uniqueness cannot be proven in such a deck.
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedClipboardItem;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (directiveEmitsSlideItem(name) and directiveHasDynamicIdentity(text, name)) {
+                return error.UnsupportedClipboardItem;
+            }
+        }
+        cursor = line.full_end;
+    }
+}
+
+fn validateCapturedItemSnippet(snippet: []const u8) PatchError!usize {
+    if (snippet.len == 0 or std.mem.startsWith(u8, snippet, utf8_bom) or
+        hasPotentialLetExpansion(snippet))
+    {
+        return error.UnsupportedClipboardItem;
+    }
+    for (snippet, 0..) |byte, index| {
+        if (byte == '\r' and (index + 1 == snippet.len or snippet[index + 1] != '\n')) {
+            return error.UnsupportedClipboardItem;
+        }
+    }
+
+    var item_offset: ?usize = null;
+    var saw_animation = false;
+    var cursor: usize = 0;
+    while (cursor < snippet.len) {
+        const line = physicalLineAt(snippet, cursor);
+        const text = snippet[cursor..line.content_end];
+        if (text.len > 0 and text[0] == '@') {
+            const name = directiveName(text);
+            if (item_offset == null and isAnimationDirective(name)) {
+                saw_animation = true;
+            } else if (item_offset == null and std.mem.eql(u8, name, "@box")) {
+                if (directiveHasDynamicIdentity(text, name)) return error.UnsupportedClipboardItem;
+                try validateClipboardDirectiveAttributes(text, name.len);
+                item_offset = cursor;
+            } else {
+                return error.UnsupportedClipboardItem;
+            }
+        } else if (item_offset == null and !saw_animation) {
+            // A captured unit begins at its directive (or earliest owned
+            // animation), never at detached formatting/prose.
+            return error.UnsupportedClipboardItem;
+        }
+        cursor = line.full_end;
+    }
+    return item_offset orelse error.UnsupportedClipboardItem;
+}
+
+fn validateClipboardDirectiveAttributes(line: []const u8, name_len: usize) PatchError!void {
+    var cursor = name_len;
+    while (cursor < line.len) {
+        while (cursor < line.len and isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+        if (cursor == line.len) break;
+        const token_start = cursor;
+        while (cursor < line.len and !isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
+        const token = line[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse
+            return error.UnsupportedClipboardItem;
+        const key = token[0..equals];
+        const value = token[equals + 1 ..];
+        if (!isAttributeName(key)) return error.UnsupportedClipboardItem;
+        if (std.mem.eql(u8, key, "text")) return;
+        validateLiteralPatch(.{ .key = key, .value = value }) catch
+            return error.UnsupportedClipboardItem;
+
+        var earlier_cursor = name_len;
+        while (earlier_cursor < token_start) {
+            while (earlier_cursor < token_start and isHorizontalWhitespace(line[earlier_cursor])) : (earlier_cursor += 1) {}
+            if (earlier_cursor == token_start) break;
+            const earlier_start = earlier_cursor;
+            while (earlier_cursor < token_start and !isHorizontalWhitespace(line[earlier_cursor])) : (earlier_cursor += 1) {}
+            const earlier = line[earlier_start..earlier_cursor];
+            const earlier_equals = std.mem.indexOfScalar(u8, earlier, '=') orelse
+                return error.UnsupportedClipboardItem;
+            if (std.mem.eql(u8, earlier[0..earlier_equals], key)) {
+                return error.UnsupportedClipboardItem;
+            }
+        }
+    }
+}
+
+fn capturedSnippetHasAnimation(snippet: []const u8, item_offset: usize) bool {
+    if (item_offset != 0) return true;
+    const line = physicalLineAt(snippet, item_offset);
+    const text = snippet[line.start..line.content_end];
+    const name = directiveName(text);
+    var cursor = name.len;
+    while (cursor < text.len) {
+        while (cursor < text.len and isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
+        if (cursor == text.len) break;
+        const token_start = cursor;
+        while (cursor < text.len and !isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
+        const token = text[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals];
+        if (std.mem.eql(u8, key, "text")) break;
+        if (std.mem.eql(u8, key, "anim") or std.mem.eql(u8, key, "effect")) return true;
+    }
+    return false;
+}
+
+fn appendSourceWithLineEnding(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    source: []const u8,
+    newline: []const u8,
+) std.mem.Allocator.Error!void {
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        try output.appendSlice(allocator, source[line.start..line.content_end]);
+        if (line.full_end > line.content_end) try output.appendSlice(allocator, newline);
+        cursor = line.full_end;
+    }
+}
+
+fn validateCoordinate(value: f32) PatchError!void {
+    if (!std.math.isFinite(value)) return error.InvalidCoordinate;
 }
 
 fn itemOwnedAnimationStart(source: []const u8, item_start: usize) PatchError!usize {
@@ -3367,6 +4189,40 @@ test "slide template override patch rejects a parser-masked earlier mutation" {
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, result.source, "@show hero x=30 y=40\n") != null);
+}
+
+test "scoped mutation validation rejects let-expanded shadowing" {
+    const instance =
+        "@popslide layout\n" ++
+        "@set hero x=10\n" ++
+        "$later_override$\n" ++
+        "@state(morph)\n";
+    try std.testing.expectError(
+        error.UnsupportedSlideTemplateOverride,
+        validateSlideTemplateOverrideTarget(
+            instance,
+            0,
+            std.mem.indexOf(u8, instance, "@set hero").?,
+            "hero",
+        ),
+    );
+
+    const morph =
+        "@slide\n" ++
+        "@box id=hero text=Hero\n" ++
+        "@state(morph)\n" ++
+        "@set hero x=20\n" ++
+        "$later_mutation$\n" ++
+        "@slide\n";
+    try std.testing.expectError(
+        error.InvalidMorphStateOffset,
+        validateMorphMutationTarget(
+            morph,
+            std.mem.indexOf(u8, morph, "@state").?,
+            std.mem.indexOf(u8, morph, "@set hero").?,
+            "hero",
+        ),
+    );
 }
 
 test "slide boundaries distinguish base insertion from complete slide end" {
@@ -4470,6 +5326,439 @@ test "item duplication rejects ambiguous pending animation and dynamic pop name"
             placement,
         ),
     );
+}
+
+test "multi item layer reorder preserves ownership order BOM CRLF and EOF validity" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@anim(fade) duration=0.4\r\n" ++
+        "# animation note\r\n" ++
+        "@box id=a x=10 y=20\r\n" ++
+        "A body\r\n" ++
+        "# A note\r\n" ++
+        "@box id=b x=20 y=30 text=B\r\n" ++
+        "@box id=c x=30 y=40 text=C";
+    const expected =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=c x=30 y=40 text=C\r\n" ++
+        "@anim(fade) duration=0.4\r\n" ++
+        "# animation note\r\n" ++
+        "@box id=a x=10 y=20\r\n" ++
+        "A body\r\n" ++
+        "# A note\r\n" ++
+        "@box id=b x=20 y=30 text=B\r\n";
+    const offsets = [_]usize{
+        std.mem.indexOf(u8, source, "@box id=a").?,
+        std.mem.indexOf(u8, source, "@box id=b").?,
+    };
+    const result = try reorderItemsLayer(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = utf8_bom.len },
+        &offsets,
+        .forward,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.source, utf8_bom));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqualStrings("c", items[0].id.?);
+    try std.testing.expectEqualStrings("a", items[1].id.?);
+    try std.testing.expectEqualStrings("b", items[2].id.?);
+    try std.testing.expect(items[1].animation != null);
+    try std.testing.expectEqualStrings("A body", items[1].text.?);
+
+    try std.testing.expectError(error.NoLayerChange, reorderItemLayer(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = utf8_bom.len },
+        std.mem.indexOf(u8, source, "@box id=c").?,
+        .to_front,
+    ));
+}
+
+test "layer operations support local popslide items and births but honor mutation barriers" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@box id=shared text=Shared\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@set shared x=100\n" ++
+        "@box id=local_a text=Local A\n" ++
+        "@box id=local_b text=Local B\n" ++
+        "@state(morph)\n" ++
+        "@set shared y=200\n" ++
+        "@box id=born_a text=Born A\n" ++
+        "@box id=born_b text=Born B\n";
+    const slide_offset = std.mem.indexOf(u8, source, "@popslide").?;
+    const state_offset = std.mem.indexOf(u8, source, "@state").?;
+    const base_moved = try reorderItemLayer(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = slide_offset },
+        std.mem.indexOf(u8, source, "@box id=local_a").?,
+        .forward,
+    );
+    defer base_moved.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, base_moved.source, "@box id=local_b").? <
+        std.mem.indexOf(u8, base_moved.source, "@box id=local_a").?);
+
+    const morph_moved = try reorderItemLayer(
+        std.testing.allocator,
+        source,
+        .{ .morph_state = state_offset },
+        std.mem.indexOf(u8, source, "@box id=born_a").?,
+        .forward,
+    );
+    defer morph_moved.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, morph_moved.source, "@box id=born_b").? <
+        std.mem.indexOf(u8, morph_moved.source, "@box id=born_a").?);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(morph_moved.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const state_items = deck.slides.items[0].morph_states.items[0].items.items;
+    try std.testing.expectEqualStrings("born_b", state_items[state_items.len - 2].id.?);
+    try std.testing.expectEqualStrings("born_a", state_items[state_items.len - 1].id.?);
+
+    const barrier =
+        "@slide\n" ++
+        "@box id=a text=A\n" ++
+        "@color=#ffffffff\n" ++
+        "@box id=b text=B\n";
+    try std.testing.expectError(error.UnsupportedItemLayerMove, reorderItemLayer(
+        std.testing.allocator,
+        barrier,
+        .{ .base_slide = 0 },
+        std.mem.indexOf(u8, barrier, "@box id=a").?,
+        .forward,
+    ));
+}
+
+test "layer operations pin background floors in base and morph scenes" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const base =
+        "@slide\n" ++
+        "@box id=buried text=Buried\n" ++
+        "@bg id=background color=#101010ff\n" ++
+        "@box id=a text=A\n" ++
+        "@box id=b text=B\n";
+    const base_result = try reorderItemLayer(
+        std.testing.allocator,
+        base,
+        .{ .base_slide = 0 },
+        std.mem.indexOf(u8, base, "@box id=b text=B").?,
+        .to_back,
+    );
+    defer base_result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@slide\n" ++
+            "@box id=buried text=Buried\n" ++
+            "@bg id=background color=#101010ff\n" ++
+            "@box id=b text=B\n" ++
+            "@box id=a text=A\n",
+        base_result.source,
+    );
+    try std.testing.expectError(error.NoLayerChange, reorderItemLayer(
+        std.testing.allocator,
+        base,
+        .{ .base_slide = 0 },
+        std.mem.indexOf(u8, base, "@box id=a").?,
+        .backward,
+    ));
+    try std.testing.expectError(error.UnsupportedItemLayerMove, reorderItemLayer(
+        std.testing.allocator,
+        base,
+        .{ .base_slide = 0 },
+        std.mem.indexOf(u8, base, "@bg").?,
+        .forward,
+    ));
+
+    const morph =
+        "@slide\n" ++
+        "@box id=base text=Base\n" ++
+        "@state(morph)\n" ++
+        "@box id=born_below text=Below\n" ++
+        "@bg id=morph_background color=#202020ff\n" ++
+        "@box id=born_a text=A\n" ++
+        "@box id=born_b text=B\n";
+    const morph_result = try reorderItemLayer(
+        std.testing.allocator,
+        morph,
+        .{ .morph_state = std.mem.indexOf(u8, morph, "@state").? },
+        std.mem.indexOf(u8, morph, "@box id=born_b text=B").?,
+        .backward,
+    );
+    defer morph_result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, morph_result.source, "@bg id=morph_background").? <
+        std.mem.indexOf(u8, morph_result.source, "@box id=born_b text=B").?);
+    try std.testing.expect(std.mem.indexOf(u8, morph_result.source, "@box id=born_b text=B").? <
+        std.mem.indexOf(u8, morph_result.source, "@box id=born_a text=A").?);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(morph_result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+}
+
+test "item scene operations reject slides captured as template definitions" {
+    const captured_base =
+        "@slide\n" ++
+        "@box id=a text=A\n" ++
+        "@box id=b text=B\n" ++
+        "@pushslide saved\n" ++
+        "@popslide saved\n";
+    const a = std.mem.indexOf(u8, captured_base, "@box id=a").?;
+    try std.testing.expectError(error.InvalidItemScene, reorderItemLayer(
+        std.testing.allocator,
+        captured_base,
+        .{ .base_slide = 0 },
+        a,
+        .forward,
+    ));
+    try std.testing.expectError(error.InvalidItemScene, captureItemSnippet(
+        std.testing.allocator,
+        captured_base,
+        .{ .base_slide = 0 },
+        a,
+    ));
+
+    const captured_morph =
+        "@slide\n" ++
+        "@box id=a text=A\n" ++
+        "@state(morph)\n" ++
+        "@box id=born text=Born\n" ++
+        "@pushslide saved\n" ++
+        "@popslide saved\n";
+    const state = std.mem.indexOf(u8, captured_morph, "@state").?;
+    const paste: CapturedPasteItem = .{
+        .snippet = "@box id=old text=Copy\n",
+        .new_id = "copy",
+        .placement = .{ .x = 10, .y = 20 },
+    };
+    try std.testing.expectError(error.InvalidItemScene, pasteCapturedItem(
+        std.testing.allocator,
+        captured_morph,
+        .{ .morph_state = state },
+        paste,
+    ));
+
+    // Rejected source operations return no PatchResult, so the caller-owned
+    // source remains byte-for-byte untouched.
+    try std.testing.expectEqualStrings(
+        "@slide\n@box id=a text=A\n@box id=b text=B\n@pushslide saved\n@popslide saved\n",
+        captured_base,
+    );
+}
+
+test "clipboard capture and atomic paste preserve boxes and unlock copies" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@anim(fade) duration=0.4\r\n" ++
+        "@box id=photo img=photo.png x=100 y=200 scale=0.5 ratio=1.4 locked=true\r\n" ++
+        "# photo note\r\n" ++
+        "@box id=caption x=40 y=50 locked=true\r\n" ++
+        "Caption body\r\n" ++
+        "@slide\r\n" ++
+        "@box id=target text=Target";
+    const first_slide = utf8_bom.len;
+    const second_slide = std.mem.lastIndexOf(u8, source, "@slide").?;
+    const photo = try captureItemSnippet(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = first_slide },
+        std.mem.indexOf(u8, source, "@box id=photo").?,
+    );
+    defer std.testing.allocator.free(photo);
+    const caption = try captureItemSnippet(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = first_slide },
+        std.mem.indexOf(u8, source, "@box id=caption").?,
+    );
+    defer std.testing.allocator.free(caption);
+    const paste_items = [_]CapturedPasteItem{
+        .{ .snippet = photo, .new_id = "photo_copy", .placement = .{ .x = 300, .y = 400 } },
+        .{ .snippet = caption, .new_id = "caption_copy", .placement = .{ .x = 500, .y = 600 } },
+    };
+    const pasted = try pasteCapturedItems(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = second_slide },
+        &paste_items,
+    );
+    defer pasted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, pasted.source, utf8_bom));
+    try std.testing.expect(std.mem.indexOf(u8, pasted.source, "id=photo_copy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pasted.source, "id=caption_copy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pasted.source, "id=photo_copy img=photo.png x=300 y=400 scale=0.5 ratio=1.4 locked=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pasted.source, "photo_copy img=photo.png x=300 y=400 w=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pasted.source, "photo_copy img=photo.png x=300 y=400 h=") == null);
+    try std.testing.expect(std.mem.endsWith(u8, pasted.source, "Caption body\r\n"));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(pasted.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[1].items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqualStrings("photo_copy", items[1].id.?);
+    try std.testing.expect(!items[1].locked);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), items[1].size.x, 0.0001);
+    try std.testing.expect(items[1].animation != null);
+    try std.testing.expectEqualStrings("caption_copy", items[2].id.?);
+    try std.testing.expectEqualStrings("Caption body", items[2].text.?);
+    try std.testing.expect(!items[2].locked);
+}
+
+test "clipboard paste supports popslide morph births and rejects animated snippets" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const destination =
+        "@box id=shared text=Shared\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@state(morph)\n" ++
+        "@set shared x=100\n";
+    const state = std.mem.indexOf(u8, destination, "@state").?;
+    const plain: CapturedPasteItem = .{
+        .snippet = "@box id=old x=1 y=2 locked=true text=Born",
+        .new_id = "born_copy",
+        .placement = .{ .x = 300, .y = 400 },
+    };
+    const pasted = try pasteCapturedItem(
+        std.testing.allocator,
+        destination,
+        .{ .morph_state = state },
+        plain,
+    );
+    defer pasted.deinit(std.testing.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(pasted.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const state_items = deck.slides.items[0].morph_states.items[0].items.items;
+    const born = state_items[state_items.len - 1];
+    try std.testing.expectEqualStrings("born_copy", born.id.?);
+    try std.testing.expect(!born.locked);
+
+    const decorated: CapturedPasteItem = .{
+        .snippet = "@anim(fade)\n@box id=old text=Animated\n",
+        .new_id = "decorated_copy",
+        .placement = .{ .x = 10, .y = 20 },
+    };
+    try std.testing.expectError(error.UnsupportedClipboardItem, pasteCapturedItem(
+        std.testing.allocator,
+        destination,
+        .{ .morph_state = state },
+        decorated,
+    ));
+    const inline_item: CapturedPasteItem = .{
+        .snippet = "@box id=old anim=fade text=Animated\n",
+        .new_id = "inline_copy",
+        .placement = .{ .x = 10, .y = 20 },
+    };
+    try std.testing.expectError(error.UnsupportedClipboardItem, pasteCapturedItem(
+        std.testing.allocator,
+        destination,
+        .{ .morph_state = state },
+        inline_item,
+    ));
+}
+
+test "clipboard rejects unsupported generated instance and colliding snippets atomically" {
+    const destination = "@slide\n@box id=used text=Used\n";
+    const rejected = [_]CapturedPasteItem{
+        .{ .snippet = "@bg id=back color=#ffffffff\n", .new_id = "back_copy", .placement = .{ .x = 0, .y = 0 } },
+        .{ .snippet = "@crowd join id=room\n", .new_id = "room_copy", .placement = .{ .x = 0, .y = 0 } },
+        .{ .snippet = "@pop card id=card\n", .new_id = "card_copy", .placement = .{ .x = 0, .y = 0 } },
+        .{ .snippet = "@box id=old x=$left$\n", .new_id = "dynamic_copy", .placement = .{ .x = 0, .y = 0 } },
+    };
+    for (rejected) |item| {
+        try std.testing.expectError(error.UnsupportedClipboardItem, pasteCapturedItem(
+            std.testing.allocator,
+            destination,
+            .{ .base_slide = 0 },
+            item,
+        ));
+    }
+    const collision: CapturedPasteItem = .{
+        .snippet = "@box id=old text=Copy\n",
+        .new_id = "used",
+        .placement = .{ .x = 1, .y = 2 },
+    };
+    try std.testing.expectError(error.ItemIdCollision, pasteCapturedItem(
+        std.testing.allocator,
+        destination,
+        .{ .base_slide = 0 },
+        collision,
+    ));
+    try std.testing.expectEqualStrings("@slide\n@box id=used text=Used\n", destination);
+}
+
+test "atomic literal edits patch and insert in original-offset caller order" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=a locked=false text=A\r\n" ++
+        "@box id=b text=B";
+    const a = std.mem.indexOf(u8, source, "@box id=a").?;
+    const b = std.mem.indexOf(u8, source, "@box id=b").?;
+    const lock_a = [_]LiteralAttributePatch{.{ .key = "locked", .value = "true" }};
+    const lock_b = [_]LiteralAttributePatch{.{ .key = "locked", .value = "false" }};
+    const edits = [_]LiteralSourceEdit{
+        .{ .patch = .{ .directive_offset = a, .patches = &lock_a } },
+        .{ .insert = .{ .insertion_offset = b, .snippet = "@box id=c text=C" } },
+        .{ .insert = .{ .insertion_offset = b, .snippet = "@box id=d text=D" } },
+        .{ .patch = .{ .directive_offset = b, .patches = &lock_b } },
+    };
+    const result = try applyLiteralEdits(std.testing.allocator, source, &edits);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "\xEF\xBB\xBF@slide\r\n" ++
+            "@box id=a locked=true text=A\r\n" ++
+            "@box id=c text=C\r\n" ++
+            "@box id=d text=D\r\n" ++
+            "@box id=b locked=false text=B",
+        result.source,
+    );
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expect(items[0].locked);
+    try std.testing.expectEqualStrings("c", items[1].id.?);
+    try std.testing.expectEqualStrings("d", items[2].id.?);
+    try std.testing.expect(!items[3].locked);
 }
 
 test "deletes only the exact selected physical directive" {

@@ -752,6 +752,17 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         }
                     }
                 }
+                if (std.mem.eql(u8, attrname, "locked")) {
+                    if (attr_it.next()) |locked_str| {
+                        if (std.mem.eql(u8, locked_str, "true")) {
+                            item_context.locked = true;
+                        } else if (std.mem.eql(u8, locked_str, "false")) {
+                            item_context.locked = false;
+                        } else {
+                            reportErrorInContext(ParserError.Syntax, context, "locked= must be true or false");
+                        }
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "shadow")) {
                     if (attr_it.next()) |shadowstr| {
                         var shadow = item_context.text_shadow orelse slides.TextShadow{};
@@ -2463,4 +2474,55 @@ test "component item background can explicitly clear an inherited fill" {
     const items = slideshow.slides.items[0].items.?.items;
     try std.testing.expectEqual(@as(u8, 0x10), items[0].background_color.?.r);
     try std.testing.expect(items[1].background_color == null);
+}
+
+test "editor locks inherit and can be overridden locally and in morph states" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const input =
+        \\@box id=hero x=10 y=20 w=300 h=100 locked=true text=Hero
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set hero locked=false
+        \\@state(morph)
+        \\@set hero locked=true
+        \\@popslide layout
+    ;
+
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const shared = context.push_slides.get("layout").?.items.?.items[0];
+    try std.testing.expect(shared.locked);
+    try std.testing.expect(shared.sharedTemplateValues().?.locked);
+
+    const customized = slideshow.slides.items[0];
+    try std.testing.expect(!customized.items.?.items[0].locked);
+    try std.testing.expect(customized.items.?.items[0].sharedTemplateValues().?.locked);
+    try std.testing.expect(customized.morph_states.items[0].items.items[0].locked);
+    try std.testing.expect(customized.morph_states.items[0].items.items[0].sharedTemplateValues().?.locked);
+
+    const ordinary = slideshow.slides.items[1].items.?.items[0];
+    try std.testing.expect(ordinary.locked);
+    try std.testing.expect(ordinary.instance_source == null);
+}
+
+test "invalid editor lock values are rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+
+    const context = try constructSlidesFromBuf(
+        "@slide\n@box id=hero w=100 h=100 locked=maybe text=Hero\n",
+        slideshow,
+        allocator,
+    );
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
+    try std.testing.expect(!slideshow.slides.items[0].items.?.items[0].locked);
 }

@@ -9,6 +9,7 @@ const std = @import("std");
 const parser = @import("parser.zig");
 const slides = @import("slides.zig");
 const source_editor = @import("source_editor.zig");
+const studio_api = @import("studio.zig");
 
 fn adoptPatch(allocator: std.mem.Allocator, source: *[]u8, patch: source_editor.PatchResult) void {
     allocator.free(source.*);
@@ -730,4 +731,40 @@ test "Studio shared deletion removes dependent overrides and preserves unrelated
     try std.testing.expectEqual(@as(usize, 1), unrelated.len);
     try std.testing.expectEqualStrings("outsider", unrelated[0].id.?);
     try std.testing.expectEqualStrings("Unrelated", unrelated[0].text.?);
+}
+
+test "Studio lock round trip retains a read-only copy selection" {
+    const allocator = std.testing.allocator;
+    const source = "@slide\n@box id=hero x=100 y=120 w=320 h=140 text=Hero\n";
+    const directive_offset = std.mem.indexOf(u8, source, "@box").?;
+    const lock_patch = [_]source_editor.LiteralAttributePatch{.{ .key = "locked", .value = "true" }};
+    const edits = [_]source_editor.LiteralSourceEdit{.{ .patch = .{
+        .directive_offset = directive_offset,
+        .patches = &lock_patch,
+    } }};
+    const patch = try source_editor.applyLiteralEdits(allocator, source, &edits);
+    defer patch.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expect(items[0].locked);
+    var studio: studio_api.Studio = .{ .enabled = true };
+    studio.selectItemsByIds(items, &.{"hero"});
+    try std.testing.expectEqual(@as(?usize, items[0].identity), studio.selected_identity);
+
+    const viewport: studio_api.Viewport = .{
+        .slide_top_left = .zero(),
+        .slide_size = studio_api.default_logical_size,
+    };
+    _ = studio.update(items, &.{}, viewport, .{ .copy_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .copy_items => |copy| try std.testing.expectEqual(items[0].identity, copy.targets[0].item_identity),
+        else => return error.UnexpectedSemanticCommand,
+    }
 }

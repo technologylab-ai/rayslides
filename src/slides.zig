@@ -205,6 +205,7 @@ pub const TemplateItemValues = struct {
     size: rl.Vector2 = .zero(),
     opacity: f32 = 1.0,
     visible: bool = true,
+    locked: bool = false,
 };
 
 pub const SlideItem = struct {
@@ -264,6 +265,9 @@ pub const SlideItem = struct {
     crowd: ?CrowdSpec = null,
     opacity: f32 = 1.0,
     visible: bool = true,
+    /// Persistent editor guard. Rendering is unchanged; Studio prevents
+    /// accidental geometry and structural edits until the item is unlocked.
+    locked: bool = false,
 
     pub fn new(a: std.mem.Allocator) !*SlideItem {
         const self = try a.create(SlideItem);
@@ -303,6 +307,7 @@ pub const SlideItem = struct {
             .size = self.size,
             .opacity = self.opacity,
             .visible = self.visible,
+            .locked = self.locked,
         };
     }
     pub fn deinit(_: *Slide) void {
@@ -330,6 +335,7 @@ pub const SlideItem = struct {
         if (context.id) |id| self.id = id;
         if (context.opacity) |opacity| self.opacity = opacity;
         if (context.visible) |visible| self.visible = visible;
+        if (context.locked) |locked| self.locked = locked;
     }
 
     pub fn applyPatch(self: *SlideItem, context: ItemContext) void {
@@ -363,6 +369,7 @@ pub const SlideItem = struct {
         }
         if (context.opacity) |opacity| self.opacity = opacity;
         if (context.visible) |visible| self.visible = visible;
+        if (context.locked) |locked| self.locked = locked;
     }
     pub fn applySlideDefaultsIfNecessary(self: *SlideItem, slide: *Slide) void {
         if (self.fontSize == null) self.fontSize = slide.fontsize;
@@ -504,6 +511,7 @@ pub const ItemContext = struct {
     morph: ?animation.MorphSpec = null,
     opacity: ?f32 = null,
     visible: ?bool = null,
+    locked: ?bool = null,
 
     pub fn applyOtherIfNull(self: *ItemContext, other: ItemContext) void {
         if (self.text == null) {
@@ -599,6 +607,9 @@ pub const ItemContext = struct {
         }
         if (self.visible == null) {
             if (other.visible) |visible| self.visible = visible;
+        }
+        if (self.locked == null) {
+            if (other.locked) |locked| self.locked = locked;
         }
     }
 };
