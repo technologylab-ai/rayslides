@@ -144,18 +144,27 @@ const StudioHistory = struct {
 
     /// Takes ownership of both source snapshots.
     fn record(self: *StudioHistory, before: []u8, after: []u8, before_slide: i32, after_slide: i32) !void {
-        // Reserve before mutating redo ownership. If allocation fails, the
-        // caller can roll the source back without silently losing redo.
+        try self.reserveRecord();
+        self.recordAssumeCapacity(before, after, before_slide, after_slide);
+    }
+
+    /// Preflight the only allocation a history record can require. Source
+    /// transactions call this before replacing/reparsing the live document so
+    /// committing history afterward is infallible.
+    fn reserveRecord(self: *StudioHistory) !void {
         if (self.undo_stack.items.len < max_entries) {
             try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
         }
+    }
+
+    fn recordAssumeCapacity(self: *StudioHistory, before: []u8, after: []u8, before_slide: i32, after_slide: i32) void {
         self.clearStack(&self.redo_stack);
         if (self.undo_stack.items.len == max_entries) {
             const oldest = self.undo_stack.orderedRemove(0);
             self.allocator.free(oldest.before);
             self.allocator.free(oldest.after);
         }
-        try self.undo_stack.append(self.allocator, .{
+        self.undo_stack.appendAssumeCapacity(.{
             .before = before,
             .after = after,
             .before_slide = before_slide,
@@ -377,6 +386,58 @@ test "Studio structural history reparses duplicated slides in both directions" {
         redo_deck.slides.items[1].items.?.items[0].id.?,
     );
     history.commitRestore(.redo);
+}
+
+test "Studio history allocation failure preserves redo ownership" {
+    const backing_allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(backing_allocator, .{});
+    const allocator = failing.allocator();
+    var history = StudioHistory.init(allocator);
+    defer history.deinit();
+
+    const first_before = try allocator.dupe(u8, "before one");
+    const first_after = try allocator.dupe(u8, "after one");
+    try history.record(first_before, first_after, 0, 0);
+    _ = (try history.prepareRestore(.undo)).?;
+    history.commitRestore(.undo);
+    try std.testing.expectEqual(@as(usize, 1), history.redo_stack.items.len);
+
+    // Force the next record to need fresh undo capacity while redo owns the
+    // previous transaction. The failed reserve must not clear that redo entry.
+    history.undo_stack.deinit(allocator);
+    history.undo_stack = .empty;
+    const second_before = try allocator.dupe(u8, "before two");
+    defer allocator.free(second_before);
+    const second_after = try allocator.dupe(u8, "after two");
+    defer allocator.free(second_after);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, history.record(second_before, second_after, 0, 0));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 1), history.redo_stack.items.len);
+    try std.testing.expectEqualStrings("before one", history.redo_stack.items[0].before);
+    try std.testing.expectEqualStrings("after one", history.redo_stack.items[0].after);
+}
+
+test "Studio history restore allocation failure leaves its cursor fixed" {
+    const backing_allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(backing_allocator, .{});
+    const allocator = failing.allocator();
+    var history = StudioHistory.init(allocator);
+    defer history.deinit();
+
+    const before = try allocator.dupe(u8, "before");
+    const after = try allocator.dupe(u8, "after");
+    try history.record(before, after, 0, 1);
+    history.redo_stack.deinit(allocator);
+    history.redo_stack = .empty;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, history.prepareRestore(.undo));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), history.redo_stack.items.len);
+    try std.testing.expectEqualStrings("before", history.undo_stack.items[0].before);
+    try std.testing.expectEqualStrings("after", history.undo_stack.items[0].after);
 }
 
 fn defaultCrowdHost(buffer: *[256]u8) []const u8 {
@@ -1519,21 +1580,24 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         // (re-) load slideshow
         if (G.slideshow_filp_to_load) |filp| {
-            studio_history.clear();
-            // Component clipboard entries carry source-order definition
-            // provenance. Never let them cross a document reload where the
-            // same name/offset could refer to unrelated source.
-            studio_clipboard.clear();
-            studio_bounds.clearRetainingCapacity();
-            try loadSlideshow(filp);
-            // loadSlideshow recreates every GPU-backed font. Rebind Studio
-            // only after that succeeds so it never retains stale glyph or
-            // texture metadata from the previous AppData generation.
-            studio_mode = .{
-                .enabled = launch_studio,
-                .ui_font = G.studio_ui_font,
-            };
-            is_pre_rendered = false;
+            const studio_was_enabled = studio_mode.enabled;
+            if (loadSlideshow(filp)) |_| {
+                studio_history.clear();
+                // Component clipboard entries carry source-order definition
+                // provenance. Clear them only after the replacement commits;
+                // a rejected hot reload leaves the complete authoring session
+                // intact.
+                studio_clipboard.clear();
+                studio_bounds.clearRetainingCapacity();
+                studio_mode = .{
+                    .enabled = launch_studio or studio_was_enabled,
+                    .ui_font = G.studio_ui_font,
+                };
+                is_pre_rendered = false;
+            } else |err| {
+                studio_mode.setNotice(.reload_failed);
+                log.err("Slideshow reload rejected; current document preserved: {any}", .{err});
+            }
         }
 
         if (is_pre_rendered == false) {
@@ -2708,10 +2772,83 @@ fn checkAutoReload() !bool {
     return false;
 }
 
+/// A parser graph built beside the live application state. Its arena lives at
+/// a stable heap address so every allocator retained by SlideShow and
+/// ParserContext remains valid when ownership moves into AppData.
+const ParsedSlideshowGraph = struct {
+    backing_allocator: std.mem.Allocator,
+    arena: ?*std.heap.ArenaAllocator,
+    slideshow_allocator: std.mem.Allocator,
+    slideshow: *SlideShow,
+    parser_context: ?*parser.ParserContext,
+
+    fn init(backing_allocator: std.mem.Allocator, source: []const u8) !ParsedSlideshowGraph {
+        const arena = try backing_allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(backing_allocator);
+        errdefer {
+            arena.deinit();
+            backing_allocator.destroy(arena);
+        }
+        const slideshow_allocator = arena.allocator();
+        const slideshow = try SlideShow.new(slideshow_allocator);
+        const context = try parser.constructSlidesFromBuf(source, slideshow, slideshow_allocator);
+        if (context.parser_errors.items.len != 0) {
+            context.deinit();
+            return error.StudioSourcePatchInvalid;
+        }
+        return .{
+            .backing_allocator = backing_allocator,
+            .arena = arena,
+            .slideshow_allocator = slideshow_allocator,
+            .slideshow = slideshow,
+            .parser_context = context,
+        };
+    }
+
+    fn deinit(self: *ParsedSlideshowGraph) void {
+        if (self.parser_context) |context| context.deinit();
+        self.parser_context = null;
+        if (self.arena) |arena| {
+            arena.deinit();
+            self.backing_allocator.destroy(arena);
+        }
+        self.arena = null;
+    }
+};
+
+test "staged parser rejection and allocation failure preserve the live graph" {
+    const allocator = std.testing.allocator;
+    var live = try ParsedSlideshowGraph.init(
+        allocator,
+        "@slide\n@box id=live x=10 y=20 text=Still here\n",
+    );
+    defer live.deinit();
+    const live_slideshow = live.slideshow;
+    const live_item = &live.slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqualStrings("live", live_item.id.?);
+
+    try std.testing.expectError(
+        error.StudioSourcePatchInvalid,
+        ParsedSlideshowGraph.init(allocator, "@slide\n@set missing x=99\n"),
+    );
+    try std.testing.expect(live.slideshow == live_slideshow);
+    try std.testing.expectEqualStrings("Still here", live_item.text.?);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ParsedSlideshowGraph.init(failing.allocator(), "@slide\n@box id=new text=Nope\n"),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(live.slideshow == live_slideshow);
+    try std.testing.expectEqualStrings("Still here", live_item.text.?);
+}
+
 const AppData = struct {
     allocator: std.mem.Allocator = undefined,
     io: std.Io = undefined,
-    slideshow_arena: std.heap.ArenaAllocator = undefined,
+    slideshow_arena: *std.heap.ArenaAllocator = undefined,
     slideshow_allocator: std.mem.Allocator = undefined,
     fonts: fonts.AvailableFonts = .{},
     /// Dedicated embedded UI face. Presentation font directives never replace
@@ -2747,7 +2884,12 @@ const AppData = struct {
         self.allocator = gpa;
         self.io = io;
 
-        self.slideshow_arena = std.heap.ArenaAllocator.init(gpa);
+        self.slideshow_arena = try gpa.create(std.heap.ArenaAllocator);
+        self.slideshow_arena.* = std.heap.ArenaAllocator.init(gpa);
+        errdefer {
+            self.slideshow_arena.deinit();
+            gpa.destroy(self.slideshow_arena);
+        }
         self.slideshow_allocator = self.slideshow_arena.allocator();
         self.parser_context = null;
 
@@ -2784,18 +2926,20 @@ const AppData = struct {
         self.allocator.free(self.editor_memory);
         self.allocator.free(self.loaded_content);
         self.slideshow_arena.deinit();
+        self.allocator.destroy(self.slideshow_arena);
     }
 
-    /// Rebuild only the parser/render graph. Document buffers, fonts, and
-    /// Studio history deliberately survive so a visual edit can be reparsed
-    /// without turning into a file reload.
-    fn resetSlideshowGraph(self: *AppData) !void {
+    fn adoptParsedGraph(self: *AppData, replacement: *ParsedSlideshowGraph) void {
         if (self.parser_context) |context| context.deinit();
-        self.parser_context = null;
         self.slideshow_arena.deinit();
-        self.slideshow_arena = std.heap.ArenaAllocator.init(self.allocator);
-        self.slideshow_allocator = self.slideshow_arena.allocator();
-        self.slideshow = try SlideShow.new(self.slideshow_allocator);
+        self.allocator.destroy(self.slideshow_arena);
+
+        self.slideshow_arena = replacement.arena.?;
+        self.slideshow_allocator = replacement.slideshow_allocator;
+        self.slideshow = replacement.slideshow;
+        self.parser_context = replacement.parser_context;
+        replacement.arena = null;
+        replacement.parser_context = null;
     }
 
     fn noteSourceMutation(self: *AppData) void {
@@ -2803,11 +2947,6 @@ const AppData = struct {
         // Keep zero as the never-observed/default generation so an overflow
         // cannot accidentally make a populated cache look pristine.
         if (self.source_revision == 0) self.source_revision = 1;
-    }
-
-    fn reinit(self: *AppData) !void {
-        self.deinit();
-        try self.init(self.allocator, self.io);
     }
 };
 
@@ -2829,104 +2968,71 @@ fn sliceToC(input: []const u8) [:0]u8 {
 fn loadSlideshow(filp: []const u8) !void {
     std.log.debug("LOAD {s}", .{filp});
     defer G.slideshow_filp_to_load = null;
-    if (std.Io.Dir.cwd().openFile(G.io, filp, .{})) |f| {
-        defer f.close(G.io);
-        G.hot_reload_last_stat = try f.stat(G.io);
+    var staged_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const staged_path = try std.fmt.bufPrint(&staged_path_buffer, "{s}", .{filp});
+    const file = try std.Io.Dir.cwd().openFile(G.io, staged_path, .{});
+    defer file.close(G.io);
+    const loaded_stat = try file.stat(G.io);
 
-        var read_buffer: [4096]u8 = undefined;
-        var file_reader = f.reader(G.io, &read_buffer);
-        const input = try file_reader.interface.allocRemaining(G.allocator, .limited(G.editor_memory.len - 1));
-        defer G.allocator.free(input);
+    var read_buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(G.io, &read_buffer);
+    const input = try file_reader.interface.allocRemaining(G.allocator, .limited(G.editor_memory.len - 1));
+    defer G.allocator.free(input);
+    if (input.len >= G.editor_memory.len) return error.StudioSourceTooLarge;
+    log.info("Read {d} bytes", .{input.len});
 
-        log.info("Read {d} bytes", .{input.len});
+    var parsed = try ParsedSlideshowGraph.init(G.allocator, input);
+    defer parsed.deinit();
 
-        if (input.len >= G.editor_memory.len) {
-            // setStatusMsg("Loading failed!");
-            std.log.err("Loading failed: File too large ({d} > {d})", .{ input.len, G.editor_memory.len });
-            return;
-        }
-        // setStatusMsg(sliceToC(input));
-
-        // parse the slideshow
-        if (G.reinit()) |_| {
-            // after reinit, the buffers are memset to zeros
-            @memcpy(G.editor_memory[0..input.len], input);
-            @memcpy(G.loaded_content[0..input.len], input);
-            G.editor_memory[input.len] = 0;
-            G.loaded_content[input.len] = 0;
-            G.source_len = input.len;
-            G.loaded_len = input.len;
-            G.noteSourceMutation();
-            G.slideshow_filp = blk: {
-                if (G.slideshow_filp) |existing| {
-                    if (existing.ptr == filp.ptr) {
-                        break :blk filp;
-                    }
-                }
-                break :blk try std.fmt.bufPrint(&G.slideshow_filp_buffer, "{s}", .{filp});
-            };
-            std.log.debug("filp is now {s}", .{G.slideshow_filp.?});
-            if (parser.constructSlidesFromBuf(G.editor_memory[0..input.len], G.slideshow, G.slideshow_allocator)) |pcontext| {
-                // SlideItem fields borrow parser-owned slices (notably from
-                // expanded @let lines), so the context is part of the live
-                // slideshow graph rather than a parse-time temporary.
-                G.parser_context = pcontext;
-                // now reload fonts
-                if (pcontext.custom_fonts_present) {
-                    std.log.debug("reloading fonts", .{});
-                    // FIXME: this needs to be done after GL has been initialized
-                    //        so, loadSlideshow() must not be called before
-                    //        raylib's update loop
-                    try G.fonts.loadCustomFonts(pcontext.fontConfig, G.slideshow_filp.?);
-                    std.log.debug("reloaded fonts", .{});
-                }
-            } else |err| {
-                std.log.err("{any}", .{err});
-                // setStatusMsg("Loading failed!");
-            }
-
-            if (true) {
-                std.log.info("=================================", .{});
-                std.log.info("          Load Summary:", .{});
-                std.log.info("=================================", .{});
-                std.log.info("Constructed {d} slides:", .{G.slideshow.slides.items.len});
-                for (G.slideshow.slides.items, 0..) |slide, i| {
-                    std.log.info("================================================", .{});
-                    std.log.info("   slide {d} pos in editor: {}", .{ i, slide.pos_in_editor });
-                    if (slide.items) |items| {
-                        std.log.info("   slide {d} has {d} items", .{ i, items.items.len });
-                        for (items.items) |item| {
-                            item.printToLog();
-                        }
-                    } else {
-                        std.log.info("   slide {d} has 0 items", .{i});
-                    }
-                }
-            }
-        } else |err| {
-            // setStatusMsg("Loading failed!");
-            std.log.err("Loading failed: {any}", .{err});
-        }
-    } else |err| {
-        // setStatusMsg("Loading failed!");
-        std.log.err("Loading failed: {any}", .{err});
+    // Fonts and their renderer are GPU-backed, so stage a complete new set
+    // while the old document remains drawable. A missing custom font or OOM
+    // therefore cannot tear down the presentation currently on screen.
+    var staged_fonts = try fonts.AvailableFonts.init(.{});
+    var staged_fonts_owned = true;
+    defer if (staged_fonts_owned) staged_fonts.deinit();
+    if (parsed.parser_context.?.custom_fonts_present) {
+        try staged_fonts.loadCustomFonts(parsed.parser_context.?.fontConfig, staged_path);
     }
+    const staged_renderer = try renderer.SlideshowRenderer.new(G.allocator, &staged_fonts);
+    var staged_renderer_owned = true;
+    defer if (staged_renderer_owned) staged_renderer.deinit();
+
+    // From here onward the commit is infallible. Destroy the old renderer
+    // before its fonts, adopt the already-valid parser graph, and then publish
+    // source/path/stat metadata together.
+    G.slide_renderer.deinit();
+    G.fonts.deinit();
+    G.adoptParsedGraph(&parsed);
+    G.fonts = staged_fonts;
+    staged_fonts_owned = false;
+    G.slide_renderer = staged_renderer;
+    staged_renderer_owned = false;
+    G.slide_renderer.fonts = &G.fonts;
+
+    const old_source_len = G.source_len;
+    const old_loaded_len = G.loaded_len;
+    @memcpy(G.editor_memory[0..input.len], input);
+    @memcpy(G.loaded_content[0..input.len], input);
+    if (old_source_len > input.len) @memset(G.editor_memory[input.len..old_source_len], 0);
+    if (old_loaded_len > input.len) @memset(G.loaded_content[input.len..old_loaded_len], 0);
+    G.editor_memory[input.len] = 0;
+    G.loaded_content[input.len] = 0;
+    G.source_len = input.len;
+    G.loaded_len = input.len;
+    @memcpy(G.slideshow_filp_buffer[0..staged_path.len], staged_path);
+    G.slideshow_filp = G.slideshow_filp_buffer[0..staged_path.len];
+    G.hot_reload_last_stat = loaded_stat;
+    G.current_slide = 0;
+    G.playback.reset(rl.getTime());
+    G.noteSourceMutation();
+    log.info("Loaded {d} parser-clean slides from {s}", .{ G.slideshow.slides.items.len, staged_path });
 }
 
 fn reparseEditorSource() !void {
     const previous_slide = G.current_slide;
-    try G.resetSlideshowGraph();
-
-    const context = try parser.constructSlidesFromBuf(
-        G.editor_memory[0..G.source_len],
-        G.slideshow,
-        G.slideshow_allocator,
-    );
-    if (context.parser_errors.items.len != 0) {
-        context.deinit();
-        return error.StudioSourcePatchInvalid;
-    }
-    G.parser_context = context;
+    var replacement = try ParsedSlideshowGraph.init(G.allocator, G.editor_memory[0..G.source_len]);
+    defer replacement.deinit();
+    G.adoptParsedGraph(&replacement);
 
     if (G.slideshow.slides.items.len == 0) {
         G.current_slide = 0;
@@ -3155,42 +3261,65 @@ fn saveEditorSource() !void {
     G.hot_reload_last_stat = try file.stat(G.io);
 }
 
-fn saveEditorSourceCopy() ![]u8 {
-    const path = G.slideshow_filp orelse "untitled.sld";
+fn writeRecoveryCopy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    source: []const u8,
+) ![]u8 {
     const stem = if (std.mem.endsWith(u8, path, ".sld")) path[0 .. path.len - ".sld".len] else path;
     var sequence: usize = 1;
     const copy_path = while (sequence < 10_000) : (sequence += 1) {
         const candidate = if (sequence == 1)
-            try std.fmt.allocPrint(G.allocator, "{s}.edited.sld", .{stem})
+            try std.fmt.allocPrint(allocator, "{s}.edited.sld", .{stem})
         else
-            try std.fmt.allocPrint(G.allocator, "{s}.edited-{d}.sld", .{ stem, sequence });
-        const reservation = std.Io.Dir.cwd().createFile(G.io, candidate, .{ .exclusive = true }) catch |err| switch (err) {
+            try std.fmt.allocPrint(allocator, "{s}.edited-{d}.sld", .{ stem, sequence });
+        const reservation = dir.createFile(io, candidate, .{ .exclusive = true }) catch |err| switch (err) {
             error.PathAlreadyExists => {
-                G.allocator.free(candidate);
+                allocator.free(candidate);
                 continue;
             },
             else => {
-                G.allocator.free(candidate);
+                allocator.free(candidate);
                 return err;
             },
         };
-        reservation.close(G.io);
+        reservation.close(io);
         break candidate;
     } else return error.TooManyEditedCopies;
-    errdefer G.allocator.free(copy_path);
-    errdefer std.Io.Dir.cwd().deleteFile(G.io, copy_path) catch {};
-    try writeEditorSourceAtomically(copy_path, null);
+    errdefer allocator.free(copy_path);
+    errdefer dir.deleteFile(io, copy_path) catch {};
+    try writeSourceAtomically(allocator, io, dir, copy_path, source, null);
     return copy_path;
 }
 
+fn saveEditorSourceCopy() ![]u8 {
+    return writeRecoveryCopy(
+        G.allocator,
+        G.io,
+        std.Io.Dir.cwd(),
+        G.slideshow_filp orelse "untitled.sld",
+        G.editor_memory[0..G.source_len],
+    );
+}
+
 fn adoptEditorSourcePath(path: []const u8) !void {
-    G.slideshow_filp = try std.fmt.bufPrint(&G.slideshow_filp_buffer, "{s}", .{path});
+    // Resolve every fallible filesystem operation before publishing the new
+    // document identity. Save As can then delete the just-created file and
+    // leave the untitled session intact if adoption fails.
+    var staged_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const staged_path = try std.fmt.bufPrint(&staged_path_buffer, "{s}", .{path});
+    const file = try std.Io.Dir.cwd().openFile(G.io, staged_path, .{});
+    defer file.close(G.io);
+    const stat = try file.stat(G.io);
+
+    @memcpy(G.slideshow_filp_buffer[0..staged_path.len], staged_path);
+    G.slideshow_filp = G.slideshow_filp_buffer[0..staged_path.len];
     @memcpy(G.loaded_content[0..G.source_len], G.editor_memory[0..G.source_len]);
     if (G.loaded_len > G.source_len) @memset(G.loaded_content[G.source_len..G.loaded_len], 0);
     G.loaded_len = G.source_len;
-    const file = try std.Io.Dir.cwd().openFile(G.io, G.slideshow_filp.?, .{});
-    defer file.close(G.io);
-    G.hot_reload_last_stat = try file.stat(G.io);
+    G.hot_reload_last_stat = stat;
 }
 
 fn normalizeUntitledSavePath(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
@@ -3234,6 +3363,7 @@ fn saveUntitledEditorSourceAs(raw_path: []const u8) !void {
         path,
         G.editor_memory[0..G.source_len],
     );
+    errdefer std.Io.Dir.cwd().deleteFile(G.io, path) catch {};
     try adoptEditorSourcePath(path);
 }
 
@@ -3274,6 +3404,47 @@ test "untitled Save As creates once and never overwrites an existing deck" {
     const created = try tmp.dir.readFileAlloc(io, "new.sld", allocator, .unlimited);
     defer allocator.free(created);
     try std.testing.expectEqualStrings("@slide\n", created);
+}
+
+test "untitled Save As removes its reservation when the atomic writer fails" {
+    const backing_allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(backing_allocator, .{});
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, writeNewSourceFile(
+        failing.allocator(),
+        io,
+        tmp.dir,
+        "retryable.sld",
+        "@slide\n",
+    ));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "retryable.sld", .{}));
+}
+
+test "recovery copies are unique and preserve every source byte" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = "\xEF\xBB\xBF@slide\r\n@box text=Unsaved · ä\r\n";
+
+    const first = try writeRecoveryCopy(allocator, io, tmp.dir, "deck.sld", source);
+    defer allocator.free(first);
+    const second = try writeRecoveryCopy(allocator, io, tmp.dir, "deck.sld", source);
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("deck.edited.sld", first);
+    try std.testing.expectEqualStrings("deck.edited-2.sld", second);
+
+    const first_source = try tmp.dir.readFileAlloc(io, first, allocator, .unlimited);
+    defer allocator.free(first_source);
+    const second_source = try tmp.dir.readFileAlloc(io, second, allocator, .unlimited);
+    defer allocator.free(second_source);
+    try std.testing.expectEqualStrings(source, first_source);
+    try std.testing.expectEqualStrings(source, second_source);
 }
 
 /// Quitting should never turn the in-memory source buffer into a data-loss
@@ -3743,6 +3914,7 @@ fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult)
     errdefer G.allocator.free(before);
     errdefer result.deinit(G.allocator);
     const before_slide = G.current_slide;
+    try history.reserveRecord();
 
     try replaceEditorSource(result.source);
     reparseEditorSource() catch |err| {
@@ -3750,11 +3922,7 @@ fn recordStudioPatch(history: *StudioHistory, result: source_editor.PatchResult)
         reparseEditorSource() catch {};
         return err;
     };
-    history.record(before, result.source, before_slide, G.current_slide) catch |err| {
-        replaceEditorSource(before) catch {};
-        reparseEditorSource() catch {};
-        return err;
-    };
+    history.recordAssumeCapacity(before, result.source, before_slide, G.current_slide);
 }
 
 fn starterDeckPatch(

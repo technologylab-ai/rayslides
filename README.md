@@ -292,6 +292,11 @@ PNG and JSON references live in `tests/studio_baselines`. The harness requires
 Python Pillow. See [the baseline notes](tests/studio_baselines/README.md) for
 tolerances and individual-scenario commands.
 
+For release work, `zig build release-confidence` runs the headless resilience
+gate. The repeatable [macOS release checklist](docs/MACOS_RELEASE_QA.md) adds
+verified Aerospace placement, focus, multi-monitor/resize/fullscreen, reload,
+Save As/recovery, and presentation/export checks.
+
 Studio edits the `.sld` document rather than maintaining a separate opaque
 scene. It changes only the source owned by the selected object and preserves
 unrelated spacing, comments, text, and line endings. Objects instantiated with

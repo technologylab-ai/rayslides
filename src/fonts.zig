@@ -217,39 +217,44 @@ pub const AvailableFonts = struct {
         log.info("LOADING CUSTOM FONTS", .{});
         var temp_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (fontConfig.normal) |fontfile| {
-            rl.unloadFont(self.normal);
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            self.normal = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            rl.unloadFont(self.normal);
+            self.normal = replacement;
             log.debug("Font {s} is ready: {}", .{ fontfile.ttf_filn, self.normal.isReady() });
         }
 
         if (fontConfig.bold) |fontfile| {
-            rl.unloadFont(self.bold);
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            self.bold = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            rl.unloadFont(self.bold);
+            self.bold = replacement;
         }
 
         if (fontConfig.italic) |fontfile| {
-            rl.unloadFont(self.italic);
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            self.italic = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            rl.unloadFont(self.italic);
+            self.italic = replacement;
         }
 
         if (fontConfig.bolditalic) |fontfile| {
-            rl.unloadFont(self.bolditalic);
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            self.bolditalic = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            rl.unloadFont(self.bolditalic);
+            self.bolditalic = replacement;
         }
 
         if (fontConfig.zig) |fontfile| {
-            rl.unloadFont(self.zig);
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            self.zig = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            rl.unloadFont(self.zig);
+            self.zig = replacement;
         }
         self.updateStyleScales();
         rl.setTextureFilter(self.normal.texture, .bilinear);

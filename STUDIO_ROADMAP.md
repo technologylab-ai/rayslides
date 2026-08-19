@@ -253,15 +253,39 @@ The ReleaseSafe reference run rebuilt 24-slide graphs in roughly 0.8–0.9 ms;
 the 160-slide scenario measured about 6.3 ms full and 0.3 ms partial. A second
 complete capture pass matched every approved image and metric envelope.
 
+## Completed tranche: Release and resilience confidence
+
+- [x] Build replacement parser graphs beside the live document and adopt them
+  only after parsing succeeds, preserving the current deck on syntax or
+  allocation failure.
+- [x] Stage replacement fonts and renderer resources before committing a file
+  reload, and retain Studio history, selection, and clipboard when reload is
+  rejected.
+- [x] Reserve history ownership before source mutation and exercise record and
+  restore allocation failures without losing redo entries or moving cursors.
+- [x] Make untitled Save As clean up an unadopted reservation and verify unique
+  recovery copies preserve BOM, CRLF, UTF-8, and every source byte.
+- [x] Add `release-confidence` and `macos-release-qa` build gates plus a
+  repeatable native checklist for focus, exact Aerospace placement,
+  multi-monitor/resize/fullscreen behavior, transactional reload, recovery,
+  export isolation, and shutdown hygiene.
+
+Live macOS QA rejected a malformed external reload while retaining the active
+rendered graph, then accepted the restored source and rebuilt the custom fonts,
+image texture, and complete slide in the same process. A separate 1600×900
+Studio capture was verified on exact workspace 12 in floating layout and exited
+without leaving an application process behind.
+
 ## Planned tranches
 
-### Release and resilience confidence
+### Distribution and first-run polish
 
-- Extend application-boundary tests around document reload, Save As, recovery,
-  and source-edit failure injection, including allocation-failure history paths.
-- Add a repeatable macOS release QA checklist covering input focus, multiple
-  Spaces/monitors, resize/fullscreen transitions, and presentation/export
-  isolation from Studio chrome.
+- Package a reproducible macOS application bundle with version metadata,
+  embedded assets, signing/notarization hooks, and downloadable release
+  artifacts without changing the existing CLI workflow.
+- Make first launch and recovery locations explicit, add `--version` and a
+  release-grade `--help`, and validate a clean-machine launch independently of
+  the development checkout.
 
 ## Deliberate non-goals
 

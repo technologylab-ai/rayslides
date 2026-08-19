@@ -72,4 +72,11 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| baseline_update_cmd.addArgs(args);
     const baseline_update_step = b.step("studio-baselines-update", "Capture and replace Studio visual/performance baselines");
     baseline_update_step.dependOn(&baseline_update_cmd.step);
+
+    const release_confidence_step = b.step("release-confidence", "Run headless release-resilience and baseline-harness tests");
+    release_confidence_step.dependOn(test_step);
+    release_confidence_step.dependOn(baseline_self_test_step);
+
+    const macos_release_qa_step = b.step("macos-release-qa", "Run automated macOS Studio baseline gates; see docs/MACOS_RELEASE_QA.md");
+    macos_release_qa_step.dependOn(baseline_check_step);
 }
