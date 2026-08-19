@@ -115,6 +115,10 @@ pub const ItemGeometryPreview = struct {
     resized: bool,
 };
 
+/// Multi-selection is deliberately bounded in Studio so live preview state
+/// remains allocation-free inside the render loop.
+pub const max_item_geometry_previews = 64;
+
 const RenderTransform = struct {
     offset: rl.Vector2 = .{ .x = 0, .y = 0 },
     opacity: f32 = 1.0,
@@ -181,7 +185,8 @@ pub const SlideshowRenderer = struct {
     texture_cache: TextureCache,
     fonts: *my_fonts.AvailableFonts,
     qr_code: qrcode.Code = .{},
-    item_geometry_preview: ?ItemGeometryPreview = null,
+    item_geometry_previews: [max_item_geometry_previews]ItemGeometryPreview = undefined,
+    item_geometry_preview_count: usize = 0,
 
     pub fn new(allocator: std.mem.Allocator, fonts: *my_fonts.AvailableFonts) !*SlideshowRenderer {
         var self: *SlideshowRenderer = try allocator.create(SlideshowRenderer);
@@ -265,7 +270,24 @@ pub const SlideshowRenderer = struct {
     }
 
     pub fn setItemGeometryPreview(self: *SlideshowRenderer, preview: ?ItemGeometryPreview) void {
-        self.item_geometry_preview = preview;
+        if (preview) |value| {
+            self.item_geometry_previews[0] = value;
+            self.item_geometry_preview_count = 1;
+        } else {
+            self.item_geometry_preview_count = 0;
+        }
+    }
+
+    pub fn setItemGeometryPreviews(self: *SlideshowRenderer, previews: []const ItemGeometryPreview) void {
+        if (previews.len > max_item_geometry_previews) {
+            // Never truncate a group preview: that would make the rendered
+            // gesture disagree with the atomic source command. Studio enforces
+            // the same fixed capacity before a selection can reach this API.
+            self.item_geometry_preview_count = 0;
+            return;
+        }
+        @memcpy(self.item_geometry_previews[0..previews.len], previews);
+        self.item_geometry_preview_count = previews.len;
     }
 
     pub fn stepAt(self: *const SlideshowRenderer, slide_number: i32, step_index: usize) ?animation.Step {
@@ -1011,9 +1033,9 @@ pub const SlideshowRenderer = struct {
         size: rl.Vector2,
         internal_render_size: rl.Vector2,
     ) !void {
-        const preview = self.item_geometry_preview;
-        self.item_geometry_preview = null;
-        defer self.item_geometry_preview = preview;
+        const preview_count = self.item_geometry_preview_count;
+        self.item_geometry_preview_count = 0;
+        defer self.item_geometry_preview_count = preview_count;
         try self.renderOneSlide(
             slide_number,
             .{ .visible_through = self.stepCount(slide_number) },
@@ -1297,7 +1319,10 @@ pub const SlideshowRenderer = struct {
         crowd_snapshot: ?crowdplay.Snapshot,
         crowd_url: []const u8,
     ) void {
-        var previewed = if (self.item_geometry_preview) |preview|
+        var previewed = if (geometryPreviewFor(
+            self.item_geometry_previews[0..self.item_geometry_preview_count],
+            element.owner_identity,
+        )) |preview|
             elementWithGeometryPreview(element.*, preview)
         else
             element.*;
@@ -1430,6 +1455,13 @@ fn elementWithGeometryPreview(element: RenderElement, preview: ItemGeometryPrevi
     };
     result.size = .{ .x = element.size.x * scale_x, .y = element.size.y * scale_y };
     return result;
+}
+
+fn geometryPreviewFor(previews: []const ItemGeometryPreview, identity: usize) ?ItemGeometryPreview {
+    for (previews) |preview| {
+        if (preview.owner_identity == identity) return preview;
+    }
+    return null;
 }
 
 fn stableMorphState(slide: *const RenderedSlide, visible_through: usize) ?usize {
@@ -2006,6 +2038,31 @@ test "Studio geometry preview moves all fragments and resizes visual surfaces" {
     const text_resize = elementWithGeometryPreview(text, resize);
     try std.testing.expectEqual(text.position, text_resize.position);
     try std.testing.expectEqual(text.size, text_resize.size);
+}
+
+test "Studio geometry preview batches resolve by item identity" {
+    const previews = [_]ItemGeometryPreview{
+        .{
+            .owner_identity = 7,
+            .before_position = .{ .x = 0, .y = 0 },
+            .before_size = .{ .x = 10, .y = 10 },
+            .after_position = .{ .x = 20, .y = 30 },
+            .after_size = .{ .x = 10, .y = 10 },
+            .resized = false,
+        },
+        .{
+            .owner_identity = 9,
+            .before_position = .{ .x = 100, .y = 100 },
+            .before_size = .{ .x = 20, .y = 20 },
+            .after_position = .{ .x = 80, .y = 90 },
+            .after_size = .{ .x = 20, .y = 20 },
+            .resized = false,
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 7), geometryPreviewFor(&previews, 7).?.owner_identity);
+    try std.testing.expectEqual(@as(usize, 9), geometryPreviewFor(&previews, 9).?.owner_identity);
+    try std.testing.expect(geometryPreviewFor(&previews, 8) == null);
 }
 
 pub fn slidePosToRenderPos(pos: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) rl.Vector2 {

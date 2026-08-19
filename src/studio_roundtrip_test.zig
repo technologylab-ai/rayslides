@@ -358,3 +358,170 @@ test "Studio template-instance overrides stay local and feed later morph states"
     try std.testing.expect(shared_second.visible);
     try std.testing.expect(shared_second.instance_source == null);
 }
+
+test "Studio group geometry patches multiple direct items in one source result" {
+    const allocator = std.testing.allocator;
+    const original =
+        "@slide\n" ++
+        "@box id=left x=40 y=60 w=200 h=100 text=Left\n" ++
+        "@box id=right x=320 y=60 w=200 h=100 text=Right\n";
+    const left_offset = std.mem.indexOf(u8, original, "@box id=left").?;
+    const right_offset = std.mem.indexOf(u8, original, "@box id=right").?;
+    const edits = [_]source_editor.GeometrySourceEdit{
+        .{ .patch = .{
+            .directive_offset = left_offset,
+            .geometry = .{ .x = 140, .y = 260 },
+        } },
+        .{ .patch = .{
+            .directive_offset = right_offset,
+            .geometry = .{ .x = 420, .y = 260 },
+        } },
+    };
+
+    const patch = try source_editor.applyGeometryEdits(allocator, original, &edits);
+    defer patch.deinit(allocator);
+
+    try std.testing.expectEqualStrings(
+        "@slide\n" ++
+            "@box id=left x=140 y=260 w=200 h=100 text=Left\n" ++
+            "@box id=right x=420 y=260 w=200 h=100 text=Right\n",
+        patch.source,
+    );
+    try std.testing.expectEqual(
+        @as(isize, @intCast(patch.source.len)) - @as(isize, @intCast(original.len)),
+        patch.byte_delta,
+    );
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("left", items[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 140), items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 260), items[0].position.y, 0.0001);
+    try std.testing.expectEqualStrings("right", items[1].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 420), items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 260), items[1].position.y, 0.0001);
+}
+
+test "Studio group morph geometry inserts same-anchor sets in one source result" {
+    const allocator = std.testing.allocator;
+    const original =
+        "@slide\n" ++
+        "@box id=title x=80 y=100 w=600 h=120 text=Title\n" ++
+        "@box id=art x=900 y=180 w=500 h=400 color=#668bffff\n" ++
+        "@state(morph)\n";
+    const state_offset = std.mem.indexOf(u8, original, "@state(morph)").?;
+    const insertion_offset = try source_editor.morphStateEndOffset(original, state_offset);
+    const edits = [_]source_editor.GeometrySourceEdit{
+        .{ .insert = .{
+            .insertion_offset = insertion_offset,
+            .snippet = "@set title x=180 y=240",
+        } },
+        .{ .insert = .{
+            .insertion_offset = insertion_offset,
+            .snippet = "@set art x=1000 y=320",
+        } },
+    };
+
+    const patch = try source_editor.applyGeometryEdits(allocator, original, &edits);
+    defer patch.deinit(allocator);
+
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        patch.source,
+        "@state(morph)\n" ++
+            "@set title x=180 y=240\n" ++
+            "@set art x=1000 y=320\n",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, patch.source, "@set title"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, patch.source, "@set art"));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = slideshow.slides.items[0];
+    try std.testing.expectEqual(@as(usize, 1), slide.morph_states.items.len);
+    const morphed = slide.morph_states.items[0].items.items;
+    try std.testing.expectEqual(@as(usize, 2), morphed.len);
+    try std.testing.expectEqualStrings("title", morphed[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 180), morphed[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 240), morphed[0].position.y, 0.0001);
+    try std.testing.expectEqualStrings("art", morphed[1].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 1000), morphed[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 320), morphed[1].position.y, 0.0001);
+}
+
+test "Studio group geometry mixes direct patch and template-local insertion atomically" {
+    const allocator = std.testing.allocator;
+    const original =
+        "@box id=hero x=10 y=20 w=300 h=120 text=Shared hero\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@box id=local x=40 y=300 w=240 h=100 text=Local item\n" ++
+        "@popslide layout\n";
+    const first_instance = std.mem.indexOf(u8, original, "@popslide layout").?;
+    const local_offset = std.mem.indexOf(u8, original, "@box id=local").?;
+    const local_override = "@set hero x=360 y=220";
+    const override_insertion = try source_editor.slideTemplateOverrideInsertionOffset(
+        original,
+        first_instance,
+        local_override,
+    );
+    const edits = [_]source_editor.GeometrySourceEdit{
+        .{ .patch = .{
+            .directive_offset = local_offset,
+            .geometry = .{ .x = 440, .y = 500 },
+        } },
+        .{ .insert = .{
+            .insertion_offset = override_insertion,
+            .snippet = local_override,
+        } },
+    };
+
+    const patch = try source_editor.applyGeometryEdits(allocator, original, &edits);
+    defer patch.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, patch.source, local_override));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        patch.source,
+        "@box id=local x=440 y=500 w=240 h=100 text=Local item\n" ++
+            "@set hero x=360 y=220\n" ++
+            "@popslide layout\n",
+    ) != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(patch.source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+    const first_items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), first_items.len);
+    try std.testing.expectEqualStrings("hero", first_items[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 360), first_items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 220), first_items[0].position.y, 0.0001);
+    try std.testing.expectEqualStrings("local", first_items[1].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 440), first_items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), first_items[1].position.y, 0.0001);
+    try std.testing.expectEqual(slides.SourceScope.slide_instance_override, first_items[0].instance_source.?.scope);
+
+    const second_items = slideshow.slides.items[1].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), second_items.len);
+    try std.testing.expectEqualStrings("hero", second_items[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), second_items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), second_items[0].position.y, 0.0001);
+    try std.testing.expect(second_items[0].instance_source == null);
+}

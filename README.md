@@ -79,9 +79,16 @@ or press <kbd>G</kbd> to toggle the visible 20-pixel grid. Holding
 <kbd>Shift</kbd> while resizing preserves the displayed aspect ratio, including
 for auto-sized images. The property panel edits text, duplicates or deletes
 the object, promotes it for reuse, applies palette colors, and aligns it to any
-slide edge or center. <kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new slide
-immediately after the current one. <kbd>Esc</kbd> cancels an active drag or
-tool, then leaves Studio.
+slide edge or center. Shift-click toggles objects into an ordered
+multi-selection, and <kbd>Cmd/Ctrl-A</kbd> selects every editable object in the
+current scene. A group can be dragged or nudged as one unit; the same alignment
+buttons align its members to the selection bounds, while **H Gap** and **V
+Gap** distribute three or more objects with equal spacing. Group changes are
+written atomically as one undoable source edit. Resize, text, color, promotion,
+duplication, and deletion remain single-object operations for now; Studio
+refuses them for a group instead of silently changing only its primary item.
+<kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new slide immediately after the
+current one. <kbd>Esc</kbd> cancels an active drag or tool, then leaves Studio.
 
 The Studio sidebar is a deck organizer and source-aware library. Its slide
 cards contain live rendered thumbnails and can select, add, duplicate, delete,
@@ -138,6 +145,8 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>G</kbd> | Toggle grid display and grid snapping |
 | Hold <kbd>Shift</kbd> while resizing | Preserve the object's aspect ratio |
 | Hold <kbd>Cmd/Ctrl</kbd> while dragging | Temporarily bypass smart guides and grid snapping |
+| <kbd>Shift</kbd> + click | Add or remove an object from the current selection |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>A</kbd> | Select every editable object in the current scene |
 | <kbd>Backspace</kbd> | Delete the selected object |
 | Hold <kbd>Alt</kbd> while editing a template item | Edit its shared definition instead of this instance |
 | <kbd>Enter</kbd> | Edit the selected object's text |

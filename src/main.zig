@@ -20,6 +20,11 @@ const studio_prompt = @import("studio_prompt.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const SlideShow = slides.SlideShow;
 
+comptime {
+    if (studio.max_selection_items > renderer.max_item_geometry_previews)
+        @compileError("Studio selection capacity exceeds renderer preview capacity");
+}
+
 const log = std.log.scoped(.main);
 
 test {
@@ -807,6 +812,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             studio_mode.updateWithWorkspaceFromRaylib(studio_items, studio_bounds.items, studio_viewport, studio_workspace)
         else
             null;
+        const studio_geometry_batch: ?studio.GeometryBatchCommand = studio_mode.takeGeometryBatch();
         if (!prompt_was_active) {
             if (studio_mode.takeSemanticCommand()) |command| {
                 switch (command) {
@@ -900,27 +906,24 @@ pub fn main(init: std.process.Init) anyerror!void {
             laser_pointer.clearDrawing();
             rl.showCursor();
         }
-        const studio_preview: ?renderer.ItemGeometryPreview = if (studio_mode.livePreview()) |preview|
-            .{
-                .owner_identity = preview.item_identity,
-                .before_position = preview.before.position,
-                .before_size = preview.before.size,
-                .after_position = preview.after.position,
-                .after_size = preview.after.size,
-                .resized = preview.resized,
+        var studio_previews: [renderer.max_item_geometry_previews]renderer.ItemGeometryPreview = undefined;
+        var studio_preview_count: usize = 0;
+        while (studio_preview_count < studio_previews.len) : (studio_preview_count += 1) {
+            const preview = studio_mode.livePreviewAt(studio_preview_count) orelse break;
+            studio_previews[studio_preview_count] = rendererPreviewFromLive(preview);
+        }
+        if (studio_preview_count == 0) {
+            if (studio_geometry_batch) |batch| {
+                for (batch.slice(), 0..) |command, index| {
+                    studio_previews[index] = rendererPreviewFromCommand(command);
+                }
+                studio_preview_count = batch.count;
+            } else if (studio_command) |command| {
+                studio_previews[0] = rendererPreviewFromCommand(command);
+                studio_preview_count = 1;
             }
-        else if (studio_command) |command|
-            .{
-                .owner_identity = command.item_identity,
-                .before_position = command.before_position,
-                .before_size = command.before_size,
-                .after_position = command.after_position,
-                .after_size = command.after_size,
-                .resized = command.resized,
-            }
-        else
-            null;
-        G.slide_renderer.setItemGeometryPreview(studio_preview);
+        }
+        G.slide_renderer.setItemGeometryPreviews(studio_previews[0..studio_preview_count]);
 
         const reveal_state: renderer.RevealState = if (export_controller.running)
             .{ .visible_through = G.slide_renderer.stepCount(G.current_slide) }
@@ -980,7 +983,17 @@ pub fn main(init: std.process.Init) anyerror!void {
             studio_mode.drawWorkspaceOverlay(studio_viewport, studio_workspace);
         }
         property_prompt.draw(window_size);
-        if (studio_command) |command| {
+        if (studio_geometry_batch) |batch| {
+            if (applyStudioGeometryBatchEdit(&studio_history, batch, current_slide, studio_mode.active_morph_state, studio_items)) |_| {} else |err| {
+                studio_mode.setNotice(.edit_failed);
+                log.err("Studio group edit failed: {any}", .{err});
+                reparseEditorSource() catch {};
+            }
+            studio_mode.dirty = editorSourceDirty();
+            is_pre_rendered = false;
+            source_graph_reparsed_this_frame = true;
+            semantic_to_apply = null;
+        } else if (studio_command) |command| {
             if (applyStudioGeometryEdit(&studio_history, command, current_slide, studio_mode.active_morph_state, studio_items)) |_| {} else |err| {
                 studio_mode.setNotice(.edit_failed);
                 log.err("Studio edit failed: {any}", .{err});
@@ -1727,6 +1740,28 @@ fn recordStudioCatalogPatch(history: *StudioHistory, result: studio_catalog.Edit
     });
 }
 
+fn rendererPreviewFromLive(preview: studio.LivePreview) renderer.ItemGeometryPreview {
+    return .{
+        .owner_identity = preview.item_identity,
+        .before_position = preview.before.position,
+        .before_size = preview.before.size,
+        .after_position = preview.after.position,
+        .after_size = preview.after.size,
+        .resized = preview.resized,
+    };
+}
+
+fn rendererPreviewFromCommand(command: studio.GeometryCommand) renderer.ItemGeometryPreview {
+    return .{
+        .owner_identity = command.item_identity,
+        .before_position = command.before_position,
+        .before_size = command.before_size,
+        .after_position = command.after_position,
+        .after_size = command.after_size,
+        .resized = command.resized,
+    };
+}
+
 const MorphItemEditTarget = union(enum) {
     patch: slides.SourceRef,
     insert_local,
@@ -1851,6 +1886,227 @@ fn applyStudioGeometryEdit(
             .h = if (command.resized) command.after_size.y else null,
         },
     ));
+}
+
+fn applyStudioGeometryBatchEdit(
+    history: *StudioHistory,
+    batch: studio.GeometryBatchCommand,
+    slide_opt: ?*slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+) !void {
+    const source = G.editor_memory[0..G.source_len];
+    var edits: [studio.max_selection_items]source_editor.GeometrySourceEdit = undefined;
+    var snippet_buffers: [studio.max_selection_items][512]u8 = undefined;
+    const planned = try planStudioGeometryBatchEdits(
+        source,
+        batch,
+        slide_opt,
+        morph_state,
+        items,
+        &edits,
+        &snippet_buffers,
+    );
+
+    return recordStudioPatch(history, try source_editor.applyGeometryEdits(
+        G.allocator,
+        source,
+        planned,
+    ));
+}
+
+fn planStudioGeometryBatchEdits(
+    source: []const u8,
+    batch: studio.GeometryBatchCommand,
+    slide_opt: ?*slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+    edits: *[studio.max_selection_items]source_editor.GeometrySourceEdit,
+    snippet_buffers: *[studio.max_selection_items][512]u8,
+) ![]const source_editor.GeometrySourceEdit {
+    if (batch.count == 0 or batch.count > studio.max_selection_items) return error.InvalidStudioGeometryBatch;
+
+    for (batch.slice(), 0..) |command, index| {
+        const item = studioItemByIdentity(items, command.item_identity) orelse return error.StudioItemMissing;
+        const geometry: source_editor.GeometryPatch = .{
+            .x = command.after_position.x,
+            .y = command.after_position.y,
+            .w = if (command.resized) command.after_size.x else null,
+            .h = if (command.resized) command.after_size.y else null,
+        };
+
+        var source_ref = command.source;
+        if (morph_state) |state_index| {
+            const slide = slide_opt orelse return error.NoStudioSlide;
+            switch (morphItemEditTarget(slide, state_index, item)) {
+                .patch => |patch_source| source_ref = patch_source,
+                .insert_local => {
+                    const id = item.id orelse return error.MorphItemNeedsId;
+                    const snippet = if (command.resized)
+                        try std.fmt.bufPrint(
+                            &snippet_buffers[index],
+                            "@set {s} x={d} y={d} w={d} h={d}",
+                            .{ id, command.after_position.x, command.after_position.y, command.after_size.x, command.after_size.y },
+                        )
+                    else
+                        try std.fmt.bufPrint(
+                            &snippet_buffers[index],
+                            "@set {s} x={d} y={d}",
+                            .{ id, command.after_position.x, command.after_position.y },
+                        );
+                    edits[index] = .{ .insert = .{
+                        .insertion_offset = try source_editor.morphStateEndOffset(
+                            source,
+                            slide.morph_states.items[state_index].source.line_offset,
+                        ),
+                        .snippet = snippet,
+                    } };
+                    continue;
+                },
+            }
+        } else switch (command.edit_scope) {
+            .local_instance => {
+                const slide = slide_opt orelse return error.NoStudioSlide;
+                const id = item.id orelse return error.TemplateInstanceItemNeedsId;
+                if (item.instance_source) |instance_source| {
+                    if (instance_source.patchable) {
+                        try source_editor.validateSlideTemplateOverrideGeometryTarget(
+                            source,
+                            slide.pos_in_editor,
+                            instance_source.line_offset,
+                            id,
+                        );
+                        source_ref = instance_source;
+                        edits[index] = .{ .patch = .{
+                            .directive_offset = source_ref.line_offset,
+                            .geometry = geometry,
+                        } };
+                        continue;
+                    }
+                }
+
+                const snippet = if (command.resized)
+                    try std.fmt.bufPrint(
+                        &snippet_buffers[index],
+                        "@set {s} x={d} y={d} w={d} h={d}",
+                        .{ id, command.after_position.x, command.after_position.y, command.after_size.x, command.after_size.y },
+                    )
+                else
+                    try std.fmt.bufPrint(
+                        &snippet_buffers[index],
+                        "@set {s} x={d} y={d}",
+                        .{ id, command.after_position.x, command.after_position.y },
+                    );
+                edits[index] = .{ .insert = .{
+                    .insertion_offset = try source_editor.slideTemplateOverrideInsertionOffset(
+                        source,
+                        slide.pos_in_editor,
+                        snippet,
+                    ),
+                    .snippet = snippet,
+                } };
+                continue;
+            },
+            .shared_template => {
+                // A shared transform based on instance-local effective geometry
+                // would bake that local delta into every instance. Studio
+                // rejects this too; retain the invariant at the persistence
+                // boundary so a future caller cannot bypass it.
+                if (item.instance_source != null) return error.SharedTemplateItemHasLocalOverride;
+                source_ref = item.source;
+            },
+            .direct => {},
+        }
+
+        if (source_ref.scope == .none or !source_ref.patchable) return error.StudioItemHasNoPatchableSource;
+        edits[index] = .{ .patch = .{
+            .directive_offset = source_ref.line_offset,
+            .geometry = geometry,
+        } };
+    }
+
+    return edits[0..batch.count];
+}
+
+test "Studio group planner mixes existing and missing local overrides with a direct patch" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@box id=hero x=10 y=20 w=300 h=120 text=Hero\n" ++
+        "@box id=badge x=40 y=180 w=160 h=80 text=Badge\n" ++
+        "@pushslide layout\n" ++
+        "@popslide layout\n" ++
+        "@set hero x=100 y=120\n" ++
+        "@box id=local x=500 y=300 w=240 h=100 text=Local\n" ++
+        "@popslide layout\n";
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+
+    const first_slide = slideshow.slides.items[0];
+    const first_items = first_slide.items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), first_items.len);
+
+    var batch = studio.GeometryBatchCommand{ .count = 3 };
+    const destinations = [_]rl.Vector2{
+        .{ .x = 150, .y = 160 },
+        .{ .x = 450, .y = 200 },
+        .{ .x = 700, .y = 500 },
+    };
+    const scopes = [_]studio.EditScope{ .local_instance, .local_instance, .direct };
+    for (first_items, destinations, scopes, 0..) |item, destination, edit_scope, index| {
+        batch.commands[index] = .{
+            .item_identity = item.identity,
+            .source = item.effectiveBaseSource(),
+            .edit_scope = edit_scope,
+            .before_position = item.position,
+            .before_size = item.size,
+            .after_position = destination,
+            .after_size = item.size,
+            .resized = false,
+        };
+    }
+
+    var edits: [studio.max_selection_items]source_editor.GeometrySourceEdit = undefined;
+    var snippets: [studio.max_selection_items][512]u8 = undefined;
+    const planned = try planStudioGeometryBatchEdits(
+        source,
+        batch,
+        first_slide,
+        null,
+        first_items,
+        &edits,
+        &snippets,
+    );
+    try std.testing.expectEqual(@as(usize, 3), planned.len);
+
+    const patch = try source_editor.applyGeometryEdits(allocator, source, planned);
+    defer patch.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, patch.source, "@set hero"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, patch.source, "@set badge"));
+
+    var reparsed_arena = std.heap.ArenaAllocator.init(allocator);
+    defer reparsed_arena.deinit();
+    const reparsed = try slides.SlideShow.new(reparsed_arena.allocator());
+    const reparsed_context = try parser.constructSlidesFromBuf(patch.source, reparsed, reparsed_arena.allocator());
+    defer reparsed_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reparsed_context.parser_errors.items.len);
+
+    const edited = reparsed.slides.items[0].items.?.items;
+    for (edited, destinations) |item, destination| {
+        try std.testing.expectApproxEqAbs(destination.x, item.position.x, 0.0001);
+        try std.testing.expectApproxEqAbs(destination.y, item.position.y, 0.0001);
+    }
+    try std.testing.expect(edited[0].instance_source != null);
+    try std.testing.expect(edited[1].instance_source != null);
+
+    const untouched = reparsed.slides.items[1].items.?.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 10), untouched[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), untouched[1].position.x, 0.0001);
 }
 
 fn colorLiteral(buffer: *[9]u8, color: rl.Color) []const u8 {

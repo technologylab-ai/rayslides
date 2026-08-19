@@ -16,8 +16,23 @@ pub const DuplicateItemPlacement = struct {
     y: f32,
 };
 
-/// The caller owns `source` and must free it with the allocator passed to
-/// `patchGeometry`.
+/// One source operation in an atomic geometry rewrite. Every offset refers to
+/// the original, unmodified source buffer. Insertions at the same offset are
+/// emitted in caller order. Snippet bytes are borrowed only for the duration
+/// of `applyGeometryEdits`; the returned source owns its copy.
+pub const GeometrySourceEdit = union(enum) {
+    patch: struct {
+        directive_offset: usize,
+        geometry: GeometryPatch,
+    },
+    insert: struct {
+        insertion_offset: usize,
+        snippet: []const u8,
+    },
+};
+
+/// The caller owns `source` and must free it with the allocator passed to the
+/// source-editing function that produced it.
 pub const PatchResult = struct {
     source: []u8,
     byte_delta: isize,
@@ -45,6 +60,7 @@ pub const PatchError = error{
     ItemIdCollision,
     NoAdjacentSlide,
     NotPromotableDirective,
+    OverlappingSourceEdits,
     SlideTemplateNameCollision,
     SourceTooLarge,
     UnsupportedItemDuplication,
@@ -129,6 +145,185 @@ pub fn patchGeometry(
         .w = w,
         .h = h,
     });
+}
+
+/// Apply multiple already-resolved geometry source edits as one rewrite.
+///
+/// Every offset is interpreted against `source`, never against the result of a
+/// preceding edit. The complete operation list is validated before any output
+/// is produced, then applied from the greatest offset to the least so byte
+/// length changes cannot invalidate later work. A patch and insertions may
+/// share a directive offset: the patch is applied first and the snippets are
+/// inserted before the patched directive. Multiple insertions at one offset
+/// are emitted in their original caller order.
+///
+/// Insert offsets are intentionally low-level, for callers that have already
+/// resolved a scoped base/state/template insertion anchor with this module's
+/// boundary helpers. Each insertion is still required to be a literal,
+/// single-directive snippet at a physical line boundary.
+pub fn applyGeometryEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: []const GeometrySourceEdit,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    try validateGeometrySourceEdits(source, edits);
+
+    var order = try allocator.alloc(usize, edits.len);
+    defer allocator.free(order);
+    for (order, 0..) |*entry, index| entry.* = index;
+    sortGeometrySourceEditOrder(edits, order);
+
+    var working: ?[]u8 = try allocator.dupe(u8, source);
+    errdefer if (working) |owned| allocator.free(owned);
+
+    var group_start: usize = 0;
+    while (group_start < order.len) {
+        const offset = geometrySourceEditOffset(edits[order[group_start]]);
+        var group_end = group_start + 1;
+        while (group_end < order.len and geometrySourceEditOffset(edits[order[group_end]]) == offset) {
+            group_end += 1;
+        }
+
+        var insertion_start = group_start;
+        if (edits[order[group_start]] == .patch) {
+            const patch = edits[order[group_start]].patch;
+            const next = try patchGeometry(allocator, working.?, patch.directive_offset, patch.geometry);
+            allocator.free(working.?);
+            working = next.source;
+            insertion_start += 1;
+        }
+
+        if (insertion_start < group_end) {
+            const next = try insertGeometrySnippetGroupAt(
+                allocator,
+                working.?,
+                offset,
+                edits,
+                order[insertion_start..group_end],
+            );
+            allocator.free(working.?);
+            working = next.source;
+        }
+        group_start = group_end;
+    }
+
+    return .{
+        .source = working.?,
+        .byte_delta = try signedLengthDelta(working.?.len, source.len),
+    };
+}
+
+fn validateGeometrySourceEdits(source: []const u8, edits: []const GeometrySourceEdit) PatchError!void {
+    for (edits, 0..) |edit, index| {
+        switch (edit) {
+            .patch => |patch| {
+                const line = try directiveLine(source, patch.directive_offset);
+                try validateGeometryPatch(patch.geometry);
+
+                // Two patches of the same physical directive would have
+                // order-dependent attribute semantics. More generally, keep
+                // this check range-based so any future multiline geometry
+                // patch remains safe without changing the public contract.
+                for (edits[0..index]) |earlier| switch (earlier) {
+                    .patch => |other| {
+                        const other_line = try directiveLine(source, other.directive_offset);
+                        if (line.start < other_line.full_end and other_line.start < line.full_end) {
+                            return error.OverlappingSourceEdits;
+                        }
+                    },
+                    .insert => {},
+                };
+            },
+            .insert => |insert| {
+                try validateSnippet(insert.snippet);
+                if (!isPhysicalLineBoundary(source, insert.insertion_offset)) {
+                    return error.InvalidInsertionOffset;
+                }
+            },
+        }
+    }
+}
+
+fn validateGeometryPatch(geometry: GeometryPatch) PatchError!void {
+    var x_buffer: [64]u8 = undefined;
+    var y_buffer: [64]u8 = undefined;
+    var w_buffer: [64]u8 = undefined;
+    var h_buffer: [64]u8 = undefined;
+    _ = try formatCoordinate(&x_buffer, geometry.x);
+    _ = try formatCoordinate(&y_buffer, geometry.y);
+    if (geometry.w) |value| _ = try formatCoordinate(&w_buffer, value);
+    if (geometry.h) |value| _ = try formatCoordinate(&h_buffer, value);
+}
+
+fn geometrySourceEditOffset(edit: GeometrySourceEdit) usize {
+    return switch (edit) {
+        .patch => |patch| patch.directive_offset,
+        .insert => |insert| insert.insertion_offset,
+    };
+}
+
+fn geometrySourceEditComesFirst(
+    edits: []const GeometrySourceEdit,
+    left_index: usize,
+    right_index: usize,
+) bool {
+    const left_offset = geometrySourceEditOffset(edits[left_index]);
+    const right_offset = geometrySourceEditOffset(edits[right_index]);
+    if (left_offset != right_offset) return left_offset > right_offset;
+
+    const left_is_patch = edits[left_index] == .patch;
+    const right_is_patch = edits[right_index] == .patch;
+    if (left_is_patch != right_is_patch) return left_is_patch;
+    return left_index < right_index;
+}
+
+fn sortGeometrySourceEditOrder(edits: []const GeometrySourceEdit, order: []usize) void {
+    var index: usize = 1;
+    while (index < order.len) : (index += 1) {
+        var moving = index;
+        while (moving > 0 and geometrySourceEditComesFirst(edits, order[moving], order[moving - 1])) : (moving -= 1) {
+            std.mem.swap(usize, &order[moving], &order[moving - 1]);
+        }
+    }
+}
+
+fn insertGeometrySnippetGroupAt(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    insertion_offset: usize,
+    edits: []const GeometrySourceEdit,
+    insertion_order: []const usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    // Validation happened against the original source. Descending application
+    // guarantees lower offsets stay fixed, including this physical boundary.
+    if (!isPhysicalLineBoundary(source, insertion_offset)) return error.InvalidInsertionOffset;
+
+    const newline = lineEndingNear(source, insertion_offset);
+    const needs_separator = insertion_offset == source.len and
+        source.len > 0 and
+        !(source.len == utf8_bom.len and std.mem.eql(u8, source, utf8_bom)) and
+        source[source.len - 1] != '\n';
+
+    var extra_capacity = newline.len;
+    for (insertion_order) |edit_index| {
+        const snippet = edits[edit_index].insert.snippet;
+        extra_capacity = std.math.add(usize, extra_capacity, snippet.len) catch return error.SourceTooLarge;
+        extra_capacity = std.math.add(usize, extra_capacity, newline.len) catch return error.SourceTooLarge;
+    }
+    const total_capacity = std.math.add(usize, source.len, extra_capacity) catch return error.SourceTooLarge;
+
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.ensureTotalCapacity(allocator, total_capacity);
+    try output.appendSlice(allocator, source[0..insertion_offset]);
+    if (needs_separator) try output.appendSlice(allocator, newline);
+    for (insertion_order) |edit_index| {
+        const snippet = edits[edit_index].insert.snippet;
+        try appendNormalizedLines(allocator, &output, std.mem.trimEnd(u8, snippet, "\n"), newline);
+        try output.appendSlice(allocator, newline);
+    }
+    try output.appendSlice(allocator, source[insertion_offset..]);
+    return finishResult(allocator, &output, source.len);
 }
 
 const GeometryTextPatch = struct {
@@ -355,10 +550,34 @@ pub fn insertSlideTemplateOverride(
     slide_offset: usize,
     snippet: []const u8,
 ) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const insertion_offset = try slideTemplateOverrideInsertionOffset(source, slide_offset, snippet);
+    return insertSnippetAt(allocator, source, insertion_offset, snippet);
+}
+
+/// Resolve and validate the source anchor for a new instance-local override
+/// without changing the source. This lets callers include the returned offset
+/// in `applyGeometryEdits` while retaining the same literal `@popslide` and
+/// `@set`/`@show`/`@hide` safety checks as `insertSlideTemplateOverride`.
+pub fn slideTemplateOverrideInsertionOffset(
+    source: []const u8,
+    slide_offset: usize,
+    snippet: []const u8,
+) PatchError!usize {
     _ = try slideTemplateInstanceBaseRegion(source, slide_offset);
     try validateSlideTemplateOverrideSnippet(snippet);
-    const insertion_offset = try slideItemInsertionOffset(source, slide_offset);
-    return insertSnippetAt(allocator, source, insertion_offset, snippet);
+    return slideItemInsertionOffset(source, slide_offset);
+}
+
+/// Validate an existing instance-local override as an atomic geometry patch
+/// target without changing the source. This rejects stale provenance, wrong
+/// slide/state ownership, dynamic targets, and mismatched item IDs.
+pub fn validateSlideTemplateOverrideGeometryTarget(
+    source: []const u8,
+    slide_offset: usize,
+    override_offset: usize,
+    item_id: []const u8,
+) PatchError!void {
+    return validateSlideTemplateOverrideLocation(source, slide_offset, override_offset, item_id);
 }
 
 /// Patch attributes on an already-authored instance-local override.
@@ -394,7 +613,7 @@ pub fn patchSlideTemplateOverrideGeometry(
     item_id: []const u8,
     geometry: GeometryPatch,
 ) (std.mem.Allocator.Error || PatchError)!PatchResult {
-    try validateSlideTemplateOverrideLocation(source, slide_offset, override_offset, item_id);
+    try validateSlideTemplateOverrideGeometryTarget(source, slide_offset, override_offset, item_id);
     return patchGeometry(allocator, source, override_offset, geometry);
 }
 
@@ -2249,6 +2468,165 @@ test "rejects offsets that do not begin a directive line" {
         error.InvalidDirectiveOffset,
         patchGeometry(std.testing.allocator, source, directive_offset + 1, .{ .x = 1, .y = 2 }),
     );
+}
+
+test "atomic geometry edits mix patches and insertion on original BOM CRLF offsets" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=first x=1 y=2 w=30 h=40 text=One\r\n" ++
+        "# between\r\n" ++
+        "@box id=second x=5 y=6 text=Two\r\n";
+    const first_offset = std.mem.indexOf(u8, source, "@box id=first") orelse unreachable;
+    const second_offset = std.mem.indexOf(u8, source, "@box id=second") orelse unreachable;
+    const edits = [_]GeometrySourceEdit{
+        .{ .insert = .{
+            .insertion_offset = second_offset,
+            .snippet = "@box id=middle x=30 y=40 text=Inserted",
+        } },
+        .{ .patch = .{
+            .directive_offset = first_offset,
+            .geometry = .{ .x = 100, .y = 200 },
+        } },
+        .{ .patch = .{
+            .directive_offset = second_offset,
+            .geometry = .{ .x = 500, .y = 600, .w = 70, .h = 80 },
+        } },
+    };
+    const expected =
+        "\xEF\xBB\xBF@slide\r\n" ++
+        "@box id=first x=100 y=200 w=30 h=40 text=One\r\n" ++
+        "# between\r\n" ++
+        "@box id=middle x=30 y=40 text=Inserted\r\n" ++
+        "@box id=second x=500 y=600 w=70 h=80 text=Two\r\n";
+
+    const result = try applyGeometryEdits(std.testing.allocator, source, &edits);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+    try std.testing.expectEqual(try signedLengthDelta(expected.len, source.len), result.byte_delta);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(result.source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqualStrings("first", items[0].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), items[0].position.y, 0.0001);
+    try std.testing.expectEqualStrings("middle", items[1].id.?);
+    try std.testing.expectEqualStrings("second", items[2].id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), items[2].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 600), items[2].position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 70), items[2].size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 80), items[2].size.y, 0.0001);
+}
+
+test "atomic geometry edits keep descending original offsets stable" {
+    const source =
+        "@slide\n" ++
+        "@box id=low text=Missing attributes grow this lower line\n" ++
+        "@box id=high x=3 y=4 text=Higher source offset\n";
+    const low_offset = std.mem.indexOf(u8, source, "@box id=low") orelse unreachable;
+    const high_offset = std.mem.indexOf(u8, source, "@box id=high") orelse unreachable;
+    const edits = [_]GeometrySourceEdit{
+        .{ .patch = .{
+            .directive_offset = low_offset,
+            .geometry = .{ .x = 10, .y = 20, .w = 30, .h = 40 },
+        } },
+        .{ .patch = .{
+            .directive_offset = high_offset,
+            .geometry = .{ .x = 300, .y = 400 },
+        } },
+    };
+    const expected =
+        "@slide\n" ++
+        "@box id=low x=10 y=20 w=30 h=40 text=Missing attributes grow this lower line\n" ++
+        "@box id=high x=300 y=400 text=Higher source offset\n";
+
+    const result = try applyGeometryEdits(std.testing.allocator, source, &edits);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+}
+
+test "atomic geometry edits retain caller order for shared unterminated EOF insertion" {
+    const source = "@slide";
+    const edits = [_]GeometrySourceEdit{
+        .{ .insert = .{ .insertion_offset = source.len, .snippet = "@box id=first x=1 y=2" } },
+        .{ .insert = .{ .insertion_offset = source.len, .snippet = "@box id=second x=3 y=4" } },
+        .{ .insert = .{ .insertion_offset = source.len, .snippet = "@box id=third x=5 y=6" } },
+    };
+    const expected =
+        "@slide\n" ++
+        "@box id=first x=1 y=2\n" ++
+        "@box id=second x=3 y=4\n" ++
+        "@box id=third x=5 y=6\n";
+
+    const result = try applyGeometryEdits(std.testing.allocator, source, &edits);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected, result.source);
+    try std.testing.expectEqual(try signedLengthDelta(expected.len, source.len), result.byte_delta);
+}
+
+test "atomic geometry edits reject overlapping stale and invalid operations" {
+    const source = "@slide\n@box id=one x=1 y=2\n@box id=two x=3 y=4\n";
+    const first_offset = std.mem.indexOf(u8, source, "@box id=one") orelse unreachable;
+
+    const overlapping = [_]GeometrySourceEdit{
+        .{ .patch = .{ .directive_offset = first_offset, .geometry = .{ .x = 10, .y = 20 } } },
+        .{ .patch = .{ .directive_offset = first_offset, .geometry = .{ .x = 30, .y = 40 } } },
+    };
+    try std.testing.expectError(
+        error.OverlappingSourceEdits,
+        applyGeometryEdits(std.testing.allocator, source, &overlapping),
+    );
+
+    const stale_patch = [_]GeometrySourceEdit{
+        .{ .patch = .{ .directive_offset = first_offset + 1, .geometry = .{ .x = 10, .y = 20 } } },
+    };
+    try std.testing.expectError(
+        error.InvalidDirectiveOffset,
+        applyGeometryEdits(std.testing.allocator, source, &stale_patch),
+    );
+
+    const stale_insert = [_]GeometrySourceEdit{
+        .{ .insert = .{ .insertion_offset = first_offset + 1, .snippet = "@box id=three" } },
+    };
+    try std.testing.expectError(
+        error.InvalidInsertionOffset,
+        applyGeometryEdits(std.testing.allocator, source, &stale_insert),
+    );
+
+    const invalid_snippet = [_]GeometrySourceEdit{
+        .{ .patch = .{ .directive_offset = first_offset, .geometry = .{ .x = 10, .y = 20 } } },
+        .{ .insert = .{ .insertion_offset = source.len, .snippet = "@box id=three\n@slide" } },
+    };
+    try std.testing.expectError(
+        error.InvalidSnippet,
+        applyGeometryEdits(std.testing.allocator, source, &invalid_snippet),
+    );
+
+    const invalid_coordinate = [_]GeometrySourceEdit{
+        .{ .patch = .{
+            .directive_offset = first_offset,
+            .geometry = .{ .x = std.math.inf(f32), .y = 20 },
+        } },
+    };
+    try std.testing.expectError(
+        error.InvalidCoordinate,
+        applyGeometryEdits(std.testing.allocator, source, &invalid_coordinate),
+    );
+}
+
+test "empty atomic geometry edit returns an owned unchanged result" {
+    const source = "\xEF\xBB\xBF@slide\r\n";
+    const result = try applyGeometryEdits(std.testing.allocator, source, &.{});
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(source, result.source);
+    try std.testing.expectEqual(@as(isize, 0), result.byte_delta);
 }
 
 test "geometry patch reparses into the edited logical item" {

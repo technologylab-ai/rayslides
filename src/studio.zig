@@ -20,6 +20,7 @@ pub const default_handle_size: f32 = 14;
 pub const default_min_item_size: f32 = 8;
 pub const default_snap_threshold_screen: f32 = 8;
 pub const default_grid_spacing: f32 = 20;
+pub const max_selection_items: usize = 64;
 
 pub const SourceRef = slides.SourceRef;
 pub const SourceScope = slides.SourceScope;
@@ -68,6 +69,11 @@ pub const AlignAction = enum {
     bottom,
 };
 
+pub const DistributionAction = enum {
+    horizontal,
+    vertical,
+};
+
 /// Describes where an emitted edit should be applied. This is deliberately
 /// separate from `SourceRef.scope`: an item cloned from a slide template keeps
 /// the template directive as its source, while an ordinary Studio edit should
@@ -89,6 +95,18 @@ pub const GeometryCommand = struct {
     after_size: rl.Vector2,
     /// False for both pointer moves and keyboard nudges.
     resized: bool,
+};
+
+/// One atomic multi-item geometry edit. Only `commands[0..count]` is valid.
+/// The fixed storage keeps Studio allocation-free and makes ownership across
+/// the update/integration boundary explicit.
+pub const GeometryBatchCommand = struct {
+    commands: [max_selection_items]GeometryCommand = undefined,
+    count: usize = 0,
+
+    pub fn slice(self: *const GeometryBatchCommand) []const GeometryCommand {
+        return self.commands[0..self.count];
+    }
 };
 
 pub const EditCommand = GeometryCommand;
@@ -272,6 +290,37 @@ pub fn snapGeometry(
     items: []const slides.SlideItem,
     resolved_bounds: []const ResolvedBounds,
 ) SnapResult {
+    const excluded = [_]usize{selected_identity};
+    return snapGeometryExcluding(
+        candidate,
+        interaction,
+        logical_size,
+        threshold,
+        grid_enabled,
+        grid_spacing,
+        minimum_size,
+        aspect_ratio,
+        include_item_targets,
+        &excluded,
+        items,
+        resolved_bounds,
+    );
+}
+
+fn snapGeometryExcluding(
+    candidate: Geometry,
+    interaction: Interaction,
+    logical_size: rl.Vector2,
+    threshold: rl.Vector2,
+    grid_enabled: bool,
+    grid_spacing: f32,
+    minimum_size: f32,
+    aspect_ratio: ?f32,
+    include_item_targets: bool,
+    excluded_identities: []const usize,
+    items: []const slides.SlideItem,
+    resolved_bounds: []const ResolvedBounds,
+) SnapResult {
     if (interaction == .idle) return .{ .geometry = candidate };
     const valid_aspect_ratio = if (aspect_ratio) |value|
         if (value > 0 and std.math.isFinite(value)) value else null
@@ -292,7 +341,14 @@ pub fn snapGeometry(
     );
     if (include_item_targets) {
         for (items) |item| {
-            if (item.identity == selected_identity or !isSelectable(item, resolved_bounds)) continue;
+            var excluded = false;
+            for (excluded_identities) |identity| {
+                if (item.identity == identity) {
+                    excluded = true;
+                    break;
+                }
+            }
+            if (excluded or !isSelectable(item, resolved_bounds)) continue;
             considerGeometryTargets(
                 &x_snap,
                 &y_snap,
@@ -415,6 +471,16 @@ pub fn itemIndexBySource(items: []const slides.SlideItem, source: slides.SourceR
     return null;
 }
 
+fn itemIndexByUniqueSource(items: []const slides.SlideItem, source: slides.SourceRef) ?usize {
+    var match: ?usize = null;
+    for (items, 0..) |item, index| {
+        if (!sourceEqual(item.source, source)) continue;
+        if (match != null) return null;
+        match = index;
+    }
+    return match;
+}
+
 fn sourceEqual(a: slides.SourceRef, b: slides.SourceRef) bool {
     return a.scope == b.scope and a.line_number == b.line_number and
         a.line_offset == b.line_offset and a.patchable == b.patchable;
@@ -457,6 +523,9 @@ pub const Notice = enum {
     shared_template_delete_unsupported,
     local_override_needs_unique_id,
     duplicate_item_unsupported,
+    multi_selection_property_unsupported,
+    selection_capacity_reached,
+    distribution_needs_three,
     template_background_local_unsupported,
     generated_source_read_only,
     property_unavailable,
@@ -644,6 +713,7 @@ pub const UiLayout = struct {
     foreground_swatches: [palette.len]rl.Rectangle,
     background_swatches: [palette.len]rl.Rectangle,
     align_buttons: [6]rl.Rectangle,
+    distribute_buttons: [2]rl.Rectangle,
 };
 
 pub const organizer_action_count = 6;
@@ -887,7 +957,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .x = viewport.slide_top_left.x + viewport.slide_size.x - property_width - margin,
         .y = viewport.slide_top_left.y + margin,
         .width = property_width,
-        .height = 278,
+        .height = 330,
     };
     const action_y = properties.y + 38;
     const action_gap: f32 = 4;
@@ -921,6 +991,13 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = align_width,
         .height = 28,
     };
+    const distribute_y = properties.y + 284;
+    const distribute_gap: f32 = 6;
+    const distribute_width = (properties.width - 24 - distribute_gap) / 2;
+    const distribute_buttons = [2]rl.Rectangle{
+        .{ .x = properties.x + 12, .y = distribute_y, .width = distribute_width, .height = 28 },
+        .{ .x = properties.x + 12 + distribute_width + distribute_gap, .y = distribute_y, .width = distribute_width, .height = 28 },
+    };
     return .{
         .toolbar = toolbar,
         .tool_buttons = tool_buttons,
@@ -937,6 +1014,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .foreground_swatches = foreground_swatches,
         .background_swatches = background_swatches,
         .align_buttons = align_buttons,
+        .distribute_buttons = distribute_buttons,
     };
 }
 
@@ -964,6 +1042,9 @@ pub const FrameInput = struct {
     lock_aspect_ratio: bool = false,
     disable_snapping: bool = false,
     align_action: ?AlignAction = null,
+    distribute_action: ?DistributionAction = null,
+    toggle_selection: bool = false,
+    select_all_pressed: bool = false,
     allow_shared_edit: bool = false,
     choose_tool: ?Tool = null,
     delete_pressed: bool = false,
@@ -1026,6 +1107,8 @@ pub const FrameInput = struct {
             .toggle_grid_pressed = !shortcut_modifier and rl.isKeyPressed(.g),
             .lock_aspect_ratio = shift,
             .disable_snapping = shortcut_modifier,
+            .toggle_selection = shift,
+            .select_all_pressed = shortcut_modifier and rl.isKeyPressed(.a),
             .allow_shared_edit = alt,
             .choose_tool = choose_tool,
             .delete_pressed = !shortcut_modifier and rl.isKeyPressed(.backspace),
@@ -1078,6 +1161,27 @@ const Drag = struct {
     edit_scope: EditScope = .direct,
 };
 
+const SelectionMember = struct {
+    identity: usize,
+    source: ?slides.SourceRef = null,
+};
+
+const GroupDragMember = struct {
+    identity: usize,
+    before: Geometry,
+    authored_before: Geometry,
+    after: Geometry,
+    edit_scope: EditScope,
+};
+
+const SelectionGeometry = struct {
+    identity: usize,
+    item_index: usize,
+    geometry: Geometry,
+    authored_geometry: Geometry,
+    edit_scope: EditScope,
+};
+
 pub const Studio = struct {
     enabled: bool = false,
     tool: Tool = .select,
@@ -1090,6 +1194,8 @@ pub const Studio = struct {
     /// Source key keeps selection stable when applying a command reparses the
     /// deck and assigns fresh in-memory identities.
     selected_source: ?slides.SourceRef = null,
+    additional_selection: [max_selection_items - 1]SelectionMember = undefined,
+    additional_selection_count: usize = 0,
     interaction: Interaction = .idle,
     handle_size_screen: f32 = default_handle_size,
     min_item_size: f32 = default_min_item_size,
@@ -1104,6 +1210,11 @@ pub const Studio = struct {
     },
     pending_semantic_command: ?SemanticCommand = null,
     pending_geometry_command: ?GeometryCommand = null,
+    pending_geometry_batch: ?GeometryBatchCommand = null,
+    group_drag: [max_selection_items]GroupDragMember = undefined,
+    group_drag_count: usize = 0,
+    group_bounds_before: Geometry = .{ .position = .zero(), .size = .zero() },
+    group_bounds_after: Geometry = .{ .position = .zero(), .size = .zero() },
     organizer_first_visible: usize = 0,
     library_first_visible: usize = 0,
     selected_library_index: ?usize = null,
@@ -1160,6 +1271,16 @@ pub const Studio = struct {
         return self.pending_semantic_command;
     }
 
+    pub fn takeGeometryBatch(self: *Studio) ?GeometryBatchCommand {
+        const command = self.pending_geometry_batch;
+        self.pending_geometry_batch = null;
+        return command;
+    }
+
+    pub fn peekGeometryBatch(self: Studio) ?GeometryBatchCommand {
+        return self.pending_geometry_batch;
+    }
+
     pub fn setTool(self: *Studio, tool: Tool, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.tool = tool;
@@ -1171,7 +1292,7 @@ pub const Studio = struct {
         if (self.active_morph_state) |state| {
             if (state >= count) {
                 self.active_morph_state = null;
-                self.snap_guides = .{};
+                self.clearSelectionState();
             }
         }
     }
@@ -1218,6 +1339,8 @@ pub const Studio = struct {
             self.active_morph_state = null;
             self.selected_identity = null;
             self.selected_source = null;
+            self.additional_selection_count = 0;
+            self.group_drag_count = 0;
             self.selected_library_index = null;
             self.snap_guides = .{};
         }
@@ -1230,6 +1353,8 @@ pub const Studio = struct {
         self.active_morph_state = null;
         self.selected_identity = null;
         self.selected_source = null;
+        self.additional_selection_count = 0;
+        self.group_drag_count = 0;
         self.selected_library_index = null;
         self.snap_guides = .{};
     }
@@ -1238,7 +1363,29 @@ pub const Studio = struct {
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.selected_identity = null;
         self.selected_source = null;
+        self.additional_selection_count = 0;
+        self.group_drag_count = 0;
         self.snap_guides = .{};
+    }
+
+    pub fn selectionCount(self: Studio) usize {
+        return if (self.selected_identity == null) 0 else 1 + self.additional_selection_count;
+    }
+
+    /// Stable selection order: primary/last-clicked first, followed by the
+    /// other members in the order they joined the selection.
+    pub fn selectedIdentityAt(self: Studio, selection_index: usize) ?usize {
+        if (selection_index >= self.selectionCount()) return null;
+        if (selection_index == 0) return self.selected_identity;
+        return self.additional_selection[selection_index - 1].identity;
+    }
+
+    pub fn isIdentitySelected(self: Studio, identity: usize) bool {
+        if (self.selected_identity != null and self.selected_identity.? == identity) return true;
+        for (self.additional_selection[0..self.additional_selection_count]) |member| {
+            if (member.identity == identity) return true;
+        }
+        return false;
     }
 
     pub fn selectedIndex(self: Studio, items: []const slides.SlideItem) ?usize {
@@ -1252,8 +1399,45 @@ pub const Studio = struct {
         return itemGeometry(items[index], resolved_bounds);
     }
 
+    fn selectedBounds(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds) ?Geometry {
+        const count = self.selectionCount();
+        if (count == 0) return null;
+        var bounds: ?Geometry = null;
+        for (0..count) |selection_index| {
+            const identity = self.selectedIdentityAt(selection_index) orelse continue;
+            const item_index = itemIndexByIdentity(items, identity) orelse continue;
+            const geometry = itemGeometry(items[item_index], resolved_bounds);
+            if (bounds) |*value| {
+                const max_x = @max(value.position.x + value.size.x, geometry.position.x + geometry.size.x);
+                const max_y = @max(value.position.y + value.size.y, geometry.position.y + geometry.size.y);
+                value.position.x = @min(value.position.x, geometry.position.x);
+                value.position.y = @min(value.position.y, geometry.position.y);
+                value.size.x = max_x - value.position.x;
+                value.size.y = max_y - value.position.y;
+            } else {
+                bounds = geometry;
+            }
+        }
+        return bounds;
+    }
+
     pub fn livePreview(self: Studio) ?LivePreview {
+        return self.livePreviewAt(0);
+    }
+
+    pub fn livePreviewAt(self: Studio, selection_index: usize) ?LivePreview {
         if (!self.enabled or self.interaction == .idle) return null;
+        if (self.group_drag_count > 1) {
+            if (selection_index >= self.group_drag_count) return null;
+            const member = self.group_drag[selection_index];
+            return .{
+                .item_identity = member.identity,
+                .before = member.before,
+                .after = member.after,
+                .resized = false,
+            };
+        }
+        if (selection_index != 0) return null;
         return .{
             .item_identity = self.selected_identity orelse return null,
             .before = self.drag.before,
@@ -1310,6 +1494,11 @@ pub const Studio = struct {
 
         self.validateSelection(items, resolved_bounds);
 
+        if (input.select_all_pressed) {
+            self.selectAll(items, resolved_bounds);
+            return null;
+        }
+
         if (input.toggle_grid_pressed) {
             self.grid_snapping = !self.grid_snapping;
             self.snap_guides = .{};
@@ -1353,6 +1542,10 @@ pub const Studio = struct {
         if (input.align_action) |action| {
             return self.alignSelected(items, resolved_bounds, viewport.logical_size, action, input.allow_shared_edit);
         }
+        if (input.distribute_action) |action| {
+            self.distributeSelected(items, resolved_bounds, action, input.allow_shared_edit);
+            return null;
+        }
 
         if (input.delete_pressed) {
             _ = self.emitSelectedCommand(items, input.allow_shared_edit, .delete_item);
@@ -1392,8 +1585,48 @@ pub const Studio = struct {
             return null;
         }
 
-        if (input.pointer_pressed and self.interaction == .idle) {
+        // The resize handle wins over Shift-click membership toggling so
+        // Shift can retain its established aspect-lock meaning at gesture
+        // start.
+        if (input.pointer_pressed and self.interaction == .idle and self.selectionCount() == 1) {
             if (self.selectedGeometry(items, resolved_bounds)) |selected_geometry| {
+                if (self.resizeHandleRect(viewport, selected_geometry)) |handle| {
+                    if (pointInRectangle(input.pointer_screen, handle)) {
+                        const selected_index = self.selectedIndex(items) orelse return null;
+                        const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
+                        self.beginInteraction(
+                            .resizing,
+                            selected_geometry,
+                            Geometry.fromItem(items[selected_index]),
+                            pointer_logical orelse return null,
+                            edit_scope,
+                        );
+                    }
+                }
+            }
+        }
+
+        if (input.pointer_pressed and self.interaction == .idle) {
+            if (input.toggle_selection) {
+                self.toggleSelectionAt(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical);
+                return null;
+            }
+            if (self.selectionCount() > 1) {
+                const hit_index = if (viewport.containsScreenPoint(input.pointer_screen) and pointer_logical != null)
+                    hitTest(items, resolved_bounds, pointer_logical.?)
+                else
+                    null;
+                if (hit_index) |index| {
+                    if (self.isIdentitySelected(items[index].identity)) {
+                        self.makeSelectionPrimary(items[index].identity);
+                        self.beginGroupMove(items, resolved_bounds, pointer_logical.?, input.allow_shared_edit);
+                    } else {
+                        self.selectAndBeginMove(items, resolved_bounds, viewport, input.pointer_screen, pointer_logical, input.allow_shared_edit);
+                    }
+                } else {
+                    self.clearSelection(items);
+                }
+            } else if (self.selectedGeometry(items, resolved_bounds)) |selected_geometry| {
                 if (self.resizeHandleRect(viewport, selected_geometry)) |handle| {
                     if (pointInRectangle(input.pointer_screen, handle)) {
                         const selected_index = self.selectedIndex(items) orelse return null;
@@ -1417,21 +1650,34 @@ pub const Studio = struct {
         }
 
         if (self.interaction != .idle and (input.pointer_down or input.pointer_released)) {
-            if (pointer_logical) |pointer| self.applyPointer(
-                items,
-                resolved_bounds,
-                viewport,
-                pointer,
-                input.lock_aspect_ratio,
-                input.disable_snapping,
-            );
+            if (pointer_logical) |pointer| {
+                if (self.group_drag_count > 1)
+                    self.applyGroupPointer(items, resolved_bounds, viewport, pointer, input.disable_snapping)
+                else
+                    self.applyPointer(
+                        items,
+                        resolved_bounds,
+                        viewport,
+                        pointer,
+                        input.lock_aspect_ratio,
+                        input.disable_snapping,
+                    );
+            }
         }
 
         if (self.interaction != .idle and input.pointer_released) {
+            if (self.group_drag_count > 1) {
+                self.finishGroupInteraction(items);
+                return null;
+            }
             return self.finishInteraction(items);
         }
 
         if (self.interaction == .idle and (input.nudge.x != 0 or input.nudge.y != 0)) {
+            if (self.selectionCount() > 1) {
+                self.applyGroupNudge(items, resolved_bounds, input.nudge, input.allow_shared_edit);
+                return null;
+            }
             const selected_index = self.selectedIndex(items) orelse return null;
             const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
             return self.applyNudge(items, resolved_bounds, input.nudge, edit_scope);
@@ -1454,6 +1700,10 @@ pub const Studio = struct {
     fn emitDuplicateItem(self: *Studio, items: []slides.SlideItem, allow_shared_edit: bool) bool {
         const index = self.selectedIndex(items) orelse return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
+        if (self.selectionCount() > 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
         const item = items[index];
 
         const edit_scope: EditScope = if (self.active_morph_state) |state_index| blk: {
@@ -1494,6 +1744,10 @@ pub const Studio = struct {
     ) bool {
         const index = self.selectedIndex(items) orelse return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
+        if (self.selectionCount() > 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         if (kind == .edit_text and items[index].kind != .textbox and items[index].kind != .crowd) {
             self.notice = .property_unavailable;
@@ -1533,6 +1787,10 @@ pub const Studio = struct {
     ) bool {
         const index = self.selectedIndex(items) orelse return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
+        if (self.selectionCount() > 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         if (!background and items[index].kind != .textbox) {
             self.notice = .property_unavailable;
@@ -1637,6 +1895,7 @@ pub const Studio = struct {
             slide_capacity,
         );
         if (self.last_workspace_slide == null or self.last_workspace_slide.? != workspace.current_slide) {
+            const changed_slide = self.last_workspace_slide != null;
             if (summaryOffsetForSlide(workspace.slides, workspace.current_slide)) |offset| {
                 self.organizer_first_visible = revealIndex(
                     self.organizer_first_visible,
@@ -1647,7 +1906,7 @@ pub const Studio = struct {
             }
             self.last_workspace_slide = workspace.current_slide;
             self.selected_library_index = null;
-            self.snap_guides = .{};
+            if (changed_slide) self.clearSelectionState() else self.snap_guides = .{};
             self.tool = .select;
         }
 
@@ -2003,6 +2262,17 @@ pub const Studio = struct {
                 return true;
             }
         }
+        for (layout.distribute_buttons, 0..) |button, index| {
+            if (pointInRectangle(pointer, button)) {
+                self.distributeSelected(
+                    items,
+                    resolved_bounds,
+                    @enumFromInt(index),
+                    allow_shared_edit,
+                );
+                return true;
+            }
+        }
         // Clicking empty property-panel space must never reach the canvas.
         return true;
     }
@@ -2028,11 +2298,141 @@ pub const Studio = struct {
         return self.updateWithWorkspace(items, resolved_bounds, viewport, workspace, FrameInput.fromRaylib());
     }
 
+    fn sourceForSelection(item: slides.SlideItem) ?slides.SourceRef {
+        return if (item.source.scope == .none) null else item.source;
+    }
+
+    fn setSingleSelection(self: *Studio, item: slides.SlideItem) void {
+        self.selected_identity = item.identity;
+        self.selected_source = sourceForSelection(item);
+        self.additional_selection_count = 0;
+        self.group_drag_count = 0;
+        self.snap_guides = .{};
+    }
+
+    fn clearSelectionState(self: *Studio) void {
+        self.interaction = .idle;
+        self.selected_identity = null;
+        self.selected_source = null;
+        self.additional_selection_count = 0;
+        self.group_drag_count = 0;
+        self.snap_guides = .{};
+    }
+
+    fn removeAdditionalSelection(self: *Studio, member_index: usize) void {
+        if (member_index >= self.additional_selection_count) return;
+        var index = member_index;
+        while (index + 1 < self.additional_selection_count) : (index += 1) {
+            self.additional_selection[index] = self.additional_selection[index + 1];
+        }
+        self.additional_selection_count -= 1;
+    }
+
+    fn makeSelectionPrimary(self: *Studio, identity: usize) void {
+        if (self.selected_identity == null or self.selected_identity.? == identity) return;
+        for (self.additional_selection[0..self.additional_selection_count], 0..) |member, member_index| {
+            if (member.identity != identity) continue;
+            self.additional_selection[member_index] = .{
+                .identity = self.selected_identity.?,
+                .source = self.selected_source,
+            };
+            self.selected_identity = member.identity;
+            self.selected_source = member.source;
+            return;
+        }
+    }
+
+    fn toggleSelectionAt(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        pointer_screen: rl.Vector2,
+        pointer_logical: ?rl.Vector2,
+    ) void {
+        if (!viewport.containsScreenPoint(pointer_screen)) return;
+        const pointer = pointer_logical orelse return;
+        const hit_index = hitTest(items, resolved_bounds, pointer) orelse return;
+        const item = items[hit_index];
+        if (self.selected_identity == null) {
+            self.setSingleSelection(item);
+            return;
+        }
+        if (self.selected_identity.? == item.identity) {
+            if (self.additional_selection_count == 0) {
+                self.clearSelectionState();
+            } else {
+                const replacement = self.additional_selection[self.additional_selection_count - 1];
+                self.additional_selection_count -= 1;
+                self.selected_identity = replacement.identity;
+                self.selected_source = replacement.source;
+                self.snap_guides = .{};
+            }
+            return;
+        }
+        for (self.additional_selection[0..self.additional_selection_count], 0..) |member, member_index| {
+            if (member.identity == item.identity) {
+                self.removeAdditionalSelection(member_index);
+                self.snap_guides = .{};
+                return;
+            }
+        }
+        if (self.selectionCount() >= max_selection_items) {
+            self.notice = .selection_capacity_reached;
+            return;
+        }
+        self.additional_selection[self.additional_selection_count] = .{
+            .identity = self.selected_identity.?,
+            .source = self.selected_source,
+        };
+        self.additional_selection_count += 1;
+        self.selected_identity = item.identity;
+        self.selected_source = sourceForSelection(item);
+        self.snap_guides = .{};
+    }
+
+    fn selectAll(self: *Studio, items: []slides.SlideItem, resolved_bounds: []const ResolvedBounds) void {
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        var primary_index: ?usize = if (self.selectedIndex(items)) |index|
+            if (isSelectable(items[index], resolved_bounds)) index else null
+        else
+            null;
+        if (primary_index == null) {
+            var index = items.len;
+            while (index > 0) {
+                index -= 1;
+                if (isSelectable(items[index], resolved_bounds)) {
+                    primary_index = index;
+                    break;
+                }
+            }
+        }
+        const selected_index = primary_index orelse {
+            self.clearSelectionState();
+            return;
+        };
+        self.setSingleSelection(items[selected_index]);
+        var overflow = false;
+        for (items, 0..) |item, index| {
+            if (index == selected_index or !isSelectable(item, resolved_bounds)) continue;
+            if (self.selectionCount() >= max_selection_items) {
+                overflow = true;
+                continue;
+            }
+            self.additional_selection[self.additional_selection_count] = .{
+                .identity = item.identity,
+                .source = sourceForSelection(item),
+            };
+            self.additional_selection_count += 1;
+        }
+        self.notice = if (overflow) .selection_capacity_reached else .none;
+    }
+
     fn validateSelection(self: *Studio, items: []slides.SlideItem, resolved_bounds: []const ResolvedBounds) void {
         if (self.selected_identity) |identity| {
             var index = itemIndexByIdentity(items, identity);
             if (self.selected_source) |source| {
-                if (itemIndexBySource(items, source)) |rebound| {
+                if (itemIndexByUniqueSource(items, source)) |rebound| {
                     index = rebound;
                     self.selected_identity = items[rebound].identity;
                     if (self.selected_identity.? != identity) self.snap_guides = .{};
@@ -2046,19 +2446,46 @@ pub const Studio = struct {
                 }
             }
             const selected_index = index orelse {
-                self.interaction = .idle;
-                self.selected_identity = null;
-                self.selected_source = null;
-                self.snap_guides = .{};
+                if (self.interaction != .idle) self.cancelInteraction(items);
+                self.clearSelectionState();
                 return;
             };
             if (!isSelectable(items[selected_index], resolved_bounds)) {
-                if (self.interaction != .idle) self.restoreBefore(&items[selected_index]);
-                self.interaction = .idle;
-                self.selected_identity = null;
-                self.selected_source = null;
-                self.snap_guides = .{};
+                if (self.interaction != .idle) self.cancelInteraction(items);
+                self.clearSelectionState();
+                return;
             }
+
+            var retained: usize = 0;
+            var member_index: usize = 0;
+            while (member_index < self.additional_selection_count) : (member_index += 1) {
+                const member = self.additional_selection[member_index];
+                const rebound_index = if (member.source) |source|
+                    itemIndexByUniqueSource(items, source) orelse itemIndexByIdentity(items, member.identity)
+                else
+                    itemIndexByIdentity(items, member.identity);
+                const valid_index = rebound_index orelse continue;
+                if (!isSelectable(items[valid_index], resolved_bounds)) continue;
+                const rebound_identity = items[valid_index].identity;
+                if (self.selected_identity != null and rebound_identity == self.selected_identity.?) continue;
+                var duplicate = false;
+                for (self.additional_selection[0..retained]) |retained_member| {
+                    if (retained_member.identity == rebound_identity) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+                self.additional_selection[retained] = .{
+                    .identity = rebound_identity,
+                    .source = sourceForSelection(items[valid_index]),
+                };
+                retained += 1;
+            }
+            if (retained != self.additional_selection_count and self.interaction != .idle) {
+                self.cancelInteraction(items);
+            }
+            self.additional_selection_count = retained;
         }
     }
 
@@ -2072,26 +2499,18 @@ pub const Studio = struct {
         allow_shared_edit: bool,
     ) void {
         if (!viewport.containsScreenPoint(pointer_screen)) {
-            self.selected_identity = null;
-            self.selected_source = null;
-            self.snap_guides = .{};
+            self.clearSelectionState();
             return;
         }
         const pointer = pointer_logical orelse {
-            self.selected_identity = null;
-            self.selected_source = null;
-            self.snap_guides = .{};
+            self.clearSelectionState();
             return;
         };
         const hit_index = hitTest(items, resolved_bounds, pointer) orelse {
-            self.selected_identity = null;
-            self.selected_source = null;
-            self.snap_guides = .{};
+            self.clearSelectionState();
             return;
         };
-        if (self.selected_identity != items[hit_index].identity) self.snap_guides = .{};
-        self.selected_identity = items[hit_index].identity;
-        self.selected_source = if (items[hit_index].source.scope == .none) null else items[hit_index].source;
+        self.setSingleSelection(items[hit_index]);
         const edit_scope = self.editScopeForItem(items, hit_index, allow_shared_edit) orelse return;
         self.beginInteraction(
             .moving,
@@ -2214,6 +2633,221 @@ pub const Studio = struct {
         return sourceScopeLabel(source.scope);
     }
 
+    fn groupDestinationLabel(self: Studio) []const u8 {
+        if (self.group_drag_count < 2) return "multiple source destinations";
+        const first_scope = self.group_drag[0].edit_scope;
+        for (self.group_drag[1..self.group_drag_count]) |member| {
+            if (member.edit_scope != first_scope) return "mixed source destinations";
+        }
+        return switch (first_scope) {
+            .direct => "group edit · direct/state sources",
+            .local_instance => "group edit · local instance overrides",
+            .shared_template => "group edit · shared templates (Alt)",
+        };
+    }
+
+    fn gatherSelectionGeometry(
+        self: *Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        allow_shared_edit: bool,
+        output: *[max_selection_items]SelectionGeometry,
+    ) ?usize {
+        const count = self.selectionCount();
+        if (count == 0 or count > max_selection_items) return null;
+        for (0..count) |selection_index| {
+            const identity = self.selectedIdentityAt(selection_index) orelse return null;
+            const item_index = itemIndexByIdentity(items, identity) orelse return null;
+            const edit_scope = self.editScopeForItem(items, item_index, allow_shared_edit) orelse return null;
+            output[selection_index] = .{
+                .identity = identity,
+                .item_index = item_index,
+                .geometry = itemGeometry(items[item_index], resolved_bounds),
+                .authored_geometry = Geometry.fromItem(items[item_index]),
+                .edit_scope = edit_scope,
+            };
+        }
+        return count;
+    }
+
+    fn geometryBounds(geometries: []const SelectionGeometry) Geometry {
+        std.debug.assert(geometries.len > 0);
+        var min_x = geometries[0].geometry.position.x;
+        var min_y = geometries[0].geometry.position.y;
+        var max_x = min_x + geometries[0].geometry.size.x;
+        var max_y = min_y + geometries[0].geometry.size.y;
+        for (geometries[1..]) |entry| {
+            min_x = @min(min_x, entry.geometry.position.x);
+            min_y = @min(min_y, entry.geometry.position.y);
+            max_x = @max(max_x, entry.geometry.position.x + entry.geometry.size.x);
+            max_y = @max(max_y, entry.geometry.position.y + entry.geometry.size.y);
+        }
+        return .{
+            .position = .{ .x = min_x, .y = min_y },
+            .size = .{ .x = max_x - min_x, .y = max_y - min_y },
+        };
+    }
+
+    fn applySelectionGeometryBatch(
+        self: *Studio,
+        items: []slides.SlideItem,
+        entries: []const SelectionGeometry,
+        after: []const Geometry,
+    ) void {
+        std.debug.assert(entries.len == after.len and entries.len <= max_selection_items);
+        var batch = GeometryBatchCommand{};
+        for (entries, after) |entry, geometry| {
+            if (geometryEqual(entry.geometry, geometry)) continue;
+            items[entry.item_index].position = geometry.position;
+            batch.commands[batch.count] = .{
+                .item_identity = entry.identity,
+                .source = self.commandSource(items[entry.item_index], entry.edit_scope),
+                .edit_scope = entry.edit_scope,
+                .before_position = entry.geometry.position,
+                .before_size = entry.geometry.size,
+                .after_position = geometry.position,
+                .after_size = geometry.size,
+                .resized = false,
+            };
+            batch.count += 1;
+        }
+        if (batch.count == 0) return;
+        self.pending_geometry_batch = batch;
+        self.dirty = true;
+        self.copy_is_current = false;
+    }
+
+    fn beginGroupMove(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        pointer: rl.Vector2,
+        allow_shared_edit: bool,
+    ) void {
+        var entries: [max_selection_items]SelectionGeometry = undefined;
+        const count = self.gatherSelectionGeometry(items, resolved_bounds, allow_shared_edit, &entries) orelse return;
+        if (count < 2) return;
+        for (entries[0..count], 0..) |entry, index| {
+            self.group_drag[index] = .{
+                .identity = entry.identity,
+                .before = entry.geometry,
+                .authored_before = entry.authored_geometry,
+                .after = entry.geometry,
+                .edit_scope = entry.edit_scope,
+            };
+        }
+        self.group_drag_count = count;
+        self.group_bounds_before = geometryBounds(entries[0..count]);
+        self.group_bounds_after = self.group_bounds_before;
+        self.drag.pointer_start = pointer;
+        self.interaction = .moving;
+        self.preview = entries[0].geometry;
+        self.snap_guides = .{};
+    }
+
+    fn applyGroupPointer(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        pointer: rl.Vector2,
+        disable_snapping: bool,
+    ) void {
+        if (self.group_drag_count < 2 or self.interaction != .moving) return;
+        const raw_delta = roundVector(subtract(pointer, self.drag.pointer_start));
+        var candidate = self.group_bounds_before;
+        candidate.position = add(candidate.position, raw_delta);
+        self.snap_guides = .{};
+
+        if (!disable_snapping and (raw_delta.x != 0 or raw_delta.y != 0)) {
+            const threshold: rl.Vector2 = if (viewport.valid()) .{
+                .x = self.snap_threshold_screen * viewport.logical_size.x / viewport.slide_size.x,
+                .y = self.snap_threshold_screen * viewport.logical_size.y / viewport.slide_size.y,
+            } else .zero();
+            var excluded: [max_selection_items]usize = undefined;
+            var include_item_targets = true;
+            for (self.group_drag[0..self.group_drag_count], 0..) |member, index| {
+                excluded[index] = member.identity;
+                if (member.edit_scope == .shared_template) include_item_targets = false;
+            }
+            const snapped = snapGeometryExcluding(
+                candidate,
+                .moving,
+                viewport.logical_size,
+                threshold,
+                self.grid_snapping,
+                self.grid_spacing,
+                self.min_item_size,
+                null,
+                include_item_targets,
+                excluded[0..self.group_drag_count],
+                items,
+                resolved_bounds,
+            );
+            candidate = snapped.geometry;
+            self.snap_guides = snapped.guides;
+        }
+
+        const effective_delta = subtract(candidate.position, self.group_bounds_before.position);
+        self.group_bounds_after = candidate;
+        for (self.group_drag[0..self.group_drag_count]) |*member| {
+            const item_index = itemIndexByIdentity(items, member.identity) orelse continue;
+            member.after = member.before;
+            member.after.position = add(member.before.position, effective_delta);
+            items[item_index].position = member.after.position;
+        }
+        self.preview = self.group_drag[0].after;
+    }
+
+    fn finishGroupInteraction(self: *Studio, items: []slides.SlideItem) void {
+        var batch = GeometryBatchCommand{};
+        for (self.group_drag[0..self.group_drag_count]) |member| {
+            if (geometryEqual(member.before, member.after)) continue;
+            const item_index = itemIndexByIdentity(items, member.identity) orelse continue;
+            batch.commands[batch.count] = .{
+                .item_identity = member.identity,
+                .source = self.commandSource(items[item_index], member.edit_scope),
+                .edit_scope = member.edit_scope,
+                .before_position = member.before.position,
+                .before_size = member.before.size,
+                .after_position = member.after.position,
+                .after_size = member.after.size,
+                .resized = false,
+            };
+            batch.count += 1;
+        }
+        if (batch.count > 0) {
+            self.pending_geometry_batch = batch;
+            self.dirty = true;
+            self.copy_is_current = false;
+        } else if (self.selectedIndex(items)) |primary_index| {
+            // A plain click without a drag selects only the clicked member;
+            // a real drag preserves and moves the whole group.
+            self.setSingleSelection(items[primary_index]);
+        }
+        self.interaction = .idle;
+        self.snap_guides = .{};
+        self.group_drag_count = 0;
+    }
+
+    fn applyGroupNudge(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        delta: rl.Vector2,
+        allow_shared_edit: bool,
+    ) void {
+        var entries: [max_selection_items]SelectionGeometry = undefined;
+        const count = self.gatherSelectionGeometry(items, resolved_bounds, allow_shared_edit, &entries) orelse return;
+        if (count < 2) return;
+        var after: [max_selection_items]Geometry = undefined;
+        for (entries[0..count], 0..) |entry, index| {
+            after[index] = entry.geometry;
+            after[index].position = add(entry.geometry.position, delta);
+        }
+        self.applySelectionGeometryBatch(items, entries[0..count], after[0..count]);
+    }
+
     fn beginInteraction(
         self: *Studio,
         interaction: Interaction,
@@ -2223,6 +2857,7 @@ pub const Studio = struct {
         edit_scope: EditScope,
     ) void {
         self.interaction = interaction;
+        self.group_drag_count = 0;
         self.snap_guides = .{};
         self.drag = .{
             .pointer_start = pointer,
@@ -2299,6 +2934,7 @@ pub const Studio = struct {
     fn finishInteraction(self: *Studio, items: []slides.SlideItem) ?GeometryCommand {
         const interaction = self.interaction;
         self.interaction = .idle;
+        self.group_drag_count = 0;
         self.snap_guides = .{};
         const identity = self.selected_identity orelse return null;
         const index = itemIndexByIdentity(items, identity) orelse return null;
@@ -2319,8 +2955,17 @@ pub const Studio = struct {
     }
 
     fn cancelInteraction(self: *Studio, items: []slides.SlideItem) void {
-        if (self.selectedIndex(items)) |index| self.restoreBefore(&items[index]);
+        if (self.group_drag_count > 1) {
+            for (self.group_drag[0..self.group_drag_count]) |member| {
+                const item_index = itemIndexByIdentity(items, member.identity) orelse continue;
+                items[item_index].position = member.authored_before.position;
+                items[item_index].size = member.authored_before.size;
+            }
+        } else if (self.selectedIndex(items)) |index| {
+            self.restoreBefore(&items[index]);
+        }
         self.interaction = .idle;
+        self.group_drag_count = 0;
         self.snap_guides = .{};
     }
 
@@ -2363,6 +3008,10 @@ pub const Studio = struct {
         action: AlignAction,
         allow_shared_edit: bool,
     ) ?GeometryCommand {
+        if (self.selectionCount() > 1) {
+            self.alignGroupSelected(items, resolved_bounds, action, allow_shared_edit);
+            return null;
+        }
         const index = self.selectedIndex(items) orelse return null;
         if (self.interaction != .idle) self.cancelInteraction(items);
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return null;
@@ -2392,6 +3041,118 @@ pub const Studio = struct {
         };
     }
 
+    fn alignGroupSelected(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        action: AlignAction,
+        allow_shared_edit: bool,
+    ) void {
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        var entries: [max_selection_items]SelectionGeometry = undefined;
+        const count = self.gatherSelectionGeometry(items, resolved_bounds, allow_shared_edit, &entries) orelse return;
+        if (count < 2) return;
+        const bounds = geometryBounds(entries[0..count]);
+        var after: [max_selection_items]Geometry = undefined;
+        for (entries[0..count], 0..) |entry, index| {
+            after[index] = entry.geometry;
+            switch (action) {
+                .left => after[index].position.x = bounds.position.x,
+                .horizontal_center => after[index].position.x = bounds.position.x + (bounds.size.x - entry.geometry.size.x) / 2,
+                .right => after[index].position.x = bounds.position.x + bounds.size.x - entry.geometry.size.x,
+                .top => after[index].position.y = bounds.position.y,
+                .vertical_center => after[index].position.y = bounds.position.y + (bounds.size.y - entry.geometry.size.y) / 2,
+                .bottom => after[index].position.y = bounds.position.y + bounds.size.y - entry.geometry.size.y,
+            }
+        }
+        self.applySelectionGeometryBatch(items, entries[0..count], after[0..count]);
+    }
+
+    fn distributeSelected(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        action: DistributionAction,
+        allow_shared_edit: bool,
+    ) void {
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        if (self.selectionCount() < 3) {
+            self.notice = .distribution_needs_three;
+            return;
+        }
+        var entries: [max_selection_items]SelectionGeometry = undefined;
+        const count = self.gatherSelectionGeometry(items, resolved_bounds, allow_shared_edit, &entries) orelse return;
+        if (count < 3) {
+            self.notice = .distribution_needs_three;
+            return;
+        }
+        const bounds = geometryBounds(entries[0..count]);
+        var order: [max_selection_items]usize = undefined;
+        var after: [max_selection_items]Geometry = undefined;
+        for (entries[0..count], 0..) |entry, index| {
+            order[index] = index;
+            after[index] = entry.geometry;
+        }
+        var index: usize = 1;
+        while (index < count) : (index += 1) {
+            const value = order[index];
+            var insertion = index;
+            while (insertion > 0) {
+                const previous = order[insertion - 1];
+                if (!distributionBefore(entries[value], entries[previous], action)) break;
+                order[insertion] = previous;
+                insertion -= 1;
+            }
+            order[insertion] = value;
+        }
+
+        var total_extent: f32 = 0;
+        for (entries[0..count]) |entry| {
+            total_extent += switch (action) {
+                .horizontal => entry.geometry.size.x,
+                .vertical => entry.geometry.size.y,
+            };
+        }
+        const available_extent = switch (action) {
+            .horizontal => bounds.size.x,
+            .vertical => bounds.size.y,
+        };
+        const gap = (available_extent - total_extent) / @as(f32, @floatFromInt(count - 1));
+        var cursor = switch (action) {
+            .horizontal => bounds.position.x,
+            .vertical => bounds.position.y,
+        };
+        for (order[0..count], 0..) |entry_index, ordinal| {
+            switch (action) {
+                .horizontal => {
+                    after[entry_index].position.x = if (ordinal + 1 == count)
+                        bounds.position.x + bounds.size.x - entries[entry_index].geometry.size.x
+                    else
+                        cursor;
+                    cursor += entries[entry_index].geometry.size.x + gap;
+                },
+                .vertical => {
+                    after[entry_index].position.y = if (ordinal + 1 == count)
+                        bounds.position.y + bounds.size.y - entries[entry_index].geometry.size.y
+                    else
+                        cursor;
+                    cursor += entries[entry_index].geometry.size.y + gap;
+                },
+            }
+        }
+        self.applySelectionGeometryBatch(items, entries[0..count], after[0..count]);
+    }
+
+    fn distributionBefore(a: SelectionGeometry, b: SelectionGeometry, action: DistributionAction) bool {
+        const primary_a = if (action == .horizontal) a.geometry.position.x else a.geometry.position.y;
+        const primary_b = if (action == .horizontal) b.geometry.position.x else b.geometry.position.y;
+        if (primary_a != primary_b) return primary_a < primary_b;
+        const secondary_a = if (action == .horizontal) a.geometry.position.y else a.geometry.position.x;
+        const secondary_b = if (action == .horizontal) b.geometry.position.y else b.geometry.position.x;
+        if (secondary_a != secondary_b) return secondary_a < secondary_b;
+        return a.identity < b.identity;
+    }
+
     /// Draw after the slide itself. While dragging, the original bounds remain
     /// visible as a subdued outline and the live geometry gets the accent.
     pub fn draw(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
@@ -2401,8 +3162,17 @@ pub const Studio = struct {
 
         if (self.interaction != .idle) {
             self.drawSnapGuides(viewport);
-            if (geometryToScreenRect(viewport, self.drag.before)) |original| {
+            const original_geometry = if (self.group_drag_count > 1) self.group_bounds_before else self.drag.before;
+            if (geometryToScreenRect(viewport, original_geometry)) |original| {
                 rl.drawRectangleLinesEx(original, 1, .{ .r = 255, .g = 255, .b = 255, .a = 105 });
+            }
+        }
+
+        for (self.additional_selection[0..self.additional_selection_count]) |member| {
+            const item_index = itemIndexByIdentity(items, member.identity) orelse continue;
+            const geometry = itemGeometry(items[item_index], resolved_bounds);
+            if (geometryToScreenRect(viewport, geometry)) |rect| {
+                rl.drawRectangleLinesEx(rect, 2, .{ .r = 80, .g = 215, .b = 255, .a = 190 });
             }
         }
 
@@ -2420,14 +3190,24 @@ pub const Studio = struct {
                     .{ .r = 80, .g = 215, .b = 255, .a = 255 };
                 rl.drawRectangleLinesEx(rect, 3, accent);
                 if (selected_index) |index| {
-                    if (self.itemEditableInScene(items[index])) {
+                    if (self.selectionCount() == 1 and self.itemEditableInScene(items[index])) {
                         if (self.resizeHandleRect(viewport, geometry)) |handle| {
                             rl.drawRectangleRec(handle, accent);
                             rl.drawRectangleLinesEx(handle, 1, .white);
                         }
                     }
                 }
-                if (self.interaction != .idle) self.drawGeometryHud(viewport, rect, geometry);
+                if (self.interaction != .idle and self.group_drag_count <= 1) self.drawGeometryHud(viewport, rect, geometry);
+            }
+        }
+
+        if (self.selectionCount() > 1) {
+            const bounds = if (self.group_drag_count > 1) self.group_bounds_after else self.selectedBounds(items, resolved_bounds);
+            if (bounds) |geometry| {
+                if (geometryToScreenRect(viewport, geometry)) |rect| {
+                    rl.drawRectangleLinesEx(rect, 2, .{ .r = 255, .g = 92, .b = 198, .a = 220 });
+                    if (self.interaction != .idle) self.drawGeometryHud(viewport, rect, geometry);
+                }
             }
         }
 
@@ -2702,7 +3482,7 @@ pub const Studio = struct {
         drawActionButton(layout.scene_next, ">");
     }
 
-    fn drawProperties(_: Studio, viewport: Viewport) void {
+    fn drawProperties(self: Studio, viewport: Viewport) void {
         const layout = uiLayout(viewport);
         drawStudioPanel(layout.properties);
         rl.drawText("PROPERTIES", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 11), 15, .white);
@@ -2714,9 +3494,18 @@ pub const Studio = struct {
         drawSwatches(layout.foreground_swatches);
         rl.drawText("BACKGROUND", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 146), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
         drawSwatches(layout.background_swatches);
-        rl.drawText("ALIGN TO SLIDE", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 210), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+        rl.drawText(
+            if (self.selectionCount() > 1) "ALIGN TO SELECTION" else "ALIGN TO SLIDE",
+            @intFromFloat(layout.properties.x + 12),
+            @intFromFloat(layout.properties.y + 210),
+            12,
+            .{ .r = 185, .g = 196, .b = 215, .a = 255 },
+        );
         const align_labels = [_][:0]const u8{ "L", "HC", "R", "T", "VC", "B" };
         for (layout.align_buttons, align_labels) |button, label| drawCompactButton(button, label);
+        rl.drawText("DISTRIBUTE", @intFromFloat(layout.properties.x + 12), @intFromFloat(layout.properties.y + 266), 12, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+        const distribute_labels = [_][:0]const u8{ "H EQUAL GAP", "V EQUAL GAP" };
+        for (layout.distribute_buttons, distribute_labels) |button, label| drawCompactButton(button, label);
     }
 
     fn drawStatus(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
@@ -2726,14 +3515,21 @@ pub const Studio = struct {
 
         var status_buffer: [512]u8 = undefined;
         const status_text = if (self.selected_identity) |identity| selected: {
-            const geometry = self.selectedGeometry(items, resolved_bounds) orelse break :selected "STUDIO · selection unavailable";
+            const geometry = if (self.selectionCount() > 1)
+                self.selectedBounds(items, resolved_bounds) orelse break :selected "STUDIO · selection unavailable"
+            else
+                self.selectedGeometry(items, resolved_bounds) orelse break :selected "STUDIO · selection unavailable";
             const index = self.selectedIndex(items) orelse break :selected "STUDIO · selection unavailable";
             const item = items[index];
             const source = if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource();
+            const destination_label = if (self.selectionCount() > 1)
+                self.groupDestinationLabel()
+            else
+                self.editDestinationLabel(item);
             break :selected std.fmt.bufPrintZ(
                 &status_buffer,
-                "STUDIO{s} · item #{d} · {s}, line {d} · x {d:.0} y {d:.0} w {d:.0} h {d:.0}",
-                .{ if (self.dirty) " *" else "", identity, self.editDestinationLabel(item), source.line_number, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
+                "STUDIO{s} · {d} selected · primary #{d} · {s}, line {d} · x {d:.0} y {d:.0} w {d:.0} h {d:.0}",
+                .{ if (self.dirty) " *" else "", self.selectionCount(), identity, destination_label, source.line_number, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
             ) catch "STUDIO · selected item";
         } else if (self.dirty) "STUDIO * · click an item to select it" else "STUDIO · click an item to select it";
 
@@ -2767,6 +3563,9 @@ pub const Studio = struct {
             .shared_template_delete_unsupported => "Shared template deletion needs dependency cleanup and is not available yet",
             .local_override_needs_unique_id => "Add a unique id=... to create a local override; Alt edits an uncustomized shared item",
             .duplicate_item_unsupported => "Duplicate is not source-safe here; use a direct item, current-state birth, or Alt on an uncustomized template",
+            .multi_selection_property_unsupported => "That property is single-item only; align, distribute, move, or nudge the selection",
+            .selection_capacity_reached => "Selection is limited to 64 items; the remaining items were left unselected",
+            .distribution_needs_three => "Equal-gap distribution needs at least three selected items",
             .template_background_local_unsupported => "Background insertion cannot be local to a template instance; hold Alt to edit the shared template",
             .generated_source_read_only => "Read-only in Studio: this item directive is produced with @let",
             .property_unavailable => "That property does not apply to this kind of item",
@@ -2925,6 +3724,22 @@ fn testItem(identity: usize, kind: slides.SlideItemKind, x: f32, y: f32, w: f32,
 fn expectVector(expected: rl.Vector2, actual: rl.Vector2) !void {
     try std.testing.expectApproxEqAbs(expected.x, actual.x, 0.0001);
     try std.testing.expectApproxEqAbs(expected.y, actual.y, 0.0001);
+}
+
+fn setTestSelection(studio: *Studio, items: []const slides.SlideItem, identities: []const usize) void {
+    studio.clearSelectionState();
+    if (identities.len == 0) return;
+    const primary_index = itemIndexByIdentity(items, identities[0]) orelse unreachable;
+    studio.setSingleSelection(items[primary_index]);
+    studio.selected_source = null;
+    for (identities[1..]) |identity| {
+        _ = itemIndexByIdentity(items, identity) orelse unreachable;
+        studio.additional_selection[studio.additional_selection_count] = .{
+            .identity = identity,
+            .source = null,
+        };
+        studio.additional_selection_count += 1;
+    }
 }
 
 test "smart snapping aligns moving edges and centers with deterministic guides" {
@@ -3380,6 +4195,465 @@ test "all align actions emit exact slide-relative geometry for resolved bounds" 
         try std.testing.expectEqual(EditScope.direct, command.edit_scope);
         try expectVector(expected_position, items[0].position);
     }
+}
+
+test "Shift click toggles membership and keeps the last added item primary" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+        testItem(3, .textbox, 500, 300, 100, 80),
+    };
+    for (&items, 0..) |*item, index| item.source.line_offset = (index + 1) * 10;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_released = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 1), studio.selectedIdentityAt(0));
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 320, .y = 320 },
+        .pointer_pressed = true,
+        .toggle_selection = true,
+    });
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 2), studio.selectedIdentityAt(0));
+    try std.testing.expectEqual(@as(?usize, 1), studio.selectedIdentityAt(1));
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 520, .y = 320 },
+        .pointer_pressed = true,
+        .toggle_selection = true,
+    });
+    try std.testing.expectEqual(@as(usize, 3), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 3), studio.selectedIdentityAt(0));
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 320, .y = 320 },
+        .pointer_pressed = true,
+        .toggle_selection = true,
+    });
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+    try std.testing.expect(!studio.isIdentitySelected(2));
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_released = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), studio.selectionCount());
+    try std.testing.expectEqual(@as(?usize, 1), studio.selectedIdentityAt(0));
+}
+
+test "select all filters the scene and reports the fixed selection capacity" {
+    var items: [66]slides.SlideItem = undefined;
+    for (&items, 0..) |*item, index| {
+        item.* = testItem(index + 1, .textbox, @floatFromInt(index * 20), 300, 10, 10);
+        item.source.line_offset = index + 1;
+    }
+    items[65].visible = false;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .select_all_pressed = true });
+    try std.testing.expectEqual(max_selection_items, studio.selectionCount());
+    try std.testing.expectEqual(Notice.selection_capacity_reached, studio.notice);
+    try std.testing.expectEqual(@as(?usize, 65), studio.selectedIdentityAt(0));
+    try std.testing.expect(!studio.isIdentitySelected(64));
+    try std.testing.expect(!studio.isIdentitySelected(66));
+    studio.toggleSelectionAt(&items, &.{}, viewport, .{ .x = 1265, .y = 305 }, .{ .x = 1265, .y = 305 });
+    try std.testing.expectEqual(max_selection_items, studio.selectionCount());
+    try std.testing.expect(!studio.isIdentitySelected(64));
+    try std.testing.expectEqual(Notice.selection_capacity_reached, studio.notice);
+}
+
+test "group nudge queues one primary-first atomic geometry batch" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 400, 120, 90),
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 2, 1 });
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 5, .y = -2 } }) == null);
+    try std.testing.expectEqual(@as(usize, 2), studio.peekGeometryBatch().?.count);
+    const batch = studio.takeGeometryBatch().?;
+    try std.testing.expectEqual(@as(usize, 2), batch.count);
+    try std.testing.expectEqual(@as(usize, 2), batch.commands[0].item_identity);
+    try std.testing.expectEqual(@as(usize, 1), batch.commands[1].item_identity);
+    try expectVector(.{ .x = 305, .y = 398 }, batch.commands[0].after_position);
+    try expectVector(.{ .x = 105, .y = 298 }, batch.commands[1].after_position);
+    try std.testing.expectEqual(EditScope.direct, batch.commands[0].edit_scope);
+    try std.testing.expect(studio.takeGeometryBatch() == null);
+}
+
+test "group move previews every member and release queues only the batch" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 400, 120, 90),
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 2, 1 });
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 170, .y = 340 },
+        .pointer_down = true,
+        .disable_snapping = true,
+    });
+    try std.testing.expectEqual(Interaction.moving, studio.interaction);
+    const primary_preview = studio.livePreviewAt(0).?;
+    const other_preview = studio.livePreviewAt(1).?;
+    try std.testing.expectEqual(@as(usize, 1), primary_preview.item_identity);
+    try std.testing.expectEqual(@as(usize, 2), other_preview.item_identity);
+    try expectVector(.{ .x = 150, .y = 320 }, primary_preview.after.position);
+    try expectVector(.{ .x = 350, .y = 420 }, other_preview.after.position);
+    try std.testing.expect(studio.livePreviewAt(2) == null);
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 170, .y = 340 },
+        .pointer_released = true,
+        .disable_snapping = true,
+    }) == null);
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    const batch = studio.takeGeometryBatch().?;
+    try std.testing.expectEqual(@as(usize, 2), batch.count);
+    try std.testing.expectEqual(@as(usize, 1), batch.commands[0].item_identity);
+    try std.testing.expectEqual(@as(usize, 2), batch.commands[1].item_identity);
+}
+
+test "group snap uses union bounds and excludes every selected member" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+        testItem(3, .textbox, 600, 700, 100, 80),
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 1, 2 });
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 125, .y = 320 },
+        .pointer_down = true,
+    });
+    try expectVector(.{ .x = 105, .y = 300 }, items[0].position);
+    try expectVector(.{ .x = 305, .y = 300 }, items[1].position);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 314, .y = 320 },
+        .pointer_down = true,
+    });
+    try expectVector(.{ .x = 300, .y = 300 }, items[0].position);
+    try expectVector(.{ .x = 500, .y = 300 }, items[1].position);
+    try std.testing.expectEqual(@as(?f32, 600), studio.liveSnapGuides().?.vertical);
+}
+
+test "group cancel restores every authored position and emits no batch" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .img, 300, 400, 0, 0),
+    };
+    const bounds = [_]ResolvedBounds{.{
+        .identity = 2,
+        .position = .{ .x = 300, .y = 400 },
+        .size = .{ .x = 120, .y = 90 },
+    }};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 2, 1 });
+
+    _ = studio.update(&items, &bounds, viewport, .{
+        .pointer_screen = .{ .x = 320, .y = 420 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = studio.update(&items, &bounds, viewport, .{
+        .pointer_screen = .{ .x = 370, .y = 450 },
+        .pointer_down = true,
+        .disable_snapping = true,
+    });
+    try expectVector(.{ .x = 350, .y = 430 }, items[1].position);
+    _ = studio.update(&items, &bounds, viewport, .{ .cancel_pressed = true });
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try expectVector(.{ .x = 100, .y = 300 }, items[0].position);
+    try expectVector(.{ .x = 300, .y = 400 }, items[1].position);
+    try expectVector(.zero(), items[1].size);
+    try std.testing.expect(studio.takeGeometryBatch() == null);
+    try std.testing.expectEqual(@as(usize, 2), studio.selectionCount());
+}
+
+test "multi-selection align modes target the original selection bounds" {
+    const original = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 100, 100, 50),
+        testItem(2, .textbox, 300, 200, 200, 100),
+        testItem(3, .textbox, 600, 400, 50, 150),
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const actions = [_]AlignAction{ .left, .horizontal_center, .right, .top, .vertical_center, .bottom };
+    const expected = [6][3]rl.Vector2{
+        .{ .{ .x = 100, .y = 100 }, .{ .x = 100, .y = 200 }, .{ .x = 100, .y = 400 } },
+        .{ .{ .x = 325, .y = 100 }, .{ .x = 275, .y = 200 }, .{ .x = 350, .y = 400 } },
+        .{ .{ .x = 550, .y = 100 }, .{ .x = 450, .y = 200 }, .{ .x = 600, .y = 400 } },
+        .{ .{ .x = 100, .y = 100 }, .{ .x = 300, .y = 100 }, .{ .x = 600, .y = 100 } },
+        .{ .{ .x = 100, .y = 300 }, .{ .x = 300, .y = 275 }, .{ .x = 600, .y = 250 } },
+        .{ .{ .x = 100, .y = 500 }, .{ .x = 300, .y = 450 }, .{ .x = 600, .y = 400 } },
+    };
+
+    for (actions, expected) |action, expected_positions| {
+        var items = original;
+        var studio: Studio = .{ .enabled = true };
+        setTestSelection(&studio, &items, &.{ 2, 1, 3 });
+        try std.testing.expect(studio.update(&items, &.{}, viewport, .{ .align_action = action }) == null);
+        for (items, expected_positions) |item, expected_position| try expectVector(expected_position, item.position);
+        try std.testing.expect(studio.takeGeometryBatch() != null);
+    }
+}
+
+test "equal-gap distribution sorts geometrically and preserves fractional outer bounds" {
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var horizontal_items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 50, 100, 40),
+        testItem(2, .textbox, 260, 200, 75, 75),
+        testItem(3, .textbox, 600, 500, 50, 50),
+    };
+    var horizontal: Studio = .{ .enabled = true };
+    setTestSelection(&horizontal, &horizontal_items, &.{ 3, 1, 2 });
+    _ = horizontal.update(&horizontal_items, &.{}, viewport, .{ .distribute_action = .horizontal });
+    try std.testing.expectApproxEqAbs(@as(f32, 100), horizontal_items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 362.5), horizontal_items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 600), horizontal_items[2].position.x, 0.0001);
+    try std.testing.expect(horizontal.takeGeometryBatch() != null);
+
+    var vertical_items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 50, 100, 40),
+        testItem(2, .textbox, 260, 200, 75, 75),
+        testItem(3, .textbox, 600, 500, 50, 50),
+    };
+    var vertical: Studio = .{ .enabled = true };
+    setTestSelection(&vertical, &vertical_items, &.{ 3, 1, 2 });
+    _ = vertical.update(&vertical_items, &.{}, viewport, .{ .distribute_action = .vertical });
+    try std.testing.expectApproxEqAbs(@as(f32, 50), vertical_items[0].position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 257.5), vertical_items[1].position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), vertical_items[2].position.y, 0.0001);
+    try std.testing.expect(vertical.takeGeometryBatch() != null);
+}
+
+test "distribution tie breaks are selection-order independent and negative gaps are exact" {
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var tied_items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 50, 40),
+        testItem(2, .textbox, 100, 100, 50, 40),
+        testItem(3, .textbox, 400, 200, 50, 40),
+    };
+    var tied: Studio = .{ .enabled = true };
+    setTestSelection(&tied, &tied_items, &.{ 1, 3, 2 });
+    _ = tied.update(&tied_items, &.{}, viewport, .{ .distribute_action = .horizontal });
+    try std.testing.expectApproxEqAbs(@as(f32, 250), tied_items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), tied_items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), tied_items[2].position.x, 0.0001);
+
+    var overlapping_items = [_]slides.SlideItem{
+        testItem(1, .textbox, 0, 100, 100, 40),
+        testItem(2, .textbox, 20, 200, 100, 40),
+        testItem(3, .textbox, 50, 300, 100, 40),
+    };
+    var overlapping: Studio = .{ .enabled = true };
+    setTestSelection(&overlapping, &overlapping_items, &.{ 2, 3, 1 });
+    _ = overlapping.update(&overlapping_items, &.{}, viewport, .{ .distribute_action = .horizontal });
+    try std.testing.expectApproxEqAbs(@as(f32, 0), overlapping_items[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 25), overlapping_items[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), overlapping_items[2].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 150), overlapping_items[2].position.x + overlapping_items[2].size.x, 0.0001);
+}
+
+test "distribution requires three selected items and leaves geometry untouched" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 1, 2 });
+    _ = studio.update(&items, &.{}, viewport, .{ .distribute_action = .horizontal });
+    try std.testing.expectEqual(Notice.distribution_needs_three, studio.notice);
+    try std.testing.expect(studio.takeGeometryBatch() == null);
+    try expectVector(.{ .x = 100, .y = 300 }, items[0].position);
+    try expectVector(.{ .x = 300, .y = 300 }, items[1].position);
+}
+
+test "mixed unsafe selection refuses atomically before preview mutation" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+    };
+    items[1].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 90, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 1, 2 });
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try std.testing.expectEqual(Notice.local_override_needs_unique_id, studio.notice);
+    try expectVector(.{ .x = 100, .y = 300 }, items[0].position);
+    try expectVector(.{ .x = 300, .y = 300 }, items[1].position);
+    try std.testing.expect(studio.livePreviewAt(0) == null);
+    try std.testing.expect(studio.takeGeometryBatch() == null);
+
+    _ = studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 10, .y = 0 } });
+    try expectVector(.{ .x = 100, .y = 300 }, items[0].position);
+    try expectVector(.{ .x = 300, .y = 300 }, items[1].position);
+    try std.testing.expect(studio.takeGeometryBatch() == null);
+}
+
+test "any shared-template group member disables instance object guides" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+        testItem(3, .textbox, 500, 700, 100, 80),
+    };
+    items[1].source = .{ .scope = .slide_template, .line_number = 9, .line_offset = 90, .patchable = true };
+    items[1].id = "shared";
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+
+    var local: Studio = .{ .enabled = true };
+    setTestSelection(&local, &items, &.{ 1, 2 });
+    _ = local.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    _ = local.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 214, .y = 320 },
+        .pointer_down = true,
+    });
+    try expectVector(.{ .x = 200, .y = 300 }, items[0].position);
+    local.cancelActiveInteraction(&items);
+
+    var shared: Studio = .{ .enabled = true };
+    setTestSelection(&shared, &items, &.{ 1, 2 });
+    _ = shared.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 120, .y = 320 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .allow_shared_edit = true,
+    });
+    _ = shared.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 214, .y = 320 },
+        .pointer_down = true,
+    });
+    try expectVector(.{ .x = 194, .y = 300 }, items[0].position);
+    try std.testing.expect(shared.liveSnapGuides().?.vertical == null);
+    _ = shared.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 214, .y = 320 },
+        .pointer_released = true,
+    });
+    const shared_batch = shared.takeGeometryBatch().?;
+    try std.testing.expectEqual(EditScope.direct, shared_batch.commands[0].edit_scope);
+    try std.testing.expectEqual(EditScope.shared_template, shared_batch.commands[1].edit_scope);
+}
+
+test "multi-selection semantic properties are refused without targeting primary" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 1, 2 });
+
+    _ = studio.update(&items, &.{}, viewport, .{ .edit_text_pressed = true });
+    try std.testing.expectEqual(Notice.multi_selection_property_unsupported, studio.notice);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    _ = studio.update(&items, &.{}, viewport, .{ .duplicate_slide_pressed = true });
+    try std.testing.expectEqual(Notice.multi_selection_property_unsupported, studio.notice);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "multi-selection rebinds primary and members by source after reparse" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 300, 100, 80),
+        testItem(2, .textbox, 300, 300, 100, 80),
+    };
+    items[0].source.line_offset = 10;
+    items[1].source.line_offset = 20;
+    var studio: Studio = .{ .enabled = true };
+    studio.setSingleSelection(items[1]);
+    studio.additional_selection[0] = .{ .identity = 1, .source = items[0].source };
+    studio.additional_selection_count = 1;
+
+    items[0].identity = 101;
+    items[1].identity = 202;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    _ = studio.update(&items, &.{}, viewport, .{});
+    try std.testing.expectEqual(@as(?usize, 202), studio.selectedIdentityAt(0));
+    try std.testing.expectEqual(@as(?usize, 101), studio.selectedIdentityAt(1));
+}
+
+test "Shift on a single resize handle starts aspect resize instead of toggling selection" {
+    var items = [_]slides.SlideItem{testItem(1, .textbox, 100, 100, 200, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 1 };
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 300, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .toggle_selection = true,
+        .lock_aspect_ratio = true,
+    });
+    try std.testing.expectEqual(Interaction.resizing, studio.interaction);
+    try std.testing.expectEqual(@as(usize, 1), studio.selectionCount());
+    const command = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 400, .y = 220 },
+        .pointer_released = true,
+        .toggle_selection = true,
+        .lock_aspect_ratio = true,
+        .disable_snapping = true,
+    }).?;
+    try expectVector(.{ .x = 300, .y = 150 }, command.after_size);
+}
+
+test "multi-selection primary handle starts a group move and never resizes" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 100, 100, 200, 100),
+        testItem(2, .textbox, 500, 300, 100, 80),
+    };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true };
+    setTestSelection(&studio, &items, &.{ 1, 2 });
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 300, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(Interaction.moving, studio.interaction);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 350, .y = 220 },
+        .pointer_released = true,
+        .disable_snapping = true,
+    });
+    try expectVector(.{ .x = 200, .y = 100 }, items[0].size);
+    try expectVector(.{ .x = 100, .y = 80 }, items[1].size);
+    const batch = studio.takeGeometryBatch().?;
+    for (batch.slice()) |command| try std.testing.expect(!command.resized);
 }
 
 test "coordinate conversion round trips through a letterboxed viewport" {
