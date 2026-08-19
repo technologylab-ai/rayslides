@@ -99,6 +99,15 @@ its tools, docks, Properties, layer controls, slide organizer, Library, and
 morph timeline. The tooltips and pointer shapes disappear during gestures and
 text entry, keeping the canvas calm while actively editing.
 
+Studio's precision view is entirely editor-side: use **Commands** to toggle
+calibrated rulers, 5% action-safe and 10% title-safe guides, or live dimensions
+and edge distances for the current selection. <kbd>Cmd/Ctrl</kbd>-wheel zooms
+around the pointer, plain wheel or trackpad input pans, and Space-drag or a
+middle-button drag moves the canvas directly. <kbd>Cmd/Ctrl</kbd>-<kbd>0</kbd>
+fits and recenters the complete slide. The view is constrained so the slide
+cannot be lost offscreen, while presentation, screenshots, PDF export, source,
+history, and saved files remain unaffected.
+
 The right inspector opens on **Objects**, a front-to-back paint-order list for
 the active base or morph scene. It includes hidden, fully transparent, and
 locked objects so they remain recoverable when canvas hit-testing cannot reach
@@ -230,6 +239,9 @@ limits.
 which makes compact/default/large screenshot regression checks deterministic.
 `--diagnostics-command-tooltip` similarly holds the Commands hover card open
 for deterministic typography and containment QA across macOS Spaces.
+`--diagnostics-precision-view` enables rulers, both safe areas, measurements,
+and a 110% canvas view for deterministic precision-surface QA; pair it with
+`--diagnostics-select=ID` to measure a specific authored object.
 
 Studio edits the `.sld` document rather than maintaining a separate opaque
 scene. It changes only the source owned by the selected object and preserves
@@ -269,6 +281,11 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
 | <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |
 | <kbd>G</kbd> | Toggle grid display and grid snapping |
+| <kbd>Cmd/Ctrl</kbd> + mouse wheel | Zoom the canvas around the pointer |
+| Mouse wheel / trackpad scroll | Pan the canvas |
+| Space + drag / middle-button drag | Pan the canvas directly |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>+</kbd> / <kbd>-</kbd> | Zoom in / out around the canvas center |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>0</kbd> | Fit and recenter the complete slide |
 | <kbd>Tab</kbd> | Toggle Focus Canvas without leaving Studio |
 | Hold <kbd>Shift</kbd> while resizing | Preserve the object's aspect ratio |
 | Hold <kbd>Cmd/Ctrl</kbd> while dragging | Temporarily bypass smart guides and grid snapping |

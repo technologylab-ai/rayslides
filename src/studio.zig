@@ -26,6 +26,10 @@ pub const default_snap_threshold_screen: f32 = 8;
 pub const default_grid_spacing: f32 = 20;
 pub const marquee_drag_threshold_screen: f32 = 3;
 pub const max_selection_items: usize = 64;
+pub const minimum_canvas_zoom: f32 = 0.5;
+pub const maximum_canvas_zoom: f32 = 8;
+pub const canvas_zoom_step: f32 = 1.25;
+pub const ruler_thickness: f32 = 28;
 
 /// Studio typography has a deliberate 14 px floor at the reference 1280x720
 /// viewport. Controls scale up to 2x on large/full-screen displays, but never
@@ -220,6 +224,10 @@ pub const Viewport = struct {
     slide_top_left: rl.Vector2,
     slide_size: rl.Vector2,
     logical_size: rl.Vector2 = default_logical_size,
+    /// The clipped editor canvas may be larger than the slide at low zoom and
+    /// smaller than it at high zoom. Null preserves the original slide-bounds
+    /// behavior for presentation and lightweight embedders.
+    canvas_area: ?rl.Rectangle = null,
     /// Null preserves the legacy overlay layout for embedders that have not
     /// adopted the docked frame API yet.
     chrome: ?ChromeLayout = null,
@@ -235,6 +243,15 @@ pub const Viewport = struct {
             point.y >= self.slide_top_left.y and
             point.x <= self.slide_top_left.x + self.slide_size.x and
             point.y <= self.slide_top_left.y + self.slide_size.y;
+    }
+
+    pub fn canvasBounds(self: Viewport) rl.Rectangle {
+        return self.canvas_area orelse .{
+            .x = self.slide_top_left.x,
+            .y = self.slide_top_left.y,
+            .width = self.slide_size.x,
+            .height = self.slide_size.y,
+        };
     }
 };
 
@@ -303,6 +320,7 @@ pub fn frameLayout(
         var viewport = fitSlideViewport(canvas_area);
         const chrome: ChromeLayout = .{ .content = safe_content, .scale = scale };
         viewport.chrome = chrome;
+        viewport.canvas_area = canvas_area;
         return .{
             .mode = .focus,
             .chrome = chrome,
@@ -390,12 +408,67 @@ pub fn frameLayout(
     };
     var viewport = fitSlideViewport(canvas_area);
     viewport.chrome = chrome;
+    viewport.canvas_area = canvas_area;
     return .{
         .mode = mode,
         .chrome = chrome,
         .canvas_area = canvas_area,
         .viewport = viewport,
     };
+}
+
+fn clampCanvasCenter(
+    center: rl.Vector2,
+    logical_size: rl.Vector2,
+    slide_size: rl.Vector2,
+    canvas: rl.Rectangle,
+) rl.Vector2 {
+    var result = center;
+    const minimum_visible_screen: f32 = 64;
+    if (slide_size.x <= 0) {
+        result.x = logical_size.x / 2;
+    } else {
+        const visible = @min(minimum_visible_screen, @min(canvas.width, slide_size.x));
+        result.x = std.math.clamp(
+            result.x,
+            (visible - canvas.width / 2) * logical_size.x / slide_size.x,
+            (canvas.width / 2 + slide_size.x - visible) * logical_size.x / slide_size.x,
+        );
+    }
+    if (slide_size.y <= 0) {
+        result.y = logical_size.y / 2;
+    } else {
+        const visible = @min(minimum_visible_screen, @min(canvas.height, slide_size.y));
+        result.y = std.math.clamp(
+            result.y,
+            (visible - canvas.height / 2) * logical_size.y / slide_size.y,
+            (canvas.height / 2 + slide_size.y - visible) * logical_size.y / slide_size.y,
+        );
+    }
+    return result;
+}
+
+fn inputCanvasCenter(viewport: Viewport) rl.Vector2 {
+    const canvas = viewport.canvasBounds();
+    return .{ .x = canvas.x + canvas.width / 2, .y = canvas.y + canvas.height / 2 };
+}
+
+/// Applies Studio's transient view camera to an already fitted viewport.
+/// Logical slide coordinates never change, so this cannot affect source,
+/// history, snapping, export, or renderer-authored bounds.
+pub fn applyCanvasCamera(base: Viewport, zoom: f32, requested_center: rl.Vector2) Viewport {
+    if (!base.valid()) return base;
+    var result = base;
+    const safe_zoom = std.math.clamp(zoom, minimum_canvas_zoom, maximum_canvas_zoom);
+    result.slide_size = .{ .x = base.slide_size.x * safe_zoom, .y = base.slide_size.y * safe_zoom };
+    const canvas = base.canvasBounds();
+    const center = clampCanvasCenter(requested_center, base.logical_size, result.slide_size, canvas);
+    const canvas_center: rl.Vector2 = .{ .x = canvas.x + canvas.width / 2, .y = canvas.y + canvas.height / 2 };
+    result.slide_top_left = .{
+        .x = canvas_center.x - center.x * result.slide_size.x / result.logical_size.x,
+        .y = canvas_center.y - center.y * result.slide_size.y / result.logical_size.y,
+    };
+    return result;
 }
 
 pub fn logicalToScreen(viewport: Viewport, point: rl.Vector2) ?rl.Vector2 {
@@ -2297,6 +2370,12 @@ pub const CommandId = enum {
     duplicate_slide,
     delete_slide,
     toggle_grid,
+    toggle_rulers,
+    toggle_safe_areas,
+    toggle_measurements,
+    zoom_in,
+    zoom_out,
+    fit_view,
     focus_canvas,
     show_slides,
     show_objects,
@@ -2340,6 +2419,12 @@ const command_specs = [_]CommandSpec{
     .{ .id = .duplicate_slide, .category = "SLIDES", .title = "Duplicate slide", .description = "Duplicate the current complete slide", .keywords = "copy page deck", .shortcut = "Cmd/Ctrl D" },
     .{ .id = .delete_slide, .category = "SLIDES", .title = "Delete slide", .description = "Remove the current slide atomically", .keywords = "remove page deck", .shortcut = "Cmd/Ctrl Backspace" },
     .{ .id = .toggle_grid, .category = "VIEW", .title = "Toggle grid", .description = "Show or hide the snapping grid", .keywords = "guides snap view", .shortcut = "G" },
+    .{ .id = .toggle_rulers, .category = "VIEW", .title = "Toggle rulers", .description = "Reserve calibrated horizontal and vertical rulers", .keywords = "measure coordinates ticks precision" },
+    .{ .id = .toggle_safe_areas, .category = "VIEW", .title = "Toggle safe areas", .description = "Show 5% action-safe and 10% title-safe guides", .keywords = "margin guides broadcast title action" },
+    .{ .id = .toggle_measurements, .category = "VIEW", .title = "Toggle measurements", .description = "Show live edge distances and selected dimensions", .keywords = "distance size geometry inspect" },
+    .{ .id = .zoom_in, .category = "VIEW", .title = "Zoom in", .description = "Magnify the canvas around the pointer", .keywords = "view scale magnify pan", .shortcut = "Cmd/Ctrl +" },
+    .{ .id = .zoom_out, .category = "VIEW", .title = "Zoom out", .description = "Reduce the canvas around the pointer", .keywords = "view scale shrink pan", .shortcut = "Cmd/Ctrl -" },
+    .{ .id = .fit_view, .category = "VIEW", .title = "Fit slide in canvas", .description = "Reset zoom and center the complete slide", .keywords = "view reset center pan 100 percent", .shortcut = "Cmd/Ctrl 0" },
     .{ .id = .focus_canvas, .category = "VIEW", .title = "Focus Canvas", .description = "Hide or restore permanent Studio chrome", .keywords = "zen canvas hide docks", .shortcut = "Tab" },
     .{ .id = .show_slides, .category = "VIEW", .title = "Show Slides and Library", .description = "Open the deck organizer dock", .keywords = "left dock organizer reusable" },
     .{ .id = .show_objects, .category = "VIEW", .title = "Show Objects", .description = "Open the source-aware object stack", .keywords = "layers inspector right dock" },
@@ -2519,6 +2604,15 @@ pub const FrameInput = struct {
     pointer_pressed: bool = false,
     pointer_down: bool = false,
     pointer_released: bool = false,
+    view_pan_modifier_down: bool = false,
+    view_pan_pressed: bool = false,
+    view_pan_down: bool = false,
+    view_pan_released: bool = false,
+    view_pan_screen_delta: rl.Vector2 = .zero(),
+    view_scroll_screen_delta: rl.Vector2 = .zero(),
+    view_zoom_wheel: f32 = 0,
+    view_zoom_steps: i8 = 0,
+    view_fit_pressed: bool = false,
     nudge: rl.Vector2 = .{ .x = 0, .y = 0 },
     toggle_grid_pressed: bool = false,
     lock_aspect_ratio: bool = false,
@@ -2564,6 +2658,14 @@ pub const FrameInput = struct {
         const shortcut_modifier = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control) or
             rl.isKeyDown(.left_super) or rl.isKeyDown(.right_super);
         const alt = rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt);
+        const pan_modifier = rl.isKeyDown(.space);
+        const wheel = rl.getMouseWheelMoveV();
+        const middle_pressed = rl.isMouseButtonPressed(.middle);
+        const middle_down = rl.isMouseButtonDown(.middle);
+        const middle_released = rl.isMouseButtonReleased(.middle);
+        const modified_pan_pressed = pan_modifier and rl.isMouseButtonPressed(.left);
+        const modified_pan_down = pan_modifier and rl.isMouseButtonDown(.left);
+        const modified_pan_released = pan_modifier and rl.isMouseButtonReleased(.left);
         const moving_slide = alt and shift;
         const amount: f32 = if (shift) 10 else 1;
         var nudge: rl.Vector2 = .{ .x = 0, .y = 0 };
@@ -2607,6 +2709,20 @@ pub const FrameInput = struct {
             .pointer_pressed = rl.isMouseButtonPressed(.left),
             .pointer_down = rl.isMouseButtonDown(.left),
             .pointer_released = rl.isMouseButtonReleased(.left),
+            .view_pan_modifier_down = pan_modifier,
+            .view_pan_pressed = middle_pressed or modified_pan_pressed,
+            .view_pan_down = middle_down or modified_pan_down,
+            .view_pan_released = middle_released or modified_pan_released,
+            .view_pan_screen_delta = rl.getMouseDelta(),
+            .view_scroll_screen_delta = if (shortcut_modifier) .zero() else .{ .x = wheel.x * 42, .y = wheel.y * 42 },
+            .view_zoom_wheel = if (shortcut_modifier) wheel.y else 0,
+            .view_zoom_steps = if (shortcut_modifier and rl.isKeyPressed(.equal))
+                1
+            else if (shortcut_modifier and rl.isKeyPressed(.minus))
+                -1
+            else
+                0,
+            .view_fit_pressed = shortcut_modifier and rl.isKeyPressed(.zero),
             .nudge = nudge,
             .toggle_grid_pressed = !shortcut_modifier and rl.isKeyPressed(.g),
             .lock_aspect_ratio = shift,
@@ -2662,7 +2778,7 @@ pub const FrameInput = struct {
                 .aurora
             else
                 null,
-            .workspace_scroll = rl.getMouseWheelMove(),
+            .workspace_scroll = wheel.y,
         };
         while (result.inline_chars_len < result.inline_chars.len) {
             const pressed = rl.getCharPressed();
@@ -2884,6 +3000,12 @@ pub const Studio = struct {
     snap_threshold_screen: f32 = default_snap_threshold_screen,
     grid_spacing: f32 = default_grid_spacing,
     grid_snapping: bool = false,
+    rulers_visible: bool = false,
+    safe_areas_visible: bool = false,
+    measurements_visible: bool = false,
+    canvas_zoom: f32 = 1,
+    canvas_center: rl.Vector2 = .{ .x = default_logical_size.x / 2, .y = default_logical_size.y / 2 },
+    view_panning: bool = false,
     snap_guides: SnapGuides = .{},
     drag: Drag = .{},
     preview: Geometry = .{
@@ -2917,7 +3039,122 @@ pub const Studio = struct {
     }
 
     pub fn layoutFrame(self: Studio, content: rl.Rectangle) FrameLayout {
-        return frameLayout(content, self.enabled, self.focus_canvas, self.active_dock);
+        var result = frameLayout(content, self.enabled, self.focus_canvas, self.active_dock);
+        if (!self.enabled) return result;
+
+        if (self.rulers_visible and result.chrome.visible) {
+            const thickness = ruler_thickness * result.chrome.scale;
+            const outer = result.canvas_area;
+            result.canvas_area = .{
+                .x = outer.x + @min(thickness, outer.width),
+                .y = outer.y + @min(thickness, outer.height),
+                .width = @max(0, outer.width - thickness),
+                .height = @max(0, outer.height - thickness),
+            };
+            var fitted = fitSlideViewport(result.canvas_area);
+            fitted.chrome = result.chrome;
+            fitted.canvas_area = result.canvas_area;
+            result.viewport = fitted;
+        }
+        result.viewport = applyCanvasCamera(result.viewport, self.canvas_zoom, self.canvas_center);
+        return result;
+    }
+
+    pub fn canvasZoomPercent(self: Studio) f32 {
+        return self.canvas_zoom * 100;
+    }
+
+    pub fn resetCanvasView(self: *Studio) void {
+        self.canvas_zoom = 1;
+        self.canvas_center = .{ .x = default_logical_size.x / 2, .y = default_logical_size.y / 2 };
+        self.view_panning = false;
+    }
+
+    fn setCanvasZoomAt(self: *Studio, viewport: Viewport, requested_zoom: f32, requested_anchor: rl.Vector2) void {
+        if (!viewport.valid()) return;
+        const canvas = viewport.canvasBounds();
+        const anchor = if (pointInRectangle(requested_anchor, canvas)) requested_anchor else rl.Vector2{
+            .x = canvas.x + canvas.width / 2,
+            .y = canvas.y + canvas.height / 2,
+        };
+        const logical_anchor = screenToLogical(viewport, anchor) orelse self.canvas_center;
+        const new_zoom = std.math.clamp(requested_zoom, minimum_canvas_zoom, maximum_canvas_zoom);
+        const ratio = new_zoom / @max(self.canvas_zoom, minimum_canvas_zoom);
+        const new_slide_size: rl.Vector2 = .{ .x = viewport.slide_size.x * ratio, .y = viewport.slide_size.y * ratio };
+        const canvas_center: rl.Vector2 = .{ .x = canvas.x + canvas.width / 2, .y = canvas.y + canvas.height / 2 };
+        const requested_center: rl.Vector2 = .{
+            .x = logical_anchor.x - (anchor.x - canvas_center.x) * viewport.logical_size.x / new_slide_size.x,
+            .y = logical_anchor.y - (anchor.y - canvas_center.y) * viewport.logical_size.y / new_slide_size.y,
+        };
+        self.canvas_zoom = new_zoom;
+        self.canvas_center = clampCanvasCenter(requested_center, viewport.logical_size, new_slide_size, canvas);
+        self.snap_guides = .{};
+        self.resetTooltip();
+    }
+
+    fn panCanvasByScreen(self: *Studio, viewport: Viewport, delta: rl.Vector2) void {
+        if (!viewport.valid() or (delta.x == 0 and delta.y == 0)) return;
+        const requested: rl.Vector2 = .{
+            .x = self.canvas_center.x - delta.x * viewport.logical_size.x / viewport.slide_size.x,
+            .y = self.canvas_center.y - delta.y * viewport.logical_size.y / viewport.slide_size.y,
+        };
+        self.canvas_center = clampCanvasCenter(requested, viewport.logical_size, viewport.slide_size, viewport.canvasBounds());
+        self.snap_guides = .{};
+        self.resetTooltip();
+    }
+
+    fn handleViewNavigation(self: *Studio, items: []slides.SlideItem, viewport: Viewport, input: FrameInput) bool {
+        const canvas = viewport.canvasBounds();
+        if (input.view_fit_pressed) {
+            if (self.interaction != .idle) self.cancelInteraction(items);
+            self.resetCanvasView();
+            return true;
+        }
+        if (input.view_zoom_steps != 0) {
+            if (self.interaction != .idle) self.cancelInteraction(items);
+            const factor = if (input.view_zoom_steps > 0) canvas_zoom_step else 1 / canvas_zoom_step;
+            self.setCanvasZoomAt(viewport, self.canvas_zoom * factor, input.pointer_screen);
+            return true;
+        }
+        if (input.view_zoom_wheel != 0 and pointInRectangle(input.pointer_screen, canvas)) {
+            if (self.interaction != .idle) self.cancelInteraction(items);
+            const factor = std.math.pow(f32, canvas_zoom_step, input.view_zoom_wheel);
+            self.setCanvasZoomAt(viewport, self.canvas_zoom * factor, input.pointer_screen);
+            return true;
+        }
+
+        if (input.view_pan_pressed and pointInRectangle(input.pointer_screen, canvas) and self.interaction == .idle and !self.marquee.active) {
+            self.view_panning = true;
+            self.snap_guides = .{};
+            self.resetTooltip();
+        }
+        if (self.view_panning) {
+            if (input.cancel_pressed) {
+                self.view_panning = false;
+                return true;
+            }
+            if (input.view_pan_down or input.view_pan_released)
+                self.panCanvasByScreen(viewport, input.view_pan_screen_delta);
+            if (input.view_pan_released) self.view_panning = false;
+            return true;
+        }
+
+        if ((input.view_scroll_screen_delta.x != 0 or input.view_scroll_screen_delta.y != 0) and
+            pointInRectangle(input.pointer_screen, canvas))
+        {
+            self.panCanvasByScreen(viewport, input.view_scroll_screen_delta);
+            return true;
+        }
+        return false;
+    }
+
+    fn precisionChromeContainsPoint(self: Studio, viewport: Viewport, point: rl.Vector2) bool {
+        if (!self.rulers_visible or self.focus_canvas or viewport.chrome == null or !viewport.chrome.?.visible) return false;
+        const canvas = viewport.canvasBounds();
+        const thickness = ruler_thickness * uiScale(viewport);
+        const top: rl.Rectangle = .{ .x = canvas.x - thickness, .y = canvas.y - thickness, .width = canvas.width + thickness, .height = thickness };
+        const left: rl.Rectangle = .{ .x = canvas.x - thickness, .y = canvas.y, .width = thickness, .height = canvas.height };
+        return pointInRectangle(point, top) or pointInRectangle(point, left);
     }
 
     pub fn setUiFont(self: *Studio, font: ?rl.Font) void {
@@ -2980,6 +3217,17 @@ pub const Studio = struct {
             .pointer_origin = .{ .x = anchor.x + anchor.width / 2, .y = anchor.y + anchor.height / 2 },
             .elapsed = tooltip_delay_seconds,
         };
+    }
+
+    /// Deterministic visual-regression surface for the complete precision
+    /// overlay. Selection can be supplied independently with
+    /// --diagnostics-select=ID so measurements exercise real rendered bounds.
+    pub fn showPrecisionViewForDiagnostics(self: *Studio) void {
+        self.rulers_visible = true;
+        self.safe_areas_visible = true;
+        self.measurements_visible = true;
+        self.canvas_zoom = 1.1;
+        self.canvas_center = .{ .x = default_logical_size.x / 2, .y = default_logical_size.y / 2 };
     }
 
     pub fn tooltipVisible(self: Studio) bool {
@@ -3175,7 +3423,7 @@ pub const Studio = struct {
     }
 
     fn updateTooltip(self: *Studio, viewport: Viewport, workspace: Workspace, input: FrameInput) void {
-        if (self.command_palette.active or self.inline_editor.active or self.interaction != .idle or
+        if (self.command_palette.active or self.inline_editor.active or self.interaction != .idle or self.view_panning or
             self.marquee.active or input.pointer_pressed or input.pointer_down)
         {
             self.resetTooltip();
@@ -3237,6 +3485,12 @@ pub const Studio = struct {
             .tool_image,
             .tool_rectangle,
             .toggle_grid,
+            .toggle_rulers,
+            .toggle_safe_areas,
+            .toggle_measurements,
+            .zoom_in,
+            .zoom_out,
+            .fit_view,
             .focus_canvas,
             .show_slides,
             .show_objects,
@@ -3370,6 +3624,12 @@ pub const Studio = struct {
             .duplicate_slide => self.pending_semantic_command = .{ .duplicate_slide = workspace.current_slide },
             .delete_slide => self.pending_semantic_command = .{ .delete_slide = workspace.current_slide },
             .toggle_grid => self.grid_snapping = !self.grid_snapping,
+            .toggle_rulers => self.rulers_visible = !self.rulers_visible,
+            .toggle_safe_areas => self.safe_areas_visible = !self.safe_areas_visible,
+            .toggle_measurements => self.measurements_visible = !self.measurements_visible,
+            .zoom_in => self.setCanvasZoomAt(viewport, self.canvas_zoom * canvas_zoom_step, inputCanvasCenter(viewport)),
+            .zoom_out => self.setCanvasZoomAt(viewport, self.canvas_zoom / canvas_zoom_step, inputCanvasCenter(viewport)),
+            .fit_view => self.resetCanvasView(),
             .focus_canvas => {
                 self.focus_canvas = !self.focus_canvas;
                 self.snap_guides = .{};
@@ -3412,7 +3672,6 @@ pub const Studio = struct {
                     self.pending_semantic_command = .{ .delete_morph_state = state };
             },
         }
-        _ = viewport;
     }
 
     fn handleCommandPalette(
@@ -4254,6 +4513,7 @@ pub const Studio = struct {
     pub fn cancelActiveInteraction(self: *Studio, items: []slides.SlideItem) void {
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
+        self.view_panning = false;
     }
 
     pub fn toggle(self: *Studio, items: []slides.SlideItem) void {
@@ -4262,6 +4522,7 @@ pub const Studio = struct {
         self.resetTooltip();
         if (self.enabled and self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
+        self.view_panning = false;
         self.enabled = !self.enabled;
         if (!self.enabled) {
             self.composition_context = null;
@@ -4283,6 +4544,7 @@ pub const Studio = struct {
         self.resetTooltip();
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
+        self.view_panning = false;
         self.composition_context = null;
         self.enabled = false;
         self.focus_canvas = false;
@@ -4550,6 +4812,7 @@ pub const Studio = struct {
         if (input.toggle_focus_canvas_pressed) {
             if (self.interaction != .idle) self.cancelInteraction(items);
             self.marquee.active = false;
+            self.view_panning = false;
             self.focus_canvas = !self.focus_canvas;
             self.snap_guides = .{};
             return null;
@@ -4557,6 +4820,9 @@ pub const Studio = struct {
 
         if (workspace.visible and workspace.new_deck and
             self.handleNewDeckChooser(items, viewport, input)) return null;
+
+        if (self.handleViewNavigation(items, viewport, input)) return null;
+        if (input.pointer_pressed and self.precisionChromeContainsPoint(viewport, input.pointer_screen)) return null;
 
         self.normalizeObjects(items, viewport);
         self.handleObjectsScroll(items, viewport, input);
@@ -6289,7 +6555,11 @@ pub const Studio = struct {
     ) ?GeometryCommand {
         const input = FrameInput.fromRaylib();
         const result = self.updateWithWorkspace(items, resolved_bounds, viewport, workspace, input);
-        rl.setMouseCursor(self.mouseCursorForPoint(items, resolved_bounds, viewport, workspace, input.pointer_screen));
+        rl.setMouseCursor(if (self.view_panning or
+            (input.view_pan_modifier_down and pointInRectangle(input.pointer_screen, viewport.canvasBounds())))
+            .resize_all
+        else
+            self.mouseCursorForPoint(items, resolved_bounds, viewport, workspace, input.pointer_screen));
         return result;
     }
 
@@ -7552,7 +7822,18 @@ pub const Studio = struct {
     pub fn draw(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
         if (!self.enabled) return;
 
+        const canvas = viewport.canvasBounds();
+        const clip_canvas = canvas.width > 0 and canvas.height > 0;
+        if (clip_canvas) rl.beginScissorMode(
+            @intFromFloat(@floor(canvas.x)),
+            @intFromFloat(@floor(canvas.y)),
+            @intFromFloat(@ceil(canvas.width)),
+            @intFromFloat(@ceil(canvas.height)),
+        );
+
         if (self.grid_snapping) self.drawLogicalGrid(viewport);
+        if (self.safe_areas_visible) self.drawSafeAreas(viewport);
+        if (self.measurements_visible) self.drawSelectionMeasurements(items, resolved_bounds, viewport);
 
         if (self.marquee.active) {
             if (geometryToScreenRect(viewport, marqueeGeometry(self.marquee))) |rect| {
@@ -7640,6 +7921,9 @@ pub const Studio = struct {
             }
         }
 
+        if (clip_canvas) rl.endScissorMode();
+        if (self.rulers_visible and !self.focus_canvas) self.drawRulers(viewport);
+
         const chrome_visible = if (viewport.chrome) |chrome| chrome.visible else true;
         if (chrome_visible) {
             self.drawToolbar(viewport);
@@ -7694,6 +7978,143 @@ pub const Studio = struct {
         }
     }
 
+    fn drawSafeAreas(self: Studio, viewport: Viewport) void {
+        if (!viewport.valid()) return;
+        const action = Geometry{
+            .position = .{ .x = viewport.logical_size.x * 0.05, .y = viewport.logical_size.y * 0.05 },
+            .size = .{ .x = viewport.logical_size.x * 0.90, .y = viewport.logical_size.y * 0.90 },
+        };
+        const title = Geometry{
+            .position = .{ .x = viewport.logical_size.x * 0.10, .y = viewport.logical_size.y * 0.10 },
+            .size = .{ .x = viewport.logical_size.x * 0.80, .y = viewport.logical_size.y * 0.80 },
+        };
+        const action_rect = geometryToScreenRect(viewport, action) orelse return;
+        const title_rect = geometryToScreenRect(viewport, title) orelse return;
+        drawDashedRectangle(action_rect, 8, 5, 1.25, .{ .r = 80, .g = 215, .b = 255, .a = 180 });
+        drawDashedRectangle(title_rect, 8, 5, 1.25, .{ .r = 255, .g = 92, .b = 198, .a = 180 });
+        const scale = uiScale(viewport);
+        const font = scaledUiFont(scale, UiTypography.compact);
+        self.drawUiText("ACTION 5%", .{ .x = action_rect.x + 6 * scale, .y = action_rect.y + 5 * scale }, font, .{ .r = 126, .g = 226, .b = 247, .a = 220 });
+        self.drawUiText("TITLE 10%", .{ .x = title_rect.x + 6 * scale, .y = title_rect.y + 5 * scale }, font, .{ .r = 255, .g = 130, .b = 205, .a = 220 });
+    }
+
+    fn drawRulers(self: Studio, viewport: Viewport) void {
+        if (!viewport.valid() or viewport.chrome == null or !viewport.chrome.?.visible) return;
+        const canvas = viewport.canvasBounds();
+        const scale = uiScale(viewport);
+        const thickness = ruler_thickness * scale;
+        const top: rl.Rectangle = .{ .x = canvas.x, .y = canvas.y - thickness, .width = canvas.width, .height = thickness };
+        const left: rl.Rectangle = .{ .x = canvas.x - thickness, .y = canvas.y, .width = thickness, .height = canvas.height };
+        const corner: rl.Rectangle = .{ .x = canvas.x - thickness, .y = canvas.y - thickness, .width = thickness, .height = thickness };
+        const background: rl.Color = .{ .r = 8, .g = 14, .b = 25, .a = 250 };
+        rl.drawRectangleRec(top, background);
+        rl.drawRectangleRec(left, background);
+        rl.drawRectangleRec(corner, .{ .r = 19, .g = 31, .b = 48, .a = 255 });
+        rl.drawRectangleLinesEx(top, 1, .{ .r = 80, .g = 215, .b = 255, .a = 145 });
+        rl.drawRectangleLinesEx(left, 1, .{ .r = 80, .g = 215, .b = 255, .a = 145 });
+        rl.drawRectangleRec(.{ .x = corner.x, .y = corner.y, .width = 3 * scale, .height = corner.height }, .{ .r = 255, .g = 92, .b = 198, .a = 255 });
+        var zoom_buffer: [16]u8 = undefined;
+        const zoom_label = std.fmt.bufPrintZ(&zoom_buffer, "{d:.1}×", .{self.canvas_zoom}) catch "×";
+        self.drawUiText(
+            zoom_label,
+            .{ .x = corner.x + 5 * scale, .y = corner.y + (corner.height - @as(f32, @floatFromInt(scaledUiFont(scale, UiTypography.compact)))) / 2 },
+            scaledUiFont(scale, UiTypography.compact),
+            .white,
+        );
+
+        const major_step = rulerMajorStep(viewport);
+        const minor_step = major_step / 5;
+        const top_left = screenToLogical(viewport, .{ .x = canvas.x, .y = canvas.y }) orelse return;
+        const bottom_right = screenToLogical(viewport, .{ .x = canvas.x + canvas.width, .y = canvas.y + canvas.height }) orelse return;
+        const minor_color: rl.Color = .{ .r = 113, .g = 151, .b = 176, .a = 150 };
+        const major_color: rl.Color = .{ .r = 126, .g = 226, .b = 247, .a = 225 };
+        const font = scaledUiFont(scale, UiTypography.compact);
+
+        var x_value = @floor(@max(@as(f32, 0), top_left.x) / minor_step) * minor_step;
+        while (x_value <= @min(viewport.logical_size.x, bottom_right.x) + minor_step * 0.5) : (x_value += minor_step) {
+            const screen = logicalToScreen(viewport, .{ .x = x_value, .y = 0 }) orelse break;
+            const major = isRulerMajor(x_value, major_step);
+            const tick = if (major) 10 * scale else 5 * scale;
+            rl.drawLineEx(.{ .x = screen.x, .y = top.y + top.height - tick }, .{ .x = screen.x, .y = top.y + top.height }, if (major) 1.25 else 1, if (major) major_color else minor_color);
+            if (major) {
+                var buffer: [16]u8 = undefined;
+                const label = rulerLabel(&buffer, x_value);
+                self.drawUiText(label, .{ .x = screen.x + 3 * scale, .y = top.y + 3 * scale }, font, major_color);
+            }
+        }
+
+        var y_value = @floor(@max(@as(f32, 0), top_left.y) / minor_step) * minor_step;
+        while (y_value <= @min(viewport.logical_size.y, bottom_right.y) + minor_step * 0.5) : (y_value += minor_step) {
+            const screen = logicalToScreen(viewport, .{ .x = 0, .y = y_value }) orelse break;
+            const major = isRulerMajor(y_value, major_step);
+            const tick = if (major) 10 * scale else 5 * scale;
+            rl.drawLineEx(.{ .x = left.x + left.width - tick, .y = screen.y }, .{ .x = left.x + left.width, .y = screen.y }, if (major) 1.25 else 1, if (major) major_color else minor_color);
+            if (major) {
+                var buffer: [16]u8 = undefined;
+                const label = rulerLabel(&buffer, y_value);
+                self.drawUiText(label, .{ .x = left.x + 3 * scale, .y = screen.y + 2 * scale }, font, major_color);
+            }
+        }
+    }
+
+    fn drawSelectionMeasurements(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+    ) void {
+        const geometry = if (self.selectionCount() > 1)
+            self.selectedBounds(items, resolved_bounds) orelse return
+        else
+            self.selectedGeometry(items, resolved_bounds) orelse return;
+        const rect = geometryToScreenRect(viewport, geometry) orelse return;
+        const slide = Geometry{ .position = .zero(), .size = viewport.logical_size };
+        const slide_rect = geometryToScreenRect(viewport, slide) orelse return;
+        const cyan: rl.Color = .{ .r = 80, .g = 215, .b = 255, .a = 205 };
+        const magenta: rl.Color = .{ .r = 255, .g = 92, .b = 198, .a = 225 };
+        self.drawDistanceMeasurement(viewport, .{ .x = slide_rect.x, .y = rect.y + rect.height / 2 }, .{ .x = rect.x, .y = rect.y + rect.height / 2 }, geometry.position.x, cyan);
+        self.drawDistanceMeasurement(viewport, .{ .x = rect.x + rect.width, .y = rect.y + rect.height / 2 }, .{ .x = slide_rect.x + slide_rect.width, .y = rect.y + rect.height / 2 }, viewport.logical_size.x - geometry.position.x - geometry.size.x, cyan);
+        self.drawDistanceMeasurement(viewport, .{ .x = rect.x + rect.width / 2, .y = slide_rect.y }, .{ .x = rect.x + rect.width / 2, .y = rect.y }, geometry.position.y, cyan);
+        self.drawDistanceMeasurement(viewport, .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height }, .{ .x = rect.x + rect.width / 2, .y = slide_rect.y + slide_rect.height }, viewport.logical_size.y - geometry.position.y - geometry.size.y, cyan);
+
+        var size_buffer: [64]u8 = undefined;
+        const size_text = std.fmt.bufPrintZ(&size_buffer, "{d:.0} × {d:.0}", .{ geometry.size.x, geometry.size.y }) catch return;
+        self.drawMeasurementPill(viewport, .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 }, size_text, magenta);
+    }
+
+    fn drawDistanceMeasurement(self: Studio, viewport: Viewport, start: rl.Vector2, end: rl.Vector2, value: f32, color: rl.Color) void {
+        if (@abs(value) < 0.5) return;
+        rl.drawLineEx(start, end, 1.25, color);
+        const horizontal = @abs(end.x - start.x) >= @abs(end.y - start.y);
+        if (horizontal) {
+            rl.drawLineEx(.{ .x = start.x, .y = start.y - 4 }, .{ .x = start.x, .y = start.y + 4 }, 1.25, color);
+            rl.drawLineEx(.{ .x = end.x, .y = end.y - 4 }, .{ .x = end.x, .y = end.y + 4 }, 1.25, color);
+        } else {
+            rl.drawLineEx(.{ .x = start.x - 4, .y = start.y }, .{ .x = start.x + 4, .y = start.y }, 1.25, color);
+            rl.drawLineEx(.{ .x = end.x - 4, .y = end.y }, .{ .x = end.x + 4, .y = end.y }, 1.25, color);
+        }
+        var buffer: [32]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&buffer, "{d:.0}", .{value}) catch return;
+        self.drawMeasurementPill(viewport, .{ .x = (start.x + end.x) / 2, .y = (start.y + end.y) / 2 }, text, color);
+    }
+
+    fn drawMeasurementPill(self: Studio, viewport: Viewport, center: rl.Vector2, text: [:0]const u8, color: rl.Color) void {
+        const scale = uiScale(viewport);
+        const font = scaledUiFont(scale, UiTypography.compact);
+        const width = self.measureUiText(text, font) + 12 * scale;
+        const height = 23 * scale;
+        const canvas = viewport.canvasBounds();
+        const rect: rl.Rectangle = .{
+            .x = std.math.clamp(center.x - width / 2, canvas.x, @max(canvas.x, canvas.x + canvas.width - width)),
+            .y = std.math.clamp(center.y - height / 2, canvas.y, @max(canvas.y, canvas.y + canvas.height - height)),
+            .width = width,
+            .height = height,
+        };
+        rl.drawRectangleRounded(rect, 0.25, 6, .{ .r = 7, .g = 13, .b = 24, .a = 235 });
+        rl.drawRectangleRoundedLinesEx(rect, 0.25, 6, 1, color);
+        self.drawUiText(text, .{ .x = rect.x + 6 * scale, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font))) / 2 }, font, .white);
+    }
+
     fn drawSnapGuides(self: Studio, viewport: Viewport) void {
         const color: rl.Color = .{ .r = 255, .g = 92, .b = 198, .a = 230 };
         if (self.snap_guides.vertical) |logical_x| {
@@ -7741,13 +8162,14 @@ pub const Studio = struct {
     }
 
     fn geometryHudRectangle(viewport: Viewport, item_rect: rl.Rectangle, hud_width: f32, hud_height: f32) rl.Rectangle {
-        const min_x = viewport.slide_top_left.x;
-        const max_x = viewport.slide_top_left.x + viewport.slide_size.x - hud_width;
+        const canvas = viewport.canvasBounds();
+        const min_x = canvas.x;
+        const max_x = canvas.x + canvas.width - hud_width;
         const x = @max(min_x, @min(item_rect.x, max_x));
         const above_y = item_rect.y - hud_height - 6;
-        const desired_y = if (above_y >= viewport.slide_top_left.y) above_y else item_rect.y + item_rect.height + 6;
-        const min_y = viewport.slide_top_left.y;
-        const max_y = viewport.slide_top_left.y + viewport.slide_size.y - hud_height;
+        const desired_y = if (above_y >= canvas.y) above_y else item_rect.y + item_rect.height + 6;
+        const min_y = canvas.y;
+        const max_y = canvas.y + canvas.height - hud_height;
         const y = @max(min_y, @min(desired_y, max_y));
         return .{ .x = x, .y = y, .width = hud_width, .height = hud_height };
     }
@@ -9163,25 +9585,36 @@ pub const Studio = struct {
 
         self.drawUiText(status_text, .{ .x = panel.x + 12 * scale, .y = panel.y + 9 * scale }, heading_font, .white);
         const compact_status = panel.height < 100 * scale;
+        var view_help_buffer: [192]u8 = undefined;
         if (compact_status and self.notice == .none) {
+            const view_help = std.fmt.bufPrintZ(
+                &view_help_buffer,
+                "VIEW {d:.0}% · Cmd/Ctrl +/- zoom · Space pan · Cmd/Ctrl-K Commands",
+                .{self.canvasZoomPercent()},
+            ) catch "Cmd/Ctrl +/- zoom · Space pan · Cmd/Ctrl-K Commands";
             self.drawUiText(
-                if (self.grid_snapping) "GRID ON · G toggle · Tab Focus Canvas · Cmd/Ctrl-S save" else "G grid · Tab Focus Canvas · Cmd/Ctrl-S save",
+                view_help,
                 .{ .x = panel.x + 12 * scale, .y = panel.y + 43 * scale },
                 body_font,
                 .{ .r = 185, .g = 196, .b = 215, .a = 255 },
             );
         } else {
+            const view_help = std.fmt.bufPrintZ(
+                &view_help_buffer,
+                "VIEW {d:.0}% · Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit",
+                .{self.canvasZoomPercent()},
+            ) catch "Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit";
             self.drawUiText(
-                if (self.grid_snapping)
-                    "GRID ON · G toggle · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap"
-                else
-                    "G grid · Shift resize locks ratio · Cmd/Ctrl-drag bypasses snap · [ ] morph scenes",
+                view_help,
                 .{ .x = panel.x + 12 * scale, .y = panel.y + 39 * scale },
                 body_font,
                 .{ .r = 185, .g = 196, .b = 215, .a = 255 },
             );
             self.drawUiText(
-                "Tab Focus Canvas  ·  Cmd/Ctrl-S save  ·  Shift-Cmd/Ctrl-S save copy  ·  Cmd/Ctrl-Z undo  ·  Shift-Cmd/Ctrl-Z redo",
+                if (self.grid_snapping)
+                    "GRID ON · G toggle · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo"
+                else
+                    "G grid · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo",
                 .{ .x = panel.x + 12 * scale, .y = panel.y + 64 * scale },
                 body_font,
                 .{ .r = 185, .g = 196, .b = 215, .a = 255 },
@@ -9247,6 +9680,56 @@ pub const Studio = struct {
         }
     }
 };
+
+fn drawDashedLine(start: rl.Vector2, end: rl.Vector2, dash: f32, gap: f32, thickness: f32, color: rl.Color) void {
+    const delta = end.subtract(start);
+    const length = delta.length();
+    if (length <= 0) return;
+    const direction = delta.scale(1 / length);
+    var cursor: f32 = 0;
+    while (cursor < length) : (cursor += dash + gap) {
+        const segment_end = @min(length, cursor + dash);
+        rl.drawLineEx(start.add(direction.scale(cursor)), start.add(direction.scale(segment_end)), thickness, color);
+    }
+}
+
+fn drawDashedRectangle(rect: rl.Rectangle, dash: f32, gap: f32, thickness: f32, color: rl.Color) void {
+    const top_left: rl.Vector2 = .{ .x = rect.x, .y = rect.y };
+    const top_right: rl.Vector2 = .{ .x = rect.x + rect.width, .y = rect.y };
+    const bottom_left: rl.Vector2 = .{ .x = rect.x, .y = rect.y + rect.height };
+    const bottom_right: rl.Vector2 = .{ .x = rect.x + rect.width, .y = rect.y + rect.height };
+    drawDashedLine(top_left, top_right, dash, gap, thickness, color);
+    drawDashedLine(top_right, bottom_right, dash, gap, thickness, color);
+    drawDashedLine(bottom_right, bottom_left, dash, gap, thickness, color);
+    drawDashedLine(bottom_left, top_left, dash, gap, thickness, color);
+}
+
+fn rulerMajorStep(viewport: Viewport) f32 {
+    if (!viewport.valid()) return 100;
+    const pixels_per_logical = @min(
+        viewport.slide_size.x / viewport.logical_size.x,
+        viewport.slide_size.y / viewport.logical_size.y,
+    );
+    const candidates = [_]f32{ 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000 };
+    for (candidates) |candidate| if (candidate * pixels_per_logical >= 72) return candidate;
+    return candidates[candidates.len - 1];
+}
+
+fn isRulerMajor(value: f32, major_step: f32) bool {
+    if (major_step <= 0) return false;
+    const quotient = value / major_step;
+    return @abs(quotient - @round(quotient)) < 0.02;
+}
+
+fn rulerLabel(buffer: []u8, value: f32) [:0]const u8 {
+    if (@abs(value) >= 1000) {
+        const thousands = value / 1000;
+        if (@abs(thousands - @round(thousands)) < 0.01)
+            return std.fmt.bufPrintZ(buffer, "{d:.0}k", .{thousands}) catch "";
+        return std.fmt.bufPrintZ(buffer, "{d:.1}k", .{thousands}) catch "";
+    }
+    return std.fmt.bufPrintZ(buffer, "{d:.0}", .{value}) catch "";
+}
 
 fn toolLabel(tool: Tool) [:0]const u8 {
     return switch (tool) {
@@ -14241,6 +14724,133 @@ test "mouse cursor communicates palette chrome and canvas affordances" {
         rl.MouseCursor.ibeam,
         studio.mouseCursorForPoint(&items, &.{}, viewport, workspace, rectangleCenter(commandPaletteLayout(viewport).search)),
     );
+}
+
+test "canvas zoom preserves the logical point beneath the pointer" {
+    var studio: Studio = .{ .enabled = true };
+    var items = [_]slides.SlideItem{};
+    const content: rl.Rectangle = .{ .x = 0, .y = 0, .width = 1600, .height = 900 };
+    const before = studio.layoutFrame(content).viewport;
+    const canvas = before.canvasBounds();
+    const anchor: rl.Vector2 = .{ .x = canvas.x + canvas.width * 0.72, .y = canvas.y + canvas.height * 0.38 };
+    const logical_before = screenToLogical(before, anchor).?;
+    _ = studio.update(&items, &.{}, before, .{ .pointer_screen = anchor, .view_zoom_steps = 1 });
+    const after = studio.layoutFrame(content).viewport;
+    const logical_after = screenToLogical(after, anchor).?;
+    try std.testing.expectApproxEqAbs(logical_before.x, logical_after.x, 0.01);
+    try std.testing.expectApproxEqAbs(logical_before.y, logical_after.y, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, canvas_zoom_step), studio.canvas_zoom, 0.001);
+    try std.testing.expect(!studio.dirty);
+    try std.testing.expect(studio.takeGeometryBatch() == null);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "space or middle drag pans a zoomed canvas without changing item geometry" {
+    var items = [_]slides.SlideItem{testItem(1201, .textbox, 100, 120, 300, 90)};
+    const authored = Geometry.fromItem(items[0]);
+    var studio: Studio = .{ .enabled = true, .canvas_zoom = 2 };
+    const content: rl.Rectangle = .{ .x = 0, .y = 0, .width = 1600, .height = 900 };
+    const before = studio.layoutFrame(content).viewport;
+    const pointer = inputCanvasCenter(before);
+    _ = studio.update(&items, &.{}, before, .{
+        .pointer_screen = pointer,
+        .view_pan_pressed = true,
+        .view_pan_down = true,
+        .view_pan_screen_delta = .{ .x = 36, .y = -24 },
+    });
+    try std.testing.expect(studio.view_panning);
+    const during = studio.layoutFrame(content).viewport;
+    try std.testing.expectApproxEqAbs(before.slide_top_left.x + 36, during.slide_top_left.x, 0.01);
+    try std.testing.expectApproxEqAbs(before.slide_top_left.y - 24, during.slide_top_left.y, 0.01);
+    try std.testing.expectEqual(authored.position, items[0].position);
+    try std.testing.expectEqual(authored.size, items[0].size);
+
+    _ = studio.update(&items, &.{}, during, .{ .pointer_screen = pointer, .view_pan_released = true });
+    try std.testing.expect(!studio.view_panning);
+    try std.testing.expect(!studio.dirty);
+}
+
+test "fit view recenters and panning cannot lose a fitted slide" {
+    var studio: Studio = .{
+        .enabled = true,
+        .canvas_zoom = 0.5,
+        .canvas_center = .{ .x = 20, .y = 40 },
+    };
+    var items = [_]slides.SlideItem{};
+    const content: rl.Rectangle = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const fitted_out = studio.layoutFrame(content).viewport;
+    const canvas = fitted_out.canvasBounds();
+    try std.testing.expect(fitted_out.slide_top_left.x + fitted_out.slide_size.x >= canvas.x + 64 - 0.01);
+    try std.testing.expect(fitted_out.slide_top_left.y + fitted_out.slide_size.y >= canvas.y + 64 - 0.01);
+    try std.testing.expect(fitted_out.slide_top_left.x <= canvas.x + canvas.width - 64 + 0.01);
+    try std.testing.expect(fitted_out.slide_top_left.y <= canvas.y + canvas.height - 64 + 0.01);
+
+    _ = studio.update(&items, &.{}, fitted_out, .{ .view_fit_pressed = true });
+    try std.testing.expectApproxEqAbs(@as(f32, 1), studio.canvas_zoom, 0.001);
+    try std.testing.expectEqual(rl.Vector2{ .x = 960, .y = 540 }, studio.canvas_center);
+}
+
+test "rulers reserve canvas space and zoomed transforms remain reversible" {
+    var studio: Studio = .{ .enabled = true, .rulers_visible = true, .canvas_zoom = 3 };
+    const content: rl.Rectangle = .{ .x = 0, .y = 0, .width = 1600, .height = 900 };
+    const ordinary = frameLayout(content, true, false, .slides);
+    const ruled = studio.layoutFrame(content);
+    const thickness = ruler_thickness * ruled.chrome.scale;
+    try std.testing.expectApproxEqAbs(ordinary.canvas_area.x + thickness, ruled.canvas_area.x, 0.001);
+    try std.testing.expectApproxEqAbs(ordinary.canvas_area.y + thickness, ruled.canvas_area.y, 0.001);
+    try std.testing.expectApproxEqAbs(ordinary.canvas_area.width - thickness, ruled.canvas_area.width, 0.001);
+    try std.testing.expectApproxEqAbs(ordinary.canvas_area.height - thickness, ruled.canvas_area.height, 0.001);
+    const logical: rl.Vector2 = .{ .x = 1432.5, .y = 276.25 };
+    const screen = logicalToScreen(ruled.viewport, logical).?;
+    const roundtrip = screenToLogical(ruled.viewport, screen).?;
+    try std.testing.expectApproxEqAbs(logical.x, roundtrip.x, 0.001);
+    try std.testing.expectApproxEqAbs(logical.y, roundtrip.y, 0.001);
+    try std.testing.expect(studio.precisionChromeContainsPoint(ruled.viewport, .{
+        .x = ruled.canvas_area.x - thickness / 2,
+        .y = ruled.canvas_area.y + 10,
+    }));
+
+    studio.focus_canvas = true;
+    const focused = studio.layoutFrame(content);
+    try std.testing.expectApproxEqAbs(focused.canvas_area.x, focused.viewport.canvasBounds().x, 0.001);
+    try std.testing.expect(!studio.precisionChromeContainsPoint(focused.viewport, focused.viewport.slide_top_left));
+}
+
+test "precision view commands are discoverable and transient" {
+    var studio: Studio = .{ .enabled = true };
+    var items = [_]slides.SlideItem{};
+    const viewport = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }).viewport;
+    const workspace: Workspace = .{ .visible = true };
+    const commands = [_]CommandId{ .toggle_rulers, .toggle_safe_areas, .toggle_measurements };
+    for (commands) |command| {
+        try std.testing.expect(studio.commandAvailability(&items, workspace, command).enabled);
+        studio.executeCommand(&items, &.{}, viewport, workspace, command);
+    }
+    try std.testing.expect(studio.rulers_visible);
+    try std.testing.expect(studio.safe_areas_visible);
+    try std.testing.expect(studio.measurements_visible);
+    studio.executeCommand(&items, &.{}, viewport, workspace, .zoom_in);
+    try std.testing.expect(studio.canvas_zoom > 1);
+    studio.executeCommand(&items, &.{}, viewport, workspace, .fit_view);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), studio.canvas_zoom, 0.001);
+    try std.testing.expect(!studio.dirty);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    studio.openCommandPalette(&items);
+    studio.appendCommandQuery("safe area");
+    try std.testing.expectEqual(@as(usize, 1), studio.commandResultCount());
+    try std.testing.expectEqual(CommandId.toggle_safe_areas, studio.commandSpecAtResult(0).?.id);
+}
+
+test "ruler ticks maintain a legible screen interval across zoom levels" {
+    const base = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const zooms = [_]f32{ 0.5, 1, 2, 4, 8 };
+    for (zooms) |zoom| {
+        const viewport = applyCanvasCamera(base, zoom, .{ .x = 960, .y = 540 });
+        const pixels = rulerMajorStep(viewport) * viewport.slide_size.x / viewport.logical_size.x;
+        try std.testing.expect(pixels >= 72 - 0.01);
+        try std.testing.expect(pixels < 180);
+    }
 }
 
 fn rectangleCenter(rect: rl.Rectangle) rl.Vector2 {

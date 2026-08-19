@@ -835,6 +835,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_enabled = false;
     var diagnostics_command_palette = false;
     var diagnostics_command_tooltip = false;
+    var diagnostics_precision_view = false;
     var diagnostics_select_buffer: [128]u8 = undefined;
     var diagnostics_select_id: ?[]const u8 = null;
 
@@ -863,6 +864,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else if (std.mem.eql(u8, arg, "--diagnostics-command-tooltip")) {
                 diagnostics_enabled = true;
                 diagnostics_command_tooltip = true;
+                launch_studio = true;
+            } else if (std.mem.eql(u8, arg, "--diagnostics-precision-view")) {
+                diagnostics_enabled = true;
+                diagnostics_precision_view = true;
                 launch_studio = true;
             } else if (std.mem.startsWith(u8, arg, "--diagnostics-select=")) {
                 diagnostics_enabled = true;
@@ -931,6 +936,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var frame_diagnostics = FrameDiagnostics{ .enabled = diagnostics_enabled };
     var diagnostics_selection_pending = diagnostics_select_id;
     var diagnostics_command_palette_pending = diagnostics_command_palette;
+    var diagnostics_precision_view_pending = diagnostics_precision_view;
 
     // Main game loop
     var is_pre_rendered: bool = false;
@@ -1195,6 +1201,10 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (diagnostics_command_palette_pending) {
             studio_mode.openCommandPaletteForDiagnostics(studio_items);
             diagnostics_command_palette_pending = false;
+        }
+        if (diagnostics_precision_view_pending) {
+            studio_mode.showPrecisionViewForDiagnostics();
+            diagnostics_precision_view_pending = false;
         }
         if (rl.isWindowResized()) studio_mode.cancelActiveInteraction(studio_items);
 
@@ -1671,6 +1681,16 @@ pub fn main(init: std.process.Init) anyerror!void {
             defer rl.endDrawing();
             rl.clearBackground(.blank);
 
+            const clip_studio_canvas = studio_mode.capturesInput() and !export_controller.running;
+            if (clip_studio_canvas) {
+                const canvas = studio_viewport.canvasBounds();
+                rl.beginScissorMode(
+                    @intFromFloat(@floor(canvas.x)),
+                    @intFromFloat(@floor(canvas.y)),
+                    @intFromFloat(@ceil(canvas.width)),
+                    @intFromFloat(@ceil(canvas.height)),
+                );
+            }
             try G.slide_renderer.render(
                 G.current_slide,
                 reveal_state,
@@ -1682,6 +1702,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 previous_crowd_snapshot,
                 crowd_runtime.public_url.slice(),
             );
+            if (clip_studio_canvas) rl.endScissorMode();
             if (!export_controller.running) {
                 studio_mode.draw(studio_items, studio_bounds.items, studio_viewport);
                 studio_mode.drawWorkspaceBackground(studio_viewport, studio_workspace);

@@ -146,11 +146,25 @@ seed the first state but cannot be renamed, deleted, or reordered.
 - [x] Route Save, Save Copy, Undo, and Redo through the same application-owned
   persistence/history boundaries as their keyboard equivalents.
 
+## Completed tranche: Precision navigation and guides
+
+- [x] Add source-neutral canvas zoom from 50% to 800%, with pointer-anchored
+  wheel zoom, keyboard steps, and one-command fit/recenter.
+- [x] Add wheel/trackpad, Space-drag, and middle-button canvas panning while
+  preserving at least a visible slide foothold at every zoom level.
+- [x] Add optional calibrated horizontal and vertical rulers whose responsive
+  tick intervals remain legible throughout the zoom range.
+- [x] Add distinct 5% action-safe and 10% title-safe overlays plus live
+  selection dimensions and edge distances, clipped strictly to the canvas.
+- [x] Expose every precision surface through the contextual command palette,
+  without adding source edits, dirty state, or history entries.
+- [x] Keep presentation, screenshots, PDF export, thumbnails, and Focus Canvas
+  independent from editor chrome and verify compact/default layouts visually.
+
 ## Planned tranches
 
-### Precision and polish
+### Performance and integration confidence
 
-- Optional rulers, measurements, safe-area guides, zoom, and pan.
 - Performance work for large decks and richer integration-level history tests.
 
 ## Deliberate non-goals
