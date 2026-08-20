@@ -50,6 +50,7 @@ const cli_help =
     \\  --diagnostics-command-palette    Open Studio with Commands visible
     \\  --diagnostics-command-tooltip    Show deterministic command hover help
     \\  --diagnostics-precision-view     Show rulers, guides, and precision tools
+    \\  --diagnostics-grid-settings      Open the Studio grid appearance popover
     \\  --diagnostics-presenter-pairing  Show the Presenter pairing overlay
     \\  --diagnostics-large-deck=N       Generate an N-slide stress deck (1-200)
     \\  --diagnostics-incremental-edit=N Edit slide N after the initial render
@@ -72,6 +73,7 @@ const cli_help =
 const MacOpenDocuments = struct {
     extern fn rayslides_macos_install_open_document_handler() void;
     extern fn rayslides_macos_take_open_document(buffer: [*]u8, capacity: usize) usize;
+    extern fn rayslides_macos_choose_image(initial_directory: [*:0]const u8, buffer: [*]u8, capacity: usize) usize;
 
     fn install() void {
         if (comptime builtin.os.tag == .macos) rayslides_macos_install_open_document_handler();
@@ -83,7 +85,40 @@ const MacOpenDocuments = struct {
         }
         return 0;
     }
+
+    fn chooseImage(initial_directory: [:0]const u8, buffer: []u8) usize {
+        if (comptime builtin.os.tag == .macos) {
+            return rayslides_macos_choose_image(initial_directory.ptr, buffer.ptr, buffer.len);
+        }
+        return 0;
+    }
 };
+
+fn studioImagePathFromSelection(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    deck_path: ?[]const u8,
+    selected_path: []const u8,
+) ![]u8 {
+    const deck_dir = if (deck_path) |path| std.fs.path.dirname(path) orelse "." else return allocator.dupe(u8, selected_path);
+    return std.fs.path.relative(allocator, cwd, null, deck_dir, selected_path);
+}
+
+test "image chooser stores paths relative to a saved deck" {
+    const allocator = std.testing.allocator;
+    const relative = try studioImagePathFromSelection(
+        allocator,
+        "/work/project",
+        "decks/talk.sld",
+        "/work/project/decks/assets/hero.png",
+    );
+    defer allocator.free(relative);
+    try std.testing.expectEqualStrings("assets/hero.png", relative);
+
+    const untitled = try studioImagePathFromSelection(allocator, "/work/project", null, "/tmp/hero.png");
+    defer allocator.free(untitled);
+    try std.testing.expectEqualStrings("/tmp/hero.png", untitled);
+}
 
 fn isMacosAppExecutable(path: []const u8) bool {
     return std.mem.indexOf(u8, path, ".app/Contents/MacOS/") != null;
@@ -1810,6 +1845,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_command_palette = false;
     var diagnostics_command_tooltip = false;
     var diagnostics_precision_view = false;
+    var diagnostics_grid_settings = false;
     var diagnostics_presenter_pairing = false;
     var diagnostics_large_deck_count: ?usize = null;
     var diagnostics_incremental_edit_slide: ?usize = null;
@@ -1879,6 +1915,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-precision-view")) {
                 diagnostics_enabled = true;
                 diagnostics_precision_view = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-grid-settings")) {
+                diagnostics_enabled = true;
+                diagnostics_grid_settings = true;
                 launch_studio = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-presenter-pairing")) {
                 diagnostics_presenter_pairing = true;
@@ -2011,6 +2051,10 @@ pub fn main(init: std.process.Init) anyerror!void {
     // Initialize GPU-backed resources after the window and unload them before it closes.
     try G.init(gpa, io);
     defer G.deinit();
+    // Raygui is only used for a small number of application message boxes,
+    // but it otherwise silently falls back to raylib's pixel font. Keep it on
+    // the same embedded face as the rest of the application UI.
+    rg.setFont(G.studio_ui_font);
     if (app_recovery_dir) |path| G.setRecoveryDirectory(path);
     if (slideshow_to_load) |path| {
         G.slideshow_filp_to_load = path;
@@ -2039,6 +2083,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_selection_pending = diagnostics_select_id;
     var diagnostics_command_palette_pending = diagnostics_command_palette;
     var diagnostics_precision_view_pending = diagnostics_precision_view;
+    var diagnostics_grid_settings_pending = diagnostics_grid_settings;
     var diagnostics_find_slide_pending = diagnostics_find_slide_query;
     var diagnostics_incremental_edit_pending = diagnostics_incremental_edit_slide;
     var diagnostics_capture_stable_frames: usize = 0;
@@ -2102,6 +2147,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         window_close_seen = window_close_now;
         const inline_edit_active_at_frame_start = studio_mode.inlineEditActive();
         const command_palette_active_at_frame_start = studio_mode.commandPaletteActive();
+        const library_picker_active_at_frame_start = studio_mode.libraryPickerActive();
         const text_input_active_at_frame_start = property_prompt.active or studio_mode.textEntryActive();
         const presenter_pairing_visible_at_frame_start = presenter_pairing_visible;
         var presenter_overlay_consumed_input = false;
@@ -2444,6 +2490,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             studio_mode.showPrecisionViewForDiagnostics();
             diagnostics_precision_view_pending = false;
         }
+        if (diagnostics_grid_settings_pending) {
+            studio_mode.showGridSettingsForDiagnostics();
+            diagnostics_grid_settings_pending = false;
+        }
         if (diagnostics_find_slide_pending) |query| {
             if (!studio_mode.openSlideSearchForDiagnostics(query))
                 log.warn("diagnostics could not open slide search for invalid query", .{});
@@ -2524,8 +2574,14 @@ pub fn main(init: std.process.Init) anyerror!void {
         var source_graph_reparsed_this_frame = false;
         const prompt_was_active = property_prompt.active;
         if (prompt_was_active) {
-            switch (property_prompt.updateFromRaylib()) {
+            switch (property_prompt.updateFromRaylib(window_size, G.studio_ui_font, builtin.os.tag == .macos)) {
                 .none => {},
+                .browse_requested => {
+                    var chosen_path: [std.fs.max_path_bytes]u8 = undefined;
+                    const chosen_len = browseStudioImagePath(&chosen_path);
+                    if (chosen_len > 0) property_prompt.begin(.image_path, chosen_path[0..chosen_len]);
+                    window_close_seen = false;
+                },
                 .submitted => {
                     if (pending_save_as) {
                         if (saveUntitledEditorSourceAs(property_prompt.text())) |_| {
@@ -2631,7 +2687,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                     },
                     .edit_text => |target| {
                         const initial = studioItemByIdentity(studio_items, target.item_identity) orelse null;
-                        const initial_text = if (initial) |item|
+                        const initial_text = studio_mode.inlineTextForModal(target) orelse if (initial) |item|
                             if (target.edit_scope == .shared_template)
                                 if (item.sharedTemplateValues()) |shared| shared.text orelse "" else ""
                             else
@@ -2643,6 +2699,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                             if (target.edit_scope == .shared_template) .shared_text else .text,
                             initial_text,
                         );
+                        // Prompt.begin copied any live inline draft, so the
+                        // narrow editor can now be dismissed without losing it.
+                        studio_mode.dismissInlineTextForModal();
                     },
                     .edit_numeric_geometry => |request| prompt: {
                         const item = studioItemByIdentity(studio_items, request.target.item_identity) orelse {
@@ -3017,7 +3076,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             if (banner.show) banner.render();
 
             frame_diagnostics.draw(G.studio_ui_font, beast_mode, frameDiagnosticsPlacement(studio_viewport, slide_tl));
-            property_prompt.draw(window_size);
+            property_prompt.draw(window_size, G.studio_ui_font, builtin.os.tag == .macos);
             if (!export_controller.running) {
                 // Discovery chrome is intentionally last: command search and
                 // hover help must remain legible above diagnostics and every
@@ -3283,6 +3342,9 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (command_palette_active_at_frame_start and !studio_mode.commandPaletteActive()) {
             // Native close flags can remain latched on macOS. Closing the
             // palette must make the deferred request observable again.
+            window_close_seen = false;
+        }
+        if (library_picker_active_at_frame_start and !studio_mode.libraryPickerActive()) {
             window_close_seen = false;
         }
 
@@ -3771,6 +3833,34 @@ const AppData = struct {
 };
 
 var G = AppData{};
+
+fn browseStudioImagePath(output: []u8) usize {
+    if (comptime builtin.os.tag != .macos) return 0;
+
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = std.Io.Dir.cwd().realPath(G.io, &cwd_buffer) catch return 0;
+    const cwd = cwd_buffer[0..cwd_len];
+    const deck_dir = if (G.slideshow_filp) |path| std.fs.path.dirname(path) orelse "." else ".";
+    const absolute_deck_dir = std.fs.path.resolve(G.allocator, &.{ cwd, deck_dir }) catch return 0;
+    defer G.allocator.free(absolute_deck_dir);
+
+    var directory_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const directory = std.fmt.bufPrintZ(&directory_buffer, "{s}", .{absolute_deck_dir}) catch return 0;
+    var selected_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const selected_len = MacOpenDocuments.chooseImage(directory, &selected_buffer);
+    if (selected_len == 0) return 0;
+
+    const source_path = studioImagePathFromSelection(
+        G.allocator,
+        cwd,
+        G.slideshow_filp,
+        selected_buffer[0..selected_len],
+    ) catch return 0;
+    defer G.allocator.free(source_path);
+    if (source_path.len > output.len) return 0;
+    @memcpy(output[0..source_path.len], source_path);
+    return source_path.len;
+}
 
 var slicetocbuf: [1024]u8 = undefined;
 fn sliceToC(input: []const u8) [:0]u8 {
@@ -6061,10 +6151,18 @@ fn itemTextSnippet(
     text_value: []const u8,
 ) ![]u8 {
     try validateStudioTextValue(text_value);
-    if (std.mem.indexOfScalar(u8, text_value, '\n') == null) {
+    if (!source_editor.semanticItemTextRequiresBody(text_value)) {
         return std.fmt.allocPrint(allocator, "{s} text={s}", .{ directive_without_text, text_value });
     }
-    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ directive_without_text, text_value });
+    const encoded = try source_editor.encodeSemanticBodyText(allocator, text_value);
+    defer allocator.free(encoded);
+    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ directive_without_text, encoded });
+}
+
+test "Studio item snippets encode visual blank lines as parser spacers" {
+    const snippet = try itemTextSnippet(std.testing.allocator, "@box id=body", "First\n \nSecond\n");
+    defer std.testing.allocator.free(snippet);
+    try std.testing.expectEqualStrings("@box id=body\nFirst\n_\nSecond\n_", snippet);
 }
 
 fn appendStudioToken(

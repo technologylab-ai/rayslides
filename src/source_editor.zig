@@ -3487,7 +3487,7 @@ pub fn patchItemText(
     text_value: []const u8,
 ) (std.mem.Allocator.Error || PatchError)!PatchResult {
     if (std.mem.indexOfScalar(u8, text_value, '\r') != null) return error.InvalidLiteralValue;
-    if (std.mem.indexOfScalar(u8, text_value, '\n') == null) {
+    if (!semanticTextRequiresBody(text_value)) {
         const patches = [_]LiteralAttributePatch{.{ .key = "text", .value = text_value }};
         return patchLiteralAttributes(allocator, source, directive_offset, &patches);
     }
@@ -3509,7 +3509,7 @@ pub fn patchItemText(
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
     if (line.full_end == line.content_end) try body.appendSlice(allocator, newline);
-    try appendNormalizedLines(allocator, &body, text_value, newline);
+    try appendSemanticBodyTextLines(allocator, &body, text_value, newline);
     try body.appendSlice(allocator, newline);
     try edits.append(allocator, .{
         .start = line.full_end,
@@ -5268,6 +5268,53 @@ fn validateBodyText(value: []const u8) PatchError!void {
     while (lines.next()) |line| {
         if (line.len > 0 and (line[0] == '@' or line[0] == '#')) return error.InvalidLiteralValue;
     }
+}
+
+fn semanticTextRequiresBody(value: []const u8) bool {
+    return std.mem.indexOfScalar(u8, value, '\n') != null or
+        (value.len > 0 and std.mem.trim(u8, value, " \t").len == 0);
+}
+
+/// Emit semantic item text in the parser's body-text dialect. The parser
+/// represents a source `_` spacer as a single-space semantic line, while it
+/// deliberately ignores physically empty or whitespace-only source lines.
+/// Canonicalizing both representations back to `_` keeps visual blank lines
+/// intact across Studio edit/reparse cycles.
+fn appendSemanticBodyTextLines(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+    newline: []const u8,
+) std.mem.Allocator.Error!void {
+    var pieces = std.mem.splitScalar(u8, value, '\n');
+    var first = true;
+    while (pieces.next()) |piece| {
+        if (!first) try output.appendSlice(allocator, newline);
+        if (std.mem.trim(u8, piece, " \t").len == 0)
+            try output.append(allocator, '_')
+        else
+            try output.appendSlice(allocator, piece);
+        first = false;
+    }
+}
+
+/// Encode semantic item text for use after a source directive. The returned
+/// bytes use LF separators; callers may place them into a snippet that will be
+/// normalized to the surrounding document's physical line ending later.
+pub fn encodeSemanticBodyText(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+) (std.mem.Allocator.Error || PatchError)![]u8 {
+    if (std.mem.indexOfScalar(u8, value, '\r') != null) return error.InvalidLiteralValue;
+    try validateBodyText(value);
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try appendSemanticBodyTextLines(allocator, &output, value, "\n");
+    return output.toOwnedSlice(allocator);
+}
+
+pub fn semanticItemTextRequiresBody(value: []const u8) bool {
+    return semanticTextRequiresBody(value);
 }
 
 fn findSpeakerNotesBlock(source: []const u8, range: LogicalSlideRange) PatchError!?Span {
@@ -8972,6 +9019,62 @@ test "multiline item text replaces inline and body text but retains comments" {
         "@box text=Next\r\n";
     const result = try patchItemText(std.testing.allocator, source, 0, "- First\n- Second");
     try expectSourceResult(result, source, expected);
+}
+
+test "Studio text round trip preserves test_public spacer lines and a new trailing line" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box x=110 y=181 w=850 h=861\n" ++
+        "This is Markdown _**ta-dah**_, **tah**, _dah_!\n" ++
+        "_\n" ++
+        "empty lines are marked with just an _ underscore\n" ++
+        "_\n" ++
+        "- here comes the text\n" ++
+        "    - even more\n" ++
+        "        - and let's wrap one more time into a nicely aligned textbox\n" ++
+        "_\n" ++
+        "- and so on\n" ++
+        "_\n" ++
+        "- now let us create a text that is very likely to need to be wrapped\n" ++
+        "- **and so on**, _and on_\n" ++
+        "@box text=Following item\n";
+    const directive_offset = std.mem.indexOf(u8, source, "@box x=110").?;
+
+    var before_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer before_arena.deinit();
+    const before_deck = try slides.SlideShow.new(before_arena.allocator());
+    const before_context = try parser.constructSlidesFromBuf(source, before_deck, before_arena.allocator());
+    defer before_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before_context.parser_errors.items.len);
+    const original_text = before_deck.slides.items[0].items.?.items[0].text.?;
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, original_text, "\n \n"));
+
+    const unchanged = try patchItemText(std.testing.allocator, source, directive_offset, original_text);
+    defer unchanged.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(source, unchanged.source);
+
+    const with_enter = try std.fmt.allocPrint(std.testing.allocator, "{s}\n", .{original_text});
+    defer std.testing.allocator.free(with_enter);
+    const changed = try patchItemText(std.testing.allocator, source, directive_offset, with_enter);
+    defer changed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        changed.source[0..std.mem.indexOf(u8, changed.source, "@box text=Following").?],
+        "- **and so on**, _and on_\n_\n",
+    ));
+
+    var after_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer after_arena.deinit();
+    const after_deck = try slides.SlideShow.new(after_arena.allocator());
+    const after_context = try parser.constructSlidesFromBuf(changed.source, after_deck, after_arena.allocator());
+    defer after_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_context.parser_errors.items.len);
+    const reparsed_text = after_deck.slides.items[0].items.?.items[0].text.?;
+    const expected_reparsed = try std.fmt.allocPrint(std.testing.allocator, "{s}\n ", .{original_text});
+    defer std.testing.allocator.free(expected_reparsed);
+    try std.testing.expectEqualStrings(expected_reparsed, reparsed_text);
 }
 
 test "single-line text that resembles source syntax remains safely inline" {

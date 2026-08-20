@@ -24,12 +24,25 @@ pub const default_handle_size: f32 = 14;
 pub const default_min_item_size: f32 = 8;
 pub const default_snap_threshold_screen: f32 = 8;
 pub const default_grid_spacing: f32 = 20;
+pub const default_grid_contrast: f32 = 0.10;
+pub const maximum_grid_contrast: f32 = 0.35;
 pub const marquee_drag_threshold_screen: f32 = 3;
 pub const max_selection_items: usize = 64;
 pub const minimum_canvas_zoom: f32 = 0.5;
 pub const maximum_canvas_zoom: f32 = 8;
 pub const canvas_zoom_step: f32 = 1.25;
 pub const ruler_thickness: f32 = 28;
+
+pub const GridAppearance = enum {
+    auto,
+    dark,
+    light,
+};
+
+pub const GridStyle = enum {
+    lines,
+    dots,
+};
 
 /// Studio typography has a deliberate 14 px floor at the reference 1280x720
 /// viewport. Controls scale up to 2x on large/full-screen displays, but never
@@ -1412,6 +1425,7 @@ pub const UiLayout = struct {
     tool_buttons: [6]rl.Rectangle,
     new_slide: rl.Rectangle,
     grid_toggle: rl.Rectangle,
+    grid_settings_toggle: rl.Rectangle,
     scene_previous: rl.Rectangle,
     scene_label: rl.Rectangle,
     scene_next: rl.Rectangle,
@@ -1446,6 +1460,7 @@ fn emptyUiLayout(scale: f32) UiLayout {
         .tool_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 6,
         .new_slide = empty_ui_rectangle,
         .grid_toggle = empty_ui_rectangle,
+        .grid_settings_toggle = empty_ui_rectangle,
         .scene_previous = empty_ui_rectangle,
         .scene_label = empty_ui_rectangle,
         .scene_next = empty_ui_rectangle,
@@ -1988,8 +2003,9 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     const tool_size: f32 = @as(f32, if (compact_toolbar) 40 else 46) * scale;
     const new_slide_width: f32 = @as(f32, if (compact_toolbar) 70 else 82) * scale;
     const grid_width: f32 = @as(f32, if (compact_toolbar) 58 else 66) * scale;
+    const grid_settings_width: f32 = @as(f32, if (compact_toolbar) 24 else 28) * scale;
     const scene_width: f32 = @as(f32, if (compact_toolbar) 112 else 150) * scale;
-    const toolbar_width = margin * 2 + tool_size * 6 + gap * 5 + gap + new_slide_width + gap + grid_width + gap + scene_width;
+    const toolbar_width = margin * 2 + tool_size * 6 + gap * 5 + gap + new_slide_width + gap + grid_width + grid_settings_width + gap + scene_width;
     const toolbar: rl.Rectangle = if (docked)
         viewport.chrome.?.toolbar
     else
@@ -2018,8 +2034,14 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = grid_width,
         .height = tool_size,
     };
+    const grid_settings_toggle: rl.Rectangle = .{
+        .x = grid_toggle.x + grid_toggle.width,
+        .y = grid_toggle.y,
+        .width = grid_settings_width,
+        .height = grid_toggle.height,
+    };
     const scene_previous: rl.Rectangle = .{
-        .x = grid_toggle.x + grid_toggle.width + gap,
+        .x = grid_settings_toggle.x + grid_settings_toggle.width + gap,
         .y = new_slide.y,
         .width = 32 * scale,
         .height = tool_size,
@@ -2210,6 +2232,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .tool_buttons = tool_buttons,
             .new_slide = new_slide,
             .grid_toggle = grid_toggle,
+            .grid_settings_toggle = grid_settings_toggle,
             .scene_previous = scene_previous,
             .scene_label = scene_label,
             .scene_next = scene_next,
@@ -2363,6 +2386,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .tool_buttons = tool_buttons,
         .new_slide = new_slide,
         .grid_toggle = grid_toggle,
+        .grid_settings_toggle = grid_settings_toggle,
         .scene_previous = scene_previous,
         .scene_label = scene_label,
         .scene_next = scene_next,
@@ -2387,6 +2411,66 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .distribute_buttons = distribute_buttons,
         .layer_buttons = layer_buttons,
         .lock_item = lock_item,
+    };
+}
+
+pub const GridSettingsLayout = struct {
+    panel: rl.Rectangle,
+    appearance_buttons: [3]rl.Rectangle,
+    contrast_hit: rl.Rectangle,
+    contrast_track: rl.Rectangle,
+    style_buttons: [2]rl.Rectangle,
+};
+
+pub fn gridSettingsLayout(viewport: Viewport) GridSettingsLayout {
+    const toolbar = uiLayout(viewport);
+    const scale = toolbar.scale;
+    const panel_width = 320 * scale;
+    const panel_height = 208 * scale;
+    const bounds = if (viewport.chrome) |chrome| chrome.content else viewport.canvasBounds();
+    const desired_x = toolbar.grid_toggle.x;
+    const minimum_x = bounds.x + 8 * scale;
+    const maximum_x = @max(minimum_x, bounds.x + bounds.width - panel_width - 8 * scale);
+    const panel: rl.Rectangle = .{
+        .x = std.math.clamp(desired_x, minimum_x, maximum_x),
+        .y = toolbar.toolbar.y + toolbar.toolbar.height + 6 * scale,
+        .width = panel_width,
+        .height = panel_height,
+    };
+    const inset = 14 * scale;
+    const inner_width = panel.width - inset * 2;
+    const button_gap = 6 * scale;
+    const appearance_width = (inner_width - button_gap * 2) / 3;
+    var appearance_buttons: [3]rl.Rectangle = undefined;
+    for (&appearance_buttons, 0..) |*button, index| button.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (appearance_width + button_gap),
+        .y = panel.y + 43 * scale,
+        .width = appearance_width,
+        .height = 30 * scale,
+    };
+    const contrast_hit: rl.Rectangle = .{
+        .x = panel.x + inset,
+        .y = panel.y + 96 * scale,
+        .width = inner_width,
+        .height = 30 * scale,
+    };
+    const contrast_track: rl.Rectangle = .{
+        .x = contrast_hit.x + 4 * scale,
+        .y = contrast_hit.y + 12 * scale,
+        .width = contrast_hit.width - 8 * scale,
+        .height = 6 * scale,
+    };
+    const style_width = (inner_width - button_gap) / 2;
+    const style_buttons = [2]rl.Rectangle{
+        .{ .x = panel.x + inset, .y = panel.y + 158 * scale, .width = style_width, .height = 30 * scale },
+        .{ .x = panel.x + inset + style_width + button_gap, .y = panel.y + 158 * scale, .width = style_width, .height = 30 * scale },
+    };
+    return .{
+        .panel = panel,
+        .appearance_buttons = appearance_buttons,
+        .contrast_hit = contrast_hit,
+        .contrast_track = contrast_track,
+        .style_buttons = style_buttons,
     };
 }
 
@@ -3104,6 +3188,11 @@ pub const Studio = struct {
     snap_threshold_screen: f32 = default_snap_threshold_screen,
     grid_spacing: f32 = default_grid_spacing,
     grid_snapping: bool = false,
+    grid_appearance: GridAppearance = .auto,
+    grid_style: GridStyle = .lines,
+    grid_contrast: f32 = default_grid_contrast,
+    grid_settings_active: bool = false,
+    grid_contrast_dragging: bool = false,
     rulers_visible: bool = false,
     safe_areas_visible: bool = false,
     measurements_visible: bool = false,
@@ -3121,6 +3210,7 @@ pub const Studio = struct {
     pending_geometry_batch: ?GeometryBatchCommand = null,
     inline_editor: InlineEditor = .{},
     command_palette: CommandPaletteState = .{},
+    library_picker_active: bool = false,
     active_search: ?SearchPanel = null,
     slide_search: PanelSearchState = .{},
     library_search: PanelSearchState = .{},
@@ -3302,6 +3392,10 @@ pub const Studio = struct {
         return self.command_palette.active;
     }
 
+    pub fn libraryPickerActive(self: Studio) bool {
+        return self.library_picker_active;
+    }
+
     /// Non-mutating launch hook used by screenshot/regression tooling. Normal
     /// product interaction continues through the visible button or Cmd/Ctrl-K.
     pub fn openCommandPaletteForDiagnostics(self: *Studio, items: []slides.SlideItem) void {
@@ -3348,12 +3442,24 @@ pub const Studio = struct {
         self.canvas_center = .{ .x = default_logical_size.x / 2, .y = default_logical_size.y / 2 };
     }
 
+    pub fn showGridSettingsForDiagnostics(self: *Studio) void {
+        self.focus_canvas = false;
+        self.closeCommandPalette();
+        self.closeReusablePicker();
+        self.active_search = null;
+        self.resetTooltip();
+        self.grid_snapping = true;
+        self.grid_settings_active = true;
+        self.grid_contrast_dragging = false;
+    }
+
     pub fn tooltipVisible(self: Studio) bool {
         return self.tooltip.visible();
     }
 
     pub fn textEntryActive(self: Studio) bool {
-        return self.inline_editor.active or self.command_palette.active or self.active_search != null;
+        return self.inline_editor.active or self.command_palette.active or
+            self.library_picker_active or self.grid_settings_active or self.active_search != null;
     }
 
     pub fn inlineEditField(self: Studio) ?InlineField {
@@ -3362,6 +3468,24 @@ pub const Studio = struct {
 
     pub fn inlineEditText(self: *const Studio) []const u8 {
         return if (self.inline_editor.active) self.inline_editor.text() else "";
+    }
+
+    /// Returns an in-progress inline text draft when the large editor is
+    /// opening for that exact source target. The integration copies this into
+    /// its modal buffer before dismissing the cramped inline editor, so using
+    /// the ellipsis control never throws away text typed immediately beforehand.
+    pub fn inlineTextForModal(self: *const Studio, target: CommandTarget) ?[]const u8 {
+        if (!self.inline_editor.active or self.inline_editor.field != .text or
+            self.inline_editor.blocked_initial or
+            self.inline_editor.target.item_identity != target.item_identity or
+            self.inline_editor.target.edit_scope != target.edit_scope)
+            return null;
+        return self.inline_editor.text();
+    }
+
+    pub fn dismissInlineTextForModal(self: *Studio) void {
+        if (self.inline_editor.active and self.inline_editor.field == .text)
+            self.cancelInlineEdit();
     }
 
     pub fn inlineEditError(self: Studio) ?InlineError {
@@ -3402,6 +3526,8 @@ pub const Studio = struct {
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.resetTooltip();
+        self.closeReusablePicker();
+        self.closeGridSettings();
         self.active_search = null;
         self.command_palette = .{ .active = true };
         self.notice = .none;
@@ -3409,6 +3535,91 @@ pub const Studio = struct {
 
     fn closeCommandPalette(self: *Studio) void {
         self.command_palette = .{};
+    }
+
+    fn closeReusablePicker(self: *Studio) void {
+        self.library_picker_active = false;
+    }
+
+    fn closeGridSettings(self: *Studio) void {
+        self.grid_settings_active = false;
+        self.grid_contrast_dragging = false;
+    }
+
+    fn setGridContrastFromPointer(self: *Studio, layout: GridSettingsLayout, pointer_x: f32) void {
+        const normalized = std.math.clamp(
+            (pointer_x - layout.contrast_track.x) / layout.contrast_track.width,
+            0,
+            1,
+        );
+        self.grid_contrast = normalized * maximum_grid_contrast;
+        self.grid_snapping = true;
+        self.snap_guides = .{};
+    }
+
+    fn handleGridSettings(self: *Studio, viewport: Viewport, input: FrameInput) bool {
+        if (!self.grid_settings_active) return false;
+
+        // Global navigation remains one-keystroke while the lightweight
+        // popover is open. Escape, by contrast, only dismisses the popover.
+        if (input.command_palette_pressed or input.toggle_focus_canvas_pressed or input.toggle_pressed) {
+            self.closeGridSettings();
+            return false;
+        }
+        if (input.cancel_pressed) {
+            self.closeGridSettings();
+            return true;
+        }
+        if (input.toggle_grid_pressed) {
+            self.grid_snapping = !self.grid_snapping;
+            self.snap_guides = .{};
+            return true;
+        }
+
+        const settings = gridSettingsLayout(viewport);
+        const toolbar = uiLayout(viewport);
+        if (self.grid_contrast_dragging) {
+            if (input.pointer_down or input.pointer_released)
+                self.setGridContrastFromPointer(settings, input.pointer_screen.x);
+            if (input.pointer_released) self.grid_contrast_dragging = false;
+            return true;
+        }
+        if (!input.pointer_pressed) return true;
+
+        if (pointInRectangle(input.pointer_screen, toolbar.grid_settings_toggle)) {
+            self.closeGridSettings();
+            return true;
+        }
+        if (pointInRectangle(input.pointer_screen, toolbar.grid_toggle)) {
+            self.grid_snapping = !self.grid_snapping;
+            self.snap_guides = .{};
+            return true;
+        }
+        if (!pointInRectangle(input.pointer_screen, settings.panel)) {
+            self.closeGridSettings();
+            return false;
+        }
+
+        for (settings.appearance_buttons, 0..) |button, index| {
+            if (!pointInRectangle(input.pointer_screen, button)) continue;
+            self.grid_appearance = @enumFromInt(index);
+            self.grid_snapping = true;
+            self.snap_guides = .{};
+            return true;
+        }
+        if (pointInRectangle(input.pointer_screen, settings.contrast_hit)) {
+            self.grid_contrast_dragging = true;
+            self.setGridContrastFromPointer(settings, input.pointer_screen.x);
+            return true;
+        }
+        for (settings.style_buttons, 0..) |button, index| {
+            if (!pointInRectangle(input.pointer_screen, button)) continue;
+            self.grid_style = @enumFromInt(index);
+            self.grid_snapping = true;
+            self.snap_guides = .{};
+            return true;
+        }
+        return true;
     }
 
     fn resetTooltip(self: *Studio) void {
@@ -3438,6 +3649,7 @@ pub const Studio = struct {
         const chrome_targets = [_]TooltipTarget{
             .{ .key = 20, .anchor = layout.new_slide, .title = "New slide", .detail = "Append a blank authored slide", .shortcut = "Cmd/Ctrl N" },
             .{ .key = 21, .anchor = layout.grid_toggle, .title = "Snapping grid", .detail = "Show the grid and snap gestures to it", .shortcut = "G" },
+            .{ .key = 29, .anchor = layout.grid_settings_toggle, .title = "Grid appearance", .detail = "Choose Auto, Dark, or Light contrast and Lines or Dots" },
             .{ .key = 22, .anchor = layout.scene_previous, .title = "Previous scene", .detail = "Cycle backward through BASE and morph states", .shortcut = "[" },
             .{ .key = 23, .anchor = layout.scene_label, .title = "Morph scene", .detail = "Click to cycle BASE and cumulative states", .shortcut = "[ / ]" },
             .{ .key = 24, .anchor = layout.scene_next, .title = "Next scene", .detail = "Cycle forward through BASE and morph states", .shortcut = "]" },
@@ -3475,7 +3687,7 @@ pub const Studio = struct {
             if (hoveredTooltip(pointer, 55, objects.page_next, "Next object page", "Show later Objects rows", "")) |target| return target;
         } else {
             const property_targets = [_]TooltipTarget{
-                .{ .key = 60, .anchor = layout.edit_text, .title = "Text", .detail = "Edit text inline; Shift-Enter adds a new line", .shortcut = "Enter" },
+                .{ .key = 60, .anchor = layout.edit_text, .title = "Text", .detail = "Edit inline, or use ... for the roomy multiline editor", .shortcut = "Enter" },
                 .{ .key = 61, .anchor = layout.duplicate_item, .title = "Duplicate", .detail = "Clone the selection in one undoable transaction", .shortcut = "Cmd/Ctrl D" },
                 .{ .key = 62, .anchor = layout.delete_item, .title = "Delete", .detail = "Remove or locally hide the selected object", .shortcut = "Backspace" },
                 .{ .key = 63, .anchor = layout.promote, .title = "Reuse or detach", .detail = "Promote authored content or detach a safe instance", .shortcut = "P" },
@@ -3545,7 +3757,8 @@ pub const Studio = struct {
     }
 
     fn updateTooltip(self: *Studio, viewport: Viewport, workspace: Workspace, input: FrameInput) void {
-        if (self.command_palette.active or self.inline_editor.active or self.interaction != .idle or self.view_panning or
+        if (self.command_palette.active or self.library_picker_active or self.grid_settings_active or self.inline_editor.active or
+            self.interaction != .idle or self.view_panning or
             self.marquee.active or self.active_search != null or input.pointer_pressed or input.pointer_down)
         {
             self.resetTooltip();
@@ -3754,6 +3967,7 @@ pub const Studio = struct {
     fn activatePanelSearch(self: *Studio, panel: SearchPanel) void {
         self.focus_canvas = false;
         self.command_palette = .{};
+        self.closeReusablePicker();
         self.cancelInlineEdit();
         self.active_search = panel;
         switch (panel) {
@@ -4010,7 +4224,7 @@ pub const Studio = struct {
             .tool_bullets => self.setTool(.add_bullets, items),
             .tool_image => self.setTool(.add_image, items),
             .tool_rectangle => self.setTool(.add_shape, items),
-            .tool_library => self.setTool(.add_reusable, items),
+            .tool_library => self.openReusablePicker(items, workspace),
             .new_slide => self.pending_semantic_command = .{ .new_slide = {} },
             .previous_slide, .next_slide => {
                 const current = summaryOffsetForSlide(workspace.slides, workspace.current_slide) orelse return;
@@ -4131,6 +4345,152 @@ pub const Studio = struct {
             if (self.commandAvailability(items, workspace, spec.id).enabled)
                 self.executeCommand(items, resolved_bounds, viewport, workspace, spec.id);
         }
+        return true;
+    }
+
+    fn normalizeReusablePickerSelection(self: *Studio, viewport: Viewport, workspace: Workspace) void {
+        const search = &self.library_search;
+        const count = librarySearchResultCount(workspace.library, search.text());
+        if (count == 0) {
+            search.selected_result = 0;
+            search.first_visible = 0;
+            return;
+        }
+        search.selected_result = @min(search.selected_result, count - 1);
+        const selected_entry = libraryIndexAtSearchResult(
+            workspace.library,
+            search.text(),
+            search.selected_result,
+        );
+        if (selected_entry == null or !workspace.library[selected_entry.?].available) {
+            for (0..count) |result_index| {
+                const entry_index = libraryIndexAtSearchResult(
+                    workspace.library,
+                    search.text(),
+                    result_index,
+                ) orelse continue;
+                if (!workspace.library[entry_index].available) continue;
+                search.selected_result = result_index;
+                break;
+            }
+        }
+        search.first_visible = revealIndex(
+            search.first_visible,
+            search.selected_result,
+            count,
+            commandPaletteRowCapacity(commandPaletteLayout(viewport)),
+        );
+    }
+
+    fn stepReusablePickerSelection(self: *Studio, workspace: Workspace, direction: i8) void {
+        const search = &self.library_search;
+        const count = librarySearchResultCount(workspace.library, search.text());
+        if (count == 0 or direction == 0) return;
+        var candidate = @min(search.selected_result, count - 1);
+        for (0..count) |_| {
+            candidate = if (direction < 0)
+                if (candidate == 0) count - 1 else candidate - 1
+            else
+                (candidate + 1) % count;
+            const entry_index = libraryIndexAtSearchResult(
+                workspace.library,
+                search.text(),
+                candidate,
+            ) orelse continue;
+            if (!workspace.library[entry_index].available) continue;
+            search.selected_result = candidate;
+            return;
+        }
+    }
+
+    fn activateReusablePickerResult(
+        self: *Studio,
+        items: []slides.SlideItem,
+        workspace: Workspace,
+        result_index: usize,
+    ) void {
+        const entry_index = libraryIndexAtSearchResult(
+            workspace.library,
+            self.library_search.text(),
+            result_index,
+        ) orelse return;
+        if (!workspace.library[entry_index].available) {
+            self.notice = .property_unavailable;
+            return;
+        }
+        self.selected_library_index = entry_index;
+        self.closeReusablePicker();
+        self.emitLibraryAction(items, workspace, .use);
+    }
+
+    fn handleReusablePicker(
+        self: *Studio,
+        items: []slides.SlideItem,
+        viewport: Viewport,
+        workspace: Workspace,
+        input: FrameInput,
+    ) bool {
+        if (!self.library_picker_active) return false;
+        if (!workspace.visible or workspace.library.len == 0) {
+            self.closeReusablePicker();
+            return false;
+        }
+        if (input.command_palette_pressed) {
+            self.closeReusablePicker();
+            return false;
+        }
+        if (input.cancel_pressed) {
+            self.closeReusablePicker();
+            return true;
+        }
+
+        if (input.inline_paste) |paste| self.appendPanelSearchQuery(.library, paste);
+        if (input.select_all_pressed) self.library_search.select_all = true;
+        if (input.inline_backspace_pressed or input.inline_delete_pressed)
+            self.removePanelSearchCodepoint(.library);
+        if (!input.shortcut_modifier_down and input.inline_chars_len > 0)
+            self.appendPanelSearchQuery(.library, input.inline_chars[0..input.inline_chars_len]);
+
+        const count = librarySearchResultCount(workspace.library, self.library_search.text());
+        if (input.palette_previous_pressed) self.stepReusablePickerSelection(workspace, -1);
+        if (input.palette_next_pressed) self.stepReusablePickerSelection(workspace, 1);
+        if (input.inline_home_pressed and count > 0) self.library_search.selected_result = 0;
+        if (input.inline_end_pressed and count > 0) self.library_search.selected_result = count - 1;
+        if (input.workspace_scroll != 0)
+            self.stepReusablePickerSelection(workspace, if (input.workspace_scroll > 0) -1 else 1);
+        self.normalizeReusablePickerSelection(viewport, workspace);
+
+        const layout = commandPaletteLayout(viewport);
+        if (input.pointer_pressed) {
+            if (!pointInRectangle(input.pointer_screen, layout.panel)) {
+                self.closeReusablePicker();
+                return true;
+            }
+            if (pointInRectangle(input.pointer_screen, layout.search)) {
+                const clear_width = 34 * layout.scale;
+                if (self.library_search.len > 0 and
+                    input.pointer_screen.x >= layout.search.x + layout.search.width - clear_width)
+                {
+                    self.library_search.clear();
+                    self.normalizeReusablePickerSelection(viewport, workspace);
+                } else {
+                    self.library_search.select_all = true;
+                }
+                return true;
+            }
+            for (0..commandPaletteRowCapacity(layout)) |slot| {
+                const row = commandPaletteRowRect(layout, slot) orelse break;
+                if (!pointInRectangle(input.pointer_screen, row)) continue;
+                const result_index = self.library_search.first_visible + slot;
+                if (result_index >= count) return true;
+                self.library_search.selected_result = result_index;
+                self.activateReusablePickerResult(items, workspace, result_index);
+                return true;
+            }
+            return true;
+        }
+        if (input.inline_submit_pressed and count > 0)
+            self.activateReusablePickerResult(items, workspace, self.library_search.selected_result);
         return true;
     }
 
@@ -4515,6 +4875,32 @@ pub const Studio = struct {
         self.notice = .none;
     }
 
+    fn openReusablePicker(self: *Studio, items: []slides.SlideItem, workspace: Workspace) void {
+        const has_available_entry = for (workspace.library) |entry| {
+            if (entry.available) break true;
+        } else false;
+        if (!workspace.visible or !has_available_entry) {
+            // Decks with no discoverable catalog retain the manual-name
+            // fallback so generated/dynamic definitions are still reachable.
+            self.closeReusablePicker();
+            self.setTool(.add_reusable, items);
+            return;
+        }
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
+        self.tool = .select;
+        self.focus_canvas = false;
+        self.cancelInlineEdit();
+        self.closeCommandPalette();
+        self.closeGridSettings();
+        self.active_search = null;
+        self.library_search.clear();
+        self.library_picker_active = true;
+        self.selected_library_index = null;
+        self.resetTooltip();
+        self.notice = .none;
+    }
+
     fn compositionContextForSelection(
         self: Studio,
         items: []const slides.SlideItem,
@@ -4637,6 +5023,12 @@ pub const Studio = struct {
         const item = items[item_index];
         const layout = uiLayout(viewport);
         if (input.pointer_pressed) {
+            const text_local_override = if (self.compositionContextForSelection(items)) |context|
+                context.local_overrides.contains(.text)
+            else
+                false;
+            if (pointInRectangle(input.pointer_screen, inlineTextExpandRect(layout.edit_text, text_local_override)))
+                return self.emitExpandedTextEditor(items, input.allow_shared_edit);
             if (self.inlineOverrideFieldAtPoint(items, layout, input.pointer_screen)) |field| {
                 if (self.inline_editor.dirty) {
                     self.inline_editor.blur_after_accept = true;
@@ -4832,6 +5224,7 @@ pub const Studio = struct {
 
     pub fn markSourceChanged(self: *Studio) void {
         self.closeCommandPalette();
+        self.closeReusablePicker();
         self.resetTooltip();
         self.copy_is_current = false;
         self.snap_guides = .{};
@@ -4948,6 +5341,8 @@ pub const Studio = struct {
     pub fn toggle(self: *Studio, items: []slides.SlideItem) void {
         self.cancelInlineEdit();
         self.closeCommandPalette();
+        self.closeReusablePicker();
+        self.closeGridSettings();
         self.resetTooltip();
         if (self.enabled and self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
@@ -4970,6 +5365,8 @@ pub const Studio = struct {
     pub fn disable(self: *Studio, items: []slides.SlideItem) void {
         self.cancelInlineEdit();
         self.closeCommandPalette();
+        self.closeReusablePicker();
+        self.closeGridSettings();
         self.resetTooltip();
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
@@ -5222,7 +5619,9 @@ pub const Studio = struct {
         }
 
         self.validateSelection(items, resolved_bounds);
+        if (self.handleGridSettings(viewport, input)) return null;
         if (self.handleCommandPalette(items, resolved_bounds, viewport, workspace, input)) return null;
+        if (self.handleReusablePicker(items, viewport, workspace, input)) return null;
         if (self.inline_editor.active and workspace.visible and self.last_workspace_slide != null and
             self.last_workspace_slide.? != workspace.current_slide)
         {
@@ -5316,7 +5715,12 @@ pub const Studio = struct {
             self.handleWorkspaceScroll(viewport, workspace, input);
         }
 
-        if (input.choose_tool) |tool| self.setTool(tool, items);
+        if (input.choose_tool) |tool| {
+            if (tool == .add_reusable)
+                self.openReusablePicker(items, workspace)
+            else
+                self.setTool(tool, items);
+        }
 
         if (input.cycle_morph_scene != 0) {
             self.cycleMorphState(items, input.cycle_morph_scene);
@@ -5390,6 +5794,7 @@ pub const Studio = struct {
             items,
             resolved_bounds,
             viewport,
+            workspace,
             input.pointer_screen,
             input.toggle_selection,
             input.allow_shared_edit,
@@ -5805,6 +6210,23 @@ pub const Studio = struct {
             .promote_to_reusable => .{ .promote_to_reusable = target },
         };
         return true;
+    }
+
+    fn emitExpandedTextEditor(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.inline_editor.active and self.inline_editor.field == .text and
+            self.selectionCount() == 1 and self.inlineTargetStillMatches(items, index) and
+            !items[index].locked)
+        {
+            self.notice = .none;
+            self.pending_semantic_command = .{ .edit_text = self.inline_editor.target };
+            return true;
+        }
+        return self.emitSelectedCommand(items, allow_shared_edit, .edit_text);
     }
 
     fn emitColorCommand(
@@ -6892,6 +7314,7 @@ pub const Studio = struct {
         items: []slides.SlideItem,
         resolved_bounds: []const ResolvedBounds,
         viewport: Viewport,
+        workspace: Workspace,
         pointer: rl.Vector2,
         toggle_selection: bool,
         allow_shared_edit: bool,
@@ -6929,9 +7352,23 @@ pub const Studio = struct {
                 self.focus_canvas = true;
                 return true;
             }
+            if (pointInRectangle(pointer, layout.grid_settings_toggle)) {
+                self.cancelInlineEdit();
+                self.closeCommandPalette();
+                self.closeReusablePicker();
+                self.active_search = null;
+                self.resetTooltip();
+                self.grid_settings_active = true;
+                self.grid_contrast_dragging = false;
+                return true;
+            }
             for (layout.tool_buttons, 0..) |button, index| {
                 if (pointInRectangle(pointer, button)) {
-                    self.setTool(@enumFromInt(index), items);
+                    const tool: Tool = @enumFromInt(index);
+                    if (tool == .add_reusable)
+                        self.openReusablePicker(items, workspace)
+                    else
+                        self.setTool(tool, items);
                     break;
                 }
             }
@@ -7029,6 +7466,12 @@ pub const Studio = struct {
         }
         const inline_properties = viewport.chrome != null;
         if (inline_properties) {
+            const text_local_override = if (self.compositionContextForSelection(items)) |context|
+                context.local_overrides.contains(.text)
+            else
+                false;
+            if (pointInRectangle(pointer, inlineTextExpandRect(layout.edit_text, text_local_override)))
+                return self.emitExpandedTextEditor(items, allow_shared_edit);
             if (self.inlineOverrideFieldAtPoint(items, layout, pointer)) |field|
                 return self.emitResetOverride(items, field);
         }
@@ -7162,8 +7605,43 @@ pub const Studio = struct {
             }
             return .arrow;
         }
+        if (self.grid_settings_active) {
+            const settings = gridSettingsLayout(viewport);
+            const toolbar = uiLayout(viewport);
+            if (pointInRectangle(pointer, toolbar.grid_toggle) or
+                pointInRectangle(pointer, toolbar.grid_settings_toggle) or
+                pointInRectangle(pointer, settings.contrast_hit)) return .pointing_hand;
+            for (settings.appearance_buttons) |button|
+                if (pointInRectangle(pointer, button)) return .pointing_hand;
+            for (settings.style_buttons) |button|
+                if (pointInRectangle(pointer, button)) return .pointing_hand;
+            return .arrow;
+        }
+        if (self.library_picker_active) {
+            const layout = commandPaletteLayout(viewport);
+            if (pointInRectangle(pointer, layout.search)) return .ibeam;
+            for (0..commandPaletteRowCapacity(layout)) |slot| {
+                const row = commandPaletteRowRect(layout, slot) orelse break;
+                if (!pointInRectangle(pointer, row)) continue;
+                const result_index = self.library_search.first_visible + slot;
+                const entry_index = libraryIndexAtSearchResult(
+                    workspace.library,
+                    self.library_search.text(),
+                    result_index,
+                ) orelse return .arrow;
+                return if (workspace.library[entry_index].available) .pointing_hand else .not_allowed;
+            }
+            return .arrow;
+        }
         if (self.inline_editor.active) {
-            const field = inlineFieldRect(uiLayout(viewport), self.inline_editor.field);
+            const layout = uiLayout(viewport);
+            const text_local_override = if (self.compositionContextForSelection(items)) |context|
+                context.local_overrides.contains(.text)
+            else
+                false;
+            if (pointInRectangle(pointer, inlineTextExpandRect(layout.edit_text, text_local_override)))
+                return .pointing_hand;
+            const field = inlineFieldRect(layout, self.inline_editor.field);
             if (pointInRectangle(pointer, field)) return .ibeam;
         }
         if (self.tooltipTargetAtPoint(viewport, workspace, pointer) != null) return .pointing_hand;
@@ -8523,8 +9001,55 @@ pub const Studio = struct {
 
     fn drawLogicalGrid(self: Studio, viewport: Viewport) void {
         if (!viewport.valid() or self.grid_spacing <= 0) return;
-        const minor: rl.Color = .{ .r = 105, .g = 207, .b = 230, .a = 24 };
-        const major: rl.Color = .{ .r = 105, .g = 207, .b = 230, .a = 52 };
+
+        if (self.grid_appearance == .auto) {
+            // Exclusion blending nudges each underlying channel toward its
+            // opposite. It gives one clean stroke local contrast without a
+            // slide-dependent color or a persistent glow.
+            rl.gl.rlSetBlendFactorsSeparate(
+                rl.gl.rl_one_minus_dst_color,
+                rl.gl.rl_one_minus_src_color,
+                rl.gl.rl_one,
+                rl.gl.rl_one_minus_src_alpha,
+                rl.gl.rl_func_add,
+                rl.gl.rl_func_add,
+            );
+            rl.beginBlendMode(.custom_separate);
+            self.drawLogicalGridGeometry(viewport);
+            rl.endBlendMode();
+        } else {
+            self.drawLogicalGridGeometry(viewport);
+        }
+    }
+
+    fn drawLogicalGridGeometry(self: Studio, viewport: Viewport) void {
+        if (self.grid_style == .dots) {
+            var x_index: usize = 0;
+            var logical_x: f32 = 0;
+            while (logical_x <= viewport.logical_size.x) : ({
+                x_index += 1;
+                logical_x = @as(f32, @floatFromInt(x_index)) * self.grid_spacing;
+            }) {
+                var y_index: usize = 0;
+                var logical_y: f32 = 0;
+                while (logical_y <= viewport.logical_size.y) : ({
+                    y_index += 1;
+                    logical_y = @as(f32, @floatFromInt(y_index)) * self.grid_spacing;
+                }) {
+                    const screen = logicalToScreen(viewport, .{ .x = logical_x, .y = logical_y }) orelse return;
+                    const major = x_index % 5 == 0 and y_index % 5 == 0;
+                    const style = logicalGridLineStyle(self.grid_appearance, self.grid_contrast, major);
+                    const size: f32 = if (major) 2.5 else 1.5;
+                    rl.drawRectangleRec(.{
+                        .x = screen.x - size / 2,
+                        .y = screen.y - size / 2,
+                        .width = size,
+                        .height = size,
+                    }, style.color);
+                }
+            }
+            return;
+        }
 
         var index: usize = 0;
         var logical_x: f32 = 0;
@@ -8533,11 +9058,12 @@ pub const Studio = struct {
             logical_x = @as(f32, @floatFromInt(index)) * self.grid_spacing;
         }) {
             const screen = logicalToScreen(viewport, .{ .x = logical_x, .y = 0 }) orelse return;
+            const style = logicalGridLineStyle(self.grid_appearance, self.grid_contrast, index % 5 == 0);
             rl.drawLineEx(
                 .{ .x = screen.x, .y = viewport.slide_top_left.y },
                 .{ .x = screen.x, .y = viewport.slide_top_left.y + viewport.slide_size.y },
-                if (index % 5 == 0) 1.25 else 1,
-                if (index % 5 == 0) major else minor,
+                style.thickness,
+                style.color,
             );
         }
 
@@ -8548,11 +9074,12 @@ pub const Studio = struct {
             logical_y = @as(f32, @floatFromInt(index)) * self.grid_spacing;
         }) {
             const screen = logicalToScreen(viewport, .{ .x = 0, .y = logical_y }) orelse return;
+            const style = logicalGridLineStyle(self.grid_appearance, self.grid_contrast, index % 5 == 0);
             rl.drawLineEx(
                 .{ .x = viewport.slide_top_left.x, .y = screen.y },
                 .{ .x = viewport.slide_top_left.x + viewport.slide_size.x, .y = screen.y },
-                if (index % 5 == 0) 1.25 else 1,
-                if (index % 5 == 0) major else minor,
+                style.thickness,
+                style.color,
             );
         }
     }
@@ -9074,11 +9601,288 @@ pub const Studio = struct {
         workspace: Workspace,
     ) void {
         if (!self.enabled) return;
-        if (self.command_palette.active) {
+        if (self.grid_settings_active) {
+            self.drawGridSettings(viewport);
+        } else if (self.command_palette.active) {
             self.drawCommandPalette(items, viewport, workspace);
+        } else if (self.library_picker_active) {
+            self.drawReusablePicker(viewport, workspace);
         } else if (self.tooltip.visible()) {
             self.drawTooltip(viewport);
         }
+    }
+
+    fn drawGridSettings(self: Studio, viewport: Viewport) void {
+        const layout = gridSettingsLayout(viewport);
+        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        const scale = uiScale(viewport);
+        const body_font = scaledUiFont(scale, UiTypography.body);
+        const compact_font = scaledUiFont(scale, UiTypography.compact);
+        const muted: rl.Color = .{ .r = 168, .g = 179, .b = 198, .a = 255 };
+        const accent: rl.Color = .{ .r = 80, .g = 215, .b = 255, .a = 255 };
+
+        rl.drawRectangleRounded(.{
+            .x = layout.panel.x + 5 * scale,
+            .y = layout.panel.y + 7 * scale,
+            .width = layout.panel.width,
+            .height = layout.panel.height,
+        }, 0.045, 10, .{ .r = 0, .g = 0, .b = 0, .a = 110 });
+        rl.drawRectangleRounded(layout.panel, 0.045, 10, .{ .r = 10, .g = 16, .b = 29, .a = 252 });
+        rl.drawRectangleRoundedLinesEx(layout.panel, 0.045, 10, 1.5 * scale, .{ .r = 80, .g = 215, .b = 255, .a = 220 });
+
+        self.drawUiText("GRID APPEARANCE", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 12 * scale }, body_font, .white);
+        const appearance_labels = [_][:0]const u8{ "AUTO", "DARK", "LIGHT" };
+        for (layout.appearance_buttons, appearance_labels, 0..) |button, label, index|
+            drawToggleButton(self, button, label, @intFromEnum(self.grid_appearance) == index);
+
+        self.drawUiText("CONTRAST", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 79 * scale }, compact_font, muted);
+        var contrast_buffer: [16]u8 = undefined;
+        const contrast_label = std.fmt.bufPrintZ(&contrast_buffer, "{d:.0}%", .{self.grid_contrast * 100}) catch "";
+        const contrast_width = self.measureUiText(contrast_label, compact_font);
+        self.drawUiText(contrast_label, .{
+            .x = layout.panel.x + layout.panel.width - 14 * scale - contrast_width,
+            .y = layout.panel.y + 79 * scale,
+        }, compact_font, .white);
+        rl.drawRectangleRounded(layout.contrast_track, 0.5, 8, .{ .r = 52, .g = 61, .b = 78, .a = 255 });
+        const normalized = std.math.clamp(self.grid_contrast / maximum_grid_contrast, 0, 1);
+        if (normalized > 0) rl.drawRectangleRounded(.{
+            .x = layout.contrast_track.x,
+            .y = layout.contrast_track.y,
+            .width = layout.contrast_track.width * normalized,
+            .height = layout.contrast_track.height,
+        }, 0.5, 8, accent);
+        const knob_center: rl.Vector2 = .{
+            .x = layout.contrast_track.x + layout.contrast_track.width * normalized,
+            .y = layout.contrast_track.y + layout.contrast_track.height / 2,
+        };
+        rl.drawCircleV(knob_center, 7 * scale, .{ .r = 10, .g = 16, .b = 29, .a = 255 });
+        rl.drawCircleV(knob_center, 4.5 * scale, accent);
+
+        self.drawUiText("STYLE", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 139 * scale }, compact_font, muted);
+        const style_labels = [_][:0]const u8{ "LINES", "DOTS" };
+        for (layout.style_buttons, style_labels, 0..) |button, label, index|
+            drawToggleButton(self, button, label, @intFromEnum(self.grid_style) == index);
+    }
+
+    fn drawReusablePicker(self: Studio, viewport: Viewport, workspace: Workspace) void {
+        const layout = commandPaletteLayout(viewport);
+        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        };
+        const scale = layout.scale;
+        const heading_font = scaledUiFont(scale, 20);
+        const body_font = scaledUiFont(scale, UiTypography.body);
+        const compact_font = scaledUiFont(scale, UiTypography.compact);
+
+        rl.drawRectangleRec(bounds, .{ .r = 2, .g = 5, .b = 12, .a = 188 });
+        rl.drawRectangleRounded(.{
+            .x = layout.panel.x + 12 * scale,
+            .y = layout.panel.y + 16 * scale,
+            .width = layout.panel.width,
+            .height = layout.panel.height,
+        }, 0.035, 12, .{ .r = 0, .g = 0, .b = 0, .a = 72 });
+        rl.drawRectangleRounded(.{
+            .x = layout.panel.x + 5 * scale,
+            .y = layout.panel.y + 7 * scale,
+            .width = layout.panel.width,
+            .height = layout.panel.height,
+        }, 0.035, 12, .{ .r = 0, .g = 0, .b = 0, .a = 118 });
+        rl.drawRectangleRounded(layout.panel, 0.035, 12, .{ .r = 10, .g = 16, .b = 29, .a = 252 });
+        rl.drawRectangleRoundedLinesEx(layout.panel, 0.035, 12, 2 * scale, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
+        rl.drawRectangleRec(.{
+            .x = layout.panel.x + 18 * scale,
+            .y = layout.panel.y,
+            .width = @max(0, layout.panel.width * 0.34),
+            .height = 3 * scale,
+        }, .{ .r = 255, .g = 92, .b = 198, .a = 245 });
+
+        rl.drawRectangleRounded(layout.search, 0.12, 8, .{ .r = 21, .g = 31, .b = 49, .a = 255 });
+        rl.drawRectangleRoundedLinesEx(layout.search, 0.12, 8, 1.5 * scale, .{ .r = 91, .g = 116, .b = 153, .a = 235 });
+        const badge: rl.Rectangle = .{
+            .x = layout.search.x + 10 * scale,
+            .y = layout.search.y + 10 * scale,
+            .width = 62 * scale,
+            .height = layout.search.height - 20 * scale,
+        };
+        rl.drawRectangleRounded(badge, 0.24, 6, .{ .r = 29, .g = 124, .b = 153, .a = 255 });
+        self.drawUiText("LIB", .{
+            .x = badge.x + 15 * scale,
+            .y = badge.y + (badge.height - @as(f32, @floatFromInt(compact_font))) / 2,
+        }, compact_font, .white);
+        const query: [:0]const u8 = self.library_search.query[0..self.library_search.len :0];
+        const query_source: []const u8 = if (query.len > 0)
+            query
+        else
+            "Choose a reusable, group, or slide template…";
+        var query_buffer: [256]u8 = undefined;
+        const fitted_query = self.fitUiText(
+            &query_buffer,
+            query_source,
+            heading_font,
+            @max(0, layout.search.width - 110 * scale),
+        );
+        self.drawUiText(fitted_query, .{
+            .x = badge.x + badge.width + 14 * scale,
+            .y = layout.search.y + (layout.search.height - @as(f32, @floatFromInt(heading_font))) / 2,
+        }, heading_font, if (query.len > 0) .white else .{ .r = 148, .g = 163, .b = 188, .a = 255 });
+        const caret_x = if (query.len == 0)
+            badge.x + badge.width + 14 * scale
+        else
+            @min(
+                layout.search.x + layout.search.width - 25 * scale,
+                badge.x + badge.width + 15 * scale + self.measureUiText(fitted_query, heading_font),
+            );
+        rl.drawRectangleRec(.{
+            .x = caret_x,
+            .y = layout.search.y + 16 * scale,
+            .width = 2 * scale,
+            .height = layout.search.height - 32 * scale,
+        }, .{ .r = 255, .g = 104, .b = 205, .a = 235 });
+        if (query.len > 0) self.drawUiText("×", .{
+            .x = layout.search.x + layout.search.width - 24 * scale,
+            .y = layout.search.y + (layout.search.height - @as(f32, @floatFromInt(heading_font))) / 2,
+        }, heading_font, .{ .r = 255, .g = 143, .b = 211, .a = 255 });
+
+        const count = librarySearchResultCount(workspace.library, self.library_search.text());
+        const capacity = commandPaletteRowCapacity(layout);
+        rl.beginScissorMode(
+            @intFromFloat(@floor(layout.rows_clip.x)),
+            @intFromFloat(@floor(layout.rows_clip.y)),
+            @intFromFloat(@ceil(layout.rows_clip.width)),
+            @intFromFloat(@ceil(layout.rows_clip.height)),
+        );
+        for (0..capacity) |slot| {
+            const result_index = self.library_search.first_visible + slot;
+            if (result_index >= count) break;
+            const entry_index = libraryIndexAtSearchResult(
+                workspace.library,
+                self.library_search.text(),
+                result_index,
+            ) orelse break;
+            const entry = workspace.library[entry_index];
+            const selected = result_index == self.library_search.selected_result;
+            const row = commandPaletteRowRect(layout, slot) orelse break;
+            rl.drawRectangleRounded(row, 0.08, 7, if (selected)
+                .{ .r = 28, .g = 68, .b = 91, .a = 255 }
+            else if (entry.available)
+                .{ .r = 20, .g = 27, .b = 42, .a = 246 }
+            else
+                .{ .r = 17, .g = 22, .b = 34, .a = 235 });
+            rl.drawRectangleRoundedLinesEx(row, 0.08, 7, if (selected) 2 * scale else scale, if (selected)
+                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            else
+                .{ .r = 63, .g = 76, .b = 98, .a = 205 });
+            if (selected) rl.drawRectangleRec(.{
+                .x = row.x,
+                .y = row.y + 9 * scale,
+                .width = 4 * scale,
+                .height = row.height - 18 * scale,
+            }, .{ .r = 255, .g = 92, .b = 198, .a = 255 });
+
+            const kind_label: [:0]const u8 = switch (entry.kind) {
+                .element => "ITEM",
+                .group => "GROUP",
+                .slide_template => "TEMPLATE",
+            };
+            const kind_width = @max(76 * scale, self.measureUiText(kind_label, compact_font) + 18 * scale);
+            const kind_rect: rl.Rectangle = .{
+                .x = row.x + 12 * scale,
+                .y = row.y + 10 * scale,
+                .width = kind_width,
+                .height = 22 * scale,
+            };
+            rl.drawRectangleRounded(kind_rect, 0.28, 6, if (entry.available)
+                .{ .r = 76, .g = 48, .b = 106, .a = 245 }
+            else
+                .{ .r = 50, .g = 48, .b = 61, .a = 220 });
+            self.drawUiText(kind_label, .{
+                .x = kind_rect.x + 8 * scale,
+                .y = kind_rect.y + (kind_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
+            }, compact_font, if (entry.available) .white else .{ .r = 133, .g = 137, .b = 150, .a = 255 });
+
+            const action_label: [:0]const u8 = switch (entry.kind) {
+                .element => "PLACE",
+                .group => "INSERT",
+                .slide_template => "NEW SLIDE",
+            };
+            const action_width = self.measureUiText(action_label, compact_font) + 20 * scale;
+            const text_x = kind_rect.x + kind_rect.width + 14 * scale;
+            const text_width = @max(0, row.x + row.width - text_x - action_width - 22 * scale);
+            var name_buffer: [192]u8 = undefined;
+            const name = self.fitUiText(&name_buffer, entry.name, body_font, text_width);
+            self.drawUiText(name, .{ .x = text_x, .y = row.y + 8 * scale }, body_font, if (entry.available)
+                .white
+            else
+                .{ .r = 137, .g = 143, .b = 158, .a = 255 });
+            var detail_buffer: [192]u8 = undefined;
+            const detail = if (entry.available)
+                std.fmt.bufPrintZ(
+                    &detail_buffer,
+                    "{s} · {d} use{s}",
+                    .{
+                        switch (entry.kind) {
+                            .element => "Place on the canvas",
+                            .group => "Insert the complete group",
+                            .slide_template => "Create a slide from this template",
+                        },
+                        entry.use_count,
+                        if (entry.use_count == 1) "" else "s",
+                    },
+                ) catch "Reusable definition"
+            else
+                "Unavailable in this source context";
+            var fitted_detail_buffer: [192]u8 = undefined;
+            const fitted_detail = self.fitUiText(&fitted_detail_buffer, detail, compact_font, text_width);
+            self.drawUiText(fitted_detail, .{ .x = text_x, .y = row.y + 35 * scale }, compact_font, if (entry.available)
+                .{ .r = 173, .g = 188, .b = 211, .a = 255 }
+            else
+                .{ .r = 203, .g = 136, .b = 157, .a = 255 });
+
+            const action_rect: rl.Rectangle = .{
+                .x = row.x + row.width - action_width - 11 * scale,
+                .y = row.y + (row.height - 28 * scale) / 2,
+                .width = action_width,
+                .height = 28 * scale,
+            };
+            rl.drawRectangleRounded(action_rect, 0.22, 6, if (entry.available)
+                .{ .r = 19, .g = 72, .b = 88, .a = 245 }
+            else
+                .{ .r = 35, .g = 38, .b = 48, .a = 220 });
+            rl.drawRectangleRoundedLinesEx(action_rect, 0.22, 6, scale, if (entry.available)
+                .{ .r = 80, .g = 215, .b = 255, .a = 220 }
+            else
+                .{ .r = 71, .g = 74, .b = 84, .a = 190 });
+            self.drawUiText(action_label, .{
+                .x = action_rect.x + 10 * scale,
+                .y = action_rect.y + (action_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
+            }, compact_font, if (entry.available) .white else .{ .r = 116, .g = 120, .b = 132, .a = 255 });
+        }
+        rl.endScissorMode();
+
+        if (count == 0) self.drawUiText("No matching reusable definitions", .{
+            .x = layout.rows_clip.x + 8 * scale,
+            .y = layout.rows_clip.y + 18 * scale,
+        }, heading_font, .{ .r = 184, .g = 194, .b = 214, .a = 255 });
+        var result_buffer: [64]u8 = undefined;
+        const result_text = std.fmt.bufPrintZ(
+            &result_buffer,
+            "{d} reusable{s}",
+            .{ count, if (count == 1) "" else "s" },
+        ) catch "reusables";
+        self.drawUiText(result_text, .{
+            .x = layout.footer.x,
+            .y = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2,
+        }, compact_font, .{ .r = 150, .g = 166, .b = 191, .a = 255 });
+        const help = "Type to filter   Up/Down navigate   Enter choose   Esc close";
+        const help_width = self.measureUiText(help, compact_font);
+        self.drawUiText(help, .{
+            .x = layout.footer.x + layout.footer.width - help_width,
+            .y = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2,
+        }, compact_font, .{ .r = 185, .g = 198, .b = 218, .a = 255 });
     }
 
     fn drawCommandPalette(
@@ -9759,6 +10563,7 @@ pub const Studio = struct {
             compact_font,
             .white,
         );
+        drawToggleButton(self, layout.grid_settings_toggle, "v", self.grid_settings_active);
         drawActionButton(self, layout.scene_previous, "<");
         var scene_buffer: [32]u8 = undefined;
         const scene_label: [:0]const u8 = if (self.active_morph_state) |state|
@@ -9894,6 +10699,7 @@ pub const Studio = struct {
         active: bool,
         invalid: bool,
         multiline: bool,
+        expandable: bool,
         local_override: bool,
         resettable_override: bool,
         viewport: Viewport,
@@ -9917,7 +10723,9 @@ pub const Studio = struct {
         const value_x = if (multiline) rect.x + 7 else rect.x + 7 + label_width + 7;
         const value_y = inlineFieldValueY(rect, multiline, value_font);
         const reset_rect = inlineResetRect(rect);
-        const reserved_right = if (local_override) reset_rect.width else 0;
+        const expand_rect = inlineTextExpandRect(rect, local_override);
+        const reserved_right = (if (local_override) reset_rect.width else 0) +
+            (if (expandable) expand_rect.width else 0);
         const draw_window: InlineDrawWindow = if (active)
             self.inlineDrawWindow(rect, value_x, value_y, value_font, multiline, reserved_right)
         else
@@ -9960,6 +10768,22 @@ pub const Studio = struct {
             }, border);
         }
         rl.endScissorMode();
+        if (expandable) {
+            rl.drawRectangleRec(expand_rect, .{ .r = 19, .g = 72, .b = 88, .a = 255 });
+            rl.drawRectangleLinesEx(expand_rect, 1, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
+            const open_label: [:0]const u8 = "...";
+            const open_font: i32 = 14;
+            const open_width = self.measureUiText(open_label, open_font);
+            self.drawUiText(
+                open_label,
+                .{
+                    .x = expand_rect.x + (expand_rect.width - open_width) / 2,
+                    .y = expand_rect.y + (expand_rect.height - @as(f32, @floatFromInt(open_font))) / 2,
+                },
+                open_font,
+                .{ .r = 221, .g = 248, .b = 255, .a = 255 },
+            );
+        }
         if (local_override) {
             rl.drawRectangleRec(reset_rect, if (resettable_override)
                 .{ .r = 99, .g = 67, .b = 25, .a = 255 }
@@ -9998,6 +10822,17 @@ pub const Studio = struct {
     fn inlineResetRect(rect: rl.Rectangle) rl.Rectangle {
         const width = @min(@as(f32, 32), rect.width);
         return .{ .x = rect.x + rect.width - width, .y = rect.y, .width = width, .height = rect.height };
+    }
+
+    fn inlineTextExpandRect(rect: rl.Rectangle, local_override: bool) rl.Rectangle {
+        const reset_width = if (local_override) inlineResetRect(rect).width else 0;
+        const width = @min(@as(f32, 36), @max(@as(f32, 0), rect.width - reset_width));
+        return .{
+            .x = rect.x + rect.width - reset_width - width,
+            .y = rect.y,
+            .width = width,
+            .height = rect.height,
+        };
     }
 
     fn compositionKindLabel(kind: ReusableInstanceKind) []const u8 {
@@ -10124,6 +10959,7 @@ pub const Studio = struct {
                 active,
                 active and self.inline_editor.error_value != null,
                 field == .text and inlineTextIsMultiline(layout),
+                field == .text,
                 local_override,
                 resettable_override,
                 viewport,
@@ -10411,6 +11247,57 @@ pub const Studio = struct {
         }
     }
 };
+
+const GridLineStyle = struct {
+    color: rl.Color,
+    thickness: f32,
+};
+
+/// In Auto, the gray channel is the strength of the exclusion blend rather
+/// than a literal on-screen color. Dark and Light use the same strength as
+/// ordinary alpha, providing deterministic fallbacks for difficult artwork.
+fn logicalGridLineStyle(appearance: GridAppearance, contrast: f32, major: bool) GridLineStyle {
+    const strength = std.math.clamp(contrast * @as(f32, if (major) 1.6 else 1), 0, 1);
+    const channel: u8 = @intFromFloat(@round(strength * 255));
+    return .{
+        .color = switch (appearance) {
+            .auto => .{ .r = channel, .g = channel, .b = channel, .a = 255 },
+            .dark => .{ .r = 0, .g = 0, .b = 0, .a = channel },
+            .light => .{ .r = 255, .g = 255, .b = 255, .a = channel },
+        },
+        .thickness = if (major) 1.25 else 1,
+    };
+}
+
+fn exclusionBlendChannel(destination: u8, source: u8) u8 {
+    const destination_f: f32 = @as(f32, @floatFromInt(destination)) / 255;
+    const source_f: f32 = @as(f32, @floatFromInt(source)) / 255;
+    return @intFromFloat(@round((destination_f + source_f - 2 * destination_f * source_f) * 255));
+}
+
+test "logical grid uses a subtle single stroke that contrasts locally" {
+    const minor = logicalGridLineStyle(.auto, default_grid_contrast, false);
+    const major = logicalGridLineStyle(.auto, default_grid_contrast, true);
+    try std.testing.expectEqual(minor.color.r, minor.color.g);
+    try std.testing.expectEqual(minor.color.g, minor.color.b);
+    try std.testing.expect(major.color.r > minor.color.r);
+    try std.testing.expect(major.thickness > minor.thickness);
+    try std.testing.expect(exclusionBlendChannel(20, minor.color.r) > 20);
+    try std.testing.expect(exclusionBlendChannel(235, minor.color.r) < 235);
+}
+
+test "logical grid dark and light modes use bounded alpha contrast" {
+    const dark = logicalGridLineStyle(.dark, default_grid_contrast, false);
+    const light = logicalGridLineStyle(.light, default_grid_contrast, false);
+    try std.testing.expectEqual(@as(u8, 0), dark.color.r);
+    try std.testing.expectEqual(@as(u8, 255), light.color.r);
+    try std.testing.expectEqual(dark.color.a, light.color.a);
+    try std.testing.expectEqual(@as(u8, 26), dark.color.a);
+
+    const strongest = logicalGridLineStyle(.light, maximum_grid_contrast, true);
+    try std.testing.expect(strongest.color.a < 255);
+    try std.testing.expect(strongest.color.a > light.color.a);
+}
 
 fn drawDashedLine(start: rl.Vector2, end: rl.Vector2, dash: f32, gap: f32, thickness: f32, color: rl.Color) void {
     const delta = end.subtract(start);
@@ -11179,6 +12066,71 @@ test "grid toggle works from keyboard input and toolbar button" {
         .pointer_pressed = true,
     });
     try std.testing.expect(!studio.grid_snapping);
+}
+
+test "grid settings popover applies appearance contrast and style" {
+    var items: [0]slides.SlideItem = .{};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const toolbar = uiLayout(viewport);
+    const settings = gridSettingsLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(toolbar.grid_settings_toggle),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.grid_settings_active);
+    try std.testing.expect(studio.textEntryActive());
+    try std.testing.expect(!studio.grid_snapping);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(settings.appearance_buttons[@intFromEnum(GridAppearance.dark)]),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(GridAppearance.dark, studio.grid_appearance);
+    try std.testing.expect(studio.grid_snapping);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{
+            .x = settings.contrast_track.x + settings.contrast_track.width * 0.75,
+            .y = settings.contrast_track.y + settings.contrast_track.height / 2,
+        },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expect(studio.grid_contrast_dragging);
+    try std.testing.expectApproxEqAbs(maximum_grid_contrast * 0.75, studio.grid_contrast, 0.0001);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{
+            .x = settings.contrast_track.x + settings.contrast_track.width * 0.25,
+            .y = settings.contrast_track.y + settings.contrast_track.height / 2,
+        },
+        .pointer_released = true,
+    });
+    try std.testing.expect(!studio.grid_contrast_dragging);
+    try std.testing.expectApproxEqAbs(maximum_grid_contrast * 0.25, studio.grid_contrast, 0.0001);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = rectangleCenter(settings.style_buttons[@intFromEnum(GridStyle.dots)]),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(GridStyle.dots, studio.grid_style);
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = viewport.slide_size.x - 8, .y = viewport.slide_size.y - 8 },
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(!studio.grid_settings_active);
+}
+
+test "grid settings layout remains inside the available canvas" {
+    const viewport: Viewport = .{ .slide_top_left = .{ .x = 17, .y = 23 }, .slide_size = .{ .x = 640, .y = 480 } };
+    const layout = gridSettingsLayout(viewport);
+    try expectRectangleContained(viewport.canvasBounds(), layout.panel);
+    for (layout.appearance_buttons) |button| try expectRectangleContained(layout.panel, button);
+    try expectRectangleContained(layout.panel, layout.contrast_hit);
+    try expectRectangleContained(layout.contrast_hit, layout.contrast_track);
+    for (layout.style_buttons) |button| try expectRectangleContained(layout.panel, button);
 }
 
 test "grid toggle on pointer release still finishes the active gesture" {
@@ -14232,6 +15184,7 @@ test "docked frame keeps permanent chrome outside a sixteen by nine canvas" {
             for (controls.tool_buttons) |button| try expectRectangleContained(frame.chrome.toolbar, button);
             try expectRectangleContained(frame.chrome.toolbar, controls.new_slide);
             try expectRectangleContained(frame.chrome.toolbar, controls.grid_toggle);
+            try expectRectangleContained(frame.chrome.toolbar, controls.grid_settings_toggle);
             try expectRectangleContained(frame.chrome.toolbar, controls.scene_previous);
             try expectRectangleContained(frame.chrome.toolbar, controls.scene_label);
             try expectRectangleContained(frame.chrome.toolbar, controls.scene_next);
@@ -14410,6 +15363,109 @@ test "inline property layout stays legible and contained at compact minimum" {
     try std.testing.expect(layout.inline_error.height >= 14);
     for (layout.foreground_swatches) |swatch| try expectRectangleContained(layout.properties, swatch);
     for (layout.background_swatches) |swatch| try expectRectangleContained(layout.properties, swatch);
+}
+
+test "inline text ellipsis control is contained and leaves local reset reachable" {
+    const frame = frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 506 }, true, false, .properties);
+    const field = uiLayout(frame.viewport).edit_text;
+    const ordinary = Studio.inlineTextExpandRect(field, false);
+    const local = Studio.inlineTextExpandRect(field, true);
+    const reset = Studio.inlineResetRect(field);
+    try expectRectangleContained(field, ordinary);
+    try expectRectangleContained(field, local);
+    try std.testing.expect(local.x + local.width <= reset.x);
+    try std.testing.expectEqual(@as(f32, 36), ordinary.width);
+    try std.testing.expectEqual(@as(f32, 36), local.width);
+}
+
+test "inline text ellipsis emits the large editor command and preserves its draft" {
+    var items = [_]slides.SlideItem{testItem(645, .textbox, 100, 120, 500, 180)};
+    items[0].text = "Original";
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 645,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = .{ .x = layout.edit_text.x + 12, .y = layout.edit_text.y + layout.edit_text.height / 2 },
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?InlineField, .text), studio.inlineEditField());
+    try std.testing.expect(studio.setInlineBuffer("Draft\nwith another line"));
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.inlineTextExpandRect(layout.edit_text, false)),
+        .pointer_pressed = true,
+    });
+    const command = studio.takeSemanticCommand().?;
+    const target = switch (command) {
+        .edit_text => |value| value,
+        else => return error.UnexpectedSemanticCommand,
+    };
+    try std.testing.expectEqualStrings("Draft\nwith another line", studio.inlineTextForModal(target).?);
+    studio.dismissInlineTextForModal();
+    try std.testing.expect(!studio.inlineEditActive());
+}
+
+test "LIB shortcut opens the reusable picker with manual fallback for empty catalogs" {
+    var items: [0]slides.SlideItem = .{};
+    const entries = [_]LibraryEntry{
+        .{ .kind = .element, .name = "caption" },
+        .{ .kind = .slide_template, .name = "chapter" },
+    };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 506 }, true, false, .properties).viewport;
+    var picker: Studio = .{ .enabled = true, .active_dock = .properties };
+    _ = picker.updateWithWorkspace(&items, &.{}, viewport, .{ .visible = true, .library = &entries }, .{
+        .choose_tool = .add_reusable,
+    });
+    try std.testing.expectEqual(Tool.select, picker.tool);
+    try std.testing.expect(picker.libraryPickerActive());
+    try std.testing.expect(picker.textEntryActive());
+    try std.testing.expect(picker.takeSemanticCommand() == null);
+
+    const picker_layout = commandPaletteLayout(viewport);
+    _ = picker.updateWithWorkspace(&items, &.{}, viewport, .{ .visible = true, .library = &entries }, .{
+        .pointer_screen = rectangleCenter(commandPaletteRowRect(picker_layout, 0).?),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(!picker.libraryPickerActive());
+    try std.testing.expectEqual(Tool.add_reusable, picker.tool);
+    try std.testing.expectEqual(@as(?usize, 0), picker.selected_library_index);
+
+    var fallback: Studio = .{ .enabled = true };
+    _ = fallback.updateWithWorkspace(&items, &.{}, viewport, .{ .visible = true }, .{
+        .choose_tool = .add_reusable,
+    });
+    try std.testing.expectEqual(Tool.add_reusable, fallback.tool);
+}
+
+test "reusable picker creates a slide directly from a chosen template" {
+    var items: [0]slides.SlideItem = .{};
+    const entries = [_]LibraryEntry{
+        .{ .kind = .slide_template, .name = "chapter" },
+    };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, true, false, .slides).viewport;
+    const workspace: Workspace = .{ .visible = true, .library = &entries };
+    var picker: Studio = .{ .enabled = true };
+    _ = picker.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .choose_tool = .add_reusable,
+    });
+    try std.testing.expect(picker.libraryPickerActive());
+
+    _ = picker.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .inline_submit_pressed = true,
+    });
+    try std.testing.expect(!picker.libraryPickerActive());
+    const command = picker.takeSemanticCommand().?;
+    switch (command) {
+        .new_slide_from_template => |entry_index| try std.testing.expectEqual(@as(usize, 0), entry_index),
+        else => return error.UnexpectedSemanticCommand,
+    }
 }
 
 test "roomy inspector uses two-row geometry fields with representative values" {
