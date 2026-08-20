@@ -12,6 +12,13 @@ This file tracks the documentation work that remains after the first site draft.
 - [x] Explain the command-line build.
 - [x] Explain the macOS app build, launch command, output path, and signing limit.
 
+## Language and terminology
+
+- [x] Name Rayslides when the text refers to the product.
+- [x] Use Finder only for file management actions.
+- [x] Keep Studio, Presenter Companion, and Crowdplay distinct.
+- [x] Review every product noun for a clear referent.
+
 ## Studio workflows
 
 - [x] Explain multi-selection.
@@ -72,6 +79,7 @@ This file tracks the documentation work that remains after the first site draft.
 - [x] Confirm that comparison images show distinct states.
 - [x] Confirm that all images keep their aspect ratio.
 - [x] Confirm that the docs use the app icon and no substitute logo.
+- [x] Confirm that every product and feature name refers to the correct thing.
 
 ## Capture safety
 

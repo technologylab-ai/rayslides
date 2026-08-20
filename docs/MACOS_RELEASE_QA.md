@@ -5,7 +5,7 @@ cannot fully exercise: native input focus, Spaces/monitors, window transitions,
 GPU resources, and isolation between Studio chrome and presentation/export.
 Run it from a clean worktree with a ReleaseSafe build.
 
-Build the non-notarized Finder application separately with:
+Build the non-notarized Rayslides application bundle separately with:
 
 ```sh
 zig build -Doptimize=ReleaseSafe macos-app
