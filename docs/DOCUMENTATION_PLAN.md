@@ -7,6 +7,11 @@ This file tracks the documentation work that remains after the first site draft.
 - [x] Map the Studio controls to their source behavior.
 - [x] Map the Presenter and Crowdplay interfaces to their shipped HTML.
 
+## Build and packaging
+
+- [x] Explain the command-line build.
+- [x] Explain the macOS app build, launch command, output path, and signing limit.
+
 ## Studio workflows
 
 - [x] Explain multi-selection.

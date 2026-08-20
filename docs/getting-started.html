@@ -34,7 +34,7 @@
         <main class="content" id="content">
           <p class="page-kicker">Get started</p>
           <h1>Create your first deck.</h1>
-          <p class="lead">Build the command-line program. Open Studio. Choose a starter, then save the source file.</p>
+          <p class="lead">Build the command-line program or the macOS app. Open Studio. Choose a starter, then save the source file.</p>
 
           <h2>Build Rayslides</h2>
           <p>Rayslides requires Zig 0.16.x. The minimum supported version is Zig 0.16.0.</p>
@@ -44,6 +44,18 @@ zig build -Doptimize=ReleaseSafe
 <span class="code-comment"># Open Studio without a deck.</span>
 zig-out/bin/rayslides</code></pre>
           <p>The build places the executable at <code class="inline-code">zig-out/bin/rayslides</code>.</p>
+
+          <h2>Build the macOS app</h2>
+          <p>On macOS, build the Finder app with the <code class="inline-code">macos-app</code> step.</p>
+          <pre><code><span class="code-comment"># Build the app bundle.</span>
+zig build -Doptimize=ReleaseSafe macos-app
+
+<span class="code-comment"># Open the app.</span>
+open zig-out/Rayslides.app</code></pre>
+          <p>The build places the app at <code class="inline-code">zig-out/Rayslides.app</code>. It also keeps the command-line executable.</p>
+          <p>The app opens <code class="inline-code">.sld</code> files from Finder. You can also drop a deck onto its window.</p>
+          <div class="callout"><p><strong>The local build is not notarized.</strong> Another Mac can require one right-click and <strong>Open</strong> before normal launches work.</p></div>
+          <p><a href="https://github.com/technologylab-ai/rayslides/blob/master/docs/MACOS_APP.md">Read the complete macOS app notes.</a></p>
 
           <h2>Choose a starter</h2>
           <p>Rayslides opens the new-deck chooser when you omit the file name.</p>
