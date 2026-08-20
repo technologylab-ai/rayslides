@@ -977,6 +977,8 @@ pub const Notice = enum {
     selection_capacity_reached,
     distribution_needs_three,
     generated_source_read_only,
+    definition_structure_locked,
+    definition_structure_unsupported,
     property_unavailable,
     base_scene_only,
     structural_source_locked,
@@ -1313,6 +1315,28 @@ pub const LibraryEntry = struct {
     deletable: bool = false,
 };
 
+pub const max_library_visual_items: usize = 16;
+
+pub const LibraryVisualItem = struct {
+    bounds: rl.Rectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    kind: slides.SlideItemKind = .textbox,
+    color: rl.Color = .{ .r = 199, .g = 211, .b = 230, .a = 255 },
+    fill: ?rl.Color = null,
+    has_text: bool = false,
+};
+
+/// Allocation-free visual summary cached by the integration layer. SLIDE
+/// definitions retain the canonical 16:9 coordinate system; ITEM/GROUP cards
+/// fit their authored content bounds so small reusable clusters remain
+/// legible instead of becoming specks in a full-slide thumbnail.
+pub const LibraryVisual = struct {
+    available: bool = false,
+    content_bounds: rl.Rectangle = .{ .x = 0, .y = 0, .width = 1920, .height = 1080 },
+    items: [max_library_visual_items]LibraryVisualItem = [_]LibraryVisualItem{.{}} ** max_library_visual_items,
+    item_count: usize = 0,
+    total_item_count: usize = 0,
+};
+
 /// Optional deck-level UI supplied by the integration layer. The legacy
 /// update/draw entry points use an invisible workspace, preserving the canvas-
 /// only API for tests and alternate frontends.
@@ -1324,6 +1348,9 @@ pub const Workspace = struct {
     slides: []const SlideSummary = &.{},
     current_slide: usize = 0,
     library: []const LibraryEntry = &.{},
+    /// Aligned one-for-one with `library`; a missing/short slice draws a
+    /// deterministic placeholder without changing Library hit targets.
+    library_visuals: []const LibraryVisual = &.{},
     /// Explicit semantic states for the current slide. Base is always scene
     /// zero and therefore is not repeated in this slice.
     morph_states: []const MorphStateSummary = &.{},
@@ -1396,6 +1423,9 @@ pub const SemanticCommand = union(enum) {
     /// Renames the indexed source definition. The integration layer prompts
     /// for and validates the new name before applying the source edit.
     rename_library_entry: usize,
+    /// Opens the exact physical Library definition as an editable projected
+    /// scene. This changes Studio navigation state, never document source.
+    edit_library_entry: usize,
     /// Requests safe deletion of the indexed source definition. The source
     /// layer remains responsible for rejecting live or unsafe uses.
     delete_library_entry: usize,
@@ -1486,6 +1516,41 @@ pub const library_row_height: f32 = 46;
 pub const library_row_gap: f32 = 6;
 pub const workspace_min_height: f32 = 260;
 
+pub const LibraryVisualDensity = enum { compact, standard, large };
+
+pub fn libraryVisualDensity(layout: WorkspaceLayout) LibraryVisualDensity {
+    const logical_width = layout.library.width / @max(layout.scale, 0.001);
+    const logical_height = layout.library.height / @max(layout.scale, 0.001);
+    const preferred: LibraryVisualDensity = if (logical_width < 280 or logical_height < 250)
+        .compact
+    else if (logical_width >= 390 and logical_height >= 430)
+        .large
+    else
+        .standard;
+    const preferred_height: f32 = switch (preferred) {
+        .compact => library_row_height,
+        .standard => 68,
+        .large => 92,
+    };
+    // Preserve at least three immediately browsable definitions in shorter
+    // docks; paging still handles larger libraries, but a visual upgrade must
+    // not hide the common ITEM/GROUP/SLIDE trio.
+    if (preferred != .compact and rowsThatFit(
+        layout.library_rows_clip.height,
+        preferred_height * layout.scale,
+        library_row_gap * layout.scale,
+    ) < 3) return .compact;
+    return preferred;
+}
+
+fn libraryCardHeight(layout: WorkspaceLayout) f32 {
+    return switch (libraryVisualDensity(layout)) {
+        .compact => library_row_height,
+        .standard => 68,
+        .large => 92,
+    } * layout.scale;
+}
+
 /// Geometry for the deck-level sidebar. Dynamic card/row rectangles are
 /// derived with slideCardRect/libraryRowRect so the layout remains allocation-
 /// free even for very large decks.
@@ -1500,6 +1565,7 @@ pub const WorkspaceLayout = struct {
     slide_page_next: rl.Rectangle,
     library: rl.Rectangle,
     library_use: rl.Rectangle,
+    library_edit: rl.Rectangle,
     library_rename: rl.Rectangle,
     library_delete: rl.Rectangle,
     library_cleanup: rl.Rectangle,
@@ -1558,6 +1624,7 @@ fn emptyWorkspaceLayout() WorkspaceLayout {
         .slide_page_next = empty_frame_rectangle,
         .library = empty_frame_rectangle,
         .library_use = empty_frame_rectangle,
+        .library_edit = empty_frame_rectangle,
         .library_rename = empty_frame_rectangle,
         .library_delete = empty_frame_rectangle,
         .library_cleanup = empty_frame_rectangle,
@@ -1616,7 +1683,11 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
         .height = @max(92 * scale, sidebar.y + sidebar.height - library_y),
     };
     const library_action_gap: f32 = 4 * scale;
-    const library_action_width: f32 = 40 * scale;
+    const library_action_count: f32 = 5;
+    const library_action_width = @max(
+        24 * scale,
+        (library.width - 24 * scale - library_action_gap * (library_action_count - 1)) / library_action_count,
+    );
     const library_cleanup: rl.Rectangle = .{
         .x = library.x + library.width - 12 * scale - library_action_width,
         .y = library.y + 5 * scale,
@@ -1635,8 +1706,14 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
         .width = library_action_width,
         .height = library_delete.height,
     };
-    const library_use: rl.Rectangle = .{
+    const library_edit: rl.Rectangle = .{
         .x = library_rename.x - library_action_gap - library_action_width,
+        .y = library_delete.y,
+        .width = library_action_width,
+        .height = library_delete.height,
+    };
+    const library_use: rl.Rectangle = .{
+        .x = library_edit.x - library_action_gap - library_action_width,
         .y = library_delete.y,
         .width = library_action_width,
         .height = library_delete.height,
@@ -1677,6 +1754,7 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
         .slide_page_next = slide_page_next,
         .library = library,
         .library_use = library_use,
+        .library_edit = library_edit,
         .library_rename = library_rename,
         .library_delete = library_delete,
         .library_cleanup = library_cleanup,
@@ -1692,7 +1770,7 @@ pub fn slideCardCapacity(layout: WorkspaceLayout) usize {
 }
 
 pub fn libraryRowCapacity(layout: WorkspaceLayout) usize {
-    return rowsThatFit(layout.library_rows_clip.height, library_row_height * layout.scale, library_row_gap * layout.scale);
+    return rowsThatFit(layout.library_rows_clip.height, libraryCardHeight(layout), library_row_gap * layout.scale);
 }
 
 fn workspaceHasRoom(layout: WorkspaceLayout) bool {
@@ -1722,10 +1800,89 @@ pub fn libraryRowRect(layout: WorkspaceLayout, visible_slot: usize) ?rl.Rectangl
     if (visible_slot >= libraryRowCapacity(layout)) return null;
     return .{
         .x = layout.library_rows_clip.x,
-        .y = layout.library_rows_clip.y + @as(f32, @floatFromInt(visible_slot)) * (library_row_height + library_row_gap) * layout.scale,
+        .y = layout.library_rows_clip.y + @as(f32, @floatFromInt(visible_slot)) *
+            (libraryCardHeight(layout) + library_row_gap * layout.scale),
         .width = layout.library_rows_clip.width,
-        .height = library_row_height * layout.scale,
+        .height = libraryCardHeight(layout),
     };
+}
+
+pub fn libraryVisualRect(layout: WorkspaceLayout, row: rl.Rectangle) rl.Rectangle {
+    const scale = layout.scale;
+    const inset = 5 * scale;
+    const height = @max(0, row.height - inset * 2);
+    const max_width: f32 = switch (libraryVisualDensity(layout)) {
+        .compact => @as(f32, 58),
+        .standard => @as(f32, 96),
+        .large => @as(f32, 132),
+    } * scale;
+    return .{
+        .x = row.x + inset,
+        .y = row.y + inset,
+        .width = @min(max_width, height * 16 / 9),
+        .height = height,
+    };
+}
+
+pub fn libraryVisualFromItems(
+    kind: LibraryEntryKind,
+    items: []const slides.SlideItem,
+) LibraryVisual {
+    var visual: LibraryVisual = .{};
+    var union_bounds: ?rl.Rectangle = null;
+    for (items) |item| {
+        if (!item.visible or item.opacity <= 0) continue;
+        var width = item.size.x;
+        var height = item.size.y;
+        if (item.kind == .background) {
+            width = default_logical_size.x;
+            height = default_logical_size.y;
+        } else {
+            if (width <= 0) width = if (item.kind == .img) 320 else 260;
+            if (height <= 0) height = if (item.kind == .img) 180 else 80;
+        }
+        const bounds: rl.Rectangle = .{
+            .x = if (item.kind == .background) 0 else item.position.x,
+            .y = if (item.kind == .background) 0 else item.position.y,
+            .width = @max(1, width),
+            .height = @max(1, height),
+        };
+        if (union_bounds) |existing| {
+            const right = @max(existing.x + existing.width, bounds.x + bounds.width);
+            const bottom = @max(existing.y + existing.height, bounds.y + bounds.height);
+            const left = @min(existing.x, bounds.x);
+            const top = @min(existing.y, bounds.y);
+            union_bounds = .{ .x = left, .y = top, .width = right - left, .height = bottom - top };
+        } else {
+            union_bounds = bounds;
+        }
+        if (visual.item_count < visual.items.len) {
+            var color: rl.Color = item.color orelse .{ .r = 199, .g = 211, .b = 230, .a = 255 };
+            color.a = @intFromFloat(@round(@as(f32, @floatFromInt(color.a)) * std.math.clamp(item.opacity, 0, 1)));
+            visual.items[visual.item_count] = .{
+                .bounds = bounds,
+                .kind = item.kind,
+                .color = color,
+                .fill = item.background_color,
+                .has_text = item.text != null and item.text.?.len > 0,
+            };
+            visual.item_count += 1;
+        }
+        visual.total_item_count += 1;
+    }
+    visual.available = union_bounds != null;
+    visual.content_bounds = if (kind == .slide_template)
+        .{ .x = 0, .y = 0, .width = default_logical_size.x, .height = default_logical_size.y }
+    else if (union_bounds) |bounds| blk: {
+        const padding = @max(12, @max(bounds.width, bounds.height) * 0.08);
+        break :blk .{
+            .x = bounds.x - padding,
+            .y = bounds.y - padding,
+            .width = bounds.width + padding * 2,
+            .height = bounds.height + padding * 2,
+        };
+    } else .{ .x = 0, .y = 0, .width = 16, .height = 9 };
+    return visual;
 }
 
 /// First-run chooser geometry is derived solely from the fitted slide area,
@@ -2983,6 +3140,50 @@ const SelectionMember = struct {
     source: ?slides.SourceRef = null,
 };
 
+pub const max_definition_name_bytes: usize = 128;
+const max_definition_selection_id_bytes: usize = 128;
+
+const DefinitionModeState = struct {
+    catalog_index: usize,
+    workspace_index: usize,
+    kind: LibraryEntryKind,
+    use_count: usize,
+    name: [max_definition_name_bytes + 1]u8 = [_]u8{0} ** (max_definition_name_bytes + 1),
+    name_len: usize = 0,
+    return_selected_identity: ?usize = null,
+    return_selected_source: ?slides.SourceRef = null,
+    return_additional_selection: [max_selection_items - 1]SelectionMember = undefined,
+    return_additional_selection_count: usize = 0,
+    return_active_morph_state: ?usize = null,
+    return_tool: Tool = .select,
+    return_canvas_zoom: f32 = 1,
+    return_canvas_center: rl.Vector2 = .{ .x = default_logical_size.x / 2, .y = default_logical_size.y / 2 },
+    return_active_dock: DockPanel = .slides,
+    return_inspector_panel: InspectorPanel = .objects,
+    pending_selection_ids: [max_selection_items][max_definition_selection_id_bytes + 1]u8 =
+        [_][max_definition_selection_id_bytes + 1]u8{
+            [_]u8{0} ** (max_definition_selection_id_bytes + 1),
+        } ** max_selection_items,
+    pending_selection_lengths: [max_selection_items]usize = [_]usize{0} ** max_selection_items,
+    pending_selection_count: usize = 0,
+    /// ITEM definitions project exactly one editable object. Select it once
+    /// when the detached scene first arrives so Properties is immediately
+    /// actionable instead of presenting an apparently disabled inspector.
+    initial_item_selection_pending: bool = false,
+
+    fn setName(self: *DefinitionModeState, name: []const u8) bool {
+        if (name.len == 0 or name.len > max_definition_name_bytes or !std.unicode.utf8ValidateSlice(name)) return false;
+        @memcpy(self.name[0..name.len], name);
+        self.name[name.len] = 0;
+        self.name_len = name.len;
+        return true;
+    }
+
+    fn nameSlice(self: *const DefinitionModeState) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
 /// Marquee selection is deliberately separate from geometry Interaction:
 /// none of the selected items is mutated while the rubber band is active.
 const Marquee = struct {
@@ -3227,6 +3428,9 @@ pub const Studio = struct {
     morph_first_visible: usize = 0,
     last_objects_primary: ?usize = null,
     selected_library_index: ?usize = null,
+    definition_mode: ?DefinitionModeState = null,
+    last_library_click_index: ?usize = null,
+    library_click_age: f32 = 10,
     library_cleanup_preview_count: usize = 0,
     library_cleanup_blocked_count: usize = 0,
     library_cleanup_preview_ready: bool = false,
@@ -3394,6 +3598,141 @@ pub const Studio = struct {
 
     pub fn libraryPickerActive(self: Studio) bool {
         return self.library_picker_active;
+    }
+
+    pub fn definitionModeActive(self: Studio) bool {
+        return self.definition_mode != null;
+    }
+
+    pub fn definitionCatalogIndex(self: Studio) ?usize {
+        return if (self.definition_mode) |mode| mode.catalog_index else null;
+    }
+
+    /// Enter a persistent projected scene while retaining enough slide-side
+    /// navigation state for Back to restore the exact authoring context.
+    pub fn enterDefinitionMode(
+        self: *Studio,
+        items: []slides.SlideItem,
+        catalog_index: usize,
+        workspace_index: usize,
+        entry: LibraryEntry,
+    ) bool {
+        var mode: DefinitionModeState = .{
+            .catalog_index = catalog_index,
+            .workspace_index = workspace_index,
+            .kind = entry.kind,
+            .use_count = entry.use_count,
+            .return_selected_identity = self.selected_identity,
+            .return_selected_source = self.selected_source,
+            .return_additional_selection_count = self.additional_selection_count,
+            .return_active_morph_state = self.active_morph_state,
+            .return_tool = self.tool,
+            .return_canvas_zoom = self.canvas_zoom,
+            .return_canvas_center = self.canvas_center,
+            .return_active_dock = self.active_dock,
+            .return_inspector_panel = self.inspector_panel,
+            .initial_item_selection_pending = entry.kind == .element,
+        };
+        if (!mode.setName(entry.name)) return false;
+        if (self.additional_selection_count > 0) {
+            @memcpy(
+                mode.return_additional_selection[0..self.additional_selection_count],
+                self.additional_selection[0..self.additional_selection_count],
+            );
+        }
+
+        self.cancelInlineEdit();
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
+        self.view_panning = false;
+        self.clearSelectionState();
+        self.definition_mode = mode;
+        self.selected_library_index = workspace_index;
+        self.active_morph_state = null;
+        self.tool = .select;
+        self.inspector_panel = .objects;
+        self.active_dock = .properties;
+        self.resetCanvasView();
+        self.notice = .none;
+        return true;
+    }
+
+    /// Refresh borrowed Library metadata after a reparse without changing the
+    /// physical catalog target that identifies this Definition mode.
+    pub fn syncDefinitionMode(
+        self: *Studio,
+        catalog_index: usize,
+        workspace_index: usize,
+        entry: LibraryEntry,
+    ) bool {
+        const mode = if (self.definition_mode) |*value| value else return false;
+        if (mode.catalog_index != catalog_index or mode.kind != entry.kind) return false;
+        if (!mode.setName(entry.name)) return false;
+        mode.workspace_index = workspace_index;
+        mode.use_count = entry.use_count;
+        self.selected_library_index = workspace_index;
+        return true;
+    }
+
+    pub fn leaveDefinitionMode(self: *Studio, items: []slides.SlideItem) void {
+        const mode = self.definition_mode orelse return;
+        self.cancelInlineEdit();
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
+        self.view_panning = false;
+        self.definition_mode = null;
+        self.selected_identity = mode.return_selected_identity;
+        self.selected_source = mode.return_selected_source;
+        self.additional_selection_count = mode.return_additional_selection_count;
+        if (mode.return_additional_selection_count > 0) {
+            @memcpy(
+                self.additional_selection[0..mode.return_additional_selection_count],
+                mode.return_additional_selection[0..mode.return_additional_selection_count],
+            );
+        }
+        self.active_morph_state = mode.return_active_morph_state;
+        self.tool = mode.return_tool;
+        self.canvas_zoom = mode.return_canvas_zoom;
+        self.canvas_center = mode.return_canvas_center;
+        self.active_dock = mode.return_active_dock;
+        self.inspector_panel = mode.return_inspector_panel;
+        self.selected_library_index = null;
+        self.composition_context = null;
+        self.group_drag_count = 0;
+        self.snap_guides = .{};
+        self.last_objects_primary = null;
+        self.notice = .none;
+    }
+
+    /// The selected Library definition owns the canvas only while Studio is
+    /// in its neutral Select tool. **Use** switches ITEM previews into the
+    /// placement tool, while GROUP/SLIDE uses immediately rewrite the deck.
+    pub fn libraryPreviewIndex(self: Studio, workspace: Workspace) ?usize {
+        if (!self.enabled or self.definition_mode != null or self.tool != .select or self.library_picker_active) return null;
+        const index = self.selected_library_index orelse return null;
+        if (index >= workspace.library.len or !workspace.library[index].available) return null;
+        return index;
+    }
+
+    pub fn dismissLibraryPreview(self: *Studio) void {
+        self.selected_library_index = null;
+    }
+
+    /// Non-mutating launch hook for deterministic visual regression captures.
+    /// Product interaction continues through the visible Library cards.
+    pub fn selectLibraryEntryForDiagnostics(
+        self: *Studio,
+        items: []slides.SlideItem,
+        workspace: Workspace,
+        workspace_index: usize,
+    ) bool {
+        if (!self.enabled or workspace_index >= workspace.library.len or
+            !workspace.library[workspace_index].available)
+        {
+            return false;
+        }
+        self.selectLibraryEntry(items, workspace_index);
+        return true;
     }
 
     /// Non-mutating launch hook used by screenshot/regression tooling. Normal
@@ -3731,6 +4070,7 @@ pub const Studio = struct {
             }
             const library_targets = [_]TooltipTarget{
                 .{ .key = 110, .anchor = deck.library_use, .title = "Use reusable", .detail = "Place the selected Library definition" },
+                .{ .key = 116, .anchor = deck.library_edit, .title = "Edit definition", .detail = "Open the selected shared definition on the canvas" },
                 .{ .key = 111, .anchor = deck.library_rename, .title = "Rename reusable", .detail = "Rename its safe source-order uses atomically" },
                 .{ .key = 112, .anchor = deck.library_delete, .title = "Delete reusable", .detail = "Delete only when no live use depends on it" },
                 .{ .key = 113, .anchor = deck.library_cleanup, .title = "Clean Library", .detail = "Preview then remove safely unreachable definitions" },
@@ -4107,9 +4447,7 @@ pub const Studio = struct {
                     self.notice = .property_unavailable;
                     return;
                 }
-                self.selected_library_index = entry_index;
-                self.tool = .select;
-                self.notice = .none;
+                self.selectLibraryEntry(items, entry_index);
             },
             .objects => {
                 const item_index = objectIndexAtSearchResult(
@@ -4214,6 +4552,22 @@ pub const Studio = struct {
         id: CommandId,
     ) void {
         self.closeCommandPalette();
+        if (self.definition_mode != null) switch (id) {
+            .new_slide,
+            .duplicate_slide,
+            .delete_slide,
+            .edit_speaker_notes,
+            .reuse_or_detach,
+            .add_morph_state,
+            .duplicate_morph_state,
+            .rename_morph_state,
+            .delete_morph_state,
+            => {
+                self.notice = .definition_structure_locked;
+                return;
+            },
+            else => {},
+        };
         switch (id) {
             .save => self.pending_semantic_command = .{ .save_document = {} },
             .save_copy => self.pending_semantic_command = .{ .save_document_copy = {} },
@@ -5231,7 +5585,9 @@ pub const Studio = struct {
         self.marquee.active = false;
         // Library commands retain only a workspace index. Any source rewrite
         // can reorder the catalog, so a prior selection must not silently
-        // resolve to a different reusable afterward.
+        // resolve to a different reusable afterward. Definition mode retains
+        // its integration-owned physical catalog index and is synchronized
+        // explicitly on the next parsed frame.
         self.selected_library_index = null;
         self.library_cleanup_preview_count = 0;
         self.library_cleanup_blocked_count = 0;
@@ -5268,10 +5624,21 @@ pub const Studio = struct {
     }
 
     pub fn setTool(self: *Studio, tool: Tool, items: []slides.SlideItem) void {
+        if (self.definition_mode != null and tool != .select and !self.definitionStructureAllowed()) {
+            self.notice = .definition_structure_locked;
+            return;
+        }
         if (self.interaction != .idle) self.cancelInteraction(items);
         self.marquee.active = false;
         self.tool = tool;
         self.notice = .none;
+    }
+
+    fn definitionStructureAllowed(self: Studio) bool {
+        return if (self.definition_mode) |mode|
+            mode.kind == .group or mode.kind == .slide_template
+        else
+            false;
     }
 
     pub fn setMorphStateCount(self: *Studio, count: usize) void {
@@ -5358,6 +5725,7 @@ pub const Studio = struct {
             self.additional_selection_count = 0;
             self.group_drag_count = 0;
             self.selected_library_index = null;
+            self.definition_mode = null;
             self.snap_guides = .{};
         }
     }
@@ -5381,6 +5749,7 @@ pub const Studio = struct {
         self.additional_selection_count = 0;
         self.group_drag_count = 0;
         self.selected_library_index = null;
+        self.definition_mode = null;
         self.snap_guides = .{};
     }
 
@@ -5456,6 +5825,80 @@ pub const Studio = struct {
                 self.additional_selection[self.additional_selection_count] = .{
                     .identity = items[index].identity,
                     .source = sourceForSelection(items[index]),
+                };
+                self.additional_selection_count += 1;
+            }
+        }
+    }
+
+    /// Structural Definition edits reparse the detached projection one frame
+    /// after the source transaction. Retain only bounded literal IDs until
+    /// that projection exists; GROUP IDs may be supplied either as the local
+    /// member ID or as the current qualified preview ID.
+    pub fn queueDefinitionSelectionIds(self: *Studio, ids: []const []const u8) void {
+        const mode = if (self.definition_mode) |*value| value else return;
+        mode.pending_selection_count = 0;
+        for (ids) |id| {
+            if (mode.pending_selection_count == mode.pending_selection_ids.len or
+                id.len == 0 or id.len > max_definition_selection_id_bytes)
+            {
+                continue;
+            }
+            const index = mode.pending_selection_count;
+            @memcpy(mode.pending_selection_ids[index][0..id.len], id);
+            mode.pending_selection_ids[index][id.len] = 0;
+            mode.pending_selection_lengths[index] = id.len;
+            mode.pending_selection_count += 1;
+        }
+        self.clearSelectionState();
+    }
+
+    pub fn applyPendingDefinitionSelection(self: *Studio, items: []const slides.SlideItem) void {
+        const kind = if (self.definition_mode) |mode| mode.kind else return;
+        if (self.definition_mode.?.initial_item_selection_pending) {
+            self.definition_mode.?.initial_item_selection_pending = false;
+            self.clearSelectionState();
+            for (items) |item| {
+                if (item.kind == .background) continue;
+                self.setSingleSelection(item);
+                self.active_dock = .properties;
+                self.inspector_panel = .properties;
+                break;
+            }
+            return;
+        }
+        const pending_count = self.definition_mode.?.pending_selection_count;
+        if (pending_count == 0) return;
+        self.definition_mode.?.pending_selection_count = 0;
+        self.clearSelectionState();
+        for (0..pending_count) |pending_index| {
+            var wanted_buffer: [max_definition_selection_id_bytes]u8 = undefined;
+            const wanted_len = self.definition_mode.?.pending_selection_lengths[pending_index];
+            @memcpy(wanted_buffer[0..wanted_len], self.definition_mode.?.pending_selection_ids[pending_index][0..wanted_len]);
+            const wanted = wanted_buffer[0..wanted_len];
+            var match: ?usize = null;
+            for (items, 0..) |item, item_index| {
+                const item_id = item.id orelse continue;
+                const exact = std.mem.eql(u8, item_id, wanted);
+                const local_group_match = kind == .group and item_id.len > wanted.len and
+                    item_id[item_id.len - wanted.len - 1] == '.' and std.mem.endsWith(u8, item_id, wanted);
+                if (!exact and !local_group_match) continue;
+                if (match != null) {
+                    match = null;
+                    break;
+                }
+                match = item_index;
+            }
+            const item_index = match orelse continue;
+            if (items[item_index].kind == .background) continue;
+            if (self.selected_identity == null) {
+                self.setSingleSelection(items[item_index]);
+            } else if (!self.isIdentitySelected(items[item_index].identity) and
+                self.additional_selection_count < self.additional_selection.len)
+            {
+                self.additional_selection[self.additional_selection_count] = .{
+                    .identity = items[item_index].identity,
+                    .source = sourceForSelection(items[item_index]),
                 };
                 self.additional_selection_count += 1;
             }
@@ -5617,6 +6060,7 @@ pub const Studio = struct {
             if (input.toggle_pressed) self.toggle(items);
             return null;
         }
+        self.library_click_age = @min(10, self.library_click_age + @max(0, input.frame_time));
 
         self.validateSelection(items, resolved_bounds);
         if (self.handleGridSettings(viewport, input)) return null;
@@ -5654,8 +6098,62 @@ pub const Studio = struct {
         if (workspace.visible and workspace.new_deck and
             self.handleNewDeckChooser(items, viewport, input)) return null;
 
+        if (self.definition_mode != null) {
+            if (input.pointer_pressed and pointInRectangle(input.pointer_screen, definitionBackRect(viewport))) {
+                self.leaveDefinitionMode(items);
+                return null;
+            }
+            if (input.cancel_pressed and self.interaction == .idle and !self.marquee.active) {
+                self.leaveDefinitionMode(items);
+                return null;
+            }
+        }
+
         if (self.handleViewNavigation(items, viewport, input)) return null;
         if (input.pointer_pressed and self.precisionChromeContainsPoint(viewport, input.pointer_screen)) return null;
+
+        // A read-only Library preview is a real canvas mode, not paint over
+        // invisible current-slide hit targets. The first click or Escape
+        // returns to the authored slide without also selecting/mutating it.
+        if (self.libraryPreviewIndex(workspace) != null) {
+            // Preview intentionally shields the authored slide and Objects,
+            // but Properties is an explicit request to edit the selected
+            // definition. On compact layouts the Inspector toolbar button is
+            // the equivalent entry point because the right dock is hidden.
+            const inspector = objectsLayout(viewport);
+            const ui = uiLayout(viewport);
+            if (input.pointer_pressed and
+                (pointInRectangle(input.pointer_screen, inspector.properties_tab) or
+                    pointInRectangle(input.pointer_screen, ui.properties_dock_toggle)))
+            {
+                self.emitLibraryAction(items, workspace, .edit);
+                return null;
+            }
+            const workspace_chrome_hit = workspace.visible and
+                pointInRectangle(input.pointer_screen, workspaceLayout(viewport).sidebar);
+            if (input.cancel_pressed or
+                (input.pointer_pressed and !workspace_chrome_hit and
+                    pointInRectangle(input.pointer_screen, viewport.canvasBounds())))
+            {
+                self.selected_library_index = null;
+                self.notice = .none;
+                return null;
+            }
+
+            // Keep deck and Library controls usable, but swallow every
+            // canvas/object mutation while the detached scene owns the
+            // canvas. This prevents nudge/delete/copy shortcuts from acting
+            // on a preserved current-slide selection hidden underneath it.
+            if (workspace.visible) {
+                self.normalizeWorkspace(viewport, workspace);
+                self.normalizeMorphTimeline(viewport, workspace);
+                if (self.handleWorkspaceKeyboard(items, workspace, input)) return null;
+                self.handleWorkspaceScroll(viewport, workspace, input);
+                if (input.pointer_pressed and
+                    self.handleWorkspaceClick(items, viewport, workspace, input.pointer_screen)) return null;
+            }
+            return null;
+        }
 
         self.normalizeObjects(items, viewport);
         self.handleObjectsScroll(items, viewport, input);
@@ -5679,6 +6177,10 @@ pub const Studio = struct {
         }
 
         if (input.paste_pressed) {
+            if (self.definition_mode != null and !self.definitionStructureAllowed()) {
+                self.notice = .definition_structure_locked;
+                return null;
+            }
             if (self.interaction != .idle) self.cancelInteraction(items);
             self.tool = .select;
             self.notice = .none;
@@ -5716,18 +6218,27 @@ pub const Studio = struct {
         }
 
         if (input.choose_tool) |tool| {
-            if (tool == .add_reusable)
+            if (self.definition_mode != null and tool != .select and !self.definitionStructureAllowed()) {
+                self.notice = .definition_structure_locked;
+            } else if (tool == .add_reusable)
                 self.openReusablePicker(items, workspace)
             else
                 self.setTool(tool, items);
         }
 
         if (input.cycle_morph_scene != 0) {
-            self.cycleMorphState(items, input.cycle_morph_scene);
+            if (self.definition_mode != null)
+                self.notice = .definition_structure_locked
+            else
+                self.cycleMorphState(items, input.cycle_morph_scene);
             return null;
         }
 
         if (input.new_slide_pressed) {
+            if (self.definition_mode != null) {
+                self.notice = .definition_structure_locked;
+                return null;
+            }
             self.clearSelection(items);
             self.tool = .select;
             self.pending_semantic_command = .{ .new_slide = {} };
@@ -5976,6 +6487,10 @@ pub const Studio = struct {
         items: []slides.SlideItem,
         allow_shared_edit: bool,
     ) bool {
+        if (self.definition_mode != null) {
+            self.notice = .definition_structure_locked;
+            return true;
+        }
         const item_index = self.selectedIndex(items) orelse return false;
         if (self.selectionCount() > 1) {
             if (self.active_morph_state != null) {
@@ -6039,10 +6554,19 @@ pub const Studio = struct {
 
     fn emitDuplicateItem(self: *Studio, items: []slides.SlideItem, allow_shared_edit: bool) bool {
         if (self.selectionCount() == 0) return false;
+        if (self.definition_mode != null and !self.definitionStructureAllowed()) {
+            self.notice = .definition_structure_locked;
+            return true;
+        }
         if (self.interaction != .idle) self.cancelInteraction(items);
         if (self.selectionCount() > 1) return self.emitDuplicateItems(items, allow_shared_edit);
         const index = self.selectedIndex(items) orelse return false;
-        const target = self.duplicateTarget(items, index, allow_shared_edit, true) orelse return true;
+        const target = self.duplicateTarget(
+            items,
+            index,
+            allow_shared_edit or self.definition_mode != null,
+            true,
+        ) orelse return true;
         self.pending_semantic_command = .{ .duplicate_item = target };
         return true;
     }
@@ -6097,7 +6621,12 @@ pub const Studio = struct {
         var command = ItemBatchCommand{};
         for (items, 0..) |item, item_index| {
             if (!self.isIdentitySelected(item.identity)) continue;
-            const target = self.duplicateTarget(items, item_index, allow_shared_edit, false) orelse {
+            const target = self.duplicateTarget(
+                items,
+                item_index,
+                allow_shared_edit or self.definition_mode != null,
+                self.definition_mode != null,
+            ) orelse {
                 if (self.notice == .duplicate_item_unsupported) self.notice = .multi_duplicate_unsupported;
                 return true;
             };
@@ -6129,7 +6658,7 @@ pub const Studio = struct {
             // Dependency-aware shared-definition deletion remains a deliberate
             // single-target action in v1. Local instance and morph hides may
             // safely coexist with physically authored removals in one plan.
-            if (edit_scope == .shared_template) {
+            if (edit_scope == .shared_template and self.definition_mode == null) {
                 self.notice = .multi_delete_unsupported;
                 return true;
             }
@@ -6176,6 +6705,10 @@ pub const Studio = struct {
         kind: TargetCommandKind,
     ) bool {
         const index = self.selectedIndex(items) orelse return false;
+        if (self.definition_mode != null and kind != .edit_text and !self.definitionStructureAllowed()) {
+            self.notice = .definition_structure_locked;
+            return true;
+        }
         if (self.interaction != .idle) self.cancelInteraction(items);
         if (self.selectionCount() > 1) {
             if (kind == .delete_item) return self.emitDeleteItems(items, allow_shared_edit);
@@ -6337,6 +6870,20 @@ pub const Studio = struct {
     ) ?CommandTarget {
         const item = items[item_index];
         if ((!copy_only and item.locked) or item.kind == .crowd or item.kind == .background or !item.source.patchable) return null;
+        if (self.definition_mode) |mode| {
+            if (mode.kind == .element) return null;
+            const valid_scope = switch (mode.kind) {
+                .element => false,
+                .group => item.source.scope == .direct or item.source.scope == .component_instance,
+                .slide_template => item.source.scope == .slide_template,
+            };
+            if (!valid_scope) return null;
+            return .{
+                .item_identity = item.identity,
+                .source = item.source,
+                .edit_scope = if (mode.kind == .slide_template) .shared_template else .direct,
+            };
+        }
         if (copy_only) {
             if (self.active_morph_state != null or
                 (item.source.scope != .direct and item.source.scope != .component_instance)) return null;
@@ -6355,6 +6902,10 @@ pub const Studio = struct {
 
     fn emitLayerCommand(self: *Studio, items: []slides.SlideItem, action: LayerAction) bool {
         if (self.selectionCount() == 0) return false;
+        if (self.definition_mode != null and !self.definitionStructureAllowed()) {
+            self.notice = .definition_structure_locked;
+            return true;
+        }
         if (self.interaction != .idle) self.cancelInteraction(items);
         var command = LayerCommand{ .action = action };
         // Paint order, rather than primary-selection order, preserves the
@@ -6383,6 +6934,10 @@ pub const Studio = struct {
 
     fn emitCopyItems(self: *Studio, items: []slides.SlideItem) bool {
         if (self.selectionCount() == 0) return false;
+        if (self.definition_mode != null and !self.definitionStructureAllowed()) {
+            self.notice = .definition_structure_locked;
+            return true;
+        }
         if (self.interaction != .idle) self.cancelInteraction(items);
         var command = CopyItemsCommand{};
         for (items, 0..) |item, item_index| {
@@ -6575,6 +7130,11 @@ pub const Studio = struct {
     }
 
     fn emitAddCommand(self: *Studio, pointer: rl.Vector2, workspace: Workspace) void {
+        if (self.definition_mode != null and !self.definitionStructureAllowed()) {
+            self.tool = .select;
+            self.notice = .definition_structure_locked;
+            return;
+        }
         if (self.tool == .add_reusable) {
             const selected_entry = if (self.selected_library_index) |index|
                 if (index < workspace.library.len and workspace.library[index].available and
@@ -6833,10 +7393,12 @@ pub const Studio = struct {
             self.emitLibraryAction(items, workspace, .delete);
             return true;
         }
-        // Enter keeps its established edit-text meaning whenever a canvas
-        // item is selected. With no canvas selection it becomes the natural
-        // activation key for the persistent library selection.
-        if (input.use_library_pressed and self.selected_identity == null and self.selected_library_index != null) {
+        // A visible Library preview owns Enter even when the current slide's
+        // selection is preserved underneath it. Outside preview mode, Enter
+        // keeps its established canvas-text precedence.
+        if (input.use_library_pressed and self.selected_library_index != null and
+            (self.selected_identity == null or self.libraryPreviewIndex(workspace) != null))
+        {
             self.emitLibraryAction(items, workspace, .use);
             return true;
         }
@@ -7050,6 +7612,10 @@ pub const Studio = struct {
             self.emitLibraryAction(items, workspace, .use);
             return true;
         }
+        if (pointInRectangle(pointer, layout.library_edit)) {
+            self.emitLibraryAction(items, workspace, .edit);
+            return true;
+        }
         if (pointInRectangle(pointer, layout.library_rename)) {
             self.emitLibraryAction(items, workspace, .rename);
             return true;
@@ -7114,13 +7680,26 @@ pub const Studio = struct {
                 self.notice = .property_unavailable;
                 return true;
             }
-            self.selected_library_index = entry_index;
-            self.tool = .select;
-            self.notice = .none;
+            const double_click = self.last_library_click_index != null and
+                self.last_library_click_index.? == entry_index and
+                self.library_click_age <= 0.4;
+            self.selectLibraryEntry(items, entry_index);
+            self.last_library_click_index = entry_index;
+            self.library_click_age = 0;
+            if (double_click) self.emitLibraryAction(items, workspace, .edit);
             return true;
         }
         // Empty sidebar space is an input shield, never a canvas click.
         return true;
+    }
+
+    fn selectLibraryEntry(self: *Studio, items: []slides.SlideItem, entry_index: usize) void {
+        if (self.definition_mode != null) self.leaveDefinitionMode(items);
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.marquee.active = false;
+        self.selected_library_index = entry_index;
+        self.tool = .select;
+        self.notice = .none;
     }
 
     fn handleMorphTimelineClick(
@@ -7242,7 +7821,7 @@ pub const Studio = struct {
         });
     }
 
-    const LibraryAction = enum { use, rename, delete };
+    const LibraryAction = enum { use, edit, rename, delete };
 
     fn emitLibraryAction(
         self: *Studio,
@@ -7261,8 +7840,15 @@ pub const Studio = struct {
             return;
         }
         const entry = workspace.library[entry_index];
+        if (self.definition_mode != null) {
+            if (action == .edit) return;
+            if (action != .rename) {
+                self.leaveDefinitionMode(items);
+                self.selected_library_index = entry_index;
+            }
+        }
         if (self.interaction != .idle) self.cancelInteraction(items);
-        self.clearSelection(items);
+        if (action != .edit) self.clearSelection(items);
         self.notice = .none;
         switch (action) {
             .use => switch (entry.kind) {
@@ -7277,6 +7863,10 @@ pub const Studio = struct {
                     self.active_morph_state = null;
                     self.pending_semantic_command = .{ .new_slide_from_template = entry_index };
                 },
+            },
+            .edit => {
+                self.tool = .select;
+                self.pending_semantic_command = .{ .edit_library_entry = entry_index };
             },
             .rename => {
                 self.tool = .select;
@@ -7302,6 +7892,7 @@ pub const Studio = struct {
     }
 
     fn prepareDeckCommand(self: *Studio, items: []slides.SlideItem) void {
+        if (self.definition_mode != null) self.leaveDefinitionMode(items);
         self.clearSelection(items);
         self.tool = .select;
         self.active_morph_state = null;
@@ -7365,7 +7956,9 @@ pub const Studio = struct {
             for (layout.tool_buttons, 0..) |button, index| {
                 if (pointInRectangle(pointer, button)) {
                     const tool: Tool = @enumFromInt(index);
-                    if (tool == .add_reusable)
+                    if (self.definition_mode != null and tool != .select and !self.definitionStructureAllowed())
+                        self.notice = .definition_structure_locked
+                    else if (tool == .add_reusable)
                         self.openReusablePicker(items, workspace)
                     else
                         self.setTool(tool, items);
@@ -7373,17 +7966,21 @@ pub const Studio = struct {
                 }
             }
             if (pointInRectangle(pointer, layout.new_slide)) {
-                self.clearSelection(items);
-                self.tool = .select;
-                self.pending_semantic_command = .{ .new_slide = {} };
+                if (self.definition_mode != null) {
+                    self.notice = .definition_structure_locked;
+                } else {
+                    self.clearSelection(items);
+                    self.tool = .select;
+                    self.pending_semantic_command = .{ .new_slide = {} };
+                }
             }
             if (pointInRectangle(pointer, layout.grid_toggle)) {
                 self.grid_snapping = !self.grid_snapping;
                 self.snap_guides = .{};
             }
-            if (pointInRectangle(pointer, layout.scene_previous)) self.cycleMorphState(items, -1);
+            if (pointInRectangle(pointer, layout.scene_previous) and self.definition_mode == null) self.cycleMorphState(items, -1);
             if (pointInRectangle(pointer, layout.scene_label) or pointInRectangle(pointer, layout.scene_next)) {
-                self.cycleMorphState(items, 1);
+                if (self.definition_mode == null) self.cycleMorphState(items, 1);
             }
             return true;
         }
@@ -7671,6 +8268,7 @@ pub const Studio = struct {
             .height = viewport.slide_size.y,
         };
         if (!pointInRectangle(pointer, slide_rect)) return .arrow;
+        if (self.libraryPreviewIndex(workspace) != null) return .pointing_hand;
         if (self.tool != .select) return .crosshair;
         if (self.selectionCount() == 1) {
             if (self.selectedIndex(items)) |index| {
@@ -8086,6 +8684,21 @@ pub const Studio = struct {
         allow_shared_edit: bool,
     ) ?EditScope {
         const item = items[item_index];
+        if (self.definition_mode) |mode| {
+            if (!item.source.patchable) {
+                self.notice = .generated_source_read_only;
+                return null;
+            }
+            return switch (mode.kind) {
+                .slide_template => if (item.source.scope == .slide_template)
+                    .shared_template
+                else blk: {
+                    self.notice = .generated_source_read_only;
+                    break :blk null;
+                },
+                .element, .group => .direct,
+            };
+        }
         if (self.active_morph_state) |state_index| {
             if (item.state_source_state != null and item.state_source_state.? == state_index) {
                 if (item.state_source != null and item.state_source.?.patchable) return .direct;
@@ -9401,6 +10014,104 @@ pub const Studio = struct {
         }
     }
 
+    fn drawLibraryVisualCard(
+        self: Studio,
+        visual_rect: rl.Rectangle,
+        visual: ?LibraryVisual,
+        accent: rl.Color,
+    ) void {
+        _ = self;
+        if (visual_rect.width <= 0 or visual_rect.height <= 0) return;
+        rl.drawRectangleRec(visual_rect, .{ .r = 10, .g = 17, .b = 29, .a = 255 });
+        rl.drawRectangleLinesEx(visual_rect, 1, .{ .r = 111, .g = 127, .b = 151, .a = 210 });
+        const summary = visual orelse {
+            const center = rl.Vector2{
+                .x = visual_rect.x + visual_rect.width / 2,
+                .y = visual_rect.y + visual_rect.height / 2,
+            };
+            rl.drawCircleV(center, @max(2, visual_rect.height * 0.09), accent);
+            return;
+        };
+        if (!summary.available or summary.content_bounds.width <= 0 or summary.content_bounds.height <= 0) {
+            rl.drawRectangleRounded(.{
+                .x = visual_rect.x + visual_rect.width * 0.28,
+                .y = visual_rect.y + visual_rect.height * 0.33,
+                .width = visual_rect.width * 0.44,
+                .height = visual_rect.height * 0.34,
+            }, 0.18, 4, accent);
+            return;
+        }
+        const inset = @max(2, visual_rect.height * 0.07);
+        const inner: rl.Rectangle = .{
+            .x = visual_rect.x + inset,
+            .y = visual_rect.y + inset,
+            .width = @max(0, visual_rect.width - inset * 2),
+            .height = @max(0, visual_rect.height - inset * 2),
+        };
+        const scale = @min(
+            inner.width / summary.content_bounds.width,
+            inner.height / summary.content_bounds.height,
+        );
+        const content_width = summary.content_bounds.width * scale;
+        const content_height = summary.content_bounds.height * scale;
+        const origin = rl.Vector2{
+            .x = inner.x + (inner.width - content_width) / 2 - summary.content_bounds.x * scale,
+            .y = inner.y + (inner.height - content_height) / 2 - summary.content_bounds.y * scale,
+        };
+        rl.beginScissorMode(
+            @intFromFloat(@floor(visual_rect.x)),
+            @intFromFloat(@floor(visual_rect.y)),
+            @intFromFloat(@ceil(visual_rect.width)),
+            @intFromFloat(@ceil(visual_rect.height)),
+        );
+        for (summary.items[0..summary.item_count]) |item| {
+            const rect: rl.Rectangle = .{
+                .x = origin.x + item.bounds.x * scale,
+                .y = origin.y + item.bounds.y * scale,
+                .width = @max(1, item.bounds.width * scale),
+                .height = @max(1, item.bounds.height * scale),
+            };
+            if (item.fill) |fill| rl.drawRectangleRounded(rect, 0.05, 4, fill);
+            switch (item.kind) {
+                .background => rl.drawRectangleRec(rect, item.color),
+                .img => {
+                    rl.drawRectangleRounded(rect, 0.05, 4, .{ .r = 44, .g = 57, .b = 77, .a = 255 });
+                    rl.drawLineEx(
+                        .{ .x = rect.x, .y = rect.y + rect.height },
+                        .{ .x = rect.x + rect.width * 0.44, .y = rect.y + rect.height * 0.45 },
+                        @max(1, visual_rect.height * 0.025),
+                        item.color,
+                    );
+                    rl.drawLineEx(
+                        .{ .x = rect.x + rect.width * 0.38, .y = rect.y + rect.height },
+                        .{ .x = rect.x + rect.width, .y = rect.y + rect.height * 0.28 },
+                        @max(1, visual_rect.height * 0.025),
+                        item.color,
+                    );
+                },
+                .textbox, .crowd => if (item.has_text) {
+                    const line_height = @max(1, @min(rect.height * 0.18, visual_rect.height * 0.075));
+                    const line_width = @max(1, rect.width * 0.78);
+                    rl.drawRectangleRec(.{
+                        .x = rect.x + rect.width * 0.07,
+                        .y = rect.y + rect.height * 0.22,
+                        .width = line_width,
+                        .height = line_height,
+                    }, item.color);
+                    rl.drawRectangleRec(.{
+                        .x = rect.x + rect.width * 0.07,
+                        .y = rect.y + rect.height * 0.53,
+                        .width = line_width * 0.62,
+                        .height = line_height,
+                    }, item.color);
+                } else {
+                    rl.drawRectangleRounded(rect, 0.08, 4, item.color);
+                },
+            }
+        }
+        rl.endScissorMode();
+    }
+
     pub fn drawWorkspaceOverlay(self: Studio, viewport: Viewport, workspace: Workspace) void {
         if (!self.enabled or !workspace.visible) return;
         self.drawMorphTimeline(viewport, workspace);
@@ -9491,6 +10202,7 @@ pub const Studio = struct {
 
         self.drawUiText("LIBRARY", .{ .x = layout.library.x + 12 * font_scale, .y = layout.library.y + 9 * font_scale }, heading_font, .white);
         drawCompactButton(self, layout.library_use, "Use");
+        drawCompactButton(self, layout.library_edit, "Edit");
         drawCompactButton(self, layout.library_rename, "Ren");
         drawCompactButton(self, layout.library_delete, "Del");
         drawCompactButton(
@@ -9551,18 +10263,30 @@ pub const Studio = struct {
                 .group => "GROUP",
                 .slide_template => "SLIDE",
             };
-            const badge_rect: rl.Rectangle = .{ .x = row.x + 7 * font_scale, .y = row.y + 9 * font_scale, .width = 48 * font_scale, .height = 28 * font_scale };
-            rl.drawRectangleRec(badge_rect, switch (entry.kind) {
+            const accent: rl.Color = switch (entry.kind) {
                 .element => .{ .r = 43, .g = 123, .b = 151, .a = if (entry.available) 255 else 100 },
                 .group => .{ .r = 170, .g = 91, .b = 126, .a = if (entry.available) 255 else 100 },
                 .slide_template => .{ .r = 116, .g = 83, .b = 160, .a = if (entry.available) 255 else 100 },
-            });
+            };
+            const visual_rect = libraryVisualRect(layout, row);
+            self.drawLibraryVisualCard(
+                visual_rect,
+                if (entry_index < workspace.library_visuals.len) workspace.library_visuals[entry_index] else null,
+                accent,
+            );
+            const badge_rect: rl.Rectangle = .{
+                .x = visual_rect.x + 2 * font_scale,
+                .y = visual_rect.y + 2 * font_scale,
+                .width = @min(45 * font_scale, @max(0, visual_rect.width - 4 * font_scale)),
+                .height = @min(19 * font_scale, @max(0, visual_rect.height - 4 * font_scale)),
+            };
+            rl.drawRectangleRec(badge_rect, accent);
             const badge_width = self.measureUiText(badge, compact_font);
             self.drawUiText(badge, .{
                 .x = badge_rect.x + (badge_rect.width - badge_width) / 2,
                 .y = badge_rect.y + (badge_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
             }, compact_font, .white);
-            const text_x = row.x + 64 * font_scale;
+            const text_x = visual_rect.x + visual_rect.width + 8 * font_scale;
             const text_width = @max(0, row.x + row.width - text_x - 7 * font_scale);
             if (text_width <= 0) continue;
             rl.beginScissorMode(
@@ -9582,13 +10306,190 @@ pub const Studio = struct {
                 "unused"
             else
                 std.fmt.bufPrintZ(&usage_buffer, "{d} use{s}", .{ entry.use_count, if (entry.use_count == 1) "" else "s" }) catch "used";
-            self.drawUiText(usage, .{ .x = text_x, .y = row.y + 27 * font_scale }, compact_font, if (entry.deletable)
+            self.drawUiText(usage, .{
+                .x = text_x,
+                .y = row.y + row.height - @as(f32, @floatFromInt(compact_font)) - 6 * font_scale,
+            }, compact_font, if (entry.deletable)
                 .{ .r = 126, .g = 231, .b = 177, .a = 255 }
             else
                 .{ .r = 168, .g = 179, .b = 198, .a = 255 });
             rl.endScissorMode();
         }
         if (workspace.new_deck) self.drawNewDeckChooser(viewport);
+    }
+
+    /// Draw after the detached definition scene. The card is deliberately
+    /// canvas-local: permanent Studio chrome remains unobscured, while the
+    /// preview cannot be mistaken for an authored slide or editable surface.
+    pub fn drawLibraryPreviewOverlay(
+        self: Studio,
+        viewport: Viewport,
+        entry: LibraryEntry,
+    ) void {
+        if (!self.enabled) return;
+        const canvas = viewport.canvasBounds();
+        if (canvas.width <= 0 or canvas.height <= 0) return;
+        const scale = uiScale(viewport);
+        const accent: rl.Color = switch (entry.kind) {
+            .element => .{ .r = 80, .g = 215, .b = 255, .a = 255 },
+            .group => .{ .r = 255, .g = 112, .b = 176, .a = 255 },
+            .slide_template => .{ .r = 183, .g = 139, .b = 255, .a = 255 },
+        };
+        rl.drawRectangleLinesEx(.{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        }, 2 * scale, accent);
+
+        const compact = canvas.height < 430 * scale;
+        const card: rl.Rectangle = .{
+            .x = canvas.x + 14 * scale,
+            .y = canvas.y + 14 * scale,
+            .width = @min(canvas.width - 28 * scale, 510 * scale),
+            .height = (if (compact) @as(f32, 44) else 64) * scale,
+        };
+        if (card.width <= 0) return;
+        rl.drawRectangleRounded(card, 0.16, 8, .{ .r = 7, .g = 12, .b = 22, .a = 244 });
+        rl.drawRectangleRoundedLinesEx(card, 0.16, 8, 1.5 * scale, accent);
+        rl.drawRectangleRec(.{
+            .x = card.x,
+            .y = card.y,
+            .width = 5 * scale,
+            .height = card.height,
+        }, accent);
+
+        const kind: []const u8 = switch (entry.kind) {
+            .element => "ITEM",
+            .group => "GROUP",
+            .slide_template => "SLIDE",
+        };
+        var title_buffer: [192]u8 = undefined;
+        const title = std.fmt.bufPrintZ(
+            &title_buffer,
+            "LIBRARY PREVIEW · {s} · {s}",
+            .{ kind, entry.name },
+        ) catch "LIBRARY PREVIEW";
+        var fitted_buffer: [192]u8 = undefined;
+        const heading_font = scaledUiFont(scale, UiTypography.heading);
+        const fitted = self.fitUiText(
+            &fitted_buffer,
+            title,
+            heading_font,
+            @max(0, card.width - 28 * scale),
+        );
+        self.drawUiText(fitted, .{
+            .x = card.x + 15 * scale,
+            .y = if (compact)
+                card.y + (card.height - @as(f32, @floatFromInt(heading_font))) / 2
+            else
+                card.y + 10 * scale,
+        }, heading_font, .white);
+        if (!compact) {
+            self.drawUiText(
+                "READ ONLY · Properties or Library Edit edits · Esc returns",
+                .{ .x = card.x + 15 * scale, .y = card.y + 36 * scale },
+                scaledUiFont(scale, UiTypography.compact),
+                .{ .r = 190, .g = 202, .b = 221, .a = 255 },
+            );
+        }
+    }
+
+    /// Compact windows reserve a shallow canvas-local header for the Library
+    /// preview label. Fit the detached scene beneath it so small ITEMs near
+    /// the authored top edge never disappear behind preview chrome.
+    pub fn libraryPreviewRenderViewport(viewport: Viewport) Viewport {
+        const canvas = viewport.canvasBounds();
+        const scale = uiScale(viewport);
+        if (canvas.height >= 430 * scale) return viewport;
+        const side_margin = 14 * scale;
+        const header_clearance = 68 * scale;
+        const bottom_margin = 14 * scale;
+        return fitSlideViewport(.{
+            .x = canvas.x + side_margin,
+            .y = canvas.y + header_clearance,
+            .width = @max(0, canvas.width - side_margin * 2),
+            .height = @max(0, canvas.height - header_clearance - bottom_margin),
+        });
+    }
+
+    fn definitionBackRect(viewport: Viewport) rl.Rectangle {
+        const canvas = viewport.canvasBounds();
+        const scale = uiScale(viewport);
+        return .{
+            .x = canvas.x + 14 * scale,
+            .y = canvas.y + 14 * scale,
+            .width = 78 * scale,
+            .height = 64 * scale,
+        };
+    }
+
+    /// Breadcrumb and explicit exit for the persistent shared-definition
+    /// scene. Selection chrome is drawn underneath this surface so existing
+    /// Objects/Properties interactions remain visually continuous.
+    pub fn drawDefinitionOverlay(self: Studio, viewport: Viewport) void {
+        const mode = if (self.definition_mode) |value| value else return;
+        const canvas = viewport.canvasBounds();
+        if (canvas.width <= 0 or canvas.height <= 0) return;
+        const scale = uiScale(viewport);
+        const accent: rl.Color = switch (mode.kind) {
+            .element => .{ .r = 80, .g = 215, .b = 255, .a = 255 },
+            .group => .{ .r = 255, .g = 112, .b = 176, .a = 255 },
+            .slide_template => .{ .r = 183, .g = 139, .b = 255, .a = 255 },
+        };
+        rl.drawRectangleLinesEx(.{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        }, 3 * scale, accent);
+
+        const back = definitionBackRect(viewport);
+        rl.drawRectangleRounded(back, 0.16, 8, .{ .r = 7, .g = 12, .b = 22, .a = 244 });
+        rl.drawRectangleRoundedLinesEx(back, 0.16, 8, 1.5 * scale, accent);
+        const back_label: [:0]const u8 = "< Back";
+        const back_font = scaledUiFont(scale, UiTypography.body);
+        self.drawUiText(back_label, .{
+            .x = back.x + (back.width - self.measureUiText(back_label, back_font)) / 2,
+            .y = back.y + (back.height - @as(f32, @floatFromInt(back_font))) / 2,
+        }, back_font, .white);
+
+        const card: rl.Rectangle = .{
+            .x = back.x + back.width + 8 * scale,
+            .y = back.y,
+            .width = @min(@max(0, canvas.x + canvas.width - (back.x + back.width + 22 * scale)), 590 * scale),
+            .height = back.height,
+        };
+        if (card.width <= 0) return;
+        rl.drawRectangleRounded(card, 0.16, 8, .{ .r = 7, .g = 12, .b = 22, .a = 244 });
+        rl.drawRectangleRoundedLinesEx(card, 0.16, 8, 1.5 * scale, accent);
+        const kind: []const u8 = switch (mode.kind) {
+            .element => "ITEM",
+            .group => "GROUP",
+            .slide_template => "SLIDE",
+        };
+        var title_buffer: [192]u8 = undefined;
+        const title = std.fmt.bufPrintZ(&title_buffer, "DEFINITION · {s} · {s}", .{ kind, mode.nameSlice() }) catch "DEFINITION";
+        var fitted_buffer: [192]u8 = undefined;
+        const heading_font = scaledUiFont(scale, UiTypography.heading);
+        const fitted = self.fitUiText(&fitted_buffer, title, heading_font, @max(0, card.width - 28 * scale));
+        self.drawUiText(fitted, .{ .x = card.x + 14 * scale, .y = card.y + 10 * scale }, heading_font, .white);
+        var detail_buffer: [160]u8 = undefined;
+        const detail = std.fmt.bufPrintZ(
+            &detail_buffer,
+            "SHARED · affects {d} use{s} · {s} edit the definition",
+            .{
+                mode.use_count,
+                if (mode.use_count == 1) "" else "s",
+                if (mode.kind == .element) "properties" else "structure + properties",
+            },
+        ) catch "SHARED · edits update the definition";
+        self.drawUiText(
+            self.fitUiText(&fitted_buffer, detail, scaledUiFont(scale, UiTypography.compact), @max(0, card.width - 28 * scale)),
+            .{ .x = card.x + 14 * scale, .y = card.y + 36 * scale },
+            scaledUiFont(scale, UiTypography.compact),
+            .{ .r = 190, .g = 202, .b = 221, .a = 255 },
+        );
     }
 
     /// Draws transient discovery chrome after the workspace thumbnails and
@@ -10873,6 +11774,18 @@ pub const Studio = struct {
         items: []const slides.SlideItem,
         buffer: *[192]u8,
     ) ?[:0]const u8 {
+        if (self.definition_mode) |mode| {
+            const kind: []const u8 = switch (mode.kind) {
+                .element => "ITEM",
+                .group => "GROUP",
+                .slide_template => "SLIDE",
+            };
+            return std.fmt.bufPrintZ(
+                buffer,
+                "{s} definition · edits shared source",
+                .{kind},
+            ) catch null;
+        }
         if (self.selectionCount() > 1)
             return std.fmt.bufPrintZ(buffer, "Selected group · Reuse creates one source-native component", .{}) catch null;
         const item_index = self.selectedIndex(items) orelse return null;
@@ -11206,6 +12119,8 @@ pub const Studio = struct {
             .selection_capacity_reached => "Selection is limited to 64 items",
             .distribution_needs_three => "Equal-gap distribution needs at least three selected items",
             .generated_source_read_only => "Read-only in Studio: this item directive is produced with @let",
+            .definition_structure_locked => "That action is unavailable here; GROUP/SLIDE support add, duplicate, delete, layer, copy, and paste",
+            .definition_structure_unsupported => "Definition structure needs a literal direct block with stable IDs; no changes were made",
             .property_unavailable => "That property does not apply to this kind of item",
             .base_scene_only => "That action is available in the BASE scene",
             .structural_source_locked => "Slide structure is source-scoped here; no changes were made",
@@ -14486,6 +15401,290 @@ test "library selection persists while Use places elements or creates template s
     }
 }
 
+test "selected Library preview dismisses without activating the underlying canvas" {
+    var items = [_]slides.SlideItem{testItem(141, .textbox, 700, 400, 300, 120)};
+    const entries = [_]LibraryEntry{.{ .kind = .element, .name = "card" }};
+    const workspace: Workspace = .{ .visible = true, .library = &entries };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = workspaceLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .selected_identity = 141 };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 0).?),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 0), studio.libraryPreviewIndex(workspace));
+    try std.testing.expectEqual(@as(?usize, 141), studio.selected_identity);
+    try std.testing.expect(!studio.dirty);
+
+    // Canvas shortcuts must not mutate the preserved, visually hidden slide
+    // selection while the detached read-only scene owns the canvas.
+    const before_position = items[0].position;
+    try std.testing.expect(studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .nudge = .{ .x = 10, .y = 0 },
+        .delete_pressed = true,
+    }) == null);
+    try std.testing.expectEqual(before_position, items[0].position);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    // The first canvas click exits preview and is consumed. It must not begin
+    // moving the authored item directly underneath it.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = .{ .x = 850, .y = 460 },
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.libraryPreviewIndex(workspace) == null);
+    try std.testing.expectEqual(Interaction.idle, studio.interaction);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expect(studio.enabled);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 0).?),
+        .pointer_pressed = true,
+    });
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cancel_pressed = true });
+    try std.testing.expect(studio.libraryPreviewIndex(workspace) == null);
+    try std.testing.expect(studio.enabled);
+}
+
+test "Library Edit button and double click open the exact selected definition" {
+    var items: [0]slides.SlideItem = .{};
+    const entries = [_]LibraryEntry{.{ .kind = .group, .name = "feature", .use_count = 3 }};
+    const workspace: Workspace = .{ .visible = true, .library = &entries };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const layout = workspaceLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 0).?),
+        .pointer_pressed = true,
+    });
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.library_edit),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .edit_library_entry => |index| try std.testing.expectEqual(@as(usize, 0), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.selected_library_index = null;
+    studio.last_library_click_index = null;
+    studio.library_click_age = 10;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 0).?),
+        .pointer_pressed = true,
+        .frame_time = 0.1,
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(layout, 0).?),
+        .pointer_pressed = true,
+        .frame_time = 0.1,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .edit_library_entry => |index| try std.testing.expectEqual(@as(usize, 0), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "Properties tab edits the selected read-only Library preview" {
+    var items: [0]slides.SlideItem = .{};
+    const entries = [_]LibraryEntry{.{ .kind = .element, .name = "stat_card", .use_count = 1 }};
+    const workspace: Workspace = .{ .visible = true, .library = &entries };
+    var studio: Studio = .{ .enabled = true };
+    const viewport = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }).viewport;
+    const library_layout = workspaceLayout(viewport);
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(libraryRowRect(library_layout, 0).?),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?usize, 0), studio.libraryPreviewIndex(workspace));
+
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(objectsLayout(viewport).properties_tab),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .edit_library_entry => |index| try std.testing.expectEqual(@as(usize, 0), index),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "Definition mode forces shared template edits and Back restores slide state" {
+    var authored = [_]slides.SlideItem{testItem(201, .textbox, 80, 90, 300, 100)};
+    authored[0].source = .{ .scope = .direct, .line_offset = 40, .patchable = true };
+    const entry: LibraryEntry = .{ .kind = .slide_template, .name = "chapter", .use_count = 4 };
+    var studio: Studio = .{
+        .enabled = true,
+        .selected_identity = 201,
+        .selected_source = authored[0].source,
+        .active_morph_state = 1,
+        .canvas_zoom = 1.5,
+        .canvas_center = .{ .x = 700, .y = 420 },
+    };
+    try std.testing.expect(studio.enterDefinitionMode(&authored, 7, 0, entry));
+    try std.testing.expect(studio.definitionModeActive());
+    try std.testing.expectEqual(@as(?usize, 7), studio.definitionCatalogIndex());
+    try std.testing.expect(studio.selected_identity == null);
+    try std.testing.expect(studio.active_morph_state == null);
+
+    var projected = [_]slides.SlideItem{testItem(1, .textbox, 120, 140, 500, 160)};
+    projected[0].source = .{ .scope = .slide_template, .line_offset = 12, .patchable = true };
+    projected[0].shared_template_values = .{
+        .position = projected[0].position,
+        .size = projected[0].size,
+    };
+    studio.selected_identity = 1;
+    studio.selected_source = projected[0].source;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const moved = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{
+        .nudge = .{ .x = 5, .y = 0 },
+    }).?;
+    try std.testing.expectEqual(EditScope.shared_template, moved.edit_scope);
+    try std.testing.expectEqual(@as(usize, 12), moved.source.line_offset);
+
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{
+        .pointer_screen = rectangleCenter(Studio.definitionBackRect(viewport)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(!studio.definitionModeActive());
+    try std.testing.expectEqual(@as(?usize, 201), studio.selected_identity);
+    try std.testing.expectEqual(@as(?usize, 1), studio.active_morph_state);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), studio.canvas_zoom, 0.0001);
+    try std.testing.expectEqual(rl.Vector2{ .x = 700, .y = 420 }, studio.canvas_center);
+}
+
+test "ITEM Definition mode blocks structural shortcuts without emitting source commands" {
+    var authored: [0]slides.SlideItem = .{};
+    const entry: LibraryEntry = .{ .kind = .element, .name = "feature" };
+    var studio: Studio = .{ .enabled = true };
+    try std.testing.expect(studio.enterDefinitionMode(&authored, 2, 0, entry));
+
+    var projected = [_]slides.SlideItem{testItem(1, .textbox, 120, 140, 500, 160)};
+    projected[0].source = .{ .scope = .direct, .line_offset = 20, .patchable = true };
+    studio.selected_identity = 1;
+    studio.selected_source = projected[0].source;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{
+        .delete_pressed = true,
+        .copy_pressed = true,
+    });
+    try std.testing.expectEqual(Notice.definition_structure_locked, studio.notice);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "ITEM Definition mode selects its projected object and opens Properties" {
+    var authored: [0]slides.SlideItem = .{};
+    var studio: Studio = .{ .enabled = true, .active_dock = .slides, .inspector_panel = .objects };
+    try std.testing.expect(studio.enterDefinitionMode(
+        &authored,
+        2,
+        0,
+        .{ .kind = .element, .name = "stat_card", .use_count = 1 },
+    ));
+
+    var projected = [_]slides.SlideItem{testItem(41, .textbox, 120, 140, 500, 160)};
+    projected[0].source = .{ .scope = .direct, .line_offset = 20, .patchable = true };
+    studio.applyPendingDefinitionSelection(&projected);
+
+    try std.testing.expectEqual(@as(?usize, 41), studio.selected_identity);
+    try std.testing.expectEqual(DockPanel.properties, studio.active_dock);
+    try std.testing.expectEqual(InspectorPanel.properties, studio.inspector_panel);
+    var help_buffer: [192]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "ITEM definition · edits shared source",
+        studio.compositionHelp(&projected, &help_buffer).?,
+    );
+
+    // The launch selection is one-shot and never steals a later user choice.
+    studio.clearSelection(&projected);
+    studio.applyPendingDefinitionSelection(&projected);
+    try std.testing.expect(studio.selected_identity == null);
+}
+
+test "GROUP Definition mode emits add duplicate delete reorder copy and paste commands" {
+    var authored: [0]slides.SlideItem = .{};
+    var studio: Studio = .{ .enabled = true };
+    try std.testing.expect(studio.enterDefinitionMode(
+        &authored,
+        2,
+        0,
+        .{ .kind = .group, .name = "feature" },
+    ));
+    var projected = [_]slides.SlideItem{
+        testItem(1, .textbox, 120, 140, 500, 160),
+        testItem(2, .textbox, 180, 360, 500, 160),
+    };
+    projected[0].id = "preview.title";
+    projected[0].source = .{ .scope = .direct, .line_offset = 20, .patchable = true };
+    projected[1].id = "preview.body";
+    projected[1].source = .{ .scope = .direct, .line_offset = 60, .patchable = true };
+    studio.selected_identity = 1;
+    studio.selected_source = projected[0].source;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{ .copy_pressed = true });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .copy_items);
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{ .duplicate_slide_pressed = true });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .duplicate_item);
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{ .layer_action = .front });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .reorder_items);
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{ .delete_pressed = true });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .delete_item);
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{ .paste_pressed = true });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .paste_items);
+
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{ .choose_tool = .add_text });
+    try std.testing.expectEqual(Tool.add_text, studio.tool);
+    _ = studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{
+        .pointer_screen = .{ .x = 900, .y = 500 },
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(std.meta.activeTag(studio.takeSemanticCommand().?) == .add_item);
+
+    studio.queueDefinitionSelectionIds(&.{"new_member"});
+    projected[1].id = "__studio_preview.new_member";
+    studio.applyPendingDefinitionSelection(&projected);
+    try std.testing.expectEqual(@as(?usize, 2), studio.selected_identity);
+}
+
+test "Definition mode survives same-catalog source rewrites and refuses generated members" {
+    var authored: [0]slides.SlideItem = .{};
+    var studio: Studio = .{ .enabled = true };
+    try std.testing.expect(studio.enterDefinitionMode(
+        &authored,
+        5,
+        1,
+        .{ .kind = .group, .name = "feature", .use_count = 2 },
+    ));
+    studio.markSourceChanged();
+    try std.testing.expect(studio.definitionModeActive());
+    try std.testing.expect(studio.selected_library_index == null);
+    try std.testing.expect(studio.syncDefinitionMode(
+        5,
+        0,
+        .{ .kind = .group, .name = "feature_renamed", .use_count = 3 },
+    ));
+    try std.testing.expect(!studio.syncDefinitionMode(
+        6,
+        0,
+        .{ .kind = .group, .name = "shadow_neighbor" },
+    ));
+    try std.testing.expectEqual(@as(?usize, 5), studio.definitionCatalogIndex());
+
+    var projected = [_]slides.SlideItem{testItem(1, .textbox, 100, 100, 300, 100)};
+    projected[0].source = .{ .scope = .direct, .line_offset = 80, .patchable = false };
+    studio.selected_identity = 1;
+    studio.selected_source = projected[0].source;
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    try std.testing.expect(studio.updateWithWorkspace(&projected, &.{}, viewport, .{}, .{
+        .nudge = .{ .x = 1, .y = 0 },
+    }) == null);
+    try std.testing.expectEqual(Notice.generated_source_read_only, studio.notice);
+}
+
 test "library management buttons and shortcuts target the persistent selection" {
     var items = [_]slides.SlideItem{testItem(130, .textbox, 100, 100, 200, 80)};
     const summaries = [_]SlideSummary{.{ .index = 0 }};
@@ -14588,7 +15787,7 @@ test "library cleanup previews then applies without dropping canvas selection" {
     try std.testing.expectEqual(Notice.library_cleanup_blocked, studio.notice);
 }
 
-test "library Enter activation yields to selected canvas item editing" {
+test "library Enter activation uses the visible preview before a hidden canvas selection" {
     var items = [_]slides.SlideItem{testItem(131, .textbox, 100, 100, 200, 80)};
     const summaries = [_]SlideSummary{.{ .index = 0 }};
     const entries = [_]LibraryEntry{.{ .kind = .element, .name = "card" }};
@@ -14600,13 +15799,11 @@ test "library Enter activation yields to selected canvas item editing" {
         .use_library_pressed = true,
         .edit_text_pressed = true,
     });
-    try std.testing.expectEqual(Tool.select, studio.tool);
-    switch (studio.takeSemanticCommand().?) {
-        .edit_text => |target| try std.testing.expectEqual(@as(usize, 131), target.item_identity),
-        else => return error.UnexpectedSemanticCommand,
-    }
+    try std.testing.expectEqual(Tool.add_reusable, studio.tool);
+    try std.testing.expect(studio.selected_identity == null);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
 
-    studio.selected_identity = null;
+    studio.tool = .select;
     _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
         .use_library_pressed = true,
         .edit_text_pressed = true,
@@ -15258,7 +16455,9 @@ test "large dock chrome scales shell rows typography and hit targets together" {
     const reference_workspace = workspaceLayout(reference.viewport);
     const large_workspace = workspaceLayout(large.viewport);
     try std.testing.expectApproxEqAbs(slideCardRect(reference_workspace, 0).?.height * 2, slideCardRect(large_workspace, 0).?.height, 0.0001);
-    try std.testing.expectApproxEqAbs(libraryRowRect(reference_workspace, 0).?.height * 2, libraryRowRect(large_workspace, 0).?.height, 0.0001);
+    try std.testing.expectEqual(LibraryVisualDensity.compact, libraryVisualDensity(reference_workspace));
+    try std.testing.expectEqual(LibraryVisualDensity.standard, libraryVisualDensity(large_workspace));
+    try std.testing.expectApproxEqAbs(@as(f32, 68) * large_workspace.scale, libraryRowRect(large_workspace, 0).?.height, 0.0001);
 
     const reference_objects = objectsLayout(reference.viewport);
     const large_objects = objectsLayout(large.viewport);
@@ -15277,6 +16476,72 @@ test "large dock chrome scales shell rows typography and hit targets together" {
         .pointer_pressed = true,
     });
     try std.testing.expectEqual(InspectorPanel.objects, studio.inspector_panel);
+}
+
+test "Library visual cards keep compact standard and large containment baselines" {
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var layout = workspaceLayout(viewport);
+    layout.scale = 1;
+    layout.library.width = 240;
+    layout.library.height = 220;
+    layout.library_rows_clip.height = 170;
+    try std.testing.expectEqual(LibraryVisualDensity.compact, libraryVisualDensity(layout));
+    const compact_row = libraryRowRect(layout, 0).?;
+    try expectRectangleContained(compact_row, libraryVisualRect(layout, compact_row));
+
+    layout.library.width = 330;
+    layout.library.height = 390;
+    layout.library_rows_clip.height = 360;
+    try std.testing.expectEqual(LibraryVisualDensity.standard, libraryVisualDensity(layout));
+    const standard_row = libraryRowRect(layout, 0).?;
+    try expectRectangleContained(standard_row, libraryVisualRect(layout, standard_row));
+
+    layout.library.width = 430;
+    layout.library.height = 560;
+    layout.library_rows_clip.height = 520;
+    try std.testing.expectEqual(LibraryVisualDensity.large, libraryVisualDensity(layout));
+    const large_row = libraryRowRect(layout, 0).?;
+    try expectRectangleContained(large_row, libraryVisualRect(layout, large_row));
+    try std.testing.expect(compact_row.height < standard_row.height);
+    try std.testing.expect(standard_row.height < large_row.height);
+}
+
+test "compact Library preview reserves its label above the fitted scene" {
+    const compact = frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 506 }, true, false, .slides).viewport;
+    const compact_canvas = compact.canvasBounds();
+    const compact_preview = Studio.libraryPreviewRenderViewport(compact);
+    try std.testing.expect(compact_preview.slide_top_left.y >= compact_canvas.y + 68);
+    try std.testing.expect(compact_preview.slide_size.y < compact.slide_size.y);
+    try std.testing.expectApproxEqAbs(
+        default_logical_size.x / default_logical_size.y,
+        compact_preview.slide_size.x / compact_preview.slide_size.y,
+        0.0001,
+    );
+
+    const roomy = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .objects).viewport;
+    const roomy_preview = Studio.libraryPreviewRenderViewport(roomy);
+    try std.testing.expectEqual(roomy.slide_top_left, roomy_preview.slide_top_left);
+    try std.testing.expectEqual(roomy.slide_size, roomy_preview.slide_size);
+}
+
+test "Library visual summaries use content bounds for reusable items and 16:9 for slides" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 600, 300, 240, 80),
+        testItem(2, .textbox, 900, 520, 300, 120),
+    };
+    items[0].text = "Title";
+    items[1].background_color = .blue;
+    const group = libraryVisualFromItems(.group, &items);
+    try std.testing.expect(group.available);
+    try std.testing.expectEqual(@as(usize, 2), group.item_count);
+    try std.testing.expect(group.content_bounds.x > 0);
+    try std.testing.expect(group.content_bounds.width < default_logical_size.x);
+
+    const slide = libraryVisualFromItems(.slide_template, &items);
+    try std.testing.expectEqual(@as(f32, 0), slide.content_bounds.x);
+    try std.testing.expectEqual(default_logical_size.x, slide.content_bounds.width);
+    try std.testing.expectEqual(default_logical_size.y, slide.content_bounds.height);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.0 / 9.0), slide.content_bounds.width / slide.content_bounds.height, 0.0001);
 }
 
 test "medium dock controls switch reserved space without overlaying the canvas" {

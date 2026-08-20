@@ -259,14 +259,40 @@ refused atomically.
 The Studio sidebar is a deck organizer and source-aware library. Its slide
 cards contain live rendered thumbnails and can select, add, duplicate, delete,
 or move complete slides while preserving their base content, morph states,
-comments, and line endings. The library lists the effective `@push` elements
-and `@pushslide` templates available at the current source position. Click an
-entry to select it, then choose **Use**: reusable elements become a one-shot
-canvas placement tool at their authored size, while slide templates create the
-next slide. **Ren** changes that definition and its source-order-resolved uses;
-**Del** removes only unused element definitions. Slide-template deletion and
-deleting elements with live uses are deliberately refused. Later or shadowed
-definitions are absent because they would not resolve at that insertion point.
+comments, and line endings. The library lists the effective `@push`,
+`@pushgroup`, and `@pushslide` definitions available at the current source
+position as cached visual cards. SLIDE cards use a 16:9 thumbnail; ITEM and
+GROUP cards fit the definition's own content so a small component remains
+recognizable. Cards reflow through compact, default, and large densities
+without changing their hit targets. Selecting an available ITEM, GROUP, or
+SLIDE shows a full, read-only, source-order-resolved preview on the canvas
+without editing the deck; click the canvas or press <kbd>Esc</kbd> to return.
+Choose **Use** to place the selected element or group at its authored size, or
+to create the next slide from a selected template.
+Choose **Edit**, double-click the row, or choose the right-side **Properties**
+tab while a preview is open (the compact **Inspector** button is equivalent)
+to open persistent Definition mode. The canvas, Objects, and Properties then
+edit the exact shared ITEM, GROUP, or
+SLIDE source, and the breadcrumb reports how many uses are affected. An ITEM
+definition selects its single object and opens Properties immediately; GROUP
+and SLIDE definitions open Objects so you can choose one or several members.
+**Back**, <kbd>Esc</kbd>, another Library card, or slide navigation leaves
+Definition mode and restores/navigates the authoring view. Edits are applied
+to the in-memory source immediately and remain undoable; there is no separate
+apply step, while <kbd>Cmd/Ctrl-S</kbd> persists the dirty deck to disk.
+Literal GROUP blocks and direct
+SLIDE templates also support the normal add, duplicate, delete, layer reorder,
+copy, and paste actions. New GROUP members always receive stable literal IDs;
+deleting a SLIDE member removes dependent local and morph mutations atomically.
+Generated structures and GROUPs nested transitively inside slide templates are
+refused with an explanation instead of being partially rewritten. ITEM
+definitions remain one-object definitions, while geometry, text, colors, font
+size, opacity, visibility, and locking use the normal source-backed undo/redo
+path for every kind. **Ren** changes that
+definition and its source-order-resolved uses; **Del** removes only unused
+ITEM or GROUP definitions. Slide-template deletion and definitions with live
+uses are deliberately refused. Later or shadowed definitions are absent
+because they would not resolve at that insertion point.
 
 The organizer's **Tpl** action promotes an eligible direct slide into a named
 `@pushslide` definition while leaving an equivalent `@popslide` instance in
@@ -286,7 +312,8 @@ source.
 Press <kbd>F3</kbd>, or launch with `--diagnostics`, to show frame time, the
 one-second peak and slow-frame count, render-graph rebuild time and mode, the
 number of slides rebuilt, full/partial/unchanged rebuild counters, slideshow
-arena capacity, Studio preparation time, cache rebuild counts, deck size,
+arena capacity, Studio preparation time, cache rebuild counts, Library gallery
+projected/placeholder counts, deck size,
 active item/render-fragment counts, mouse coordinates, and window size. A `*`
 beside the cache counters marks a rebuild in the current frame. Slow frames
 are also rate-limited in the log while diagnostics are active. In Studio the
@@ -317,6 +344,12 @@ with the large-deck flag to verify that the next HUD event is a selective
 deterministic query, and `--diagnostics-window=WIDTHxHEIGHT` requests an exact
 Studio client size (minimum 900×506). Together they make compact/default/large
 navigation screenshots reproducible without synthesizing global key input.
+`--diagnostics-library-preview=NAME` selects the exact physical Library
+definition and opens its isolated read-only canvas preview.
+`--diagnostics-library-definition=NAME` opens that definition in the editable
+Definition scene. The parser-clean `testslides/studio-library-qa.sld` fixture
+contains representative ITEM, GROUP, and SLIDE definitions for deterministic
+gallery/editor captures at default and minimum window sizes.
 `--no-startup-banner` suppresses the four-second launch banner for unattended
 captures, kiosk launches, and other cases that need the first frame to contain
 only the deck and Studio chrome.

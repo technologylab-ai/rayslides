@@ -21,6 +21,11 @@ pub const DuplicateItemPlacement = struct {
 pub const ItemSceneAnchor = union(enum) {
     base_slide: usize,
     morph_state: usize,
+    /// Exact literal `@pushgroup` opening whose body owns the item scene.
+    group_definition: usize,
+    /// Exact literal `@pushslide` that captures the preceding direct item
+    /// scene. Nested/captured templates remain deliberately unsupported.
+    slide_definition: usize,
 };
 
 pub const LayerMove = enum {
@@ -49,6 +54,15 @@ pub const DeleteItemTarget = union(enum) {
     hide: struct {
         item_id: []const u8,
     },
+};
+
+/// One literal member owned directly by a GROUP or SLIDE definition. The
+/// optional ID is optimistic provenance from the parsed projection; GROUP
+/// callers may pass a qualified instance ID because the source layer derives
+/// and validates the stable definition-local member ID itself.
+pub const DefinitionDeleteTarget = struct {
+    directive_offset: usize,
+    item_id: ?[]const u8 = null,
 };
 
 /// Owned clipboard source plus the exact component definition used by a
@@ -268,6 +282,7 @@ pub const PatchError = error{
     UnsupportedSlideTemplateOverride,
     UnsupportedSharedTemplateDeletion,
     UnsupportedSlidePromotion,
+    UnsupportedDefinitionStructure,
     UnsafeSlideGlobalDirective,
     UnsupportedBatchDeletion,
     UnterminatedSpeakerNotes,
@@ -3221,25 +3236,79 @@ pub fn deleteSharedSlideTemplateItem(
     shared_directive_offset: usize,
     item_id: ?[]const u8,
 ) (std.mem.Allocator.Error || PatchError)!PatchResult {
-    if (item_id) |id| {
-        if (!isLiteralItemId(id)) return error.InvalidLiteralValue;
-    }
-
     const resolved = try resolveSlideTemplateDefinitionForInstance(source, instance_slide_offset);
-    try validateDirectSharedTemplateItem(
-        source,
-        resolved.definition,
-        shared_directive_offset,
-        item_id,
-    );
+    const targets = [_]DefinitionDeleteTarget{.{
+        .directive_offset = shared_directive_offset,
+        .item_id = item_id,
+    }};
+    return deleteSlideDefinitionItems(allocator, source, resolved.definition, resolved.name, &targets);
+}
 
-    const shared_line = directiveLine(source, shared_directive_offset) catch
-        return error.UnsupportedSharedTemplateDeletion;
+/// Atomically delete one or more members from an exact literal GROUP or
+/// direct SLIDE definition. GROUP member IDs are required by the block
+/// grammar; dependent literal mutations on root group instances are removed.
+/// A group nested in a slide template is refused because its qualified member
+/// dependencies fan out transitively through every template instance. SLIDE
+/// deletion reuses the conservative shared-template dependency analysis used
+/// by authored instance editing.
+pub fn deleteDefinitionItems(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scene: ItemSceneAnchor,
+    targets: []const DefinitionDeleteTarget,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (targets.len == 0) return error.UnsupportedDefinitionStructure;
+    return switch (scene) {
+        .group_definition => |definition_offset| deleteGroupDefinitionItems(
+            allocator,
+            source,
+            definition_offset,
+            targets,
+        ),
+        .slide_definition => |definition_offset| blk: {
+            const definition = directiveLine(source, definition_offset) catch
+                return error.UnsupportedDefinitionStructure;
+            const text = source[definition.start..definition.content_end];
+            if (!std.mem.eql(u8, directiveName(text), "@pushslide") or hasPotentialLetExpansion(text)) {
+                return error.UnsupportedDefinitionStructure;
+            }
+            const name = directiveContextName(text, "@pushslide".len) orelse
+                return error.UnsupportedDefinitionStructure;
+            if (!isReusableName(name)) return error.UnsupportedDefinitionStructure;
+            break :blk deleteSlideDefinitionItems(allocator, source, definition, name, targets);
+        },
+        else => error.UnsupportedDefinitionStructure,
+    };
+}
+
+fn deleteSlideDefinitionItems(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    definition: DirectiveLine,
+    template_name: []const u8,
+    targets: []const DefinitionDeleteTarget,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
     var edits = std.ArrayList(Edit).empty;
     defer edits.deinit(allocator);
-    try appendItemDeletionEdits(allocator, source, shared_line, &edits);
+    for (targets, 0..) |target, target_index| {
+        for (targets[0..target_index]) |previous| {
+            if (previous.directive_offset == target.directive_offset) {
+                return error.UnsupportedDefinitionStructure;
+            }
+        }
+        if (target.item_id) |id| if (!isLiteralItemId(id)) return error.InvalidLiteralValue;
+        try validateDirectSharedTemplateItem(
+            source,
+            definition,
+            target.directive_offset,
+            target.item_id,
+        );
+        const shared_line = directiveLine(source, target.directive_offset) catch
+            return error.UnsupportedSharedTemplateDeletion;
+        try appendItemDeletionEdits(allocator, source, shared_line, &edits);
+    }
 
-    var cursor = resolved.definition.full_end;
+    var cursor = definition.full_end;
     while (cursor < source.len) {
         const line = physicalLineAt(source, cursor);
         if (cursor < line.content_end and source[cursor] == '@') {
@@ -3252,19 +3321,20 @@ pub fn deleteSharedSlideTemplateItem(
                 }
                 const pushed_name = directiveContextName(text, name.len) orelse
                     return error.AmbiguousSlideTemplateDependency;
-                if (std.mem.eql(u8, pushed_name, resolved.name)) break;
+                if (std.mem.eql(u8, pushed_name, template_name)) break;
             } else if (std.mem.eql(u8, name, "@popslide")) {
                 if (hasPotentialLetExpansion(text)) {
                     return error.AmbiguousSlideTemplateDependency;
                 }
                 const popped_name = directiveContextName(text, name.len) orelse
                     return error.AmbiguousSlideTemplateDependency;
-                if (std.mem.eql(u8, popped_name, resolved.name)) {
-                    const end = try appendSharedTemplateInstanceDependencyEdits(
+                if (std.mem.eql(u8, popped_name, template_name)) {
+                    var end = line.full_end;
+                    for (targets) |target| end = try appendSharedTemplateInstanceDependencyEdits(
                         allocator,
                         source,
                         line,
-                        item_id,
+                        target.item_id,
                         &edits,
                     );
                     cursor = end;
@@ -3276,7 +3346,150 @@ pub fn deleteSharedSlideTemplateItem(
     }
 
     sortEditsByPosition(edits.items);
+    try validateNonOverlappingEdits(edits.items);
     return applyEdits(allocator, source, edits.items);
+}
+
+fn deleteGroupDefinitionItems(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    definition_offset: usize,
+    targets: []const DefinitionDeleteTarget,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const range = try resolveGroupDefinitionItemScene(source, definition_offset);
+    const opening = directiveLine(source, definition_offset) catch
+        return error.UnsupportedDefinitionStructure;
+    const opening_text = source[opening.start..opening.content_end];
+    const group_name = directiveContextName(opening_text, "@pushgroup".len) orelse
+        return error.UnsupportedDefinitionStructure;
+    var units = std.ArrayList(ItemSourceUnit).empty;
+    defer units.deinit(allocator);
+    collectSceneItemUnits(allocator, source, range, &units) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnsupportedDefinitionStructure,
+    };
+    if (targets.len >= units.items.len) return error.UnsupportedDefinitionStructure;
+
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    for (targets, 0..) |target, target_index| {
+        for (targets[0..target_index]) |previous| {
+            if (previous.directive_offset == target.directive_offset) {
+                return error.UnsupportedDefinitionStructure;
+            }
+        }
+        const unit = findItemSourceUnit(units.items, target.directive_offset) orelse
+            return error.UnsupportedDefinitionStructure;
+        const line = directiveLine(source, target.directive_offset) catch
+            return error.UnsupportedDefinitionStructure;
+        const text = source[line.start..line.content_end];
+        const directive = directiveName(text);
+        const member_id = effectiveLiteralId(text, directive.len) orelse
+            return error.UnsupportedDefinitionStructure;
+        if (!isReusableName(member_id)) return error.UnsupportedDefinitionStructure;
+        if (target.item_id) |expected| {
+            const matches_local = std.mem.eql(u8, expected, member_id);
+            const matches_qualified = expected.len > member_id.len and
+                expected[expected.len - member_id.len - 1] == '.' and
+                std.mem.endsWith(u8, expected, member_id);
+            if (!matches_local and !matches_qualified) return error.UnsupportedDefinitionStructure;
+        }
+        try edits.append(allocator, .{
+            .start = unit.start,
+            .end = unit.end,
+            .replacement = "",
+        });
+        try appendGroupDefinitionDependencyEdits(
+            allocator,
+            source,
+            opening,
+            group_name,
+            member_id,
+            &edits,
+        );
+    }
+
+    sortEditsByPosition(edits.items);
+    try validateNonOverlappingEdits(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+fn appendGroupDefinitionDependencyEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    definition: DirectiveLine,
+    group_name: []const u8,
+    member_id: []const u8,
+    edits: *std.ArrayList(Edit),
+) (std.mem.Allocator.Error || PatchError)!void {
+    const definition_range = try resolveGroupDefinitionItemScene(source, definition.start);
+    const closing = directiveLine(source, definition_range.end) catch
+        return error.UnsupportedDefinitionStructure;
+    var cursor = closing.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[line.start..line.content_end];
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedDefinitionStructure;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@pushgroup")) {
+                const pushed_name = directiveContextName(text, name.len) orelse
+                    return error.UnsupportedDefinitionStructure;
+                if (std.mem.eql(u8, pushed_name, group_name)) break;
+            } else if (std.mem.eql(u8, name, "@popgroup")) {
+                const popped_name = directiveContextName(text, name.len) orelse
+                    return error.UnsupportedDefinitionStructure;
+                if (std.mem.eql(u8, popped_name, group_name)) {
+                    const info = inspectReusableGroupInstance(allocator, source, line.start) catch
+                        return error.UnsupportedDefinitionStructure;
+                    if (info.definition_offset != definition.start) {
+                        return error.UnsupportedDefinitionStructure;
+                    }
+                    const qualified = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}.{s}",
+                        .{ info.instance_id, member_id },
+                    );
+                    defer allocator.free(qualified);
+                    var dependency_cursor = line.full_end;
+                    while (dependency_cursor < source.len) {
+                        const dependency_line = physicalLineAt(source, dependency_cursor);
+                        const dependency_text = source[dependency_line.start..dependency_line.content_end];
+                        if (hasPotentialLetExpansion(dependency_text)) {
+                            return error.UnsupportedDefinitionStructure;
+                        }
+                        if (dependency_cursor < dependency_line.content_end and source[dependency_cursor] == '@') {
+                            const dependency_name = directiveName(dependency_text);
+                            if (std.mem.eql(u8, dependency_name, "@pushslide")) {
+                                return error.UnsupportedDefinitionStructure;
+                            }
+                            if (std.mem.eql(u8, dependency_name, "@slide") or
+                                std.mem.eql(u8, dependency_name, "@popslide")) break;
+                            if (isMorphMutationDirective(dependency_name)) {
+                                const target = directiveContextName(dependency_text, dependency_name.len) orelse
+                                    return error.UnsupportedDefinitionStructure;
+                                if (std.mem.eql(u8, target, qualified)) {
+                                    try edits.append(allocator, .{
+                                        .start = dependency_line.start,
+                                        .end = dependency_line.full_end,
+                                        .replacement = "",
+                                    });
+                                    try appendBodyDeletionEdits(
+                                        allocator,
+                                        source,
+                                        dependency_line.full_end,
+                                        edits,
+                                    );
+                                }
+                            }
+                        }
+                        dependency_cursor = dependency_line.full_end;
+                    }
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
 }
 
 fn appendItemDeletionEdits(
@@ -4685,7 +4898,7 @@ fn validateComponentDetachTail(source: []const u8, start: usize) PatchError!void
     }
 }
 
-const ItemSceneKind = enum { base, template_base, morph };
+const ItemSceneKind = enum { base, template_base, morph, group_definition, slide_definition };
 
 const ItemSceneRange = struct {
     start: usize,
@@ -4703,6 +4916,162 @@ fn resolveItemScene(source: []const u8, anchor: ItemSceneAnchor) PatchError!Item
     return switch (anchor) {
         .base_slide => |slide_offset| resolveDirectBaseItemScene(source, slide_offset),
         .morph_state => |state_offset| resolveDirectMorphItemScene(source, state_offset),
+        .group_definition => |definition_offset| resolveGroupDefinitionItemScene(source, definition_offset),
+        .slide_definition => |definition_offset| resolveSlideDefinitionItemScene(source, definition_offset),
+    };
+}
+
+/// Return the exact source insertion point for one validated authored item
+/// scene. Definition callers use this instead of deriving block boundaries in
+/// the UI/integration layer.
+pub fn itemSceneInsertionOffset(source: []const u8, anchor: ItemSceneAnchor) PatchError!usize {
+    return (try resolveItemScene(source, anchor)).end;
+}
+
+fn resolveGroupDefinitionItemScene(source: []const u8, definition_offset: usize) PatchError!ItemSceneRange {
+    const opening = directiveLine(source, definition_offset) catch
+        return error.UnsupportedDefinitionStructure;
+    const opening_text = source[opening.start..opening.content_end];
+    if (!std.mem.eql(u8, directiveName(opening_text), "@pushgroup") or
+        hasPotentialLetExpansion(opening_text))
+    {
+        return error.UnsupportedDefinitionStructure;
+    }
+    var opening_words = std.mem.tokenizeAny(u8, opening_text, " \t");
+    _ = opening_words.next();
+    const group_name = opening_words.next() orelse return error.UnsupportedDefinitionStructure;
+    if (!isReusableName(group_name) or opening_words.next() != null) {
+        return error.UnsupportedDefinitionStructure;
+    }
+
+    var member_ids: [256][]const u8 = undefined;
+    var member_count: usize = 0;
+    var pending_animation = false;
+    var cursor = opening.full_end;
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const text = source[line.start..line.content_end];
+        if (hasPotentialLetExpansion(text)) return error.UnsupportedDefinitionStructure;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@endgroup")) {
+                if (std.mem.trim(u8, text[name.len..], " \t").len != 0 or
+                    pending_animation or member_count == 0)
+                {
+                    return error.UnsupportedDefinitionStructure;
+                }
+                return .{
+                    .start = opening.full_end,
+                    .end = line.start,
+                    .kind = .group_definition,
+                };
+            }
+            if (isAnimationDirective(name)) {
+                if (pending_animation) return error.UnsupportedDefinitionStructure;
+                pending_animation = true;
+            } else if (std.mem.eql(u8, name, "@box") or std.mem.eql(u8, name, "@pop")) {
+                if (directiveHasDynamicIdentity(text, name)) return error.UnsupportedDefinitionStructure;
+                if (std.mem.eql(u8, name, "@pop")) {
+                    const component_name = directiveContextName(text, name.len) orelse
+                        return error.UnsupportedDefinitionStructure;
+                    if (!isReusableName(component_name)) return error.UnsupportedDefinitionStructure;
+                }
+                const member_id = effectiveLiteralId(text, name.len) orelse
+                    return error.UnsupportedDefinitionStructure;
+                if (!isReusableName(member_id) or member_count == member_ids.len) {
+                    return error.UnsupportedDefinitionStructure;
+                }
+                for (member_ids[0..member_count]) |existing| {
+                    if (std.mem.eql(u8, existing, member_id)) return error.UnsupportedDefinitionStructure;
+                }
+                member_ids[member_count] = member_id;
+                member_count += 1;
+                pending_animation = false;
+            } else {
+                return error.UnsupportedDefinitionStructure;
+            }
+        }
+        cursor = line.full_end;
+    }
+    return error.UnsupportedDefinitionStructure;
+}
+
+fn resolveSlideDefinitionItemScene(source: []const u8, definition_offset: usize) PatchError!ItemSceneRange {
+    const definition = directiveLine(source, definition_offset) catch
+        return error.UnsupportedDefinitionStructure;
+    const definition_text = source[definition.start..definition.content_end];
+    if (!std.mem.eql(u8, directiveName(definition_text), "@pushslide") or
+        hasPotentialLetExpansion(definition_text))
+    {
+        return error.UnsupportedDefinitionStructure;
+    }
+    var words = std.mem.tokenizeAny(u8, definition_text, " \t");
+    _ = words.next();
+    const template_name = words.next() orelse return error.UnsupportedDefinitionStructure;
+    if (!isReusableName(template_name) or words.next() != null) {
+        return error.UnsupportedDefinitionStructure;
+    }
+
+    // A direct slide template is the item scene accumulated since the prior
+    // pushslide reset. Definitions may precede the first item, but rendered
+    // slide anchors, morph structure, or generated source make ownership
+    // ambiguous and are rejected rather than moved across.
+    var scan_start = sourceStart(source);
+    var cursor = sourceStart(source);
+    while (cursor < definition.start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > definition.start) return error.UnsupportedDefinitionStructure;
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@pushslide")) scan_start = line.full_end;
+        }
+        cursor = line.full_end;
+    }
+    if (cursor != definition.start) return error.UnsupportedDefinitionStructure;
+
+    var scene_start: ?usize = null;
+    var pending_animation = false;
+    cursor = scan_start;
+    while (cursor < definition.start) {
+        const line = physicalLineAt(source, cursor);
+        if (line.full_end > definition.start) return error.UnsupportedDefinitionStructure;
+        const text = source[line.start..line.content_end];
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(text);
+            if (std.mem.eql(u8, name, "@slide") or std.mem.eql(u8, name, "@popslide") or
+                isMorphStateDirective(name) or isMorphMutationDirective(name))
+            {
+                return error.UnsupportedDefinitionStructure;
+            }
+            if (isAnimationDirective(name)) {
+                if (hasPotentialLetExpansion(text) or pending_animation) {
+                    return error.UnsupportedDefinitionStructure;
+                }
+                if (scene_start == null) scene_start = line.start;
+                pending_animation = true;
+            } else if (directiveEmitsSlideItem(name)) {
+                if (hasPotentialLetExpansion(text) or directiveHasDynamicIdentity(text, name)) {
+                    return error.UnsupportedDefinitionStructure;
+                }
+                if (scene_start == null) scene_start = line.start;
+                pending_animation = false;
+            } else if (scene_start != null) {
+                // Once item ownership begins, any global/context directive is
+                // a hard structural barrier for the complete definition.
+                return error.UnsupportedDefinitionStructure;
+            }
+        } else if (scene_start == null) {
+            // Leading comments/default body are outside the structural item
+            // range. Text after the first item belongs to that item and stays.
+        }
+        cursor = line.full_end;
+    }
+    if (pending_animation) return error.UnsupportedDefinitionStructure;
+    return .{
+        .start = scene_start orelse definition.start,
+        .end = definition.start,
+        .kind = .slide_definition,
     };
 }
 
@@ -8150,6 +8519,113 @@ test "clipboard paste supports popslide morph births and rejects animated snippe
         destination,
         .{ .morph_state = state },
         inline_item,
+    ));
+}
+
+test "GROUP definition structure uses the exact block and deletes qualified dependencies" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@pushgroup feature\r\n" ++
+        "@box id=title x=100 y=120 text=Title\r\n" ++
+        "@box id=body x=100 y=260 text=Body\r\n" ++
+        "@endgroup\r\n" ++
+        "@slide\r\n" ++
+        "@popgroup feature id=hero\r\n" ++
+        "@set hero.title x=220\r\n" ++
+        "@state(morph) label=focus\r\n" ++
+        "@hide hero.title\r\n";
+    const definition_offset = std.mem.indexOf(u8, source, "@pushgroup feature").?;
+    const title_offset = std.mem.indexOf(u8, source, "@box id=title").?;
+    const scene: ItemSceneAnchor = .{ .group_definition = definition_offset };
+    try std.testing.expectEqual(
+        std.mem.indexOf(u8, source, "@endgroup").?,
+        try itemSceneInsertionOffset(source, scene),
+    );
+
+    const deleted = try deleteDefinitionItems(allocator, source, scene, &.{.{
+        .directive_offset = title_offset,
+        .item_id = "preview.title",
+    }});
+    defer deleted.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "id=title") == null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "hero.title") == null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "id=body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "@endgroup\r\n") != null);
+
+    const duplicated = try duplicateItems(
+        allocator,
+        source,
+        scene,
+        scene,
+        &.{.{
+            .directive_offset = title_offset,
+            .new_id = "title_copy",
+            .placement = .{ .x = 140, .y = 160 },
+        }},
+    );
+    defer duplicated.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, duplicated.source, "@box id=title_copy x=140 y=160") != null);
+    try std.testing.expect(std.mem.indexOf(u8, duplicated.source, "@box id=title_copy").? <
+        std.mem.indexOf(u8, duplicated.source, "@endgroup").?);
+
+    const reordered = try reorderItemsLayer(
+        allocator,
+        source,
+        scene,
+        &.{title_offset},
+        .to_front,
+    );
+    defer reordered.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reordered.source, "id=body").? <
+        std.mem.indexOf(u8, reordered.source, "id=title").?);
+}
+
+test "SLIDE definition structure deletes instance and morph dependencies atomically" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@box id=title x=100 y=80 text=Title\n" ++
+        "@box id=body x=100 y=220 text=Body\n" ++
+        "@pushslide chapter\n" ++
+        "@popslide chapter\n" ++
+        "@set title x=220\n" ++
+        "@state(morph) label=focus\n" ++
+        "@hide title\n" ++
+        "@slide\n";
+    const definition_offset = std.mem.indexOf(u8, source, "@pushslide chapter").?;
+    const title_offset = std.mem.indexOf(u8, source, "@box id=title").?;
+    const scene: ItemSceneAnchor = .{ .slide_definition = definition_offset };
+    try std.testing.expectEqual(definition_offset, try itemSceneInsertionOffset(source, scene));
+
+    const deleted = try deleteDefinitionItems(allocator, source, scene, &.{.{
+        .directive_offset = title_offset,
+        .item_id = "title",
+    }});
+    defer deleted.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "id=title") == null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "@set title") == null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "@hide title") == null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "id=body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.source, "@pushslide chapter") != null);
+}
+
+test "GROUP structural deletion refuses transitive slide-template ownership" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@pushgroup feature\n" ++
+        "@box id=title text=Title\n" ++
+        "@box id=body text=Body\n" ++
+        "@endgroup\n" ++
+        "@popgroup feature id=hero\n" ++
+        "@pushslide chapter\n" ++
+        "@popslide chapter\n";
+    try std.testing.expectError(error.UnsupportedDefinitionStructure, deleteDefinitionItems(
+        allocator,
+        source,
+        .{ .group_definition = std.mem.indexOf(u8, source, "@pushgroup").? },
+        &.{.{
+            .directive_offset = std.mem.indexOf(u8, source, "@box id=title").?,
+            .item_id = "preview.title",
+        }},
     ));
 }
 

@@ -67,7 +67,7 @@ pub const Slide = struct {
         return self;
     }
     pub fn deinit(self: *Slide) void {
-        self.items.deinit(self.allocator);
+        if (self.items) |*items| items.deinit(self.allocator);
         for (self.morph_states.items) |*state| state.items.deinit(self.allocator);
         self.morph_states.deinit(self.allocator);
     }
@@ -235,6 +235,10 @@ pub const SlideItem = struct {
     id: ?[]const u8 = null,
     /// Location and authoring scope of the directive that created this item.
     source: SourceRef = .{},
+    /// Exact `@push` directive resolved by a component instance. Ordinary
+    /// slide editing continues to target `source` (the local `@pop`), while
+    /// Studio Definition mode can deliberately patch the shared definition.
+    component_source: ?SourceRef = null,
     /// Original literal `@box`/`@pop` line inside a reusable-group
     /// definition. `source` remains the `@popgroup` structural owner for an
     /// emitted instance, while this reference enables an editor to offer an

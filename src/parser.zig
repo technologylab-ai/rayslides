@@ -1835,16 +1835,25 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         // also set the parsing context to the current context
         if (parsing_item_context.context_name) |context_name| {
             const ctx_opt = context.push_contexts.get(context_name);
+            var component_source: ?slides.SourceRef = null;
             if (ctx_opt) |ctx| {
                 context.current_context = ctx;
                 context.current_context.text = null;
                 context.current_context.img_path = null;
                 parsing_item_context.applyOtherIfNull(ctx);
+                component_source = .{
+                    .scope = .direct,
+                    .line_number = ctx.line_number,
+                    .line_offset = ctx.line_offset,
+                    .patchable = ctx.source_patchable,
+                };
             } else {
                 const errmsg = try std.fmt.allocPrint(context.allocator, "cannot @pop `{s}` : was not pushed!", .{context_name});
                 reportErrorInParsingContext(ParserError.Syntax, parsing_item_context, context, errmsg);
             }
             _ = try commitItemToSlide(parsing_item_context, context);
+            const committed_items = context.current_slide.currentItems(context.active_morph_state);
+            committed_items.items[committed_items.items.len - 1].component_source = component_source;
         }
         return;
     }
@@ -2593,6 +2602,10 @@ test "logical items retain directive source scope line and offset" {
     try std.testing.expect(component.source.patchable);
     try std.testing.expectEqual(@as(usize, 6), component.source.line_number);
     try std.testing.expectEqual(std.mem.indexOf(u8, input, "@pop title text=Component").?, component.source.line_offset);
+    try std.testing.expectEqual(slides.SourceScope.direct, component.component_source.?.scope);
+    try std.testing.expect(component.component_source.?.patchable);
+    try std.testing.expectEqual(@as(usize, 1), component.component_source.?.line_number);
+    try std.testing.expectEqual(std.mem.indexOf(u8, input, "@push title").?, component.component_source.?.line_offset);
 
     const template_item = slideshow.slides.items[0].items.?.items[0];
     try std.testing.expectEqual(slides.SourceScope.slide_template, template_item.source.scope);

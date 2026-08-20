@@ -92,6 +92,89 @@ definitions to a fixed point and commits one undoable rewrite. Definitions
 whose parser-context ownership cannot be proven remain in source and are
 reported as blocked rather than guessed away.
 
+## Active tranche: Visual reusable definitions
+
+This tranche makes the source-backed Library visible and directly editable
+without inserting disposable instances into the authored deck. Work is split
+into independently shippable increments so preview infrastructure, shared
+editing, and structural editing cannot be conflated or lost between sessions.
+
+### Increment 1: Selected-definition preview
+
+- [x] Selecting an available ITEM, GROUP, or SLIDE Library row renders its
+  exact source-order-resolved definition on the Studio canvas.
+- [x] Preview construction is in-memory and never changes source, dirty state,
+  history, slide count, or current-slide identity.
+- [x] ITEM and GROUP previews resolve at the same insertion offset used by
+  **Use**, including shadowed definitions and current use-site defaults.
+- [x] The canvas clearly identifies the definition kind/name and read-only
+  state; click or Escape returns to the current slide, while **Use** retains
+  its existing placement/slide-creation behavior.
+- [x] Parsed and rendered preview work is cached by source revision,
+  definition, and insertion context, then invalidated safely on source edits,
+  slide changes, reloads, and Studio exit.
+- [x] Headless tests cover all three definition kinds, exact shadowing,
+  non-mutation, cache keys, and preview dismissal.
+
+### Increment 2: Definition mode and property editing
+
+- [x] **Edit** or a double-click opens a persistent Definition mode with a
+  breadcrumb and an explicit “Back to slide” action.
+- [x] Existing Objects, Properties, selection, move, resize, and inline-edit
+  surfaces operate on projected definition items.
+- [x] SLIDE template edits target the shared definition automatically; Alt is
+  unnecessary inside Definition mode and the UI reports affected use count.
+- [x] ITEM edits patch the exact `@push`; GROUP edits patch exact member
+  directives; generated or ambiguous physical source remains read-only.
+- [x] Undo/redo and every successful source rewrite rebuild and re-resolve the
+  same logical definition without drifting to a shadowing neighbor.
+- [x] Tests cover shared fan-out, inherited/default values, rename, undo/redo,
+  generated-source refusal, and return-state restoration.
+
+Definition mode reuses the normal Studio editing surfaces against a detached,
+source-provenance-preserving projection. ITEM projections carry the resolved
+`@push` owner, GROUP members carry their exact definition directive, and SLIDE
+items retain shared-template ownership. Non-structural edits therefore use the
+same guarded transactions and history as ordinary slides. Structural actions
+are supplied by the following increment for literal GROUP and direct SLIDE
+definitions; ITEM definitions remain intentionally single-object.
+
+### Increment 3: Structural definition editing and gallery browsing
+
+- [x] Add, duplicate, delete, reorder, copy, and paste operate within eligible
+  GROUP and SLIDE definitions through exact source-owner transactions.
+- [x] Slide-template structural edits update or reject dependent local/morph
+  mutations atomically, reusing the existing conservative dependency rules.
+- [x] GROUP member creation enforces stable literal IDs and the explicit block
+  grammar; unsupported nested/generated structures explain their refusal.
+- [x] The Library can present cached visual cards: 16:9 thumbnails for SLIDE
+  templates and content-aware cards for ITEM/GROUP definitions.
+- [x] Compact/default/large visual baselines and large-library diagnostics
+  cover preview/editor containment and steady-frame cache behavior.
+- [x] Deterministic `--diagnostics-library-preview=NAME` and
+  `--diagnostics-library-definition=NAME` launch hooks plus the parser-clean
+  `testslides/studio-library-qa.sld` fixture reproduce ITEM/GROUP/SLIDE visual
+  QA without synthesized pointer or keyboard input.
+
+Definition structure now uses exact source-scene anchors: the body of a
+literal `@pushgroup … @endgroup`, or the direct item capture immediately before
+a literal `@pushslide`. Every created or pasted GROUP member receives a stable
+literal ID. SLIDE member deletion removes dependent instance-local and morph
+mutations in the same transaction; GROUP deletion removes qualified root-use
+mutations and refuses transitive template nesting rather than leaving dangling
+targets. Visual Library summaries are projected once per source/use-site cache
+key, use full 16:9 coordinates for SLIDE templates and fitted content bounds
+for ITEM/GROUP definitions, and expose rebuild/projected/placeholder counts in
+diagnostics. The 900×506 preview reserves its compact label above a fitted
+scene so top-edge content remains visible; Definition navigation uses an ASCII
+`< Back` label supported by the bundled UI font. ITEM Definition mode selects
+its single projection and opens Properties immediately, with explicit shared-
+source ownership help; GROUP and SLIDE modes retain Objects-first multi-member
+editing. A preview-level Properties/compact Inspector click now enters
+Definition mode directly; Back, Esc, Library selection, and slide navigation
+leave it without a separate apply step, while ordinary document Save controls
+disk persistence.
+
 ## Completed tranche: New-deck experience
 
 - [x] Open no-file launches directly into a visual starter chooser inside

@@ -373,6 +373,9 @@ fn boundaryTrailingOffset(boundary: BoundarySpacing, slice_end: usize, span_len:
 
 pub const SlideshowRenderer = struct {
     renderedSlides: std.ArrayList(*RenderedSlide) = undefined,
+    /// One detached, source-neutral Studio Library scene. It shares fonts and
+    /// texture cache with the deck graph but never changes slide indexes.
+    studio_preview: ?*RenderedSlide = null,
     allocator: std.mem.Allocator = undefined,
     md_parser: markdownlineparser.MdLineParser = .{},
     texture_cache: TextureCache,
@@ -394,6 +397,7 @@ pub const SlideshowRenderer = struct {
     }
 
     pub fn deinit(self: *SlideshowRenderer) void {
+        self.clearStudioPreview();
         self.deinitRenderedSlides(&self.renderedSlides);
         self.md_parser.deinit();
         self.texture_cache.deinit();
@@ -671,6 +675,27 @@ pub const SlideshowRenderer = struct {
             break :blk slide.morph_scenes.items[state_index].elements.items;
         } else slide.elements.items;
 
+        return collectRenderedItemBounds(allocator, output, elements);
+    }
+
+    /// Logical owner bounds for the detached Library/Definition scene. This
+    /// is the same render-derived geometry used by normal Studio hit testing,
+    /// including auto-sized images and fragmented rich text.
+    pub fn collectStudioPreviewBounds(
+        self: *const SlideshowRenderer,
+        allocator: std.mem.Allocator,
+        output: *std.ArrayList(ItemRenderBounds),
+    ) !usize {
+        output.clearRetainingCapacity();
+        const preview = self.studio_preview orelse return 0;
+        return collectRenderedItemBounds(allocator, output, preview.elements.items);
+    }
+
+    fn collectRenderedItemBounds(
+        allocator: std.mem.Allocator,
+        output: *std.ArrayList(ItemRenderBounds),
+        elements: []const RenderElement,
+    ) !usize {
         for (elements) |element| {
             if (element.kind == .background) continue;
             const right = element.position.x + element.size.x;
@@ -1458,6 +1483,80 @@ pub const SlideshowRenderer = struct {
         );
     }
 
+    /// Transactionally replace the detached Studio Library preview. A failed
+    /// build leaves the previous preview drawable, matching deck rebuild
+    /// behavior and preventing a transient empty canvas on image/font errors.
+    pub fn prepareStudioPreview(
+        self: *SlideshowRenderer,
+        slide: *const slides.Slide,
+        slideshow_filp: []const u8,
+    ) !void {
+        const replacement = try self.buildRenderedSlide(
+            slide,
+            0,
+            slideshow_filp,
+            renderInputFingerprint(slide, slideshow_filp),
+        );
+        const previous = self.studio_preview;
+        self.studio_preview = replacement;
+        if (previous) |rendered| self.destroyRenderedSlide(rendered);
+    }
+
+    pub fn clearStudioPreview(self: *SlideshowRenderer) void {
+        if (self.studio_preview) |preview| self.destroyRenderedSlide(preview);
+        self.studio_preview = null;
+    }
+
+    pub fn hasStudioPreview(self: *const SlideshowRenderer) bool {
+        return self.studio_preview != null;
+    }
+
+    /// Paint the complete stable detached preview while ignoring any live
+    /// geometry gesture belonging to the current authored slide.
+    pub fn renderStudioPreview(
+        self: *SlideshowRenderer,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+    ) !void {
+        const preview = self.studio_preview orelse return;
+        const preview_count = self.item_geometry_preview_count;
+        self.item_geometry_preview_count = 0;
+        defer self.item_geometry_preview_count = preview_count;
+        try self.renderRenderedSlide(
+            preview,
+            .{ .visible_through = preview.steps.items.len },
+            .{},
+            pos,
+            size,
+            internal_render_size,
+            null,
+            "",
+        );
+    }
+
+    /// Paint the detached scene with live geometry previews enabled. Definition
+    /// mode uses this path so the ordinary Studio drag/resize experience is
+    /// identical to editing a slide.
+    pub fn renderStudioDefinition(
+        self: *SlideshowRenderer,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+    ) !void {
+        const preview = self.studio_preview orelse return;
+        try self.renderRenderedSlide(
+            preview,
+            .{ .visible_through = preview.steps.items.len },
+            .{},
+            pos,
+            size,
+            internal_render_size,
+            null,
+            "",
+        );
+    }
+
     fn renderOneSlide(
         self: *SlideshowRenderer,
         slide_number: i32,
@@ -1472,6 +1571,29 @@ pub const SlideshowRenderer = struct {
         if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return;
         const slide = self.renderedSlides.items[@intCast(slide_number)];
 
+        try self.renderRenderedSlide(
+            slide,
+            reveal,
+            slide_transform,
+            pos,
+            size,
+            internal_render_size,
+            crowd_snapshot,
+            crowd_url,
+        );
+    }
+
+    fn renderRenderedSlide(
+        self: *SlideshowRenderer,
+        slide: *RenderedSlide,
+        reveal: RevealState,
+        slide_transform: RenderTransform,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+        crowd_snapshot: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
+    ) !void {
         if (reveal.active_step) |active_step| {
             if (active_step > 0 and active_step <= slide.steps.items.len) {
                 const step = slide.steps.items[active_step - 1];
@@ -2383,6 +2505,51 @@ test "slide number replacement excludes unused formatter bytes" {
     const rendered = try replaceSlideNumber(std.testing.allocator, "page $slide_number of $slide_number", 6);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("page 6 of 6", rendered);
+}
+
+test "Studio Library preview remains detached and replaces transactionally" {
+    const allocator = std.testing.allocator;
+    var unused_fonts: my_fonts.AvailableFonts = undefined;
+    const renderer = try SlideshowRenderer.new(allocator, &unused_fonts);
+    defer renderer.deinit();
+
+    var slide: slides.Slide = .{ .allocator = allocator };
+    slide.items = std.ArrayList(slides.SlideItem).empty;
+    slide.morph_states = std.ArrayList(slides.MorphState).empty;
+    defer {
+        slide.items.?.deinit(allocator);
+        slide.morph_states.deinit(allocator);
+    }
+    try slide.items.?.append(allocator, .{
+        .identity = 1,
+        .kind = .background,
+        .color = .black,
+    });
+
+    try renderer.prepareStudioPreview(&slide, "deck.sld");
+    try std.testing.expect(renderer.hasStudioPreview());
+    try std.testing.expectEqual(@as(usize, 0), renderer.renderedSlides.items.len);
+    const first = renderer.studio_preview.?;
+    try first.elements.append(allocator, .{
+        .kind = .text,
+        .owner_identity = 9,
+        .position = .{ .x = 120, .y = 80 },
+        .size = .{ .x = 300, .y = 90 },
+    });
+    var bounds = std.ArrayList(SlideshowRenderer.ItemRenderBounds).empty;
+    defer bounds.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), try renderer.collectStudioPreviewBounds(allocator, &bounds));
+    try std.testing.expectEqual(@as(usize, 1), bounds.items.len);
+    try std.testing.expectEqual(@as(usize, 9), bounds.items[0].owner_identity);
+
+    slide.items.?.items[0].color = .white;
+    try renderer.prepareStudioPreview(&slide, "deck.sld");
+    try std.testing.expect(renderer.studio_preview.? != first);
+    try std.testing.expectEqual(rl.Color.white, renderer.studio_preview.?.elements.items[0].color.?);
+
+    renderer.clearStudioPreview();
+    try std.testing.expect(!renderer.hasStudioPreview());
+    try std.testing.expectEqual(@as(usize, 0), renderer.renderedSlides.items.len);
 }
 
 test "repeated preRender releases slides morph scenes plans and owned text" {
