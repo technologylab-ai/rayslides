@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#060c14">
+    <meta name="description" content="Build Rayslides and create your first .sld deck.">
+    <title>Get started — Rayslides</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="icon" href="images/rayslides-app-icon.png" type="image/png">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="index.html" aria-label="Rayslides documentation home">
+        <img class="brand-mark" src="images/rayslides-app-icon.png" alt="" width="192" height="192"><span>rayslides docs</span>
+      </a>
+      <nav class="header-links" aria-label="Header">
+        <a href="getting-started.html">Get started</a><a href="reference.html">Controls</a>
+        <a class="github-link" href="https://github.com/technologylab-ai/rayslides">GitHub</a>
+      </nav>
+    </header>
+    <div class="docs-shell">
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <p class="sidebar-label">Guides</p>
+        <nav aria-label="Guide pages">
+          <a href="index.html">Overview</a><a href="getting-started.html" aria-current="page">Get started</a>
+          <a href="studio.html">Use Studio</a><a href="motion.html">Animate a deck</a>
+          <a href="presenter.html">Use a phone</a><a href="crowdplay.html">Run a poll</a>
+          <a href="format.html">Write .sld source</a><a href="reference.html">Controls and limits</a>
+        </nav>
+      </aside>
+      <div class="docs-main">
+        <main class="content" id="content">
+          <p class="page-kicker">Get started</p>
+          <h1>Create your first deck.</h1>
+          <p class="lead">Build the command-line program. Open Studio. Choose a starter, then save the source file.</p>
+
+          <h2>Build Rayslides</h2>
+          <p>Rayslides requires Zig 0.16.x. The minimum supported version is Zig 0.16.0.</p>
+          <pre><code><span class="code-comment"># Build an optimized executable.</span>
+zig build -Doptimize=ReleaseSafe
+
+<span class="code-comment"># Open Studio without a deck.</span>
+zig-out/bin/rayslides</code></pre>
+          <p>The build places the executable at <code class="inline-code">zig-out/bin/rayslides</code>.</p>
+
+          <h2>Choose a starter</h2>
+          <p>Rayslides opens the new-deck chooser when you omit the file name.</p>
+          <figure class="shot">
+            <img src="images/new-deck.png" alt="Rayslides new-deck chooser with Blank, Midnight, Editorial, and Aurora starters" width="1600" height="900">
+            <figcaption><strong>Choose with the mouse or keys 1–4.</strong> Each choice creates normal <code>.sld</code> source.</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Starter</th><th>Use it when</th><th>What it creates</th></tr></thead>
+              <tbody>
+                <tr><td>Blank</td><td>You want an empty slide.</td><td>One clean slide.</td></tr>
+                <tr><td>Midnight</td><td>You want a dark deck.</td><td>Two slides, layouts, and a footer group.</td></tr>
+                <tr><td>Editorial</td><td>You want a light deck.</td><td>Two publication-style slides and reusable parts.</td></tr>
+                <tr><td>Aurora</td><td>You want strong color.</td><td>Two dark slides with glass panels and accents.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>Save the deck</h2>
+          <ol class="steps">
+            <li><strong>Press <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd>.</strong><p>Choose a path for the new deck.</p></li>
+            <li><strong>Enter a file name.</strong><p>Rayslides adds the <code>.sld</code> extension when it is missing.</p></li>
+            <li><strong>Continue editing.</strong><p>The same shortcut saves later changes with an atomic file update.</p></li>
+          </ol>
+          <div class="callout"><p><strong>Rayslides does not overwrite an existing file during the first save.</strong> Choose another name when a file exists.</p></div>
+
+          <h2>Open an existing deck</h2>
+          <p>Pass the deck path to present it. Add <code class="inline-code">--studio</code> to start in the editor.</p>
+          <pre><code><span class="code-comment"># Present the deck.</span>
+zig-out/bin/rayslides talk.sld
+
+<span class="code-comment"># Edit the deck in Studio.</span>
+zig-out/bin/rayslides --studio talk.sld
+
+<span class="code-comment"># Use the development build step.</span>
+zig build run -- talk.sld</code></pre>
+
+          <h2>Make a small deck by hand</h2>
+          <p>Create <code class="inline-code">hello.sld</code> with this source.</p>
+          <pre><code><span class="code-key">@slide</span>
+<span class="code-key">@bg</span> color=<span class="code-value">#07111fff</span>
+<span class="code-key">@box</span> x=120 y=160 w=1680 h=160 fontsize=84 color=<span class="code-value">#f7fbffff</span> text=<span class="code-string">Hello, Rayslides</span>
+<span class="code-key">@box</span> x=120 y=390 w=1300 h=100 fontsize=36 color=<span class="code-value">#61dafbff</span> text=<span class="code-string">The file is the deck.</span></code></pre>
+          <p>Run <code class="inline-code">zig-out/bin/rayslides hello.sld</code> to present it.</p>
+
+          <a class="next-guide" href="studio.html"><span><span>Next guide</span><strong>Use Studio</strong></span><b aria-hidden="true">→</b></a>
+        </main>
+        <footer class="site-footer"><span>Rayslides uses Zig and raylib.</span><nav aria-label="Footer"><a href="reference.html">Controls</a><a href="https://github.com/technologylab-ai/rayslides">Source</a></nav></footer>
+      </div>
+    </div>
+  </body>
+</html>

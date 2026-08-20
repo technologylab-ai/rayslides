@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#060c14">
+    <meta name="description" content="Write Rayslides decks with the plain-text .sld format.">
+    <title>Write .sld source — Rayslides</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="icon" href="images/rayslides-app-icon.png" type="image/png">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="index.html" aria-label="Rayslides documentation home"><img class="brand-mark" src="images/rayslides-app-icon.png" alt="" width="192" height="192"><span>rayslides docs</span></a>
+      <nav class="header-links" aria-label="Header"><a href="getting-started.html">Get started</a><a href="reference.html">Controls</a><a class="github-link" href="https://github.com/technologylab-ai/rayslides">GitHub</a></nav>
+    </header>
+    <div class="docs-shell">
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <p class="sidebar-label">Guides</p>
+        <nav aria-label="Guide pages">
+          <a href="index.html">Overview</a><a href="getting-started.html">Get started</a>
+          <a href="studio.html">Use Studio</a><a href="motion.html">Animate a deck</a>
+          <a href="presenter.html">Use a phone</a><a href="crowdplay.html">Run a poll</a>
+          <a href="format.html" aria-current="page">Write .sld source</a><a href="reference.html">Controls and limits</a>
+        </nav>
+      </aside>
+      <div class="docs-main">
+        <main class="content" id="content">
+          <p class="page-kicker">The .sld format</p>
+          <h1>Write an <code>.sld</code> file.</h1>
+          <p class="lead">An <code>.sld</code> file is plain text. Studio reads and writes the same format.</p>
+
+          <h2>Use the slide coordinate system</h2>
+          <p>Rayslides renders each slide at 1920 × 1080. Use these coordinates for every display size.</p>
+          <p>The <code class="inline-code">x</code> and <code class="inline-code">y</code> values set the top-left corner. The <code class="inline-code">w</code> and <code class="inline-code">h</code> values set the size.</p>
+          <pre><code><span class="code-key">@slide</span>
+<span class="code-key">@bg</span> color=<span class="code-value">#07111fff</span>
+<span class="code-key">@box</span> x=<span class="code-value">120</span> y=<span class="code-value">160</span> w=<span class="code-value">1680</span> h=<span class="code-value">140</span> fontsize=<span class="code-value">72</span> text=<span class="code-string">A clear title</span></code></pre>
+          <figure class="diagram coordinate-figure">
+            <div class="diagram-frame coordinate-frame">
+              <div class="coordinate-stage" role="img" aria-label="A box at x 120 and y 160 on a 1920 by 1080 slide">
+                <span class="coordinate-mark coordinate-mark-origin">0</span>
+                <span class="coordinate-mark coordinate-mark-x-mid">960</span>
+                <span class="coordinate-mark coordinate-mark-x-end">1920</span>
+                <span class="coordinate-mark coordinate-mark-y-mid">540</span>
+                <span class="coordinate-mark coordinate-mark-y-end">1080</span>
+                <span class="coordinate-object coordinate-object-source">
+                  <strong>A clear title</strong>
+                  <small>x 120 · y 160 · w 1680 · h 140</small>
+                </span>
+              </div>
+            </div>
+            <figcaption><strong>The source values place the box.</strong> The display size does not change these coordinates.</figcaption>
+          </figure>
+
+          <h2>Set deck defaults</h2>
+          <p>Put shared font and color values before the first slide.</p>
+          <pre><code><span class="code-key">@font</span>=./assets/Calibri Regular.ttf
+<span class="code-key">@font_bold</span>=./assets/Calibri Bold.TTF
+<span class="code-key">@font_italic</span>=./assets/Calibri Italic.ttf
+<span class="code-key">@font_bold_italic</span>=./assets/Calibri Bold Italic.ttf
+<span class="code-key">@fontsize</span>=36
+<span class="code-key">@color</span>=<span class="code-value">#edf5fbff</span>
+<span class="code-key">@bullet_color</span>=<span class="code-value">#61dafbff</span>
+<span class="code-key">@line_height</span>=1.15</code></pre>
+          <p>A local value overrides the deck default for that item.</p>
+
+          <h2>Add text and shapes</h2>
+          <p>Use <code class="inline-code">@box</code> for text, a panel, or both.</p>
+          <pre><code><span class="code-key">@box</span> x=120 y=160 w=1680 h=120 fontsize=72 text=<span class="code-string">Source stays readable</span>
+
+<span class="code-key">@box</span> x=120 y=330 w=640 h=260 bg=<span class="code-value">#10253aff</span> color=<span class="code-value">#dbe8f5ff</span>
+This body can continue on later lines.
+- A bullet starts with a dash.
+    - Four spaces create a nested bullet.</code></pre>
+          <p>Put <code class="inline-code">text=</code> last when the text stays on the directive line.</p>
+          <p>Use <code class="inline-code">@bg</code> for the full slide. Use <code class="inline-code">bg=</code> for one item.</p>
+
+          <h3>Format text inside a box</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Source</th><th>Result</th></tr></thead>
+              <tbody>
+                <tr><td><code>**Bold**</code></td><td>Bold text</td></tr>
+                <tr><td><code>_Italic_</code></td><td>Italic text</td></tr>
+                <tr><td><code>_**Both**_</code></td><td>Bold italic text</td></tr>
+                <tr><td><code>~~Underline~~</code></td><td>Underlined text</td></tr>
+                <tr><td><code>`Code`</code></td><td>Text in the extra font</td></tr>
+                <tr><td><code>&lt;#ffb547ff&gt;Amber&lt;/&gt;</code></td><td>Amber text</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Rayslides also provides monochrome fallbacks for common arrows, marks, and symbols.</p>
+
+          <h3>Add a text shadow</h3>
+          <p>Set the shadow color and offset on the text item.</p>
+          <pre><code><span class="code-key">@box</span> x=120 y=120 w=1680 h=160 fontsize=84
+shadow=<span class="code-value">#000000a0</span> shadow_x=3 shadow_y=5 text=<span class="code-string">A crisp shadow</span></code></pre>
+          <p>Use <code class="inline-code">shadow_offset=4</code> when both offsets match. Use <code class="inline-code">shadow=none</code> to remove an inherited shadow.</p>
+
+          <h2>Add images</h2>
+          <p>Image paths are relative to the deck file.</p>
+          <pre><code><span class="code-comment"># Keep the image's natural size.</span>
+<span class="code-key">@box</span> img=assets/photo.png x=1100 y=180
+
+<span class="code-comment"># Set both dimensions.</span>
+<span class="code-key">@box</span> img=assets/photo.png x=1100 y=180 w=650 h=420
+
+<span class="code-comment"># Set one dimension and preserve the aspect ratio.</span>
+<span class="code-key">@box</span> img=assets/photo.png x=1100 y=180 w=650
+
+<span class="code-comment"># Scale the natural size, then adjust its ratio.</span>
+<span class="code-key">@box</span> img=assets/photo.png x=1100 y=180 scale=0.5 ratio=1.2</code></pre>
+
+          <h2>Reuse one item</h2>
+          <p><code class="inline-code">@push</code> saves an item definition. <code class="inline-code">@pop</code> places an instance later in the file.</p>
+          <pre><code><span class="code-key">@push</span> slide_title x=120 y=80 w=1680 h=100 fontsize=52 color=<span class="code-value">#edf5fbff</span>
+
+<span class="code-key">@slide</span>
+<span class="code-key">@pop</span> slide_title text=<span class="code-string">The first title</span>
+
+<span class="code-key">@slide</span>
+<span class="code-key">@pop</span> slide_title color=<span class="code-value">#ffb547ff</span> text=<span class="code-string">A local override</span></code></pre>
+          <p>A definition affects only the source that follows it. A later definition with the same name takes precedence.</p>
+
+          <h2>Reuse several items</h2>
+          <p>A group keeps several named objects together.</p>
+          <pre><code><span class="code-key">@pushgroup</span> feature
+<span class="code-key">@box</span> id=title x=120 y=120 w=760 h=100 fontsize=64 text=<span class="code-string">Fast by design</span>
+<span class="code-key">@box</span> id=art img=assets/feature.png x=1040 y=120 w=680 h=680
+<span class="code-key">@endgroup</span>
+
+<span class="code-key">@slide</span>
+<span class="code-key">@popgroup</span> feature id=intro
+
+<span class="code-key">@state(morph)</span>
+<span class="code-key">@set</span> intro.title y=420</code></pre>
+          <p>Each member needs an explicit <code class="inline-code">id=</code>. Each group instance also needs an ID.</p>
+          <p>Use <code class="inline-code">INSTANCE.MEMBER</code> to target one member. The example targets <code class="inline-code">intro.title</code>.</p>
+
+          <h2>Reuse a slide layout</h2>
+          <p><code class="inline-code">@pushslide</code> saves the current slide as a template. It does not render that definition.</p>
+          <pre><code><span class="code-key">@bg</span> color=<span class="code-value">#07111fff</span>
+<span class="code-key">@box</span> id=title x=120 y=80 w=1680 h=100 fontsize=52 text=<span class="code-string">Shared title</span>
+<span class="code-key">@box</span> id=page x=1780 y=1010 w=80 h=40 text=<span class="code-string">$slide_number</span>
+<span class="code-key">@pushslide</span> content transition=fade duration=0.4
+
+<span class="code-key">@popslide</span> content
+<span class="code-key">@set</span> title color=<span class="code-value">#ffb547ff</span> text=<span class="code-string">Only this slide changes</span>
+<span class="code-key">@hide</span> page</code></pre>
+          <p>Put local <code class="inline-code">@set</code>, <code class="inline-code">@show</code>, and <code class="inline-code">@hide</code> lines before the first morph state.</p>
+          <p>Studio writes these local overrides when you edit a template instance.</p>
+
+          <h2>Build a complete small deck</h2>
+          <p>This example defines a title, a layout, and two rendered slides.</p>
+          <pre><code><span class="code-key">@fontsize</span>=34
+<span class="code-key">@color</span>=<span class="code-value">#dbe8f5ff</span>
+
+<span class="code-key">@push</span> title x=120 y=90 w=1680 h=100 fontsize=58 color=<span class="code-value">#61dafbff</span>
+
+<span class="code-key">@bg</span> color=<span class="code-value">#07111fff</span>
+<span class="code-key">@pop</span> title text=<span class="code-string">Section</span>
+<span class="code-key">@pushslide</span> content transition=slide-left duration=0.35
+
+<span class="code-key">@popslide</span> content
+<span class="code-key">@set</span> title text=<span class="code-string">Why plain text?</span>
+<span class="code-key">@anim(fade)</span> by=bullet
+<span class="code-key">@box</span> x=120 y=260 w=1200 h=600
+- Git can show each change.
+- Studio can edit the same file.
+- The presenter needs no cloud service.
+
+<span class="code-key">@popslide</span> content transition=fade
+<span class="code-key">@set</span> title text=<span class="code-string">The result</span>
+<span class="code-key">@box</span> x=120 y=300 w=1680 h=220 fontsize=64 text=<span class="code-string">One file. Two ways to edit.</span></code></pre>
+
+          <a class="next-guide" href="reference.html"><span><span>Next page</span><strong>Controls and limits</strong></span><b aria-hidden="true">→</b></a>
+        </main>
+        <footer class="site-footer"><span>Rayslides uses Zig and raylib.</span><nav aria-label="Footer"><a href="reference.html">Controls</a><a href="https://github.com/technologylab-ai/rayslides">Source</a></nav></footer>
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#060c14">
+    <meta name="description" content="Add a local audience join screen and live polls with Rayslides Crowdplay.">
+    <title>Run a Crowdplay poll — Rayslides</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="icon" href="images/rayslides-app-icon.png" type="image/png">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="index.html" aria-label="Rayslides documentation home"><img class="brand-mark" src="images/rayslides-app-icon.png" alt="" width="192" height="192"><span>rayslides docs</span></a>
+      <nav class="header-links" aria-label="Header"><a href="getting-started.html">Get started</a><a href="reference.html">Controls</a><a class="github-link" href="https://github.com/technologylab-ai/rayslides">GitHub</a></nav>
+    </header>
+    <div class="docs-shell">
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <p class="sidebar-label">Guides</p>
+        <nav aria-label="Guide pages">
+          <a href="index.html">Overview</a><a href="getting-started.html">Get started</a>
+          <a href="studio.html">Use Studio</a><a href="motion.html">Animate a deck</a>
+          <a href="presenter.html">Use a phone</a><a href="crowdplay.html" aria-current="page">Run a poll</a>
+          <a href="format.html">Write .sld source</a><a href="reference.html">Controls and limits</a>
+        </nav>
+      </aside>
+      <div class="docs-main">
+        <main class="content content-wide" id="content">
+          <p class="page-kicker">Crowdplay</p>
+          <h1>Run a poll on the local network.</h1>
+          <p class="lead">Audience phones join through a QR code. They need a browser, but they need no app or account.</p>
+
+          <h2>Add a join slide</h2>
+          <p>Add one Crowdplay join panel to a slide.</p>
+          <pre><code><span class="code-key">@slide</span>
+<span class="code-key">@bg</span> color=<span class="code-value">#070b18ff</span>
+<span class="code-key">@crowd</span> join x=100 y=80 w=1720 h=920
+Scan to join Crowdplay</code></pre>
+          <figure class="shot">
+            <img src="images/crowdplay-join.png" alt="Crowdplay join panel with a local address, QR code, and participant count" width="1600" height="900" loading="lazy">
+            <figcaption><strong>The join panel shows the address and live count.</strong> It updates as audience phones connect.</figcaption>
+          </figure>
+
+          <h2>Add a poll</h2>
+          <p>Give each poll a unique ID. Put the question first, then add one choice per bullet.</p>
+          <pre><code><span class="code-key">@slide</span>
+<span class="code-key">@bg</span> color=<span class="code-value">#070b18ff</span>
+<span class="code-key">@crowd</span> poll id=<span class="code-value">next-slide</span> open=<span class="code-value">true</span> x=100 y=80 w=1720 h=920
+What should the next slide show?
+- The working source
+- The finished design
+- A live demo
+- All three</code></pre>
+          <figure class="shot">
+            <img src="images/crowdplay-poll.png" alt="Crowdplay poll with four answer choices in Studio" width="1600" height="900" loading="lazy">
+            <figcaption><strong>The poll is a normal slide object.</strong> Studio keeps it in the Objects list and the slide paint order.</figcaption>
+          </figure>
+
+          <h2>Vote from a phone</h2>
+          <p>The audience page shows one active question. A person can change their vote while the poll stays open.</p>
+          <div class="shot-grid phone-shot-grid">
+            <figure class="shot">
+              <img src="images/crowdplay-vote-phone.png" alt="Crowdplay audience voting screen with All three selected" width="520" height="932" loading="lazy">
+              <figcaption><strong>The selected answer gets a cyan mark.</strong> The page confirms the vote without showing the result.</figcaption>
+            </figure>
+            <figure class="shot">
+              <img src="images/crowdplay-results-phone.png" alt="Crowdplay final result screen with percentages for four choices" width="520" height="1100" loading="lazy">
+              <figcaption><strong>The result view shows bars and percentages.</strong> The selected answer remains marked.</figcaption>
+            </figure>
+          </div>
+
+          <h2>Control the poll</h2>
+          <figure class="diagram">
+            <div class="diagram-frame poll-flow">
+              <div><b>JOIN</b><span>The audience scans the code.</span></div>
+              <div><b>O</b><span>Open or lock the poll.</span></div>
+              <div><b>V</b><span>Show or hide the results.</span></div>
+              <div><b>R</b><span>Clear every vote.</span></div>
+            </div>
+            <figcaption><strong>Poll access and result display are separate.</strong> You can show live results while voting stays open.</figcaption>
+          </figure>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Key</th><th>Action</th></tr></thead>
+              <tbody>
+                <tr><td><kbd>O</kbd></td><td>Open the poll or lock it.</td></tr>
+                <tr><td><kbd>V</kbd></td><td>Reveal the distribution or hide it.</td></tr>
+                <tr><td><kbd>R</kbd></td><td>Remove the votes from the active poll.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>Poll IDs</h2>
+          <p>A browser can change its vote while the poll is open. The stable poll ID keeps each vote tied to the correct question.</p>
+          <p>Use letters, digits, hyphens, or underscores. Keep the ID at 48 bytes or fewer.</p>
+          <p>A deck supports 32 polls. One poll supports eight choices and 512 active participants.</p>
+
+          <h2>Use Crowdplay in a morph state</h2>
+          <p>The poll ID also acts as a morph target. Declare the poll before the first morph state.</p>
+          <pre><code><span class="code-key">@crowd</span> poll id=<span class="code-value">architecture</span> open=<span class="code-value">true</span> x=100 y=80 w=1720 h=920
+What should we build?
+- A compiler
+- A moon base
+
+<span class="code-key">@state(morph)</span> duration=<span class="code-value">0.6</span>
+<span class="code-key">@set</span> architecture x=980 y=110 w=840 h=720</code></pre>
+          <p>The panel keeps its audience state while it moves or fades.</p>
+
+          <h2>Set the network address</h2>
+          <p>Crowdplay uses port 7331 by default. Phones and the presenting computer must use the same network.</p>
+          <pre><code>zig-out/bin/rayslides talk.sld \
+  --crowd-host=192.168.1.42 \
+  --crowd-port=7331</code></pre>
+          <p>Set an explicit local address when mDNS does not work. Windows requires a local network address.</p>
+          <p>Use <code class="inline-code">--no-crowd</code> to disable the server.</p>
+          <div class="callout callout-warning"><p><strong>The local firewall must allow the selected port.</strong> The address <code>localhost</code> works only on the presenting computer.</p></div>
+
+          <a class="next-guide" href="format.html"><span><span>Next guide</span><strong>Write .sld source</strong></span><b aria-hidden="true">→</b></a>
+        </main>
+        <footer class="site-footer"><span>Rayslides uses Zig and raylib.</span><nav aria-label="Footer"><a href="reference.html">Controls</a><a href="https://github.com/technologylab-ai/rayslides">Source</a></nav></footer>
+      </div>
+    </div>
+  </body>
+</html>

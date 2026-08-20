@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#060c14">
+    <meta name="description" content="Add reveals, slide transitions, and semantic morph states to a Rayslides deck.">
+    <title>Animate a deck — Rayslides</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="icon" href="images/rayslides-app-icon.png" type="image/png">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="index.html" aria-label="Rayslides documentation home"><img class="brand-mark" src="images/rayslides-app-icon.png" alt="" width="192" height="192"><span>rayslides docs</span></a>
+      <nav class="header-links" aria-label="Header"><a href="getting-started.html">Get started</a><a href="reference.html">Controls</a><a class="github-link" href="https://github.com/technologylab-ai/rayslides">GitHub</a></nav>
+    </header>
+    <div class="docs-shell">
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <p class="sidebar-label">Guides</p>
+        <nav aria-label="Guide pages">
+          <a href="index.html">Overview</a><a href="getting-started.html">Get started</a>
+          <a href="studio.html">Use Studio</a><a href="motion.html" aria-current="page">Animate a deck</a>
+          <a href="presenter.html">Use a phone</a><a href="crowdplay.html">Run a poll</a>
+          <a href="format.html">Write .sld source</a><a href="reference.html">Controls and limits</a>
+        </nav>
+      </aside>
+      <div class="docs-main">
+        <main class="content content-wide" id="content">
+          <p class="page-kicker">Motion</p>
+          <h1>Add motion to a deck.</h1>
+          <p class="lead">Rayslides supports three motion types. Each type changes a different part of the presentation.</p>
+
+          <h2>Choose the motion type</h2>
+          <figure class="diagram">
+            <div class="diagram-frame motion-types">
+              <div class="motion-type">
+                <div class="motion-icon" aria-hidden="true"><i class="bullet-dot"></i><i class="bullet-dot"></i><i class="bullet-dot"></i></div>
+                <strong>Reveal</strong><span>Show content inside one slide.</span>
+              </div>
+              <div class="motion-type">
+                <div class="motion-icon transition-icon" aria-hidden="true"><i></i></div>
+                <strong>Transition</strong><span>Move between two logical slides.</span>
+              </div>
+              <div class="motion-type">
+                <div class="motion-icon morph-icon" aria-hidden="true"><span></span><span></span></div>
+                <strong>Morph</strong><span>Change named objects inside one slide.</span>
+              </div>
+            </div>
+            <figcaption><strong>Use one type or combine them.</strong> Reveals run before morph states. A transition runs at the slide boundary.</figcaption>
+          </figure>
+
+          <h2>Reveal items</h2>
+          <p>Place <code class="inline-code">@anim(...)</code> before the item that must appear later.</p>
+          <pre><code><span class="code-key">@anim(fade)</span> by=<span class="code-value">bullet</span> duration=<span class="code-value">0.25</span>
+<span class="code-key">@box</span> x=140 y=250 w=900 h=500
+- First point
+- Second point
+- Third point</code></pre>
+          <p>The forward controls reveal the next step. The backward controls hide the current step.</p>
+
+          <figure class="diagram">
+            <div class="diagram-frame reveal-sequence">
+              <div class="mini-slide"><b>Initial view</b><span class="hidden-item">First point</span><span class="hidden-item">Second point</span><span class="hidden-item">Third point</span></div>
+              <div class="mini-slide"><b>After one step</b><span>First point</span><span class="hidden-item">Second point</span><span class="hidden-item">Third point</span></div>
+              <div class="mini-slide"><b>Final view</b><span>First point</span><span>Second point</span><span>Third point</span></div>
+            </div>
+            <figcaption><strong>One logical slide contains all three views.</strong> Rayslides does not create extra PDF pages.</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Grouping</th><th>Result</th></tr></thead>
+              <tbody>
+                <tr><td><code>by=item</code></td><td>Rayslides reveals the complete object.</td></tr>
+                <tr><td><code>by=line</code></td><td>Rayslides reveals each non-empty source line.</td></tr>
+                <tr><td><code>by=bullet</code></td><td>Rayslides reveals each bullet line. Other lines stay visible.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Effects include <code>appear</code>, <code>fade</code>, and four slide directions.</p>
+          <p>Add <code class="inline-code">after=0.8</code> to start a step after the previous motion ends.</p>
+
+          <h2>Move between slides</h2>
+          <p>Set a transition on a slide or a slide template.</p>
+          <pre><code><span class="code-key">@pushslide</span> content transition=<span class="code-value">slide-left</span> duration=<span class="code-value">0.35</span>
+
+<span class="code-key">@popslide</span> content transition=<span class="code-value">fade</span> duration=<span class="code-value">0.5</span></code></pre>
+          <p>The transition moves the old and new slides together. Backward navigation reverses the direction.</p>
+          <p>Use <code class="inline-code">transition=none</code> to disable the inherited transition for one slide.</p>
+
+          <h2>Change one slide with morph states</h2>
+          <p>A morph state changes named objects. Give each target a stable <code class="inline-code">id=</code>.</p>
+          <p>Then add a state and set only the values that must change.</p>
+          <pre><code><span class="code-key">@box</span> id=<span class="code-value">photo</span> img=assets/photo.png x=1210 y=250 w=610 h=347
+
+<span class="code-key">@state(morph)</span> label=<span class="code-value">TAKEOVER</span> duration=<span class="code-value">0.8</span> ease=<span class="code-value">spring</span>
+<span class="code-key">@set</span> photo x=0 y=0 w=1920 h=1080</code></pre>
+          <figure class="diagram">
+            <div class="diagram-frame state-strip">
+              <div class="state-box"><span>BASE</span><strong>The photo is a thumbnail.</strong></div>
+              <div class="state-arrow" aria-hidden="true">→</div>
+              <div class="state-box"><span>TAKEOVER</span><strong>The same photo fills the slide.</strong></div>
+              <div class="state-arrow" aria-hidden="true">→</div>
+              <div class="state-box"><span>FLOW</span><strong>The same objects form a diagram.</strong></div>
+            </div>
+            <figcaption><strong>Each state is a cumulative patch.</strong> Values carry forward when a state does not set them.</figcaption>
+          </figure>
+
+          <h3>Use state directives</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Directive</th><th>Use</th></tr></thead>
+              <tbody>
+                <tr><td><code>@set name ...</code></td><td>Change one or more values.</td></tr>
+                <tr><td><code>@hide name ...</code></td><td>Hide an object. You can also move or style it.</td></tr>
+                <tr><td><code>@show name ...</code></td><td>Show a hidden object. You can also change it.</td></tr>
+                <tr><td><code>@box</code> inside a state</td><td>Create an object in that state.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Values that interpolate</h3>
+          <p>Rayslides interpolates geometry, font size, colors, opacity, image scale, and text shadows.</p>
+          <p>Changed text and changed images use a cross-fade. New and removed objects also use a cross-fade.</p>
+
+          <h2>Edit morph states in Studio</h2>
+          <p>The bottom timeline shows the base scene and each resolved state.</p>
+          <figure class="shot">
+            <img src="images/morph-timeline.png" alt="Morph timeline with Base, Takeover, Explain, and Flow cards plus six state controls" width="1600" height="156" loading="lazy">
+            <figcaption><strong>The timeline keeps every control readable.</strong> The selected card has a cyan border.</figcaption>
+          </figure>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Control</th><th>Action</th></tr></thead>
+              <tbody>
+                <tr><td>+</td><td>Append a cumulative morph state.</td></tr>
+                <tr><td>Dup</td><td>Insert a new state from the selected snapshot.</td></tr>
+                <tr><td>Name</td><td>Give the selected state a source-backed label.</td></tr>
+                <tr><td>Del</td><td>Delete the complete selected state block.</td></tr>
+                <tr><td>&lt; · &gt;</td><td>Move the selected state earlier or later.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Edit one state</h3>
+          <figure class="diagram">
+            <div class="diagram-frame morph-edit-figure">
+              <div class="morph-edit-canvas">
+                <span class="morph-edit-label">FLOW selected</span>
+                <i class="morph-edit-object">#step_three</i>
+              </div>
+              <div class="morph-edit-properties">
+                <b>Properties</b>
+                <span>X&nbsp; 1280</span><span>Y&nbsp; 390</span>
+                <span>W&nbsp; 420</span><span>H&nbsp; 220</span>
+                <small>MORPH STATE · writes @set</small>
+              </div>
+            </div>
+            <figcaption><strong>Select a state, then select an object.</strong> A geometry or style change writes a state-local <code>@set</code>.</figcaption>
+          </figure>
+          <ol class="steps">
+            <li><strong>Select a state card.</strong><p>Studio shows the objects after that state and every earlier state.</p></li>
+            <li><strong>Select an object.</strong><p>The cyan outline identifies the object that will change.</p></li>
+            <li><strong>Move it or change a property.</strong><p>Studio writes only the values that differ.</p></li>
+            <li><strong>Use <kbd>[</kbd> and <kbd>]</kbd>.</strong><p>These keys select the previous or next scene.</p></li>
+          </ol>
+
+          <h3>Read the state values</h3>
+          <p>A card shows the delay, duration, and easing from its <code>@state(morph)</code> line.</p>
+          <pre><code><span class="code-key">@state(morph)</span> name=<span class="code-value">flow</span> after=<span class="code-value">0.2</span> duration=<span class="code-value">0.9</span> ease=<span class="code-value">spring</span></code></pre>
+          <ul>
+            <li><code>after</code> delays the state after the previous motion.</li>
+            <li><code>duration</code> sets the motion time in seconds.</li>
+            <li><code>ease</code> sets the interpolation curve.</li>
+            <li>The source order sets the playback order.</li>
+          </ul>
+          <p>Edit these values in the <code>.sld</code> source. Studio reports them on the cards.</p>
+          <div class="callout"><p><strong>The BASE card is the authored root.</strong> You cannot rename, remove, or move it.</p></div>
+
+          <h2>See the final state</h2>
+          <p>This slide uses three states. The last state moves the same three objects into a flow.</p>
+          <figure class="shot">
+            <img src="images/morph-final.png" alt="Final morph state with three cards connected by arrows" width="1392" height="864" loading="lazy">
+            <figcaption><strong>The source sets IDs and destination values.</strong> Rayslides draws the frames and can reverse the path.</figcaption>
+          </figure>
+
+          <h2>Export animated slides</h2>
+          <p>A PDF contains one page for each logical slide. Rayslides renders the final reveal and morph state.</p>
+          <p>A transition does not add a PDF page.</p>
+
+          <a class="next-guide" href="presenter.html"><span><span>Next guide</span><strong>Use a phone while you present</strong></span><b aria-hidden="true">→</b></a>
+        </main>
+        <footer class="site-footer"><span>Rayslides uses Zig and raylib.</span><nav aria-label="Footer"><a href="reference.html">Controls</a><a href="https://github.com/technologylab-ai/rayslides">Source</a></nav></footer>
+      </div>
+    </div>
+  </body>
+</html>

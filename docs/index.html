@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#060c14">
+    <meta name="description" content="Learn how to build, edit, animate, and present Rayslides decks.">
+    <title>Rayslides documentation</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="icon" href="images/rayslides-app-icon.png" type="image/png">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="index.html" aria-label="Rayslides documentation home">
+        <img class="brand-mark" src="images/rayslides-app-icon.png" alt="" width="192" height="192">
+        <span>rayslides docs</span>
+      </a>
+      <nav class="header-links" aria-label="Header">
+        <a href="getting-started.html">Get started</a>
+        <a href="reference.html">Controls</a>
+        <a class="github-link" href="https://github.com/technologylab-ai/rayslides">GitHub</a>
+      </nav>
+    </header>
+
+    <div class="docs-shell">
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <p class="sidebar-label">Guides</p>
+        <nav aria-label="Guide pages">
+          <a href="index.html" aria-current="page">Overview</a>
+          <a href="getting-started.html">Get started</a>
+          <a href="studio.html">Use Studio</a>
+          <a href="motion.html">Animate a deck</a>
+          <a href="presenter.html">Use a phone</a>
+          <a href="crowdplay.html">Run a poll</a>
+          <a href="format.html">Write .sld source</a>
+          <a href="reference.html">Controls and limits</a>
+        </nav>
+      </aside>
+
+      <div class="docs-main">
+        <main class="content content-wide" id="content">
+          <p class="page-kicker">Rayslides documentation</p>
+          <h1>Build, edit, and present <code>.sld</code> decks.</h1>
+          <p class="lead">Rayslides gives you a visual editor and a readable source file. Both views edit the same deck.</p>
+
+          <div class="page-actions">
+            <a class="button button-primary" href="getting-started.html">Build your first deck</a>
+            <a class="button button-secondary" href="studio.html">Learn Studio</a>
+          </div>
+
+          <div class="quick-facts">
+            <div><strong>Source</strong><span>Plain-text .sld files</span></div>
+            <div><strong>Platforms</strong><span>macOS, Linux, Windows</span></div>
+            <div><strong>Output</strong><span>Live display, PNG, PDF</span></div>
+          </div>
+
+          <figure class="shot">
+            <img src="images/rayslides-studio-properties.jpg" alt="Rayslides Studio with a selected title and its Properties panel" width="1319" height="768">
+            <figcaption><strong>Studio edits the source.</strong> The canvas, panels, and timeline operate on the loaded <code>.sld</code> file.</figcaption>
+          </figure>
+
+          <h2>Choose a guide</h2>
+          <p class="section-intro">Start with a task. Each guide shows the source, the interface, and the result.</p>
+
+          <div class="card-grid">
+            <a class="doc-card" href="getting-started.html">
+              <span class="doc-card-number">01</span><span class="doc-card-arrow" aria-hidden="true">→</span>
+              <h3>Get started</h3>
+              <p>Build Rayslides. Create a deck. Save it as an <code>.sld</code> file.</p>
+            </a>
+            <a class="doc-card" href="studio.html">
+              <span class="doc-card-number">02</span><span class="doc-card-arrow" aria-hidden="true">→</span>
+              <h3>Use Studio</h3>
+              <p>Select objects, edit values, arrange layers, and manage reusable content.</p>
+            </a>
+            <a class="doc-card" href="motion.html">
+              <span class="doc-card-number">03</span><span class="doc-card-arrow" aria-hidden="true">→</span>
+              <h3>Animate a deck</h3>
+              <p>Use reveals, slide transitions, and semantic morph states.</p>
+            </a>
+            <a class="doc-card" href="presenter.html">
+              <span class="doc-card-number">04</span><span class="doc-card-arrow" aria-hidden="true">→</span>
+              <h3>Use a phone</h3>
+              <p>Read private notes. Change slides. Point and draw on the live slide.</p>
+            </a>
+            <a class="doc-card" href="crowdplay.html">
+              <span class="doc-card-number">05</span><span class="doc-card-arrow" aria-hidden="true">→</span>
+              <h3>Run a poll</h3>
+              <p>Let the audience join and vote through the local network.</p>
+            </a>
+            <a class="doc-card" href="format.html">
+              <span class="doc-card-number">06</span><span class="doc-card-arrow" aria-hidden="true">→</span>
+              <h3>Write .sld source</h3>
+              <p>Define slides, objects, templates, groups, text, images, and colors.</p>
+            </a>
+          </div>
+        </main>
+
+        <footer class="site-footer">
+          <span>Rayslides uses Zig and raylib.</span>
+          <nav aria-label="Footer">
+            <a href="reference.html">Controls</a>
+            <a href="https://github.com/technologylab-ai/rayslides">Source</a>
+          </nav>
+        </footer>
+      </div>
+    </div>
+  </body>
+</html>

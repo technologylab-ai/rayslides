@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#060c14">
+    <meta name="description" content="Use Rayslides Presenter Companion for notes, navigation, pointing, and drawing.">
+    <title>Use Presenter Companion — Rayslides</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="icon" href="images/rayslides-app-icon.png" type="image/png">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="index.html" aria-label="Rayslides documentation home"><img class="brand-mark" src="images/rayslides-app-icon.png" alt="" width="192" height="192"><span>rayslides docs</span></a>
+      <nav class="header-links" aria-label="Header"><a href="getting-started.html">Get started</a><a href="reference.html">Controls</a><a class="github-link" href="https://github.com/technologylab-ai/rayslides">GitHub</a></nav>
+    </header>
+    <div class="docs-shell">
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <p class="sidebar-label">Guides</p>
+        <nav aria-label="Guide pages">
+          <a href="index.html">Overview</a><a href="getting-started.html">Get started</a>
+          <a href="studio.html">Use Studio</a><a href="motion.html">Animate a deck</a>
+          <a href="presenter.html" aria-current="page">Use a phone</a><a href="crowdplay.html">Run a poll</a>
+          <a href="format.html">Write .sld source</a><a href="reference.html">Controls and limits</a>
+        </nav>
+      </aside>
+      <div class="docs-main">
+        <main class="content content-wide" id="content">
+          <p class="page-kicker">Presenter Companion</p>
+          <h1>Control the presentation from your phone.</h1>
+          <p class="lead">The phone shows private notes and slide controls. It connects directly to the presenting computer.</p>
+
+          <h2>Add speaker notes</h2>
+          <p>Place one notes block inside each slide.</p>
+          <pre><code><span class="code-key">@slide</span>
+<span class="code-key">@box</span> text=<span class="code-string">The audience sees this text.</span>
+<span class="code-key">@notes</span>
+Open with the customer story.
+Pause before the final point.
+<span class="code-key">@endnotes</span></code></pre>
+          <p>Notes do not become slide objects. Screenshots, PDFs, and Crowdplay never include them.</p>
+          <p>Use Commands in Studio to edit the notes for the current slide.</p>
+
+          <h2>Pair the phone</h2>
+          <ol class="steps">
+            <li><strong>Put both devices on one network.</strong><p>A phone hotspot also works.</p></li>
+            <li><strong>Press <kbd>P</kbd>.</strong><p>Rayslides starts the private Presenter server and shows a QR code.</p></li>
+            <li><strong>Scan the code.</strong><p>The phone opens the built-in web interface. It needs no app or account.</p></li>
+            <li><strong>Press <kbd>P</kbd> again.</strong><p>Rayslides hides the code. The paired phone stays connected.</p></li>
+          </ol>
+          <figure class="shot">
+            <img src="images/presenter-pairing.png" alt="Presenter Companion pairing screen with a QR code" width="1600" height="900" loading="lazy">
+            <figcaption><strong>Scan before you mirror the display.</strong> The QR code contains a private pairing capability.</figcaption>
+          </figure>
+          <div class="callout callout-warning"><p><strong>Do not show the pairing code to the audience.</strong> Pair the phone before you enable screen mirroring.</p></div>
+
+          <h2>Use the three phone modes</h2>
+          <h3>Notes mode</h3>
+          <div class="phone-mode-guide">
+            <figure class="shot phone-capture">
+              <img src="images/presenter-notes-phone.png" alt="Presenter Companion Notes mode on a phone" width="520" height="932" loading="lazy">
+              <figcaption><strong>Notes mode keeps the current notes large.</strong> It also shows the next notes and talk time.</figcaption>
+            </figure>
+            <div>
+              <p>Use Notes mode when you do not need to point or draw.</p>
+              <p>Previous and Next use the same playback path as the keyboard.</p>
+              <p>They preserve reveals, transitions, and morph states.</p>
+            </div>
+          </div>
+
+          <h3>Pointer mode</h3>
+          <div class="phone-mode-guide">
+            <figure class="shot phone-capture">
+              <img src="images/presenter-pointer-phone.png" alt="Presenter Companion Pointer mode with a pointer on the slide preview" width="520" height="932" loading="lazy">
+              <figcaption><strong>The preview matches the projected slide.</strong> The red point shows the active touch position.</figcaption>
+            </figure>
+            <div>
+              <p>Touch and hold the preview to show the software pointer.</p>
+              <p>Move your finger to move the point. Lift your finger to hide it.</p>
+              <p>Rayslides also hides the point after a short connection loss.</p>
+            </div>
+          </div>
+
+          <h3>Draw mode</h3>
+          <div class="phone-mode-guide">
+            <figure class="shot phone-capture">
+              <img src="images/presenter-draw-phone.png" alt="Presenter Companion Draw mode with slide preview and Clear drawing button" width="520" height="1000" loading="lazy">
+              <figcaption><strong>Draw mode adds a drawing surface.</strong> Clear drawing removes every active stroke.</figcaption>
+            </figure>
+            <div>
+              <p>Draw on the preview. The phone sends each stroke to the projected slide.</p>
+              <p>A drawing stays visible through reveal steps.</p>
+              <p>Rayslides clears it when the logical slide changes.</p>
+              <p>Use Clear drawing on the phone. You can also press <kbd>C</kbd> on the computer.</p>
+            </div>
+          </div>
+
+          <h2>Stop the Presenter server</h2>
+          <p>Press <kbd>Shift</kbd> + <kbd>P</kbd> to unpair the phone and stop the server.</p>
+          <p>Pressing <kbd>P</kbd> only hides the setup screen. It does not end the connection.</p>
+
+          <h2>Set the network address</h2>
+          <p>Rayslides uses port 7332 by default. You can set the advertised host and port.</p>
+          <pre><code>zig-out/bin/rayslides talk.sld \
+  --presenter-host=192.168.1.42 \
+  --presenter-port=7332</code></pre>
+          <p>Windows requires an explicit local network address. Pair again after you change networks.</p>
+
+          <h2>Use a trusted network</h2>
+          <p>The QR link contains a random access code. Keep the complete link private.</p>
+          <p>Presenter Companion uses local HTTP. It does not encrypt the traffic.</p>
+
+          <a class="next-guide" href="crowdplay.html"><span><span>Next guide</span><strong>Run a Crowdplay poll</strong></span><b aria-hidden="true">→</b></a>
+        </main>
+        <footer class="site-footer"><span>Rayslides uses Zig and raylib.</span><nav aria-label="Footer"><a href="reference.html">Controls</a><a href="https://github.com/technologylab-ai/rayslides">Source</a></nav></footer>
+      </div>
+    </div>
+  </body>
+</html>

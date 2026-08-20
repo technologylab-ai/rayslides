@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#060c14">
+    <meta name="description" content="Use Rayslides Studio to edit objects, slides, reusable content, and source-backed properties.">
+    <title>Use Studio — Rayslides</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="icon" href="images/rayslides-app-icon.png" type="image/png">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="index.html" aria-label="Rayslides documentation home"><img class="brand-mark" src="images/rayslides-app-icon.png" alt="" width="192" height="192"><span>rayslides docs</span></a>
+      <nav class="header-links" aria-label="Header"><a href="getting-started.html">Get started</a><a href="reference.html">Controls</a><a class="github-link" href="https://github.com/technologylab-ai/rayslides">GitHub</a></nav>
+    </header>
+    <div class="docs-shell">
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <p class="sidebar-label">Guides</p>
+        <nav aria-label="Guide pages">
+          <a href="index.html">Overview</a><a href="getting-started.html">Get started</a>
+          <a href="studio.html" aria-current="page">Use Studio</a><a href="motion.html">Animate a deck</a>
+          <a href="presenter.html">Use a phone</a><a href="crowdplay.html">Run a poll</a>
+          <a href="format.html">Write .sld source</a><a href="reference.html">Controls and limits</a>
+        </nav>
+      </aside>
+      <div class="docs-main">
+        <main class="content content-wide" id="content">
+          <p class="page-kicker">Studio</p>
+          <h1>Edit a deck on the canvas.</h1>
+          <p class="lead">Studio changes the loaded <code>.sld</code> source. It does not create a second project format.</p>
+
+          <h2>Open Studio</h2>
+          <p>Start without a file to create a deck. Use <code class="inline-code">--studio</code> to edit an existing deck.</p>
+          <pre><code>zig-out/bin/rayslides --studio talk.sld</code></pre>
+          <p>You can also press <kbd>E</kbd> during a presentation.</p>
+
+          <h2>The Studio workspace</h2>
+          <p>The workspace keeps the slide visible. The main controls remain outside the 16:9 canvas.</p>
+          <figure class="shot">
+            <div class="annotated-shot">
+              <img src="images/rayslides-studio-properties.jpg" alt="Annotated Rayslides Studio workspace" width="1319" height="768">
+              <span class="marker marker-one">1</span><span class="marker marker-two">2</span><span class="marker marker-three">3</span><span class="marker marker-four">4</span><span class="marker marker-five">5</span>
+            </div>
+            <figcaption><strong>The five main areas stay visible in a wide window.</strong> A narrow window shows one side panel at a time.</figcaption>
+          </figure>
+          <ol class="legend">
+            <li><b>1</b><span><strong>Slides</strong> selects, adds, copies, removes, and moves slides.</span></li>
+            <li><b>2</b><span><strong>Library</strong> lists reusable items, groups, and slide templates.</span></li>
+            <li><b>3</b><span><strong>Canvas</strong> selects and moves the visible objects.</span></li>
+            <li><b>4</b><span><strong>Inspector</strong> shows the object list or exact properties.</span></li>
+            <li><b>5</b><span><strong>Timeline</strong> selects the base scene or a morph state.</span></li>
+          </ol>
+
+          <h2>Create an object</h2>
+          <p>Choose a creation tool, then click the canvas. Studio returns to Select after one placement.</p>
+          <figure class="shot shot-toolbar">
+            <img src="images/studio-creation-toolbar.png" alt="Studio toolbar with Select, Text, Bullets, Image, Rectangle, and Library tools" width="690" height="72" loading="lazy">
+            <figcaption><strong>The first six buttons are canvas tools.</strong> Each new object becomes source-backed content.</figcaption>
+          </figure>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Button</th><th>Action</th></tr></thead>
+              <tbody>
+                <tr><td>V · Select</td><td>Select, move, resize, or frame objects with a marquee.</td></tr>
+                <tr><td>T · Text</td><td>Place a text box with a suggested size.</td></tr>
+                <tr><td>B · Bullets</td><td>Place a bulleted text box.</td></tr>
+                <tr><td>IMG · Image</td><td>Choose an image file, then place it on the canvas.</td></tr>
+                <tr><td>RECT · Rectangle</td><td>Place a filled rectangle.</td></tr>
+                <tr><td>LIB · Library</td><td>Choose a reusable item, then place it on the canvas.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>Select and move objects</h2>
+          <ol class="steps">
+            <li><strong>Choose the Select tool.</strong><p>Press <kbd>V</kbd> or click the first toolbar button.</p></li>
+            <li><strong>Click an object.</strong><p>Studio draws a cyan outline and a resize handle.</p></li>
+            <li><strong>Drag the object.</strong><p>Magenta guides show nearby edges, centers, and snap points.</p></li>
+            <li><strong>Drag the handle.</strong><p>Hold <kbd>Shift</kbd> to keep the displayed aspect ratio.</p></li>
+          </ol>
+          <p>Use the arrow keys for a one-pixel nudge. Hold <kbd>Shift</kbd> for ten pixels.</p>
+          <div class="callout"><p><strong>Hold <kbd>Cmd/Ctrl</kbd> during a drag to bypass snapping.</strong> Press <kbd>G</kbd> to show the 20-pixel grid.</p></div>
+
+          <h3>Select more than one object</h3>
+          <figure class="diagram">
+            <div class="diagram-frame selection-sequence">
+              <div class="selection-step">
+                <b>Shift-click</b>
+                <div class="selection-canvas" aria-hidden="true"><i class="object-a selected"></i><i class="object-b"></i><i class="object-c selected"></i></div>
+                <span>Add or remove one object.</span>
+              </div>
+              <div class="selection-step">
+                <b>Marquee</b>
+                <div class="selection-canvas" aria-hidden="true"><i class="object-a selected"></i><i class="object-b selected"></i><i class="object-c"></i><em></em></div>
+                <span>Drag empty canvas around objects.</span>
+              </div>
+              <div class="selection-step">
+                <b>Move as one</b>
+                <div class="selection-canvas group-bounds" aria-hidden="true"><i class="object-a selected"></i><i class="object-b selected"></i><i class="object-c selected"></i></div>
+                <span>Drag any selected member.</span>
+              </div>
+            </div>
+            <figcaption><strong>The cyan box is the selection bound.</strong> Alignment and distribution use this box.</figcaption>
+          </figure>
+          <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>A</kbd> to select every editable object in the current scene.</p>
+          <p>Hold <kbd>Shift</kbd> during a marquee to toggle its hits against the existing selection.</p>
+          <p>A group move or nudge creates one undo step. Studio keeps the selection order during layer changes.</p>
+
+          <h2>Set exact values</h2>
+          <p>Open the Properties tab after you select one object.</p>
+          <p>Edit its text, position, size, font size, opacity, and colors. Press <kbd>Enter</kbd> to save a value.</p>
+          <p>Press <kbd>Esc</kbd> to cancel the current value. Invalid values stay in the field and show an explanation.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Field</th><th>Accepted value</th><th>Example</th></tr></thead>
+              <tbody>
+                <tr><td>X, Y, W, H</td><td>A logical pixel value</td><td><code>120</code></td></tr>
+                <tr><td>FG, BG</td><td>A hex color or <code>none</code></td><td><code>#61dafbff</code></td></tr>
+                <tr><td>Opacity</td><td>A value from 0 to 1, or a percent</td><td><code>75%</code></td></tr>
+                <tr><td>Font</td><td>A positive font size</td><td><code>52</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Use the Properties actions</h3>
+          <div class="panel-guide">
+            <figure class="shot panel-capture">
+              <img src="images/studio-properties-panel.png" alt="Properties panel with Duplicate, Delete, Reuse, Lock, geometry, and color controls" width="316" height="520" loading="lazy">
+              <figcaption><strong>The scope appears below the fields.</strong> This example edits a shared group definition.</figcaption>
+            </figure>
+            <div class="panel-copy">
+              <dl class="control-list">
+                <div><dt>Dup</dt><dd>Clone the selection in one undo step.</dd></div>
+                <div><dt>Del</dt><dd>Remove direct content or hide an inherited object locally.</dd></div>
+                <div><dt>Reuse</dt><dd>Promote authored content, make a group, or detach a safe instance.</dd></div>
+                <div><dt>Lock</dt><dd>Protect the selection from canvas changes. Use the Objects list to unlock it.</dd></div>
+                <div><dt>FG and BG</dt><dd>Choose a swatch or enter an exact hex color.</dd></div>
+                <div><dt>None</dt><dd>Remove the selected object's background fill.</dd></div>
+              </dl>
+            </div>
+          </div>
+          <p>Duplicate and Delete can act on a multi-selection. Studio rejects the complete action when any member is unsafe.</p>
+
+          <h2>Align and distribute objects</h2>
+          <p>Select one object to align it to a slide edge or center.</p>
+          <p>Select two or more objects to align them inside the current selection bounds.</p>
+          <figure class="diagram">
+            <div class="diagram-frame layout-controls" role="img" aria-label="The six alignment buttons and two equal-gap buttons from the Properties panel">
+              <div class="layout-button-row" aria-hidden="true">
+                <span>L</span><span>HC</span><span>R</span><span>T</span><span>VC</span><span>B</span>
+              </div>
+              <div class="layout-button-row layout-button-row-wide" aria-hidden="true">
+                <span>H EQUAL GAP</span><span>V EQUAL GAP</span>
+              </div>
+            </div>
+            <figcaption><strong>Alignment uses the selected bounds.</strong> Equal Gap keeps the outside bounds and spaces the objects between them.</figcaption>
+          </figure>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Button</th><th>Result</th></tr></thead>
+              <tbody>
+                <tr><td>L · HC · R</td><td>Align left, center horizontally, or align right.</td></tr>
+                <tr><td>T · VC · B</td><td>Align top, center vertically, or align bottom.</td></tr>
+                <tr><td>H Equal Gap</td><td>Give three or more objects equal horizontal gaps.</td></tr>
+                <tr><td>V Equal Gap</td><td>Give three or more objects equal vertical gaps.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Each alignment or distribution action creates one undo step.</p>
+
+          <h2>Use the Objects list</h2>
+          <p>The Objects tab lists the paint order from front to back.</p>
+          <p>The list also includes hidden, transparent, and locked objects. Use it when the canvas cannot select an object.</p>
+          <figure class="shot">
+            <img src="images/rayslides-studio-objects.jpg" alt="Objects list beside the Studio canvas" width="1319" height="768" loading="lazy">
+            <figcaption><strong>Each row shows the source name and object type.</strong> Use Vis and U to change visibility or locking.</figcaption>
+          </figure>
+          <p>The Back, Down, Up, and Front buttons change the paint order. Studio makes each layer change one undo step.</p>
+
+          <h2>Copy, paste, and duplicate</h2>
+          <figure class="diagram">
+            <div class="diagram-frame clipboard-flow">
+              <div><span class="clipboard-shortcut"><kbd>Cmd/Ctrl</kbd> + <kbd>C</kbd></span><strong>Copy</strong><span>Store the selected source items in Studio.</span></div>
+              <i aria-hidden="true">→</i>
+              <div><span class="clipboard-shortcut"><kbd>Cmd/Ctrl</kbd> + <kbd>V</kbd></span><strong>Paste</strong><span>Create new IDs and offset the objects by 20 pixels.</span></div>
+              <i aria-hidden="true">↗</i>
+              <div><span class="clipboard-shortcut"><kbd>Cmd/Ctrl</kbd> + <kbd>D</kbd></span><strong>Duplicate</strong><span>Clone the selection without a separate copy step.</span></div>
+            </div>
+            <figcaption><strong>Studio uses its own authoring clipboard.</strong> A paste keeps the copied paint order.</figcaption>
+          </figure>
+          <p>Copy supports literal base-scene objects and component instances. Other generated content can remain read-only.</p>
+          <p>A failed multi-copy, duplicate, or delete changes nothing. The status bar explains which source rule blocked the action.</p>
+
+          <h2>Set the grid</h2>
+          <p>Press <kbd>G</kbd> to show the grid and enable grid snapping.</p>
+          <p>The grid uses 20 logical pixels. Every fifth line or dot is stronger.</p>
+          <figure class="diagram">
+            <div class="diagram-frame grid-options">
+              <div class="grid-options-panel">
+                <strong>Grid appearance</strong>
+                <div class="grid-option-row"><span class="active">Auto</span><span>Dark</span><span>Light</span></div>
+                <div class="grid-contrast-label"><span>Contrast</span><span>40%</span></div>
+                <div class="grid-contrast-track"><i></i></div>
+                <strong>Style</strong>
+                <div class="grid-option-row grid-option-row-short"><span class="active">Lines</span><span>Dots</span></div>
+              </div>
+              <div class="grid-sample" aria-hidden="true"><span>20 px</span><i></i></div>
+            </div>
+            <figcaption><strong>The down-arrow beside Grid opens these settings.</strong> A setting change also enables the grid.</figcaption>
+          </figure>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Setting</th><th>Result</th></tr></thead>
+              <tbody>
+                <tr><td>Auto</td><td>Adjust the grid against the slide content.</td></tr>
+                <tr><td>Dark · Light</td><td>Use a fixed dark or light grid.</td></tr>
+                <tr><td>Contrast</td><td>Change the grid strength.</td></tr>
+                <tr><td>Lines · Dots</td><td>Choose continuous lines or grid points.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Smart guides take priority near an edge or center.</p>
+          <p>Hold <kbd>Cmd/Ctrl</kbd> during a drag to bypass the grid and smart guides.</p>
+
+          <h2>Measure the layout</h2>
+          <p>Open Commands and enable rulers, safe areas, or measurements. These tools do not change the deck.</p>
+          <figure class="diagram coordinate-figure">
+            <div class="diagram-frame coordinate-frame">
+              <div class="coordinate-stage" role="img" aria-label="A 1920 by 1080 slide with ruler marks, two safe areas, and one measured object">
+                <span class="coordinate-mark coordinate-mark-origin">0</span>
+                <span class="coordinate-mark coordinate-mark-x-mid">960</span>
+                <span class="coordinate-mark coordinate-mark-x-end">1920</span>
+                <span class="coordinate-mark coordinate-mark-y-mid">540</span>
+                <span class="coordinate-mark coordinate-mark-y-end">1080</span>
+                <span class="coordinate-safe coordinate-safe-outer"><span>action safe</span></span>
+                <span class="coordinate-safe coordinate-safe-inner"><span>title safe</span></span>
+                <span class="coordinate-object coordinate-object-measured">
+                  <strong>Selected object</strong>
+                  <small>x 420 · y 300 · w 1080 · h 360</small>
+                </span>
+              </div>
+            </div>
+            <figcaption><strong>Rulers use the 1920×1080 slide space.</strong> Measurements show the selected object's source values.</figcaption>
+          </figure>
+          <p>Use <kbd>Cmd/Ctrl</kbd> with the mouse wheel to zoom around the pointer. Use the plain wheel to pan.</p>
+          <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>0</kbd> to fit the complete slide.</p>
+
+          <h2>Change the workspace view</h2>
+          <figure class="diagram">
+            <div class="diagram-frame workspace-modes">
+              <div class="workspace-mode">
+                <b>Wide window</b>
+                <div class="workspace-map wide-map" aria-hidden="true"><i></i><span class="workspace-canvas"></span><em></em><footer></footer></div>
+                <span>Both side panels and the timeline stay visible.</span>
+              </div>
+              <div class="workspace-mode">
+                <b>Focus Canvas</b>
+                <div class="workspace-map focus-map" aria-hidden="true"><span class="workspace-canvas"></span></div>
+                <span><kbd>Tab</kbd> hides the permanent chrome. Editing stays active.</span>
+              </div>
+              <div class="workspace-mode">
+                <b>Narrow window</b>
+                <div class="workspace-map narrow-map" aria-hidden="true"><header>Slides · Inspector</header><span class="workspace-canvas"></span><em></em><footer></footer></div>
+                <span>Slides and Inspector open one side panel at a time.</span>
+              </div>
+            </div>
+            <figcaption><strong>The canvas keeps the same slide coordinates.</strong> Compact layouts only change the surrounding controls.</figcaption>
+          </figure>
+          <p>Click Slides or Inspector to open a hidden dock. Click Focus or press <kbd>Tab</kbd> to restore the complete workspace.</p>
+
+          <h2>Read the status bar</h2>
+          <p>The first line reports the current selection and its source owner.</p>
+          <figure class="shot shot-status">
+            <img src="images/studio-status-bar.png" alt="Studio status bar with selection count, primary object, source line, geometry, and shortcut help" width="1319" height="96" loading="lazy">
+            <figcaption><strong>This object is direct content on line 16.</strong> The same line shows its x, y, width, and height.</figcaption>
+          </figure>
+          <ul>
+            <li>The selection count and primary ID identify the active objects.</li>
+            <li>The scope says direct, local instance, shared template, group, or definition.</li>
+            <li>The source line points to the directive that owns the change.</li>
+            <li>A notice replaces the help text after a save, refusal, or error.</li>
+          </ul>
+
+          <h2>Organize slides</h2>
+          <div class="panel-guide">
+            <figure class="shot panel-capture">
+              <img src="images/studio-slides-panel.png" alt="Slides panel with Add, Duplicate, Delete, Up, Down, Template, Find, Previous, and Next controls" width="270" height="428" loading="lazy">
+              <figcaption><strong>A slide card shows its title, item count, and state count.</strong> Click the card to load it.</figcaption>
+            </figure>
+            <div class="panel-copy">
+              <dl class="control-list">
+                <div><dt>+</dt><dd>Append a blank slide.</dd></div>
+                <div><dt>Dup</dt><dd>Duplicate the complete current slide.</dd></div>
+                <div><dt>Del</dt><dd>Delete the current slide. A deck must keep one slide.</dd></div>
+                <div><dt>Up · Down</dt><dd>Move the current slide earlier or later.</dd></div>
+                <div><dt>Tpl</dt><dd>Promote the current slide to a reusable slide template.</dd></div>
+                <div><dt>Find</dt><dd>Filter by title, slide number, item count, or state count.</dd></div>
+                <div><dt>Prev · Next</dt><dd>Show the previous or next page of cards or matches.</dd></div>
+              </dl>
+            </div>
+          </div>
+          <p>Each slide action changes the <code>.sld</code> source in one undo step.</p>
+
+          <h2>Find a command</h2>
+          <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> to open the command list.</p>
+          <p>Type an action, tool, category, or shortcut. Disabled commands stay visible and explain why they cannot run.</p>
+          <figure class="shot">
+            <img src="images/command-palette.png" alt="Studio command list showing save, history, and tool commands" width="1600" height="900" loading="lazy">
+            <figcaption><strong>The list uses the current context.</strong> It can explain an unavailable action without changing the source.</figcaption>
+          </figure>
+
+          <h2>Reuse a composition</h2>
+          <p>The Library contains reusable items, groups, and slide templates.</p>
+          <p>Select an entry to preview it. The preview does not change the deck.</p>
+          <div class="panel-guide">
+            <figure class="shot panel-capture panel-capture-short">
+              <img src="images/studio-library-panel.png" alt="Library panel with Item, Group, and Slide entries plus management controls" width="270" height="277" loading="lazy">
+              <figcaption><strong>Each row shows its type and use count.</strong> An unused entry can still be a deliberate asset.</figcaption>
+            </figure>
+            <div class="panel-copy">
+              <dl class="control-list">
+                <div><dt>Item</dt><dd>A reusable element. Choose Use, then click the canvas.</dd></div>
+                <div><dt>Group</dt><dd>A reusable composition with editable member objects.</dd></div>
+                <div><dt>Slide</dt><dd>A template that creates a new slide.</dd></div>
+                <div><dt>Find</dt><dd>Filter by name, type, use count, or availability.</dd></div>
+                <div><dt>Prev · Next</dt><dd>Show the previous or next page of entries or matches.</dd></div>
+              </dl>
+            </div>
+          </div>
+          <div class="shot-grid">
+            <figure class="shot">
+              <img src="images/library-preview.png" alt="Read-only preview of a reusable group" width="1600" height="900" loading="lazy">
+              <figcaption><strong>Preview mode is read-only.</strong> Inspect the resolved group before you use it.</figcaption>
+            </figure>
+            <figure class="shot">
+              <img src="images/library-definition.png" alt="Definition mode with the title selected and its shared Properties open" width="1280" height="720" loading="lazy">
+              <figcaption><strong>Definition mode edits shared members.</strong> Select an object, then change its Properties.</figcaption>
+            </figure>
+          </div>
+          <ol class="steps">
+            <li><strong>Select a Library entry.</strong><p>Studio opens a read-only preview on the canvas.</p></li>
+            <li><strong>Choose Use.</strong><p>Studio places an item or group, or creates a slide from a template.</p></li>
+            <li><strong>Choose Edit.</strong><p>Studio opens the shared definition and shows its member objects.</p></li>
+            <li><strong>Choose Back.</strong><p>Studio returns to the deck and keeps the source changes in history.</p></li>
+          </ol>
+
+          <h3>Manage Library entries</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Button</th><th>Action</th><th>Limit</th></tr></thead>
+              <tbody>
+                <tr><td>Ren</td><td>Rename the definition and its safe source uses.</td><td>The new name must be unique.</td></tr>
+                <tr><td>Del</td><td>Delete one unused definition.</td><td>Later uses block deletion. Slide-template deletion is not source-safe yet.</td></tr>
+                <tr><td>Clean</td><td>Preview every safely unreachable definition.</td><td>Studio leaves blocked definitions unchanged.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Clean is a two-step action. The first click reports safe and blocked counts in the status bar.</p>
+          <p>The button then changes to Apply. The second click removes only the safe definitions.</p>
+
+          <h2>Local and shared edits</h2>
+          <p>A normal edit changes the selected instance. An inherited template item gets a local override.</p>
+          <p>Hold <kbd>Alt</kbd> to edit the shared template definition. Every resolved use can then change.</p>
+          <figure class="diagram">
+            <div class="diagram-frame edit-scope-compare">
+              <div class="edit-scope-card local-scope">
+                <p>LOCAL INSTANCE</p>
+                <div class="scope-uses" aria-hidden="true"><i class="changed"></i><i></i><i></i></div>
+                <strong>One use changes.</strong>
+                <span>Studio writes an override beside that instance.</span>
+              </div>
+              <div class="edit-scope-card shared-scope">
+                <p>SHARED · AFFECTS 3 USES</p>
+                <div class="scope-uses" aria-hidden="true"><i class="changed"></i><i class="changed"></i><i class="changed"></i></div>
+                <strong>All resolved uses can change.</strong>
+                <span>Studio edits the reusable definition.</span>
+              </div>
+            </div>
+            <figcaption><strong>The affected-use count appears before a shared edit.</strong> Local overrides still win over shared values.</figcaption>
+          </figure>
+          <div class="callout callout-warning"><p><strong>Check the status bar before a shared edit.</strong> It states whether the action is local or shared.</p></div>
+
+          <h2>Save and recover work</h2>
+          <p>An asterisk beside STUDIO means that the source has unsaved changes.</p>
+          <ul>
+            <li>Press <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> to save the current file.</li>
+            <li>Press <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> to save a copy.</li>
+            <li>Press <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> to undo one source edit.</li>
+            <li>Press <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> to redo it.</li>
+          </ul>
+          <p>Rayslides writes a recovery copy when you quit with unsaved work.</p>
+
+          <a class="next-guide" href="motion.html"><span><span>Next guide</span><strong>Animate a deck</strong></span><b aria-hidden="true">→</b></a>
+        </main>
+        <footer class="site-footer"><span>Rayslides uses Zig and raylib.</span><nav aria-label="Footer"><a href="reference.html">Controls</a><a href="https://github.com/technologylab-ai/rayslides">Source</a></nav></footer>
+      </div>
+    </div>
+  </body>
+</html>
