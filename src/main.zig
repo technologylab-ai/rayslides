@@ -2237,6 +2237,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var windowed_width = screenWidth;
     var windowed_height = screenHeight;
     var window_close_seen = false;
+    var studio_was_capturing_input = false;
 
     while (true) {
         frame_diagnostics.observeFrame(rl.getTime());
@@ -2489,6 +2490,10 @@ pub fn main(init: std.process.Init) anyerror!void {
         const now = rl.getTime();
         G.playback.settle(now);
         G.slide_renderer.tickVideos(now);
+        // Entering Studio must silence a playing video; editing over audio
+        // is jarring and Studio always shows the static base scene anyway.
+        if (studio_mode.capturesInput() and !studio_was_capturing_input) G.slide_renderer.stopAllVideos();
+        studio_was_capturing_input = studio_mode.capturesInput();
         if (!export_controller.running and !studio_mode.capturesInput()) updateAutomaticReveal(now);
         const current_crowd_spec = crowdSpecForSlide(G.slideshow, G.current_slide);
         if (crowd_runtime.isRunning() and !export_controller.running) crowd_runtime.activate(current_crowd_spec);
@@ -3331,6 +3336,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         // complete render graph; beginning the frame only when pixels are
         // ready prevents a partially held back buffer from presenting as a
         // redraw flash on macOS.
+        var video_overlay_consumed_click = false;
         {
             rl.beginDrawing();
             defer rl.endDrawing();
@@ -3358,6 +3364,23 @@ pub fn main(init: std.process.Init) anyerror!void {
                 crowd_runtime.public_url.slice(),
             );
             if (clip_studio_canvas) rl.endScissorMode();
+            video_overlay_consumed_click = G.slide_renderer.processVideoOverlay(
+                G.current_slide,
+                G.playback.visible_step,
+                .{
+                    .mouse = rl.getMousePosition(),
+                    .pressed = rl.isMouseButtonPressed(.left),
+                    .down = rl.isMouseButtonDown(.left),
+                    .released = rl.isMouseButtonReleased(.left),
+                },
+                slide_tl,
+                slide_size_in_window,
+                internal_render_size,
+                now,
+                G.studio_ui_font,
+                !export_controller.running and !studio_mode.capturesInput() and
+                    !presenter_overlay_captures_input and !laser_pointer.show,
+            );
             if (!export_controller.running) {
                 if (definition_preview_entry != null) {
                     const canvas = studio_viewport.canvasBounds();
@@ -3742,7 +3765,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         //
         // hanlde keys
         //
-        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and (rl.isKeyPressed(.space) or rl.isKeyPressed(.right) or rl.isKeyPressed(.page_down) or (!laser_pointer.show and rl.isMouseButtonPressed(.left)))) {
+        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and (rl.isKeyPressed(.space) or rl.isKeyPressed(.right) or rl.isKeyPressed(.page_down) or (!laser_pointer.show and !video_overlay_consumed_click and !G.slide_renderer.videoOverlayShieldsClick(rl.getMousePosition()) and rl.isMouseButtonPressed(.left)))) {
             advancePresentation(rl.getTime());
         }
 

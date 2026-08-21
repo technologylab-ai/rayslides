@@ -121,6 +121,11 @@ shadow=<span class="code-value">#000000a0</span> shadow_x=3 shadow_y=5 text=<spa
 <span class="code-comment"># Start on slide entry and restart when the video ends.</span>
 <span class="code-key">@box</span> vid=assets/demo.mp4 x=320 y=200 w=1280 autoplay loop</code></pre>
           <p>A video shows its first frame until it plays. <kbd>M</kbd> plays or pauses the videos on the current slide; <kbd>Shift</kbd> + <kbd>M</kbd> stops and rewinds them. Leaving the slide stops its videos. PDF export always captures the first frame.</p>
+          <p>Moving the mouse into a video reveals hover controls — play/pause, stop, and a seek bar — which fade out when the cursor leaves or rests. Clicking the video picture itself still advances the presentation; only the control bar consumes clicks.</p>
+          <figure class="shot">
+            <img src="images/video-controls.jpg" alt="A playing video with the hover control bar: pause and stop buttons, elapsed time, seek bar, and total duration" width="1067" height="600" loading="lazy">
+            <figcaption><strong>Hover controls appear on demand.</strong> Big Buck Bunny (© 2008 Blender Foundation, CC-BY 3.0) paused mid-seek; the bar fades away when the cursor leaves or rests on the picture.</figcaption>
+          </figure>
 
           <h2>Reuse one item</h2>
           <p><code class="inline-code">@push</code> saves an item definition. <code class="inline-code">@pop</code> places an instance later in the file.</p>

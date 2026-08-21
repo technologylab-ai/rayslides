@@ -84,6 +84,8 @@ const ProbeResult = struct {
     height: i32,
     fps: f64,
     has_audio: bool,
+    /// 0 when the container doesn't report one; seeking is disabled then.
+    duration: f64,
 };
 
 fn parseFrameRate(value: []const u8) ?f64 {
@@ -100,7 +102,7 @@ fn probe(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !ProbeResult {
         .argv = &.{
             ffprobe_exe.?,          "-v",  "error",
             "-select_streams",      "v:0", "-show_entries",
-            "stream=width,height,avg_frame_rate,r_frame_rate", "-of", "default=noprint_wrappers=1",
+            "stream=width,height,avg_frame_rate,r_frame_rate,duration:format=duration", "-of", "default=noprint_wrappers=1",
             path,
         },
         .stdout_limit = .limited(4096),
@@ -117,6 +119,7 @@ fn probe(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !ProbeResult {
     var height: ?i32 = null;
     var avg_fps: ?f64 = null;
     var raw_fps: ?f64 = null;
+    var duration: ?f64 = null;
     var lines = std.mem.tokenizeAny(u8, video_result.stdout, "\r\n");
     while (lines.next()) |line| {
         var kv = std.mem.tokenizeScalar(u8, line, '=');
@@ -130,6 +133,10 @@ fn probe(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !ProbeResult {
             avg_fps = parseFrameRate(value);
         } else if (std.mem.eql(u8, key, "r_frame_rate")) {
             raw_fps = parseFrameRate(value);
+        } else if (std.mem.eql(u8, key, "duration")) {
+            // The stream line comes first; the format-section fallback only
+            // fills in when the stream reports N/A (e.g. webm).
+            if (duration == null) duration = std.fmt.parseFloat(f64, value) catch null;
         }
     }
     const w = width orelse return error.VideoProbeFailed;
@@ -155,6 +162,7 @@ fn probe(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !ProbeResult {
         .height = h,
         .fps = avg_fps orelse raw_fps orelse 30.0,
         .has_audio = has_audio,
+        .duration = @max(0, duration orelse 0),
     };
 }
 
@@ -260,6 +268,8 @@ pub const VideoPlayer = struct {
     height: i32,
     fps: f64,
     has_audio: bool,
+    /// 0 when unknown; the overlay hides its seek bar then.
+    duration: f64,
     // Set from the initiating item's element each time playback starts;
     // players are shared per file, so this is not authoring state.
     loop: bool = false,
@@ -270,9 +280,15 @@ pub const VideoPlayer = struct {
     poster: []u8,
 
     state: PlayState = .stopped,
+    /// Seconds since the current pipeline was spawned; the presented
+    /// position is seek_offset + clock.
     clock: f64 = 0,
     last_tick: f64 = 0,
     frames_shown: u64 = 0,
+    seek_offset: f64 = 0,
+    /// After a paused seek, present the first decoded frame once so the
+    /// sought position becomes visible without running the clock.
+    awaiting_paused_frame: bool = false,
 
     pipeline: ?*Pipeline = null,
 
@@ -318,6 +334,7 @@ pub const VideoPlayer = struct {
             .height = meta.height,
             .fps = meta.fps,
             .has_audio = meta.has_audio,
+            .duration = meta.duration,
             .texture = texture,
             .poster = poster_result.stdout,
         };
@@ -374,10 +391,47 @@ pub const VideoPlayer = struct {
         self.state = .stopped;
         self.clock = 0;
         self.frames_shown = 0;
+        self.seek_offset = 0;
+        self.awaiting_paused_frame = false;
         rl.updateTexture(self.texture, self.poster.ptr);
     }
 
+    /// Presented position in seconds, for the overlay's seek bar.
+    pub fn position(self: *const Self) f64 {
+        const pos = self.seek_offset + self.clock;
+        if (self.duration > 0) return @min(pos, self.duration);
+        return pos;
+    }
+
+    /// Restart the pipeline at t while preserving play/pause state. A paused
+    /// seek shows the sought frame as soon as it is decoded.
+    pub fn seekTo(self: *Self, t: f64, now: f64) void {
+        const target = if (self.duration > 0) std.math.clamp(t, 0, @max(0, self.duration - 0.1)) else @max(0, t);
+        const was_playing = self.state == .playing;
+        self.killPipeline();
+        self.pipeline = self.buildPipeline(target) catch |err| {
+            log.warn("could not seek {s}: {}", .{ self.path, err });
+            self.state = .stopped;
+            return;
+        };
+        self.seek_offset = target;
+        self.clock = 0;
+        self.frames_shown = 0;
+        self.last_tick = now;
+        if (was_playing) {
+            self.state = .playing;
+            self.awaiting_paused_frame = false;
+        } else {
+            self.state = .paused;
+            self.awaiting_paused_frame = true;
+            if (self.pipeline) |p| {
+                if (p.audio_stream) |stream| rl.pauseAudioStream(stream);
+            }
+        }
+    }
+
     pub fn tick(self: *Self, now: f64) void {
+        if (self.state == .paused and self.awaiting_paused_frame) self.presentPausedFrame();
         if (self.state != .playing) return;
         self.clock += now - self.last_tick;
         self.last_tick = now;
@@ -388,27 +442,48 @@ pub const VideoPlayer = struct {
 
     fn startPipeline(self: *Self, now: f64) void {
         self.killPipeline();
-        self.pipeline = self.buildPipeline() catch |err| {
+        self.pipeline = self.buildPipeline(0) catch |err| {
             log.warn("could not start playback for {s}: {}", .{ self.path, err });
             return;
         };
+        self.seek_offset = 0;
         self.clock = 0;
         self.frames_shown = 0;
         self.last_tick = now;
         self.state = .playing;
+        self.awaiting_paused_frame = false;
     }
 
-    fn buildPipeline(self: *Self) !*Pipeline {
+    fn buildPipeline(self: *Self, start_at: f64) !*Pipeline {
         const gpa = self.allocator;
         const frame_size: usize = @as(usize, @intCast(self.width)) * @as(usize, @intCast(self.height)) * 3;
 
+        // `-ss` before `-i` seeks by keyframe, then decodes precisely up to
+        // the target, so pipeline start stays fast even deep into a file.
+        var seek_buf: [32]u8 = undefined;
+        const seek_arg: ?[]const u8 = if (start_at > 0.001)
+            std.fmt.bufPrint(&seek_buf, "{d:.3}", .{start_at}) catch null
+        else
+            null;
+
+        var video_argv_buf: [16][]const u8 = undefined;
+        var video_argv_len: usize = 0;
+        for ([_][]const u8{ ffmpeg_exe.?, "-v", "error", "-noautorotate" }) |arg| {
+            video_argv_buf[video_argv_len] = arg;
+            video_argv_len += 1;
+        }
+        if (seek_arg) |arg| {
+            video_argv_buf[video_argv_len] = "-ss";
+            video_argv_buf[video_argv_len + 1] = arg;
+            video_argv_len += 2;
+        }
+        for ([_][]const u8{ "-i", self.path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-" }) |arg| {
+            video_argv_buf[video_argv_len] = arg;
+            video_argv_len += 1;
+        }
+
         var video_child = try std.process.spawn(self.io, .{
-            .argv = &.{
-                ffmpeg_exe.?, "-v",       "error",
-                "-noautorotate", "-i",    self.path,
-                "-f",         "rawvideo", "-pix_fmt",
-                "rgb24",      "-",
-            },
+            .argv = video_argv_buf[0..video_argv_len],
             .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .ignore,
@@ -436,14 +511,23 @@ pub const VideoPlayer = struct {
         p.video_reader = p.video_child.stdout.?.readerStreaming(self.io, p.video_reader_buf);
 
         if (self.has_audio) audio: {
+            var audio_argv_buf: [18][]const u8 = undefined;
+            var audio_argv_len: usize = 0;
+            for ([_][]const u8{ ffmpeg_exe.?, "-v", "error" }) |arg| {
+                audio_argv_buf[audio_argv_len] = arg;
+                audio_argv_len += 1;
+            }
+            if (seek_arg) |arg| {
+                audio_argv_buf[audio_argv_len] = "-ss";
+                audio_argv_buf[audio_argv_len + 1] = arg;
+                audio_argv_len += 2;
+            }
+            for ([_][]const u8{ "-i", self.path, "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", "-" }) |arg| {
+                audio_argv_buf[audio_argv_len] = arg;
+                audio_argv_len += 1;
+            }
             const audio_child = std.process.spawn(self.io, .{
-                .argv = &.{
-                    ffmpeg_exe.?, "-v",     "error",
-                    "-i",         self.path, "-vn",
-                    "-f",         "s16le",  "-acodec",
-                    "pcm_s16le",  "-ar",    "48000",
-                    "-ac",        "2",      "-",
-                },
+                .argv = audio_argv_buf[0..audio_argv_len],
                 .stdin = .ignore,
                 .stdout = .pipe,
                 .stderr = .ignore,
@@ -526,6 +610,26 @@ pub const VideoPlayer = struct {
             p.space_cond.broadcast(p.io);
             rl.updateAudioStream(stream, p.audio_chunk.ptr, @intCast(n / audio_bytes_per_frame));
         }
+    }
+
+    fn presentPausedFrame(self: *Self) void {
+        const p = self.pipeline orelse {
+            self.awaiting_paused_frame = false;
+            return;
+        };
+        p.mutex.lockUncancelable(p.io);
+        const has_frame = p.frame_count > 0;
+        const head = p.frame_head;
+        p.mutex.unlock(p.io);
+        if (!has_frame) return; // decoder not there yet; retry next tick
+        rl.updateTexture(self.texture, p.frames[head].ptr);
+        self.frames_shown += 1;
+        p.mutex.lockUncancelable(p.io);
+        p.frame_head = (head + 1) % frame_ring_len;
+        p.frame_count -= 1;
+        p.mutex.unlock(p.io);
+        p.space_cond.broadcast(p.io);
+        self.awaiting_paused_frame = false;
     }
 
     fn presentDueFrames(self: *Self, p: *Pipeline) void {

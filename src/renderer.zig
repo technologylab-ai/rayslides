@@ -381,6 +381,29 @@ fn boundaryTrailingOffset(boundary: BoundarySpacing, slice_end: usize, span_len:
     return if (slice_end == span_len) boundary.trailing else 0.0;
 }
 
+/// Transient state of the hover-revealed video controls. One cursor means at
+/// most one active pill; it stays addressable through its owner identity
+/// while fading out or while a seek drag is in flight.
+const VideoOverlayUi = struct {
+    alpha: f32 = 0,
+    active_identity: ?usize = null,
+    last_mouse: rl.Vector2 = .{ .x = -1, .y = -1 },
+    last_mouse_move_time: f64 = 0,
+    dragging: bool = false,
+    drag_identity: usize = 0,
+    drag_target: f64 = 0,
+    drag_was_playing: bool = false,
+    /// Last frame's pill rect. A cursor resting on the controls must not
+    /// idle-fade them away: the user is aiming, and a click landing after a
+    /// silent fade-out would fall through to "advance the presentation".
+    last_pill: rl.Rectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+};
+
+fn formatPlayerTime(buf: []u8, seconds: f64) [:0]const u8 {
+    const total: u64 = @intFromFloat(@max(0, seconds));
+    return std.fmt.bufPrintZ(buf, "{d}:{d:0>2}", .{ total / 60, total % 60 }) catch "0:00";
+}
+
 pub const SlideshowRenderer = struct {
     renderedSlides: std.ArrayList(*RenderedSlide) = undefined,
     /// One detached, source-neutral Studio Library scene. It shares fonts and
@@ -394,6 +417,7 @@ pub const SlideshowRenderer = struct {
     qr_code: qrcode.Code = .{},
     item_geometry_previews: [max_item_geometry_previews]ItemGeometryPreview = undefined,
     item_geometry_preview_count: usize = 0,
+    video_overlay: VideoOverlayUi = .{},
 
     pub fn new(allocator: std.mem.Allocator, fonts: *my_fonts.AvailableFonts) !*SlideshowRenderer {
         var self: *SlideshowRenderer = try allocator.create(SlideshowRenderer);
@@ -1543,6 +1567,205 @@ pub const SlideshowRenderer = struct {
             const player = element.video orelse continue;
             player.stop();
         }
+    }
+
+    /// Whether a fresh mouse press at `mouse` belongs to the video controls.
+    /// raylib polls input inside endDrawing, so the frame's key/mouse
+    /// handlers run on NEWER input than processVideoOverlay saw inside the
+    /// draw frame. A press landing on the visible pill must not advance the
+    /// presentation; the overlay itself acts on it one frame later.
+    pub fn videoOverlayShieldsClick(self: *const SlideshowRenderer, mouse: rl.Vector2) bool {
+        const st = &self.video_overlay;
+        if (st.dragging) return true;
+        if (st.alpha <= 0.02) return false;
+        return rl.checkCollisionPointRec(mouse, st.last_pill);
+    }
+
+    pub const VideoOverlayInput = struct {
+        mouse: rl.Vector2,
+        pressed: bool,
+        down: bool,
+        released: bool,
+    };
+
+    fn videoElementScreenRect(
+        element: *const RenderElement,
+        slide_tl: rl.Vector2,
+        slide_size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+    ) rl.Rectangle {
+        const tl = slidePosToRenderPos(element.position, slide_tl, slide_size, internal_render_size);
+        const size = slideSizeToRenderSize(element.size, slide_size, internal_render_size);
+        return .{ .x = tl.x, .y = tl.y, .width = size.x, .height = size.y };
+    }
+
+    /// Hover-revealed playback controls for the videos on the current slide.
+    /// Must be called inside the draw frame, after the slide has rendered.
+    /// Returns true when a mouse press was consumed by the pill, so the
+    /// caller must not treat that click as "advance the presentation".
+    pub fn processVideoOverlay(
+        self: *SlideshowRenderer,
+        slide_number: i32,
+        visible_step: usize,
+        input: VideoOverlayInput,
+        slide_tl: rl.Vector2,
+        slide_size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+        now: f64,
+        ui_font: rl.Font,
+        enabled: bool,
+    ) bool {
+        const st = &self.video_overlay;
+        if (!enabled or slide_number < 0 or slide_number >= self.renderedSlides.items.len) {
+            st.alpha = 0;
+            st.dragging = false;
+            st.active_identity = null;
+            return false;
+        }
+        const elements = self.renderedSlides.items[@intCast(slide_number)].elements.items;
+
+        if (input.mouse.x != st.last_mouse.x or input.mouse.y != st.last_mouse.y) {
+            st.last_mouse = input.mouse;
+            st.last_mouse_move_time = now;
+        }
+
+        // Topmost visible video under the cursor wins.
+        var hovered: ?*const RenderElement = null;
+        for (elements) |*element| {
+            if (element.kind != .video or element.video == null) continue;
+            if (element.reveal_step > visible_step) continue;
+            if (element.opacity <= 0) continue;
+            const rect = videoElementScreenRect(element, slide_tl, slide_size, internal_render_size);
+            if (rl.checkCollisionPointRec(input.mouse, rect)) hovered = element;
+        }
+
+        // A running seek drag pins the pill to its video even when the
+        // cursor strays; the pill also stays addressable while fading out.
+        var active: ?*const RenderElement = null;
+        const wanted_identity: ?usize = if (st.dragging) st.drag_identity else if (hovered) |h| h.owner_identity else st.active_identity;
+        if (wanted_identity) |identity| {
+            for (elements) |*element| {
+                if (element.kind == .video and element.video != null and element.owner_identity == identity) active = element;
+            }
+        }
+        if (st.dragging and active == null) st.dragging = false;
+        st.active_identity = if (active) |element| element.owner_identity else null;
+
+        // Fade in on hover, back out on leave or after the cursor sits
+        // still over the picture, so a resting mouse never leaves chrome on
+        // screen mid-talk. A cursor resting on the pill itself keeps it
+        // alive (see VideoOverlayUi.last_pill).
+        const cursor_alive = (now - st.last_mouse_move_time) < 1.5 or
+            rl.checkCollisionPointRec(input.mouse, st.last_pill);
+        const want_visible = st.dragging or (hovered != null and cursor_alive);
+        const fade_step = 8.0 * rl.getFrameTime();
+        st.alpha = if (want_visible) @min(1.0, st.alpha + fade_step) else @max(0.0, st.alpha - fade_step);
+        if (st.alpha <= 0.02) {
+            if (!st.dragging) st.active_identity = null;
+            return false;
+        }
+        const element = active orelse return false;
+        const player = element.video.?;
+
+        // ------ layout (window coordinates) ------
+        const rect = videoElementScreenRect(element, slide_tl, slide_size, internal_render_size);
+        const ui_scale = std.math.clamp(slide_size.y / 1080.0, 0.5, 2.0);
+        const margin = 12.0 * ui_scale;
+        const pill_h = 44.0 * ui_scale;
+        var pill_w = rect.width - 2.0 * margin;
+        if (pill_w < 160.0 * ui_scale) pill_w = @min(rect.width, 160.0 * ui_scale);
+        const pill = rl.Rectangle{
+            .x = rect.x + (rect.width - pill_w) / 2.0,
+            .y = @max(rect.y, rect.y + rect.height - pill_h - margin),
+            .width = pill_w,
+            .height = pill_h,
+        };
+        st.last_pill = pill;
+        const btn = 26.0 * ui_scale;
+        const btn_y = pill.y + (pill.height - btn) / 2.0;
+        const play_rect = rl.Rectangle{ .x = pill.x + 12.0 * ui_scale, .y = btn_y, .width = btn, .height = btn };
+        const stop_rect = rl.Rectangle{ .x = play_rect.x + btn + 10.0 * ui_scale, .y = btn_y, .width = btn, .height = btn };
+        const font_size = 15.0 * ui_scale;
+        const text_y = pill.y + (pill.height - font_size) / 2.0;
+
+        var elapsed_buf: [32]u8 = undefined;
+        var total_buf: [32]u8 = undefined;
+        const shown_position = if (st.dragging) st.drag_target else player.position();
+        const elapsed_text = formatPlayerTime(&elapsed_buf, shown_position);
+        const total_text = formatPlayerTime(&total_buf, player.duration);
+        const elapsed_w = rl.measureTextEx(ui_font, elapsed_text, font_size, 0).x;
+        const total_w = rl.measureTextEx(ui_font, total_text, font_size, 0).x;
+
+        const has_seek_bar = player.duration > 0;
+        const elapsed_x = stop_rect.x + btn + 14.0 * ui_scale;
+        const bar_x = elapsed_x + elapsed_w + 12.0 * ui_scale;
+        const bar_end = pill.x + pill.width - 14.0 * ui_scale - (if (has_seek_bar) total_w + 12.0 * ui_scale else 0.0);
+        const bar_w = bar_end - bar_x;
+        const bar_y = pill.y + pill.height / 2.0;
+        // Generous vertical grab area for the thin track.
+        const bar_hit = rl.Rectangle{ .x = bar_x - 6.0, .y = pill.y, .width = bar_w + 12.0, .height = pill.height };
+        const seek_usable = has_seek_bar and bar_w > 30.0 * ui_scale;
+
+        // ------ input ------
+        var consumed = false;
+        if (st.dragging) {
+            consumed = true;
+            if (seek_usable) {
+                const fraction = std.math.clamp((input.mouse.x - bar_x) / bar_w, 0.0, 1.0);
+                st.drag_target = fraction * player.duration;
+            }
+            if (input.released or !input.down) {
+                st.dragging = false;
+                player.seekTo(st.drag_target, now);
+                if (st.drag_was_playing) player.play(now);
+            }
+        } else if (hovered != null and input.pressed and rl.checkCollisionPointRec(input.mouse, pill)) {
+            consumed = true;
+            if (rl.checkCollisionPointRec(input.mouse, play_rect)) {
+                if (player.state == .playing) {
+                    player.pause(now);
+                } else {
+                    player.loop = element.video_loop;
+                    player.play(now);
+                }
+            } else if (rl.checkCollisionPointRec(input.mouse, stop_rect)) {
+                player.stop();
+            } else if (seek_usable and rl.checkCollisionPointRec(input.mouse, bar_hit)) {
+                st.dragging = true;
+                st.drag_identity = element.owner_identity;
+                st.drag_was_playing = player.state == .playing;
+                player.pause(now);
+                const fraction = std.math.clamp((input.mouse.x - bar_x) / bar_w, 0.0, 1.0);
+                st.drag_target = fraction * player.duration;
+            }
+        }
+        // ------ draw ------
+        const fg = colorWithOpacity(.{ .r = 235, .g = 240, .b = 245, .a = 255 }, st.alpha);
+        const dim = colorWithOpacity(.{ .r = 235, .g = 240, .b = 245, .a = 140 }, st.alpha);
+        rl.drawRectangleRounded(pill, 0.5, 8, colorWithOpacity(.{ .r = 12, .g = 16, .b = 22, .a = 225 }, st.alpha));
+        if (player.state == .playing) {
+            const bar_thickness = btn * 0.28;
+            rl.drawRectangleRec(.{ .x = play_rect.x + btn * 0.12, .y = play_rect.y + btn * 0.08, .width = bar_thickness, .height = btn * 0.84 }, fg);
+            rl.drawRectangleRec(.{ .x = play_rect.x + btn * 0.60, .y = play_rect.y + btn * 0.08, .width = bar_thickness, .height = btn * 0.84 }, fg);
+        } else {
+            rl.drawTriangle(
+                .{ .x = play_rect.x + btn * 0.15, .y = play_rect.y + btn * 0.05 },
+                .{ .x = play_rect.x + btn * 0.15, .y = play_rect.y + btn * 0.95 },
+                .{ .x = play_rect.x + btn * 0.95, .y = play_rect.y + btn * 0.50 },
+                fg,
+            );
+        }
+        rl.drawRectangleRec(.{ .x = stop_rect.x + btn * 0.15, .y = stop_rect.y + btn * 0.15, .width = btn * 0.70, .height = btn * 0.70 }, fg);
+        rl.drawTextEx(ui_font, elapsed_text, .{ .x = elapsed_x, .y = text_y }, font_size, 0, fg);
+        if (seek_usable) {
+            const fraction: f32 = @floatCast(std.math.clamp(shown_position / player.duration, 0.0, 1.0));
+            const track_h = 4.0 * ui_scale;
+            rl.drawRectangleRounded(.{ .x = bar_x, .y = bar_y - track_h / 2.0, .width = bar_w, .height = track_h }, 1.0, 4, dim);
+            rl.drawRectangleRounded(.{ .x = bar_x, .y = bar_y - track_h / 2.0, .width = bar_w * fraction, .height = track_h }, 1.0, 4, fg);
+            rl.drawCircleV(.{ .x = bar_x + bar_w * fraction, .y = bar_y }, 7.0 * ui_scale, fg);
+            rl.drawTextEx(ui_font, total_text, .{ .x = bar_end + 12.0 * ui_scale, .y = text_y }, font_size, 0, dim);
+        }
+        return consumed;
     }
 
     pub fn render(

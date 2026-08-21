@@ -726,6 +726,15 @@ the slide stops all videos, and re-entering starts them from the beginning.
 `loop` restarts the video when it ends; without it, the last frame stays on
 screen. PDF export and Studio always show the poster frame.
 
+Moving the mouse into a video also reveals on-demand player controls:
+play/pause and stop buttons plus a seek bar with the current position. The
+controls fade out when the cursor leaves or rests, so they never disturb a
+prepared presentation. Playback pauses while you scrub and resumes at the
+released position. Only clicks on the control bar are consumed — clicking
+the video picture itself still advances the presentation as usual.
+
+![A playing video with hover controls: pause and stop buttons, elapsed time, seek bar, and total duration](images/video-controls.jpg)
+
 ## Reusable groups
 
 `@push`/`@pop` represents one reusable item. A reusable composition of several
