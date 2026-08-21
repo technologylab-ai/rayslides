@@ -273,6 +273,10 @@ pub const VideoPlayer = struct {
     // Set from the initiating item's element each time playback starts;
     // players are shared per file, so this is not authoring state.
     loop: bool = false,
+    /// Presenter-adjusted audio level; survives stop/replay and seeks
+    /// because pipelines re-apply it whenever a stream is created.
+    volume: f32 = 1.0,
+    muted: bool = false,
 
     texture: rl.Texture2D,
     /// First frame, kept so stop() can rewind the on-screen texture without
@@ -294,28 +298,54 @@ pub const VideoPlayer = struct {
 
     const Self = @This();
 
-    pub fn create(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8) !*Self {
+    fn decodePosterFrame(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, at: f64, frame_size: usize) ![]u8 {
+        var seek_buf: [32]u8 = undefined;
+        const seek_arg = std.fmt.bufPrint(&seek_buf, "{d:.3}", .{at}) catch "0";
+        var argv_buf: [16][]const u8 = undefined;
+        var argv_len: usize = 0;
+        for ([_][]const u8{ ffmpeg_exe.?, "-v", "error", "-noautorotate" }) |arg| {
+            argv_buf[argv_len] = arg;
+            argv_len += 1;
+        }
+        if (at > 0.001) {
+            argv_buf[argv_len] = "-ss";
+            argv_buf[argv_len + 1] = seek_arg;
+            argv_len += 2;
+        }
+        for ([_][]const u8{ "-i", realpath, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-" }) |arg| {
+            argv_buf[argv_len] = arg;
+            argv_len += 1;
+        }
+        const result = try std.process.run(gpa, io, .{
+            .argv = argv_buf[0..argv_len],
+            .stdout_limit = .limited(frame_size),
+            .stderr_limit = .limited(4096),
+        });
+        gpa.free(result.stderr);
+        errdefer gpa.free(result.stdout);
+        if (result.stdout.len != frame_size) return error.VideoPosterFailed;
+        return result.stdout;
+    }
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, poster_time: f64) !*Self {
         try requireTools(io, gpa);
         const meta = try probe(io, gpa, realpath);
         const frame_size: usize = @as(usize, @intCast(meta.width)) * @as(usize, @intCast(meta.height)) * 3;
 
-        const poster_result = try std.process.run(gpa, io, .{
-            .argv = &.{
-                ffmpeg_exe.?, "-v",         "error",
-                "-noautorotate", "-i",      realpath,
-                "-frames:v",  "1",          "-f",
-                "rawvideo",   "-pix_fmt",   "rgb24",
-                "-",
-            },
-            .stdout_limit = .limited(frame_size),
-            .stderr_limit = .limited(4096),
-        });
-        errdefer gpa.free(poster_result.stdout);
-        gpa.free(poster_result.stderr);
-        if (poster_result.stdout.len != frame_size) return error.VideoPosterFailed;
+        const poster_at = if (meta.duration > 0)
+            std.math.clamp(poster_time, 0, @max(0, meta.duration - 0.1))
+        else
+            @max(0, poster_time);
+        const poster = decodePosterFrame(gpa, io, realpath, poster_at, frame_size) catch |err| fallback: {
+            if (poster_at <= 0.001) return err;
+            // A poster= beyond what ffmpeg can reach must not lose the video.
+            log.warn("poster at {d:.2}s failed for {s} ({}); using the first frame", .{ poster_at, realpath, err });
+            break :fallback try decodePosterFrame(gpa, io, realpath, 0, frame_size);
+        };
+        errdefer gpa.free(poster);
 
         const image = rl.Image{
-            .data = poster_result.stdout.ptr,
+            .data = poster.ptr,
             .width = meta.width,
             .height = meta.height,
             .mipmaps = 1,
@@ -336,7 +366,7 @@ pub const VideoPlayer = struct {
             .has_audio = meta.has_audio,
             .duration = meta.duration,
             .texture = texture,
-            .poster = poster_result.stdout,
+            .poster = poster,
         };
         log.info("video {s}: {d}x{d} @ {d:.2} fps, audio: {}", .{
             realpath, meta.width, meta.height, meta.fps, meta.has_audio,
@@ -374,6 +404,24 @@ pub const VideoPlayer = struct {
             if (p.audio_stream) |stream| rl.pauseAudioStream(stream);
         }
         self.state = .paused;
+    }
+
+    fn applyVolume(self: *Self) void {
+        const p = self.pipeline orelse return;
+        const stream = p.audio_stream orelse return;
+        rl.setAudioStreamVolume(stream, if (self.muted) 0 else self.volume);
+    }
+
+    pub fn setVolume(self: *Self, volume: f32) void {
+        self.volume = std.math.clamp(volume, 0, 1);
+        // Adjusting the slider is an intent to hear something.
+        if (self.volume > 0) self.muted = false;
+        self.applyVolume();
+    }
+
+    pub fn toggleMute(self: *Self) void {
+        self.muted = !self.muted;
+        self.applyVolume();
     }
 
     pub fn togglePlayPause(self: *Self, now: f64) void {
@@ -542,6 +590,7 @@ pub const VideoPlayer = struct {
             p.audio_reader = p.audio_child.?.stdout.?.readerStreaming(self.io, p.audio_reader_buf);
             if (rl.loadAudioStream(audio_sample_rate, 16, audio_channels)) |stream| {
                 p.audio_stream = stream;
+                rl.setAudioStreamVolume(stream, if (self.muted) 0 else self.volume);
                 rl.playAudioStream(stream);
             } else |err| {
                 log.warn("no audio for {s}: could not open audio stream: {}", .{ self.path, err });
@@ -692,19 +741,23 @@ pub const VideoCache = struct {
         };
     }
 
-    pub fn getVideoPlayer(self: *Self, p: []const u8, refpath: ?[]const u8) !?*VideoPlayer {
+    pub fn getVideoPlayer(self: *Self, p: []const u8, refpath: ?[]const u8, poster_time: f64) !?*VideoPlayer {
         const io = self.io orelse return null;
         const realpath = try pathRelativeTo(p, refpath);
-        if (self.path2player.get(realpath)) |cached| return cached;
+        // The poster is baked into a player's texture, so the same file with
+        // different poster= stills becomes distinct cache entries.
+        var key_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "{s}|poster={d:.3}", .{ realpath, poster_time });
+        if (self.path2player.get(key)) |cached| return cached;
 
         // pathRelativeTo returns a shared static buffer; own the key now.
-        const owned_path = try self.allocator.dupe(u8, realpath);
-        errdefer self.allocator.free(owned_path);
-        const player: ?*VideoPlayer = VideoPlayer.create(self.allocator, io, owned_path) catch |err| blk: {
-            log.warn("could not load video {s}: {}", .{ owned_path, err });
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        const player: ?*VideoPlayer = VideoPlayer.create(self.allocator, io, realpath, poster_time) catch |err| blk: {
+            log.warn("could not load video {s}: {}", .{ realpath, err });
             break :blk null;
         };
-        try self.path2player.put(owned_path, player);
+        try self.path2player.put(owned_key, player);
         return player;
     }
 

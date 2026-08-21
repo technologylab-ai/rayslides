@@ -60,7 +60,7 @@ The `.sld` format uses directives prefixed with `@`:
 - `@box img=path x=N y=N scale=0.5` - image scaled to 50% of natural size
 - `@box img=path x=N y=N scale=0.5 ratio=0.5` - scaled with adjusted w/h ratio
 - `@box img=path x=N y=N w=N` - image with specified width, height auto-calculated
-- `@box vid=path x=N y=N w=N` - video (decoded by piping frames from the installed `ffmpeg`; audio plays too). Same auto-dimension rules as images, plus `autoplay` and `loop` flags. Keys: `m` play/pause, `Shift+M` stop
+- `@box vid=path x=N y=N w=N` - video (decoded by piping frames from the installed `ffmpeg`; audio plays too). Same auto-dimension rules as images, plus `autoplay`, `loop`, and `poster=SECONDS` (still frame shown before playback). Keys: `m` play/pause, `Shift+M` stop; hovering shows player controls (play/pause, stop, mute/volume, seek)
 - `@push name` / `@pop name` - save/restore element templates
 - `@pushslide name` / `@popslide name` - save/restore slide templates
 - `@let var=value` - variable substitution (`$var$` in text)

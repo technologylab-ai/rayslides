@@ -712,6 +712,9 @@ Videos are placed like images, with the `vid=` attribute instead of `img=`:
 
 # start playing when the slide is entered; restart when the video ends:
 @box vid=assets/demo.mp4 x=320 y=200 w=1280 autoplay loop
+
+# show the frame at 6.2 seconds as the still before playback:
+@box vid=assets/demo.mp4 x=320 y=200 w=1280 poster=6.2
 ```
 
 Decoding is delegated to [ffmpeg](https://ffmpeg.org), which must be installed
@@ -719,7 +722,9 @@ Decoding is delegated to [ffmpeg](https://ffmpeg.org), which must be installed
 `.mp4`, `.mov`, `.webm`, and `.mkv`. If the video has an audio track, it plays
 too.
 
-A video shows its first frame (poster) until it plays. Use <kbd>M</kbd> to
+A video shows its first frame until it plays; `poster=SECONDS` picks a
+prettier still from anywhere in the video instead (PDF export and Studio show
+the same frame, and playback still starts at the beginning). Use <kbd>M</kbd> to
 play/pause the videos on the current slide and <kbd>Shift</kbd>+<kbd>M</kbd>
 to stop and rewind them; `autoplay` starts playback on slide entry. Leaving
 the slide stops all videos, and re-entering starts them from the beginning.
@@ -727,13 +732,14 @@ the slide stops all videos, and re-entering starts them from the beginning.
 screen. PDF export and Studio always show the poster frame.
 
 Moving the mouse into a video also reveals on-demand player controls:
-play/pause and stop buttons plus a seek bar with the current position. The
+play/pause and stop buttons, a mute toggle with a volume slider (for videos
+with an audio track), and a seek bar with the current position. The
 controls fade out when the cursor leaves or rests, so they never disturb a
 prepared presentation. Playback pauses while you scrub and resumes at the
 released position. Only clicks on the control bar are consumed — clicking
 the video picture itself still advances the presentation as usual.
 
-![A playing video with hover controls: pause and stop buttons, elapsed time, seek bar, and total duration](images/video-controls.jpg)
+![A video with hover controls: play and stop buttons, mute toggle, volume slider, elapsed time, seek bar, and total duration](images/video-controls.jpg)
 
 ## Reusable groups
 

@@ -1283,6 +1283,15 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                 if (std.mem.eql(u8, attrname, "loop")) {
                     item_context.vid_loop = boolFromAttrValue(attr_it.next());
                 }
+                if (std.mem.eql(u8, attrname, "poster")) {
+                    if (attr_it.next()) |posterstr| {
+                        const poster_val = std.fmt.parseFloat(f32, posterstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse poster=");
+                            continue;
+                        };
+                        item_context.vid_poster = poster_val;
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "scale")) {
                     if (attr_it.next()) |scalestr| {
                         const scale_val = std.fmt.parseFloat(f32, scalestr) catch |err| {
@@ -1512,6 +1521,7 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     if (parsing_item_context.vid_path == null) parsing_item_context.vid_path = item_context.vid_path;
     if (parsing_item_context.vid_autoplay == null) parsing_item_context.vid_autoplay = item_context.vid_autoplay;
     if (parsing_item_context.vid_loop == null) parsing_item_context.vid_loop = item_context.vid_loop;
+    if (parsing_item_context.vid_poster == null) parsing_item_context.vid_poster = item_context.vid_poster;
     if (parsing_item_context.underline_width == null) parsing_item_context.underline_width = item_context.underline_width;
     if (parsing_item_context.line_height_factor == null) parsing_item_context.line_height_factor = item_context.line_height_factor;
     if (parsing_item_context.bullet_color == null) parsing_item_context.bullet_color = item_context.bullet_color;

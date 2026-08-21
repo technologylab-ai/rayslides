@@ -244,6 +244,7 @@ const RenderFingerprinter = struct {
         self.addOptionalString(item.vid_path);
         self.addBool(item.vid_autoplay);
         self.addBool(item.vid_loop);
+        self.addOptionalF32(item.vid_poster);
         self.addVector(item.position);
         self.addVector(item.size);
         self.addOptionalI32(item.underline_width);
@@ -390,6 +391,7 @@ const VideoOverlayUi = struct {
     last_mouse: rl.Vector2 = .{ .x = -1, .y = -1 },
     last_mouse_move_time: f64 = 0,
     dragging: bool = false,
+    volume_dragging: bool = false,
     drag_identity: usize = 0,
     drag_target: f64 = 0,
     drag_was_playing: bool = false,
@@ -1463,7 +1465,8 @@ pub const SlideshowRenderer = struct {
 
     fn createVid(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
         if (item.vid_path) |p| {
-            const result = self.video_cache.getVideoPlayer(p, slideshow_filp) catch |err| {
+            const poster_time: f64 = if (item.vid_poster) |poster| @max(0, poster) else 0;
+            const result = self.video_cache.getVideoPlayer(p, slideshow_filp, poster_time) catch |err| {
                 log.warn("Could not load video {s}: {}", .{ p, err });
                 return; // Skip element
             };
@@ -1576,7 +1579,7 @@ pub const SlideshowRenderer = struct {
     /// presentation; the overlay itself acts on it one frame later.
     pub fn videoOverlayShieldsClick(self: *const SlideshowRenderer, mouse: rl.Vector2) bool {
         const st = &self.video_overlay;
-        if (st.dragging) return true;
+        if (st.dragging or st.volume_dragging) return true;
         if (st.alpha <= 0.02) return false;
         return rl.checkCollisionPointRec(mouse, st.last_pill);
     }
@@ -1639,16 +1642,32 @@ pub const SlideshowRenderer = struct {
             if (rl.checkCollisionPointRec(input.mouse, rect)) hovered = element;
         }
 
-        // A running seek drag pins the pill to its video even when the
-        // cursor strays; the pill also stays addressable while fading out.
+        // Debug/docs helper: RAYSLIDES_PILL_SHOT keeps the controls of the
+        // first video visible so headless runs can screenshot them (main.zig
+        // exports the frame; see the env var there).
+        if (std.c.getenv("RAYSLIDES_PILL_SHOT") != null) {
+            if (hovered == null) {
+                for (elements) |*element| {
+                    if (element.kind == .video and element.video != null) hovered = element;
+                }
+            }
+            st.last_mouse_move_time = now;
+        }
+
+        // A running drag pins the pill to its video even when the cursor
+        // strays; the pill also stays addressable while fading out.
         var active: ?*const RenderElement = null;
-        const wanted_identity: ?usize = if (st.dragging) st.drag_identity else if (hovered) |h| h.owner_identity else st.active_identity;
+        const any_drag = st.dragging or st.volume_dragging;
+        const wanted_identity: ?usize = if (any_drag) st.drag_identity else if (hovered) |h| h.owner_identity else st.active_identity;
         if (wanted_identity) |identity| {
             for (elements) |*element| {
                 if (element.kind == .video and element.video != null and element.owner_identity == identity) active = element;
             }
         }
-        if (st.dragging and active == null) st.dragging = false;
+        if (any_drag and active == null) {
+            st.dragging = false;
+            st.volume_dragging = false;
+        }
         st.active_identity = if (active) |element| element.owner_identity else null;
 
         // Fade in on hover, back out on leave or after the cursor sits
@@ -1657,11 +1676,11 @@ pub const SlideshowRenderer = struct {
         // alive (see VideoOverlayUi.last_pill).
         const cursor_alive = (now - st.last_mouse_move_time) < 1.5 or
             rl.checkCollisionPointRec(input.mouse, st.last_pill);
-        const want_visible = st.dragging or (hovered != null and cursor_alive);
+        const want_visible = st.dragging or st.volume_dragging or (hovered != null and cursor_alive);
         const fade_step = 8.0 * rl.getFrameTime();
         st.alpha = if (want_visible) @min(1.0, st.alpha + fade_step) else @max(0.0, st.alpha - fade_step);
         if (st.alpha <= 0.02) {
-            if (!st.dragging) st.active_identity = null;
+            if (!st.dragging and !st.volume_dragging) st.active_identity = null;
             return false;
         }
         const element = active orelse return false;
@@ -1680,11 +1699,25 @@ pub const SlideshowRenderer = struct {
             .width = pill_w,
             .height = pill_h,
         };
-        st.last_pill = pill;
+        // Near-misses around the pill must do nothing, not advance the
+        // presentation: hit-testing (and the click shield via last_pill)
+        // uses this padded halo, in which stray clicks are consumed silently.
+        const halo = 12.0 * ui_scale;
+        const pill_hit = rl.Rectangle{
+            .x = pill.x - halo,
+            .y = pill.y - halo,
+            .width = pill.width + 2.0 * halo,
+            .height = pill.height + 2.0 * halo,
+        };
+        st.last_pill = pill_hit;
         const btn = 26.0 * ui_scale;
         const btn_y = pill.y + (pill.height - btn) / 2.0;
+        const btn_pad = 4.0 * ui_scale;
         const play_rect = rl.Rectangle{ .x = pill.x + 12.0 * ui_scale, .y = btn_y, .width = btn, .height = btn };
         const stop_rect = rl.Rectangle{ .x = play_rect.x + btn + 10.0 * ui_scale, .y = btn_y, .width = btn, .height = btn };
+        // Buttons accept the pill's full height plus a little sideways slack.
+        const play_hit = rl.Rectangle{ .x = play_rect.x - btn_pad, .y = pill_hit.y, .width = btn + 2.0 * btn_pad, .height = pill_hit.height };
+        const stop_hit = rl.Rectangle{ .x = stop_rect.x - btn_pad, .y = pill_hit.y, .width = btn + 2.0 * btn_pad, .height = pill_hit.height };
         const font_size = 15.0 * ui_scale;
         const text_y = pill.y + (pill.height - font_size) / 2.0;
 
@@ -1696,14 +1729,24 @@ pub const SlideshowRenderer = struct {
         const elapsed_w = rl.measureTextEx(ui_font, elapsed_text, font_size, 0).x;
         const total_w = rl.measureTextEx(ui_font, total_text, font_size, 0).x;
 
+        // Audio controls sit with the other buttons so the seek bar keeps
+        // one contiguous stretch of pill.
+        const has_volume_ui = player.has_audio;
+        const spk_rect = rl.Rectangle{ .x = stop_rect.x + btn + 12.0 * ui_scale, .y = btn_y, .width = btn, .height = btn };
+        const spk_hit = rl.Rectangle{ .x = spk_rect.x - btn_pad, .y = pill_hit.y, .width = btn + 2.0 * btn_pad, .height = pill_hit.height };
+        const vol_w = 52.0 * ui_scale;
+        const vol_x = spk_rect.x + btn + 6.0 * ui_scale;
+        const vol_hit = rl.Rectangle{ .x = vol_x - 6.0, .y = pill_hit.y, .width = vol_w + 12.0, .height = pill_hit.height };
+        const controls_end = if (has_volume_ui) vol_x + vol_w else stop_rect.x + btn;
+
         const has_seek_bar = player.duration > 0;
-        const elapsed_x = stop_rect.x + btn + 14.0 * ui_scale;
+        const elapsed_x = controls_end + 14.0 * ui_scale;
         const bar_x = elapsed_x + elapsed_w + 12.0 * ui_scale;
         const bar_end = pill.x + pill.width - 14.0 * ui_scale - (if (has_seek_bar) total_w + 12.0 * ui_scale else 0.0);
         const bar_w = bar_end - bar_x;
         const bar_y = pill.y + pill.height / 2.0;
         // Generous vertical grab area for the thin track.
-        const bar_hit = rl.Rectangle{ .x = bar_x - 6.0, .y = pill.y, .width = bar_w + 12.0, .height = pill.height };
+        const bar_hit = rl.Rectangle{ .x = bar_x - 6.0, .y = pill_hit.y, .width = bar_w + 12.0, .height = pill_hit.height };
         const seek_usable = has_seek_bar and bar_w > 30.0 * ui_scale;
 
         // ------ input ------
@@ -1719,17 +1762,27 @@ pub const SlideshowRenderer = struct {
                 player.seekTo(st.drag_target, now);
                 if (st.drag_was_playing) player.play(now);
             }
-        } else if (hovered != null and input.pressed and rl.checkCollisionPointRec(input.mouse, pill)) {
+        } else if (st.volume_dragging) {
             consumed = true;
-            if (rl.checkCollisionPointRec(input.mouse, play_rect)) {
+            player.setVolume(@floatCast(std.math.clamp((input.mouse.x - vol_x) / vol_w, 0.0, 1.0)));
+            if (input.released or !input.down) st.volume_dragging = false;
+        } else if (hovered != null and input.pressed and rl.checkCollisionPointRec(input.mouse, pill_hit)) {
+            consumed = true;
+            if (rl.checkCollisionPointRec(input.mouse, play_hit)) {
                 if (player.state == .playing) {
                     player.pause(now);
                 } else {
                     player.loop = element.video_loop;
                     player.play(now);
                 }
-            } else if (rl.checkCollisionPointRec(input.mouse, stop_rect)) {
+            } else if (rl.checkCollisionPointRec(input.mouse, stop_hit)) {
                 player.stop();
+            } else if (has_volume_ui and rl.checkCollisionPointRec(input.mouse, spk_hit)) {
+                player.toggleMute();
+            } else if (has_volume_ui and rl.checkCollisionPointRec(input.mouse, vol_hit)) {
+                st.volume_dragging = true;
+                st.drag_identity = element.owner_identity;
+                player.setVolume(@floatCast(std.math.clamp((input.mouse.x - vol_x) / vol_w, 0.0, 1.0)));
             } else if (seek_usable and rl.checkCollisionPointRec(input.mouse, bar_hit)) {
                 st.dragging = true;
                 st.drag_identity = element.owner_identity;
@@ -1756,6 +1809,39 @@ pub const SlideshowRenderer = struct {
             );
         }
         rl.drawRectangleRec(.{ .x = stop_rect.x + btn * 0.15, .y = stop_rect.y + btn * 0.15, .width = btn * 0.70, .height = btn * 0.70 }, fg);
+        if (has_volume_ui) {
+            const spk_color = if (player.muted) dim else fg;
+            // Speaker: box plus right-widening cone, matching the play
+            // triangle's vertex winding.
+            rl.drawRectangleRec(.{ .x = spk_rect.x + btn * 0.06, .y = spk_rect.y + btn * 0.36, .width = btn * 0.18, .height = btn * 0.28 }, spk_color);
+            rl.drawTriangle(
+                .{ .x = spk_rect.x + btn * 0.52, .y = spk_rect.y + btn * 0.14 },
+                .{ .x = spk_rect.x + btn * 0.22, .y = spk_rect.y + btn * 0.50 },
+                .{ .x = spk_rect.x + btn * 0.52, .y = spk_rect.y + btn * 0.86 },
+                spk_color,
+            );
+            if (player.muted) {
+                rl.drawLineEx(
+                    .{ .x = spk_rect.x + btn * 0.62, .y = spk_rect.y + btn * 0.30 },
+                    .{ .x = spk_rect.x + btn * 0.95, .y = spk_rect.y + btn * 0.70 },
+                    @max(1.5, 2.0 * ui_scale),
+                    fg,
+                );
+                rl.drawLineEx(
+                    .{ .x = spk_rect.x + btn * 0.95, .y = spk_rect.y + btn * 0.30 },
+                    .{ .x = spk_rect.x + btn * 0.62, .y = spk_rect.y + btn * 0.70 },
+                    @max(1.5, 2.0 * ui_scale),
+                    fg,
+                );
+            } else {
+                rl.drawRing(.{ .x = spk_rect.x + btn * 0.58, .y = spk_rect.y + btn * 0.50 }, btn * 0.24, btn * 0.30, -60, 60, 12, spk_color);
+            }
+            const vol_track_h = 4.0 * ui_scale;
+            const vol_fill = if (player.muted) 0.0 else player.volume;
+            rl.drawRectangleRounded(.{ .x = vol_x, .y = bar_y - vol_track_h / 2.0, .width = vol_w, .height = vol_track_h }, 1.0, 4, dim);
+            rl.drawRectangleRounded(.{ .x = vol_x, .y = bar_y - vol_track_h / 2.0, .width = vol_w * vol_fill, .height = vol_track_h }, 1.0, 4, fg);
+            rl.drawCircleV(.{ .x = vol_x + vol_w * vol_fill, .y = bar_y }, 5.0 * ui_scale, fg);
+        }
         rl.drawTextEx(ui_font, elapsed_text, .{ .x = elapsed_x, .y = text_y }, font_size, 0, fg);
         if (seek_usable) {
             const fraction: f32 = @floatCast(std.math.clamp(shown_position / player.duration, 0.0, 1.0));

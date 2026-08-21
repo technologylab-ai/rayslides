@@ -2239,6 +2239,23 @@ pub fn main(init: std.process.Init) anyerror!void {
     var window_close_seen = false;
     var studio_was_capturing_input = false;
 
+    // Dev/docs helper: RAYSLIDES_PILL_SHOT=SECONDS[:PATH] keeps the video
+    // controls visible (see processVideoOverlay) and exports the frame shown
+    // at SECONDS to PATH (default /tmp/video_pill_shot.png), for headless
+    // screenshots of the player pill.
+    var pill_shot_at: ?f64 = null;
+    var pill_shot_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var pill_shot_path: [:0]const u8 = "/tmp/video_pill_shot.png";
+    if (std.c.getenv("RAYSLIDES_PILL_SHOT")) |raw_spec| {
+        const spec = std.mem.span(raw_spec);
+        var spec_it = std.mem.splitScalar(u8, spec, ':');
+        pill_shot_at = std.fmt.parseFloat(f64, spec_it.next() orelse "") catch null;
+        if (spec_it.rest().len > 0) {
+            pill_shot_path = std.fmt.bufPrintZ(&pill_shot_path_buffer, "{s}", .{spec_it.rest()}) catch pill_shot_path;
+        }
+        if (pill_shot_at == null) log.err("RAYSLIDES_PILL_SHOT wants SECONDS[:PATH], got {s}", .{spec});
+    }
+
     while (true) {
         frame_diagnostics.observeFrame(rl.getTime());
         // Window managers may tile a just-launched diagnostic process while
@@ -2299,6 +2316,21 @@ pub fn main(init: std.process.Init) anyerror!void {
             // window size changed
             std.log.debug("win size changed from {} to {}", .{ G.last_window_size, G.content_window_size });
             G.last_window_size = G.content_window_size;
+        }
+
+        // The pill screenshot reads the last completed frame here, before any
+        // drawing, for the same reason ExportController.snapshot does.
+        if (pill_shot_at) |shot_at| {
+            if (rl.getTime() > shot_at) {
+                pill_shot_at = null;
+                var img = try rl.loadImageFromScreen();
+                defer rl.unloadImage(img);
+                if (img.exportToFile(pill_shot_path)) {
+                    log.info("pill screenshot saved to {s}", .{pill_shot_path});
+                } else {
+                    log.err("could not export pill screenshot to {s}", .{pill_shot_path});
+                }
+            }
         }
 
         if (export_controller.running) {

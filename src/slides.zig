@@ -278,6 +278,8 @@ pub const SlideItem = struct {
     vid_path: ?[]const u8 = null,
     vid_autoplay: bool = false,
     vid_loop: bool = false,
+    /// Timestamp (seconds) of the still shown before playback; 0 = frame 0.
+    vid_poster: ?f32 = null,
     position: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
 
@@ -350,6 +352,7 @@ pub const SlideItem = struct {
         if (context.vid_path) |vid_path| self.vid_path = vid_path;
         if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
+        if (context.vid_poster) |vid_poster| self.vid_poster = vid_poster;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
         if (context.color) |color| self.color = color;
         if (context.has_background_color) self.background_color = context.background_color;
@@ -377,6 +380,7 @@ pub const SlideItem = struct {
         if (context.vid_path) |vid_path| self.vid_path = vid_path;
         if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
+        if (context.vid_poster) |vid_poster| self.vid_poster = vid_poster;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
         if (context.color) |color| self.color = color;
         if (context.has_background_color) self.background_color = context.background_color;
@@ -529,6 +533,7 @@ pub const ItemContext = struct {
     vid_path: ?[]const u8 = null,
     vid_autoplay: ?bool = null,
     vid_loop: ?bool = null,
+    vid_poster: ?f32 = null,
     position: ?rl.Vector2 = null,
     size: ?rl.Vector2 = null,
     has_x: bool = false,
@@ -577,6 +582,9 @@ pub const ItemContext = struct {
         }
         if (self.vid_loop == null) {
             if (other.vid_loop) |vid_loop| self.vid_loop = vid_loop;
+        }
+        if (self.vid_poster == null) {
+            if (other.vid_poster) |vid_poster| self.vid_poster = vid_poster;
         }
         if (self.fontSize == null) {
             if (other.fontSize) |fontsize| self.fontSize = fontsize;
