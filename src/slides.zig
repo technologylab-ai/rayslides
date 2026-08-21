@@ -126,6 +126,7 @@ pub const SlideItemKind = enum {
     background,
     textbox,
     img,
+    vid,
     crowd,
 };
 
@@ -133,6 +134,7 @@ pub const SlideItemError = error{
     TextNull,
     LineHeightNull,
     ImgPathNull,
+    VidPathNull,
     FontSizeNull,
     ColorNull,
     UnderlineWidthNull,
@@ -273,6 +275,9 @@ pub const SlideItem = struct {
     /// `@bg` slide-background item and does not affect item ordering.
     background_color: ?rl.Color = null,
     img_path: ?[]const u8 = null,
+    vid_path: ?[]const u8 = null,
+    vid_autoplay: bool = false,
+    vid_loop: bool = false,
     position: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
 
@@ -342,6 +347,9 @@ pub const SlideItem = struct {
         if (context.text) |text| self.text = text;
 
         if (context.img_path) |img_path| self.img_path = img_path;
+        if (context.vid_path) |vid_path| self.vid_path = vid_path;
+        if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
+        if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
         if (context.color) |color| self.color = color;
         if (context.has_background_color) self.background_color = context.background_color;
@@ -366,6 +374,9 @@ pub const SlideItem = struct {
         if (context.text) |text| self.text = text;
         if (context.crowd) |crowd| self.crowd = crowd;
         if (context.img_path) |img_path| self.img_path = img_path;
+        if (context.vid_path) |vid_path| self.vid_path = vid_path;
+        if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
+        if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
         if (context.color) |color| self.color = color;
         if (context.has_background_color) self.background_color = context.background_color;
@@ -423,6 +434,7 @@ pub const SlideItem = struct {
         if (self.bullet_symbol == null and self.kind == .textbox) return SlideItemError.BulletSymbolNull;
 
         if (self.img_path == null and (self.kind == .img)) return SlideItemError.ImgPathNull;
+        if (self.vid_path == null and (self.kind == .vid)) return SlideItemError.VidPathNull;
         if (self.kind == .background) {
             if (self.img_path == null and self.color == null) {
                 return SlideItemError.ColorNull;
@@ -467,6 +479,12 @@ pub const SlideItem = struct {
                 log.info(indent ++ "   pos: {any}", .{self.position});
                 log.info(indent ++ "  size: {any}", .{self.size});
             },
+            .vid => {
+                log.info(indent ++ "Kind: Video", .{});
+                log.info(indent ++ "   vid: {any}", .{self.vid_path});
+                log.info(indent ++ "   pos: {any}", .{self.position});
+                log.info(indent ++ "  size: {any}", .{self.size});
+            },
             .textbox => {
                 log.info(indent ++ "Kind: TextBox", .{});
                 log.info(indent ++ "   pos: {any}", .{self.position});
@@ -508,6 +526,9 @@ pub const ItemContext = struct {
     background_color: ?rl.Color = null,
     has_background_color: bool = false,
     img_path: ?[]const u8 = null,
+    vid_path: ?[]const u8 = null,
+    vid_autoplay: ?bool = null,
+    vid_loop: ?bool = null,
     position: ?rl.Vector2 = null,
     size: ?rl.Vector2 = null,
     has_x: bool = false,
@@ -547,6 +568,15 @@ pub const ItemContext = struct {
 
         if (self.img_path == null) {
             if (other.img_path) |img_path| self.img_path = img_path;
+        }
+        if (self.vid_path == null) {
+            if (other.vid_path) |vid_path| self.vid_path = vid_path;
+        }
+        if (self.vid_autoplay == null) {
+            if (other.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
+        }
+        if (self.vid_loop == null) {
+            if (other.vid_loop) |vid_loop| self.vid_loop = vid_loop;
         }
         if (self.fontSize == null) {
             if (other.fontSize) |fontsize| self.fontSize = fontsize;

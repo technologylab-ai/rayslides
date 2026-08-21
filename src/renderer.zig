@@ -7,6 +7,7 @@ const crowdplay = @import("crowdplay.zig");
 const markdownlineparser = @import("markdownlineparser.zig");
 const my_fonts = @import("fonts.zig");
 const qrcode = @import("qrcode.zig");
+const videoplayer = @import("videoplayer.zig");
 
 const rl = @import("raylib");
 
@@ -29,6 +30,7 @@ const RenderElementKind = enum {
     background,
     text,
     image,
+    video,
     crowd,
 };
 
@@ -45,6 +47,11 @@ const RenderElement = struct {
     line_height_factor: ?f32 = null,
     bullet_color: ?rl.Color = null,
     texture: ?rl.Texture2D = null,
+    video: ?*videoplayer.VideoPlayer = null,
+    // Players are shared per video file, so per-item playback intent stays on
+    // the element and is applied to the player when playback starts.
+    video_autoplay: bool = false,
+    video_loop: bool = false,
     bullet_symbol: [*:0]const u8 = "",
     reveal_step: usize = 0,
     text_shadow: ?slides.TextShadow = null,
@@ -234,6 +241,9 @@ const RenderFingerprinter = struct {
         self.addOptionalColor(item.color);
         self.addOptionalColor(item.background_color);
         self.addOptionalString(item.img_path);
+        self.addOptionalString(item.vid_path);
+        self.addBool(item.vid_autoplay);
+        self.addBool(item.vid_loop);
         self.addVector(item.position);
         self.addVector(item.size);
         self.addOptionalI32(item.underline_width);
@@ -379,6 +389,7 @@ pub const SlideshowRenderer = struct {
     allocator: std.mem.Allocator = undefined,
     md_parser: markdownlineparser.MdLineParser = .{},
     texture_cache: TextureCache,
+    video_cache: videoplayer.VideoCache,
     fonts: *my_fonts.AvailableFonts,
     qr_code: qrcode.Code = .{},
     item_geometry_previews: [max_item_geometry_previews]ItemGeometryPreview = undefined,
@@ -388,6 +399,7 @@ pub const SlideshowRenderer = struct {
         var self: *SlideshowRenderer = try allocator.create(SlideshowRenderer);
         self.* = .{
             .texture_cache = .init(allocator),
+            .video_cache = .init(allocator),
             .fonts = fonts,
         };
         self.*.allocator = allocator;
@@ -401,6 +413,7 @@ pub const SlideshowRenderer = struct {
         self.deinitRenderedSlides(&self.renderedSlides);
         self.md_parser.deinit();
         self.texture_cache.deinit();
+        self.video_cache.deinit();
         self.allocator.destroy(self);
     }
 
@@ -800,6 +813,7 @@ pub const SlideshowRenderer = struct {
             .background => try self.createBg(renderSlide, rendered_item, slideshow_filp),
             .textbox => try self.preRenderTextBlock(renderSlide, rendered_item, slide_number),
             .img => try self.createImg(renderSlide, rendered_item, slideshow_filp),
+            .vid => try self.createVid(renderSlide, rendered_item, slideshow_filp),
             .crowd => try self.createCrowd(renderSlide, rendered_item),
         }
         if (has_item_background and renderSlide.elements.items.len > first_element + 1) {
@@ -1423,6 +1437,114 @@ pub const SlideshowRenderer = struct {
         }
     }
 
+    fn createVid(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
+        if (item.vid_path) |p| {
+            const result = self.video_cache.getVideoPlayer(p, slideshow_filp) catch |err| {
+                log.warn("Could not load video {s}: {}", .{ p, err });
+                return; // Skip element
+            };
+
+            if (result) |player| {
+                const reveal_step = try self.wholeItemStep(renderSlide, item);
+                var final_size = item.size;
+
+                // Calculate dimensions if needed
+                const natural_w: f32 = @floatFromInt(player.width);
+                const natural_h: f32 = @floatFromInt(player.height);
+                const aspect_ratio = natural_w / natural_h;
+
+                const has_w = item.size.x > 0;
+                const has_h = item.size.y > 0;
+
+                if (!has_w and !has_h) {
+                    // Neither specified: use natural dimensions with scale and ratio
+                    var w = natural_w;
+                    var h = natural_h;
+
+                    if (item.scale) |scale| {
+                        w *= scale;
+                        h *= scale;
+                    }
+
+                    if (item.ratio) |ratio| {
+                        h = w / ratio;
+                    }
+
+                    final_size = .{ .x = w, .y = h };
+                } else if (has_w and !has_h) {
+                    final_size.y = final_size.x / aspect_ratio;
+                } else if (!has_w and has_h) {
+                    final_size.x = final_size.y * aspect_ratio;
+                }
+                // else: both specified, use as-is
+
+                try renderSlide.elements.append(self.allocator, RenderElement{
+                    .kind = .video,
+                    .position = item.position,
+                    .size = final_size,
+                    .video = player,
+                    .video_autoplay = item.vid_autoplay,
+                    .video_loop = item.vid_loop,
+                    .reveal_step = reveal_step,
+                });
+            }
+        }
+    }
+
+    /// Drive all decoding pipelines; players that aren't playing are no-ops.
+    pub fn tickVideos(self: *SlideshowRenderer, now: f64) void {
+        self.video_cache.tickAll(now);
+    }
+
+    pub fn stopAllVideos(self: *SlideshowRenderer) void {
+        self.video_cache.stopAll();
+    }
+
+    fn videoPlayersOnSlide(self: *SlideshowRenderer, slide_number: i32) []RenderElement {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return &.{};
+        return self.renderedSlides.items[@intCast(slide_number)].elements.items;
+    }
+
+    pub fn autoplayVideosOnSlide(self: *SlideshowRenderer, slide_number: i32, now: f64) void {
+        for (self.videoPlayersOnSlide(slide_number)) |element| {
+            if (element.kind != .video) continue;
+            const player = element.video orelse continue;
+            if (element.video_autoplay) {
+                player.loop = element.video_loop;
+                player.play(now);
+            }
+        }
+    }
+
+    /// One shared control for every video on the slide: if any is playing,
+    /// pause them all, otherwise start/resume them all.
+    pub fn toggleVideosOnSlide(self: *SlideshowRenderer, slide_number: i32, now: f64) void {
+        var any_playing = false;
+        for (self.videoPlayersOnSlide(slide_number)) |element| {
+            if (element.kind != .video) continue;
+            const player = element.video orelse continue;
+            if (player.state == .playing) any_playing = true;
+        }
+        for (self.videoPlayersOnSlide(slide_number)) |element| {
+            if (element.kind != .video) continue;
+            const player = element.video orelse continue;
+            if (any_playing) {
+                player.pause(now);
+            } else {
+                player.loop = element.video_loop;
+                player.play(now);
+            }
+        }
+    }
+
+    pub fn stopVideosOnSlide(self: *SlideshowRenderer, slide_number: i32) void {
+        for (self.videoPlayersOnSlide(slide_number)) |element| {
+            if (element.kind != .video) continue;
+            const player = element.video orelse continue;
+            player.stop();
+        }
+    }
+
     pub fn render(
         self: *SlideshowRenderer,
         slide_number: i32,
@@ -1874,6 +1996,11 @@ pub const SlideshowRenderer = struct {
             .image => {
                 if (displayed.texture) |texture| {
                     renderImg(displayed.position, displayed.size, texture, .white, .blank, pos, size, internal_render_size, transform);
+                }
+            },
+            .video => {
+                if (displayed.video) |player| {
+                    renderImg(displayed.position, displayed.size, player.texture, .white, .blank, pos, size, internal_render_size, transform);
                 }
             },
             .crowd => self.renderCrowd(displayed, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),

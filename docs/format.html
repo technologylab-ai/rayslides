@@ -113,6 +113,15 @@ shadow=<span class="code-value">#000000a0</span> shadow_x=3 shadow_y=5 text=<spa
 <span class="code-comment"># Scale the natural size, then adjust its ratio.</span>
 <span class="code-key">@box</span> img=assets/photo.png x=1100 y=180 scale=0.5 ratio=1.2</code></pre>
 
+          <h2>Add videos</h2>
+          <p>Videos are placed like images, with <code class="inline-code">vid=</code> instead of <code class="inline-code">img=</code>. Playback uses the installed <code class="inline-code">ffmpeg</code>, so every format ffmpeg reads plays — including its audio track.</p>
+          <pre><code><span class="code-comment"># Sized like an image; height follows the aspect ratio.</span>
+<span class="code-key">@box</span> vid=assets/demo.mp4 x=320 y=200 w=1280
+
+<span class="code-comment"># Start on slide entry and restart when the video ends.</span>
+<span class="code-key">@box</span> vid=assets/demo.mp4 x=320 y=200 w=1280 autoplay loop</code></pre>
+          <p>A video shows its first frame until it plays. <kbd>M</kbd> plays or pauses the videos on the current slide; <kbd>Shift</kbd> + <kbd>M</kbd> stops and rewinds them. Leaving the slide stops its videos. PDF export always captures the first frame.</p>
+
           <h2>Reuse one item</h2>
           <p><code class="inline-code">@push</code> saves an item definition. <code class="inline-code">@pop</code> places an instance later in the file.</p>
           <pre><code><span class="code-key">@push</span> slide_title x=120 y=80 w=1680 h=100 fontsize=52 color=<span class="code-value">#edf5fbff</span>

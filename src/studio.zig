@@ -930,6 +930,7 @@ fn objectDisplayName(item: slides.SlideItem, buffer: *[192]u8) []const u8 {
         else
             std.fmt.bufPrint(buffer, "Text · line {d}", .{item.source.line_number}) catch "Text",
         .img => if (item.img_path) |path| std.fs.path.basename(path) else "Image",
+        .vid => if (item.vid_path) |path| std.fs.path.basename(path) else "Video",
         .crowd => if (item.crowd) |crowd|
             if (crowd.id.len > 0)
                 std.fmt.bufPrint(buffer, "{s} · {s}", .{ @tagName(crowd.kind), crowd.id }) catch "Crowd"
@@ -10074,7 +10075,7 @@ pub const Studio = struct {
             if (item.fill) |fill| rl.drawRectangleRounded(rect, 0.05, 4, fill);
             switch (item.kind) {
                 .background => rl.drawRectangleRec(rect, item.color),
-                .img => {
+                .img, .vid => {
                     rl.drawRectangleRounded(rect, 0.05, 4, .{ .r = 44, .g = 57, .b = 77, .a = 255 });
                     rl.drawLineEx(
                         .{ .x = rect.x, .y = rect.y + rect.height },
@@ -11349,6 +11350,7 @@ pub const Studio = struct {
                 .background => "BG",
                 .textbox => "Text",
                 .img => "Image",
+                .vid => "Video",
                 .crowd => if (item.crowd) |crowd| switch (crowd.kind) {
                     .join => "Crowd join",
                     .poll => "Crowd poll",
@@ -12469,6 +12471,7 @@ fn objectMatchesSearch(item: slides.SlideItem, query: []const u8) bool {
     const type_name: []const u8 = switch (item.kind) {
         .textbox => "text textbox",
         .img => "image picture",
+        .vid => "video movie",
         .crowd => "crowd crowdplay",
         .background => "background barrier",
     };

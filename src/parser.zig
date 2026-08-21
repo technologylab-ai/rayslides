@@ -332,6 +332,7 @@ fn buildReusableGroupMember(
         builder.local_context = component;
         builder.local_context.text = null;
         builder.local_context.img_path = null;
+        builder.local_context.vid_path = null;
         builder.post_context = builder.local_context;
         item_context.applyOtherIfNull(component);
     }
@@ -347,7 +348,7 @@ fn buildReusableGroupMember(
     };
     item.applySlideDefaultsIfNecessary(context.current_slide);
     item.applySlideShowDefaultsIfNecessary(context.slideshow);
-    item.kind = if (item.img_path != null) .img else .textbox;
+    item.kind = if (item.img_path != null) .img else if (item.vid_path != null) .vid else .textbox;
     item.sanityCheck() catch |err| {
         reportErrorInParsingContext(err, item_context, context, "reusable-group member sanity check failed");
         builder.valid = false;
@@ -1271,6 +1272,17 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.img_path = imgpath;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "vid")) {
+                    if (attr_it.next()) |vidpath| {
+                        item_context.vid_path = vidpath;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "autoplay")) {
+                    item_context.vid_autoplay = boolFromAttrValue(attr_it.next());
+                }
+                if (std.mem.eql(u8, attrname, "loop")) {
+                    item_context.vid_loop = boolFromAttrValue(attr_it.next());
+                }
                 if (std.mem.eql(u8, attrname, "scale")) {
                     if (attr_it.next()) |scalestr| {
                         const scale_val = std.fmt.parseFloat(f32, scalestr) catch |err| {
@@ -1454,6 +1466,13 @@ fn isMorphStateLabel(label: []const u8) bool {
 // - slide defaults
 // - slideshow defaults
 //
+/// Flag attributes may be given bare (`autoplay`) or with a value
+/// (`autoplay=no`); bare means enabled.
+fn boolFromAttrValue(value: ?[]const u8) bool {
+    const v = value orelse return true;
+    return !(std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no") or std.mem.eql(u8, v, "0"));
+}
+
 fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_context: *slides.ItemContext) void {
     if (parsing_item_context.id == null) parsing_item_context.id = item_context.id;
     if (parsing_item_context.text == null) parsing_item_context.text = item_context.text;
@@ -1475,8 +1494,8 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     }
     parsing_item_context.has_x = parsing_item_context.has_x or item_context.has_x;
     parsing_item_context.has_y = parsing_item_context.has_y or item_context.has_y;
-    // Don't inherit size for image boxes - let renderer use auto-dimensions
-    if (parsing_item_context.img_path == null) {
+    // Don't inherit size for image/video boxes - let renderer use auto-dimensions
+    if (parsing_item_context.img_path == null and parsing_item_context.vid_path == null) {
         if (parsing_item_context.size) |own_size| {
             if (item_context.size) |inherited_size| {
                 var merged = own_size;
@@ -1490,6 +1509,9 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
         parsing_item_context.has_w = parsing_item_context.has_w or item_context.has_w;
         parsing_item_context.has_h = parsing_item_context.has_h or item_context.has_h;
     }
+    if (parsing_item_context.vid_path == null) parsing_item_context.vid_path = item_context.vid_path;
+    if (parsing_item_context.vid_autoplay == null) parsing_item_context.vid_autoplay = item_context.vid_autoplay;
+    if (parsing_item_context.vid_loop == null) parsing_item_context.vid_loop = item_context.vid_loop;
     if (parsing_item_context.underline_width == null) parsing_item_context.underline_width = item_context.underline_width;
     if (parsing_item_context.line_height_factor == null) parsing_item_context.line_height_factor = item_context.line_height_factor;
     if (parsing_item_context.bullet_color == null) parsing_item_context.bullet_color = item_context.bullet_color;
@@ -1840,6 +1862,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                 context.current_context = ctx;
                 context.current_context.text = null;
                 context.current_context.img_path = null;
+                context.current_context.vid_path = null;
                 parsing_item_context.applyOtherIfNull(ctx);
                 component_source = .{
                     .scope = .direct,
@@ -1999,6 +2022,8 @@ fn commitItemToSlide(parsing_item_context: *slides.ItemContext, parser_context: 
     slide_item.applySlideShowDefaultsIfNecessary(parser_context.slideshow);
     if (slide_item.img_path != null) {
         slide_item.kind = .img;
+    } else if (slide_item.vid_path != null) {
+        slide_item.kind = .vid;
     } else {
         slide_item.kind = .textbox;
     }

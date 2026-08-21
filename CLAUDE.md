@@ -19,7 +19,7 @@ zig build run -- testslides/test_public.sld
 zig build test
 ```
 
-**Requirements:** Zig 0.16.x (minimum 0.16.0, specified in build.zig.zon)
+**Requirements:** Zig 0.16.x (minimum 0.16.0, specified in build.zig.zon). Video playback additionally needs `ffmpeg`/`ffprobe` installed at runtime.
 
 ## Architecture
 
@@ -38,6 +38,8 @@ zig build test
 - **fonts.zig** - Font loading and management, supports custom fonts via `@font`, `@font_bold`, etc. directives.
 
 - **texturecache.zig** - Caches loaded image textures to avoid redundant loading.
+
+- **videoplayer.zig** - Video playback by piping raw frames/PCM from external `ffmpeg` processes (no codec libraries linked). `VideoPlayer` streams into a texture and a raylib AudioStream; `VideoCache` mirrors texturecache, one shared player per video file.
 
 ### Rendering Pipeline
 
@@ -58,6 +60,7 @@ The `.sld` format uses directives prefixed with `@`:
 - `@box img=path x=N y=N scale=0.5` - image scaled to 50% of natural size
 - `@box img=path x=N y=N scale=0.5 ratio=0.5` - scaled with adjusted w/h ratio
 - `@box img=path x=N y=N w=N` - image with specified width, height auto-calculated
+- `@box vid=path x=N y=N w=N` - video (decoded by piping frames from the installed `ffmpeg`; audio plays too). Same auto-dimension rules as images, plus `autoplay` and `loop` flags. Keys: `m` play/pause, `Shift+M` stop
 - `@push name` / `@pop name` - save/restore element templates
 - `@pushslide name` / `@popslide name` - save/restore slide templates
 - `@let var=value` - variable substitution (`$var$` in text)

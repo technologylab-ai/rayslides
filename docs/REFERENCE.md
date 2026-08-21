@@ -91,6 +91,8 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>0</kbd> | Goto last slide |
 | <kbd>G</kbd> | Goto first slide |
 | <kbd>Shift</kbd> + <kbd>G</kbd> | Goto last slide |
+| <kbd>M</kbd> | Play or pause videos on the current slide |
+| <kbd>Shift</kbd> + <kbd>M</kbd> | Stop videos on the current slide (rewind to poster frame) |
 | <kbd>O</kbd> | Open or lock the active Crowdplay poll |
 | <kbd>V</kbd> | Reveal or hide Crowdplay results |
 | <kbd>R</kbd> | Reset votes in the active Crowdplay poll |
@@ -693,6 +695,36 @@ for a future WebSocket transport.
 Internal render buffer resolution is 1920x1080. So always use coordinates in this range.
 
 More documentation to follow.
+
+## Videos
+
+Videos are placed like images, with the `vid=` attribute instead of `img=`:
+
+```text
+# explicit size:
+@box vid=assets/demo.mp4 x=320 y=200 w=1280 h=720
+
+# only width; height follows the video's aspect ratio:
+@box vid=assets/demo.mp4 x=320 y=200 w=1280
+
+# natural size, with the same scale=/ratio= adjustments images support:
+@box vid=assets/demo.mp4 x=320 y=200 scale=0.5
+
+# start playing when the slide is entered; restart when the video ends:
+@box vid=assets/demo.mp4 x=320 y=200 w=1280 autoplay loop
+```
+
+Decoding is delegated to [ffmpeg](https://ffmpeg.org), which must be installed
+(`brew install ffmpeg` on macOS); any format ffmpeg can read plays, including
+`.mp4`, `.mov`, `.webm`, and `.mkv`. If the video has an audio track, it plays
+too.
+
+A video shows its first frame (poster) until it plays. Use <kbd>M</kbd> to
+play/pause the videos on the current slide and <kbd>Shift</kbd>+<kbd>M</kbd>
+to stop and rewind them; `autoplay` starts playback on slide entry. Leaving
+the slide stops all videos, and re-entering starts them from the beginning.
+`loop` restarts the video when it ends; without it, the last frame stays on
+screen. PDF export and Studio always show the poster frame.
 
 ## Reusable groups
 

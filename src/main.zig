@@ -23,6 +23,7 @@ const studio_library_preview = @import("studio_library_preview.zig");
 const studio_new_deck = @import("studio_new_deck.zig");
 const studio_prompt = @import("studio_prompt.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
+const videoplayer = @import("videoplayer.zig");
 const SlideShow = slides.SlideShow;
 const studio_ui_font_data = @embedFile("assets/Calibri Regular.ttf");
 const presenter_ui_font_data = @embedFile("assets/Calibri Light.ttf");
@@ -2148,6 +2149,11 @@ pub fn main(init: std.process.Init) anyerror!void {
     rl.setExitKey(.null);
     defer rl.closeWindow(); // Close window and OpenGL context
 
+    // Video sound arrives as raw PCM chunks streamed into an AudioStream.
+    rl.setAudioStreamBufferSizeDefault(videoplayer.audio_stream_buffer_frames);
+    rl.initAudioDevice();
+    defer rl.closeAudioDevice();
+
     // Initialize GPU-backed resources after the window and unload them before it closes.
     try G.init(gpa, io);
     defer G.deinit();
@@ -2346,6 +2352,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                 }
             } else if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                 if (export_controller.running == false) {
+                    // Stopped videos show their poster frame, which keeps the
+                    // exported pages deterministic.
+                    G.slide_renderer.stopAllVideos();
                     export_controller.start(G.current_slide, G.playback.visible_step, G.slideshow.slides.items.len);
                     G.current_slide = 0;
                 }
@@ -2463,6 +2472,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                         if (G.current_slide < 0 or G.current_slide >= G.slideshow.slides.items.len) G.current_slide = 0;
                         const now = rl.getTime();
                         G.playback.enterSlide(null, 0, 0, G.slide_renderer.transitionForSlide(G.current_slide), 1, now);
+                        if (!export_controller.running and !studio_mode.capturesInput()) {
+                            G.slide_renderer.autoplayVideosOnSlide(G.current_slide, now);
+                        }
                     }
                     log.info("PRE-RENDERED {s} {d}/{d} slides", .{
                         @tagName(result.mode),
@@ -2476,6 +2488,7 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         const now = rl.getTime();
         G.playback.settle(now);
+        G.slide_renderer.tickVideos(now);
         if (!export_controller.running and !studio_mode.capturesInput()) updateAutomaticReveal(now);
         const current_crowd_spec = crowdSpecForSlide(G.slideshow, G.current_slide);
         if (crowd_runtime.isRunning() and !export_controller.running) crowd_runtime.activate(current_crowd_spec);
@@ -3836,6 +3849,14 @@ pub fn main(init: std.process.Init) anyerror!void {
             remote_drawing.clear();
         }
 
+        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.m)) {
+            if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
+                G.slide_renderer.stopVideosOnSlide(G.current_slide);
+            } else {
+                G.slide_renderer.toggleVideosOnSlide(G.current_slide, rl.getTime());
+            }
+        }
+
         // An external file change must never silently replace an unsaved
         // Studio document. Polling resumes after the buffer is saved.
         const do_reload = if (editorSourceDirty() or studio_mode.capturesInput()) false else checkAutoReload() catch false;
@@ -3905,12 +3926,20 @@ fn moveToSlide(target: i32, direction: i8, initial_step: usize, now: f64) void {
         G.slide_renderer.transitionForSlide(old_slide);
     G.current_slide = target;
     G.playback.enterSlide(old_slide, old_step, initial_step, transition, direction, now);
+    // Navigation is disabled while a PDF export runs, so autoplay here cannot
+    // disturb the deterministic poster-frame captures.
+    G.slide_renderer.stopAllVideos();
+    G.slide_renderer.autoplayVideosOnSlide(target, now);
 }
 
 fn jumpToSlide(target: i32, now: f64) void {
     if (target < 0 or target >= G.slideshow.slides.items.len) return;
     G.current_slide = target;
     G.playback.enterSlide(null, 0, 0, .{}, 1, now);
+    // Navigation is disabled while a PDF export runs, so autoplay here cannot
+    // disturb the deterministic poster-frame captures.
+    G.slide_renderer.stopAllVideos();
+    G.slide_renderer.autoplayVideosOnSlide(target, now);
 }
 
 fn checkAutoReload() !bool {
@@ -4469,6 +4498,7 @@ const AppData = struct {
         // so unchanged rendered slides and cached textures can survive those
         // reparses and be replaced selectively.
         self.slide_renderer = try renderer.SlideshowRenderer.new(self.allocator, &self.fonts);
+        self.slide_renderer.video_cache.io = io;
         self.playback.reset(rl.getTime());
 
         self.editor_memory = try self.allocator.alloc(u8, 128 * 1024);
@@ -4591,6 +4621,7 @@ fn loadSlideshow(filp: []const u8) !void {
         try staged_fonts.loadCustomFonts(parsed.parser_context.?.fontConfig, staged_path);
     }
     const staged_renderer = try renderer.SlideshowRenderer.new(G.allocator, &staged_fonts);
+    staged_renderer.video_cache.io = G.io;
     var staged_renderer_owned = true;
     defer if (staged_renderer_owned) staged_renderer.deinit();
 
