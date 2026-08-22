@@ -499,6 +499,85 @@ pre {
   box-shadow: 0 22px 60px rgba(0, 0, 0, 0.3);
 }
 
+.zoomable-image {
+  cursor: zoom-in;
+}
+
+.zoomable-image:focus-visible {
+  outline: 3px solid var(--cyan);
+  outline-offset: 4px;
+}
+
+.image-lightbox-open {
+  overflow: hidden;
+}
+
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  display: none;
+  place-items: center;
+  box-sizing: border-box;
+  width: 100vw;
+  max-width: none;
+  height: 100vh;
+  max-height: none;
+  margin: 0;
+  padding: clamp(10px, 2vw, 28px);
+  overflow: hidden;
+  border: 0;
+  background: rgba(2, 7, 11, 0.94);
+}
+
+.image-lightbox[open] {
+  display: grid;
+}
+
+.image-lightbox::backdrop {
+  background: rgba(2, 7, 11, 0.88);
+  backdrop-filter: blur(8px);
+}
+
+.image-lightbox-image {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: calc(100vw - clamp(20px, 4vw, 56px));
+  max-height: calc(100vh - clamp(20px, 4vw, 56px));
+  object-fit: contain;
+  border: 1px solid rgba(97, 218, 251, 0.32);
+  border-radius: 8px;
+  box-shadow: 0 24px 90px rgba(0, 0, 0, 0.58);
+}
+
+.image-lightbox-close {
+  position: absolute;
+  z-index: 1;
+  top: max(12px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  padding: 0 0 4px;
+  color: var(--text);
+  border: 1px solid rgba(97, 218, 251, 0.45);
+  border-radius: 50%;
+  background: rgba(6, 16, 27, 0.9);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  font: inherit;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.image-lightbox-close:hover,
+.image-lightbox-close:focus-visible {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  outline: none;
+}
+
 .shot figcaption,
 .diagram figcaption {
   margin-top: 12px;
