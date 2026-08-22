@@ -79,7 +79,9 @@ This file tracks the documentation work that remains after the first site draft.
   - Show selected rotated image and video objects with their exact source-backed controls.
   - Show current command discovery, Showtime preflight, reusable preview, and shared Definition editing.
 - [x] Keep deterministic documentation capture separate from checked-in images.
-  - Run `python3 tools/docs_studio_capture.py --output /tmp/rayslides-doc-captures --workspace 12`.
+  - Capture slide-only evidence with `python3 tools/docs_presentation_capture.py --output /tmp/rayslides-slide-captures --workspace 12`.
+  - Capture Studio evidence with `python3 tools/docs_studio_capture.py --output /tmp/rayslides-studio-captures --workspace 12`.
+  - Use a native 2560×1440 framebuffer for both presentation and full Studio captures; never enlarge a lower-resolution capture.
   - Inspect temporary captures before promoting selected files into `docs/images`.
   - Keep every capture window floating on Aerospace workspace 12 and close it after capture.
 - [x] Re-run the complete desktop/mobile documentation review and release-confidence gate after promotion.

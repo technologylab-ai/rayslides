@@ -58,6 +58,8 @@ const cli_help =
     \\  --diagnostics-grid-settings      Open the Studio grid appearance popover
     \\  --diagnostics-presenter-pairing  Show the Presenter pairing overlay
     \\  --diagnostics-presenter-session  Pair, then enter presentation for browser QA
+    \\  --diagnostics-presentation-capture
+    \\                                    Capture a presentation-size framebuffer
     \\  --diagnostics-display-picker     Show the presentation display picker
     \\  --diagnostics-confirm-display=N  Confirm active display N (1-based) before QA
     \\  --diagnostics-showtime           Open the Showtime readiness overlay
@@ -3347,6 +3349,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_grid_settings = false;
     var diagnostics_presenter_pairing = false;
     var diagnostics_presenter_session = false;
+    var diagnostics_presentation_capture = false;
     var diagnostics_display_picker = false;
     var diagnostics_confirm_display: ?i32 = null;
     var diagnostics_showtime = false;
@@ -3437,6 +3440,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                 launch_studio = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-presenter-session")) {
                 diagnostics_presenter_session = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-presentation-capture")) {
+                diagnostics_enabled = true;
+                diagnostics_presentation_capture = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-display-picker")) {
                 diagnostics_display_picker = true;
                 launch_studio = true;
@@ -3568,6 +3574,15 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     if ((diagnostics_report_path != null or diagnostics_exit_after_capture) and diagnostics_capture_path == null)
         return error.DiagnosticCapturePathRequired;
+    if (diagnostics_presentation_capture) {
+        if (slideshow_to_load == null or diagnostics_window_size == null or diagnostics_capture_path == null or
+            !diagnostics_presenter_session)
+            return error.InvalidDiagnosticPresentationCapture;
+        // Studio-oriented diagnostics keep their existing defaults. This
+        // explicit mode reuses the same stable framebuffer capture while the
+        // real presentation renderer is driven through Presenter Companion.
+        launch_studio = false;
+    }
     if (showtime_report_path != null and portable_show_path != null)
         return error.ShowtimeOutputModesConflict;
     if (portable_show_path != null and slideshow_to_load == null)
@@ -3592,7 +3607,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     });
     rl.initWindow(screenWidth, screenHeight, "rayslides");
     rl.setWindowMinSize(900, 506);
-    if (starts_in_studio) {
+    if (starts_in_studio or diagnostics_presentation_capture) {
         const monitor = rl.getCurrentMonitor();
         const dimensions = diagnostics_window_size orelse studioStartupWindowSize(
             rl.getMonitorWidth(monitor),

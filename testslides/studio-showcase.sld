@@ -31,8 +31,8 @@
 @box id=headline x=104 y=158 w=1040 h=144 fontsize=96 color=#f8fbffff text=**Design the talk.**
 @box id=headline_accent x=104 y=286 w=1040 h=144 fontsize=96 color=#ffb547ff text=**Own every detail.**
 @box id=story x=112 y=462 w=1000 h=170 fontsize=34 color=#a9bdd0ff text=Visual authoring, crisp presentation pixels, and readable .sld source stay in one loop.
-@line id=flow_one x=194 y=696 w=270 h=0 stroke_width=7 direction=down arrow=end color=#61dafbff
-@line id=flow_two x=584 y=696 w=270 h=0 stroke_width=7 direction=down arrow=end color=#ffb547ff
+@line id=flow_one x=382 y=696 w=42 h=0 stroke_width=7 direction=down arrow=end color=#61dafbff
+@line id=flow_two x=694 y=696 w=42 h=0 stroke_width=7 direction=down arrow=end color=#ffb547ff
 @pop capability_pill id=source_pill x=112 y=664 w=270 text=SOURCE
 @pop capability_pill id=studio_pill x=424 y=664 w=270 bg=#24455fff text=STUDIO
 @pop capability_pill id=showtime_pill x=736 y=664 w=310 bg=#6b4c1fff color=#fff0d5ff text=SHOWTIME
