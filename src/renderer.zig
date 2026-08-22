@@ -11,6 +11,11 @@ const videoplayer = @import("videoplayer.zig");
 
 const rl = @import("raylib");
 
+extern "c" fn rlPushMatrix() void;
+extern "c" fn rlPopMatrix() void;
+extern "c" fn rlTranslatef(x: f32, y: f32, z: f32) void;
+extern "c" fn rlRotatef(angle: f32, x: f32, y: f32, z: f32) void;
+
 const log = std.log.scoped(.renderer);
 
 const RenderDistortion = struct { dx: f32 = 0.0, dy: f32 = 0.0 };
@@ -29,6 +34,7 @@ pub fn updateRenderDistortion() void {
 const RenderElementKind = enum {
     background,
     text,
+    line,
     image,
     video,
     crowd,
@@ -52,6 +58,14 @@ const RenderElement = struct {
     // the element and is applied to the player when playback starts.
     video_autoplay: bool = false,
     video_loop: bool = false,
+    video_default_volume: f32 = 1.0,
+    video_default_muted: bool = false,
+    media_fit: slides.MediaFit = .stretch,
+    media_focus: rl.Vector2 = .{ .x = 0.5, .y = 0.5 },
+    media_source_size: rl.Vector2 = .zero(),
+    media_duration: f32 = 0,
+    media_availability: slides.MediaAvailability = .ready,
+    media_audio: slides.MediaAudioAvailability = .not_applicable,
     bullet_symbol: [*:0]const u8 = "",
     reveal_step: usize = 0,
     text_shadow: ?slides.TextShadow = null,
@@ -60,6 +74,16 @@ const RenderElement = struct {
     owner_identity: usize = 0,
     part_index: usize = 0,
     is_item_background: bool = false,
+    corner_radius: f32 = 0,
+    line_start: rl.Vector2 = .zero(),
+    line_end: rl.Vector2 = .zero(),
+    line_width: f32 = 4,
+    line_arrow_start: bool = false,
+    line_arrow_end: bool = false,
+    rotation: f32 = 0,
+    rotation_center: rl.Vector2 = .zero(),
+    /// Logical wrapped/explicit line used while positioning text fragments.
+    text_line_index: usize = 0,
 };
 
 const RenderedScene = struct {
@@ -238,6 +262,14 @@ const RenderFingerprinter = struct {
         self.addOptionalString(item.text);
         self.addOptionalI32(item.fontSize);
         self.addOptionalF32(item.line_height_factor);
+        self.addScalar(@as(u8, @intFromEnum(item.text_alignment)));
+        self.addScalar(@as(u8, @intFromEnum(item.text_vertical_alignment)));
+        self.addF32(item.corner_radius);
+        self.addF32(item.line_width);
+        self.addScalar(@as(u8, @intFromEnum(item.line_direction)));
+        self.addBool(item.line_arrow_start);
+        self.addBool(item.line_arrow_end);
+        self.addF32(item.rotation);
         self.addOptionalColor(item.color);
         self.addOptionalColor(item.background_color);
         self.addOptionalString(item.img_path);
@@ -245,6 +277,10 @@ const RenderFingerprinter = struct {
         self.addBool(item.vid_autoplay);
         self.addBool(item.vid_loop);
         self.addOptionalF32(item.vid_poster);
+        self.addF32(item.vid_volume);
+        self.addBool(item.vid_muted);
+        self.addScalar(@as(u8, @intFromEnum(item.media_fit)));
+        self.addVector(item.media_focus);
         self.addVector(item.position);
         self.addVector(item.size);
         self.addOptionalI32(item.underline_width);
@@ -317,6 +353,7 @@ pub const ItemGeometryPreview = struct {
     after_position: rl.Vector2,
     after_size: rl.Vector2,
     resized: bool,
+    rotation: ?f32 = null,
 };
 
 /// Multi-selection is deliberately bounded in Studio so live preview state
@@ -420,6 +457,10 @@ pub const SlideshowRenderer = struct {
     item_geometry_previews: [max_item_geometry_previews]ItemGeometryPreview = undefined,
     item_geometry_preview_count: usize = 0,
     video_overlay: VideoOverlayUi = .{},
+    /// Scoped by passive render entry points. The live presentation always
+    /// uses the decoder texture; thumbnails/previews/exports use the authored
+    /// immutable poster without mutating player state.
+    render_video_posters: bool = false,
 
     pub fn new(allocator: std.mem.Allocator, fonts: *my_fonts.AvailableFonts) !*SlideshowRenderer {
         var self: *SlideshowRenderer = try allocator.create(SlideshowRenderer);
@@ -692,7 +733,144 @@ pub const SlideshowRenderer = struct {
     pub const ItemRenderBounds = struct {
         owner_identity: usize,
         bounds: rl.Rectangle,
+        /// Intrinsic image/video dimensions when this owner has media.
+        natural_size: rl.Vector2 = .zero(),
+        /// Video duration in seconds; zero for images or unavailable probes.
+        media_duration: f32 = 0,
+        media_availability: slides.MediaAvailability = .ready,
+        media_audio: slides.MediaAudioAvailability = .not_applicable,
     };
+
+    /// Renderer-owned observation consumed by Showtime. It intentionally
+    /// contains no texture/player handles, so a full-deck audit cannot mutate
+    /// playback while still using the exact generated scene graph.
+    pub const ShowtimeRenderItem = struct {
+        owner_identity: usize,
+        bounds: rl.Rectangle,
+        has_bounds: bool = false,
+        has_pixels: bool = false,
+        media_duration: f32 = 0,
+        media_availability: slides.MediaAvailability = .ready,
+        media_audio: slides.MediaAudioAvailability = .not_applicable,
+        first_missing_codepoint: ?u21 = null,
+    };
+
+    /// Collect one stable base or cumulative morph scene without drawing it,
+    /// seeking video, changing reveal state, or touching Studio selection.
+    pub fn collectShowtimeRenderItems(
+        self: *const SlideshowRenderer,
+        allocator: std.mem.Allocator,
+        output: *std.ArrayList(ShowtimeRenderItem),
+        slide_number: i32,
+        morph_state: ?usize,
+    ) !usize {
+        output.clearRetainingCapacity();
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return 0;
+        const slide = self.renderedSlides.items[@intCast(slide_number)];
+        const elements = if (morph_state) |state_index| blk: {
+            if (state_index >= slide.morph_scenes.items.len) return 0;
+            break :blk slide.morph_scenes.items[state_index].elements.items;
+        } else slide.elements.items;
+
+        for (elements) |element| {
+            var element_bounds: rl.Rectangle = if (element.kind == .background)
+                .{ .x = 0, .y = 0, .width = 1920, .height = 1080 }
+            else
+                .{ .x = element.position.x, .y = element.position.y, .width = element.size.x, .height = element.size.y };
+            if (element.kind == .text and element.text != null and element.fontSize != null) {
+                const measured = self.fonts.measureTextWithFallback(
+                    self.fontForStyle(element.fontStyle),
+                    element.text.?,
+                    element.fontSize.?,
+                    0,
+                );
+                element_bounds.width = measured.x;
+                element_bounds.height = measured.y;
+            }
+            if (element.kind == .line) {
+                const half_stroke = @max(@as(f32, 0.5), element.line_width / 2);
+                const left = @min(element.line_start.x, element.line_end.x) - half_stroke;
+                const top = @min(element.line_start.y, element.line_end.y) - half_stroke;
+                element_bounds = .{
+                    .x = left,
+                    .y = top,
+                    .width = @max(element.line_start.x, element.line_end.x) + half_stroke - left,
+                    .height = @max(element.line_start.y, element.line_end.y) + half_stroke - top,
+                };
+            }
+            if (element.kind != .background and @abs(element.rotation) > 0.0001)
+                element_bounds = rotatedRectangleBounds(element_bounds, element.rotation_center, element.rotation);
+            const has_bounds = element.kind == .background or (element_bounds.width > 0 and element_bounds.height > 0);
+            const has_pixels = switch (element.kind) {
+                .background => element.texture != null or element.color != null,
+                .text => element.text != null or element.color != null,
+                .line => element.color != null,
+                .image => element.texture != null,
+                .video => element.video != null,
+                .crowd => element.crowd != null,
+            } and element.opacity > 0;
+            var missing_codepoint: ?u21 = null;
+            if (element.text) |text| {
+                var byte_index: usize = 0;
+                while (byte_index < text.len) {
+                    const sequence_len = std.unicode.utf8ByteSequenceLength(text[byte_index]) catch {
+                        missing_codepoint = '?';
+                        break;
+                    };
+                    const end = byte_index + sequence_len;
+                    if (end > text.len) {
+                        missing_codepoint = '?';
+                        break;
+                    }
+                    const codepoint = std.unicode.utf8Decode(text[byte_index..end]) catch {
+                        missing_codepoint = '?';
+                        break;
+                    };
+                    byte_index = end;
+                    if (!self.fonts.supportsCodepointForStyle(element.fontStyle, codepoint)) {
+                        missing_codepoint = codepoint;
+                        break;
+                    }
+                }
+            }
+
+            if (output.items.len > 0 and output.items[output.items.len - 1].owner_identity == element.owner_identity) {
+                const previous = &output.items[output.items.len - 1];
+                if (has_bounds) {
+                    if (previous.has_bounds) {
+                        const left = @min(previous.bounds.x, element_bounds.x);
+                        const top = @min(previous.bounds.y, element_bounds.y);
+                        previous.bounds = .{
+                            .x = left,
+                            .y = top,
+                            .width = @max(previous.bounds.x + previous.bounds.width, element_bounds.x + element_bounds.width) - left,
+                            .height = @max(previous.bounds.y + previous.bounds.height, element_bounds.y + element_bounds.height) - top,
+                        };
+                    } else {
+                        previous.bounds = element_bounds;
+                        previous.has_bounds = true;
+                    }
+                }
+                previous.has_pixels = previous.has_pixels or has_pixels;
+                if (previous.media_duration <= 0 and element.media_duration > 0) previous.media_duration = element.media_duration;
+                if (element.media_availability != .ready) previous.media_availability = element.media_availability;
+                if (element.media_audio != .not_applicable) previous.media_audio = element.media_audio;
+                if (previous.first_missing_codepoint == null) previous.first_missing_codepoint = missing_codepoint;
+            } else {
+                try output.append(allocator, .{
+                    .owner_identity = element.owner_identity,
+                    .bounds = element_bounds,
+                    .has_bounds = has_bounds,
+                    .has_pixels = has_pixels,
+                    .media_duration = element.media_duration,
+                    .media_availability = element.media_availability,
+                    .media_audio = element.media_audio,
+                    .first_missing_codepoint = missing_codepoint,
+                });
+            }
+        }
+        return elements.len;
+    }
 
     /// Collect every rendered owner in one linear pass. Studio previously
     /// called itemRenderBoundsForMorphState once per SlideItem, rescanning all
@@ -740,7 +918,8 @@ pub const SlideshowRenderer = struct {
             const right = element.position.x + element.size.x;
             const bottom = element.position.y + element.size.y;
             if (output.items.len > 0 and output.items[output.items.len - 1].owner_identity == element.owner_identity) {
-                const previous = &output.items[output.items.len - 1].bounds;
+                const previous_entry = &output.items[output.items.len - 1];
+                const previous = &previous_entry.bounds;
                 const left = @min(previous.x, element.position.x);
                 const top = @min(previous.y, element.position.y);
                 previous.* = .{
@@ -749,6 +928,14 @@ pub const SlideshowRenderer = struct {
                     .width = @max(previous.x + previous.width, right) - left,
                     .height = @max(previous.y + previous.height, bottom) - top,
                 };
+                if (previous_entry.natural_size.x <= 0 and element.media_source_size.x > 0)
+                    previous_entry.natural_size = element.media_source_size;
+                if (previous_entry.media_duration <= 0 and element.media_duration > 0)
+                    previous_entry.media_duration = element.media_duration;
+                if (element.media_availability != .ready)
+                    previous_entry.media_availability = element.media_availability;
+                if (element.media_audio != .not_applicable)
+                    previous_entry.media_audio = element.media_audio;
             } else {
                 try output.append(allocator, .{
                     .owner_identity = element.owner_identity,
@@ -758,6 +945,10 @@ pub const SlideshowRenderer = struct {
                         .width = element.size.x,
                         .height = element.size.y,
                     },
+                    .natural_size = element.media_source_size,
+                    .media_duration = element.media_duration,
+                    .media_availability = element.media_availability,
+                    .media_audio = element.media_audio,
                 });
             }
         }
@@ -838,6 +1029,7 @@ pub const SlideshowRenderer = struct {
         switch (rendered_item.kind) {
             .background => try self.createBg(renderSlide, rendered_item, slideshow_filp),
             .textbox => try self.preRenderTextBlock(renderSlide, rendered_item, slide_number),
+            .line => try self.createLine(renderSlide, rendered_item),
             .img => try self.createImg(renderSlide, rendered_item, slideshow_filp),
             .vid => try self.createVid(renderSlide, rendered_item, slideshow_filp),
             .crowd => try self.createCrowd(renderSlide, rendered_item),
@@ -861,16 +1053,27 @@ pub const SlideshowRenderer = struct {
             // lets the morph planner keep unchanged content above the fill.
             element.part_index = emitted_index - @intFromBool(has_item_background and emitted_index > 0);
             element.opacity = if (rendered_item.visible) rendered_item.opacity else 0.0;
+            element.rotation = rendered_item.rotation;
+        }
+        if (rendered_item.kind != .background and renderSlide.elements.items.len > first_element) {
+            const center = ownerRotationCenter(renderSlide.elements.items[first_element..], rendered_item);
+            for (renderSlide.elements.items[first_element..]) |*element| element.rotation_center = center;
         }
     }
 
     fn createBg(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
         log.info("pre-rendering bg {}", .{item});
         if (item.img_path) |p| {
-            const result = try self.texture_cache.getImageTexture(p, slideshow_filp);
+            const result = self.texture_cache.getImageTexture(p, slideshow_filp, .{ .x = 1920, .y = 1080 }) catch |err| {
+                log.warn("Could not load background image {s}: {}", .{ p, err });
+                try appendUnavailableBackgroundElement(renderSlide, self.allocator, classifyImageLoadFailure(err));
+                return;
+            };
             if (result) |tex_info| {
                 const reveal_step = try self.wholeItemStep(renderSlide, item);
                 try renderSlide.elements.append(self.allocator, RenderElement{ .kind = .background, .texture = tex_info.texture, .reveal_step = reveal_step });
+            } else {
+                try appendUnavailableBackgroundElement(renderSlide, self.allocator, .image_decode_failed);
             }
         } else {
             if (item.color) |color| {
@@ -894,6 +1097,32 @@ pub const SlideshowRenderer = struct {
         });
     }
 
+    fn createLine(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem) !void {
+        const start: rl.Vector2 = switch (item.line_direction) {
+            .down => item.position,
+            .up => .{ .x = item.position.x, .y = item.position.y + item.size.y },
+        };
+        const end: rl.Vector2 = switch (item.line_direction) {
+            .down => .{ .x = item.position.x + item.size.x, .y = item.position.y + item.size.y },
+            .up => .{ .x = item.position.x + item.size.x, .y = item.position.y },
+        };
+        try renderSlide.elements.append(self.allocator, .{
+            .kind = .line,
+            .position = item.position,
+            .size = .{
+                .x = @max(item.size.x, item.line_width),
+                .y = @max(item.size.y, item.line_width),
+            },
+            .color = item.color,
+            .line_start = start,
+            .line_end = end,
+            .line_width = item.line_width,
+            .line_arrow_start = item.line_arrow_start,
+            .line_arrow_end = item.line_arrow_end,
+            .reveal_step = try self.wholeItemStep(renderSlide, item),
+        });
+    }
+
     fn preRenderTextBlock(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slide_number: usize) !void {
         // for line in lines:
         //     if line is bulleted: emit bullet, adjust x pos
@@ -903,6 +1132,7 @@ pub const SlideshowRenderer = struct {
         var fontSize: i32 = 0;
         var line_height_bullet_width: rl.Vector2 = .{ .x = 0.0, .y = 0.0 };
         var item_reveal_step: usize = 0;
+        const text_element_start = renderSlide.elements.items.len;
         if (item.animation) |spec| {
             if (spec.by == .item) item_reveal_step = try self.appendStep(renderSlide, spec);
         }
@@ -922,6 +1152,7 @@ pub const SlideshowRenderer = struct {
                 .line_height_factor = null,
                 .text = null,
                 .color = item.color,
+                .corner_radius = item.corner_radius,
                 .reveal_step = item_reveal_step,
             });
             log.debug("LEAVE preRenderTextBlock (color) for slide {d}", .{slide_number});
@@ -986,6 +1217,7 @@ pub const SlideshowRenderer = struct {
                 if (line.len == 0) {
                     // empty line
                     layoutContext.current_pos.y += layoutContext.current_line_height;
+                    layoutContext.text_line_index += 1;
                     continue;
                 }
                 // find out, if line is a list item:
@@ -1011,16 +1243,23 @@ pub const SlideshowRenderer = struct {
 
                 if (is_bulleted) {
                     // 1. add indented bullet symbol at the current pos
+                    const bullet_size = self.fonts.measureTextWithFallback(
+                        self.fonts.normal,
+                        bulletSymbol,
+                        @floatFromInt(fontSize),
+                        0,
+                    );
                     try renderSlide.elements.append(self.allocator, RenderElement{
                         .kind = .text,
                         .position = .{ .x = tl_pos.x + indent_in_pixels, .y = layoutContext.current_pos.y },
-                        .size = .{ .x = available_width, .y = layoutContext.available_size.y },
+                        .size = bullet_size,
                         .fontSize = @floatFromInt(fontSize),
                         .underline_width = underline_width,
                         .text = bulletSymbol,
                         .color = bulletColor,
                         .reveal_step = line_reveal_step,
                         .text_shadow = item.text_shadow,
+                        .text_line_index = layoutContext.text_line_index,
                     });
                     // 2. increase indent by 1 and add indented text block
                     available_width -= line_height_bullet_width.x;
@@ -1035,6 +1274,7 @@ pub const SlideshowRenderer = struct {
                 // advance to the next line
                 layoutContext.current_pos.x = tl_pos.x;
                 layoutContext.current_pos.y += layoutContext.current_line_height;
+                layoutContext.text_line_index += 1;
 
                 // don't render (much) beyond size
                 //
@@ -1048,6 +1288,7 @@ pub const SlideshowRenderer = struct {
                 }
             }
         }
+        alignTextElements(renderSlide.elements.items[text_element_start..], item);
         log.debug("LEAVE preRenderTextBlock for slide {d}", .{slide_number});
     }
 
@@ -1063,6 +1304,7 @@ pub const SlideshowRenderer = struct {
         text: []const u8 = undefined,
         reveal_step: usize = 0,
         text_shadow: ?slides.TextShadow = null,
+        text_line_index: usize = 0,
     };
 
     fn fontForStyle(self: *const SlideshowRenderer, style: my_fonts.FontStyle) rl.Font {
@@ -1115,6 +1357,7 @@ pub const SlideshowRenderer = struct {
                 .underline_width = @intCast(layoutContext.underline_width),
                 .reveal_step = layoutContext.reveal_step,
                 .text_shadow = layoutContext.text_shadow,
+                .text_line_index = layoutContext.text_line_index,
             };
 
             for (spans.items, 0..) |span, span_index| {
@@ -1196,7 +1439,7 @@ pub const SlideshowRenderer = struct {
                     element.position.x += boundary_spacing.leading;
                     element.position.y += baseline_offset;
                     element.size.x = attempted_span_size.x + boundary_spacing.trailing;
-                    //element.size = attempted_span_size;
+                    element.size.y = attempted_span_size.y;
                     log.debug(">>>>>>> appending non-wrapping text element: {?s}@{d:3.0},{d:3.0}", .{ element.text, element.position.x, element.position.y });
                     try renderSlide.elements.append(self.allocator, element);
                     // advance render pos
@@ -1286,7 +1529,8 @@ pub const SlideshowRenderer = struct {
                                 element.position.x += boundaryLeadingOffset(boundary_spacing, rendered_slice_start);
                                 element.position.y += baseline_offset;
                                 element.size.x = attempted_span_size.x + boundaryTrailingOffset(boundary_spacing, end_of_string_pos, span.text.?.len);
-                                // element.size = attempted_span_size;
+                                element.size.y = attempted_span_size.y;
+                                element.text_line_index = layoutContext.text_line_index;
                                 log.debug(">>>>>>> appending wrapping text element: {?s} width={d:3.0}", .{ element.text, rendered_width });
                                 try renderSlide.elements.append(self.allocator, element);
                                 // advance render pos
@@ -1303,6 +1547,8 @@ pub const SlideshowRenderer = struct {
                                 layoutContext.current_pos.x = layoutContext.origin_pos.x;
                                 layoutContext.current_pos.y += layoutContext.current_line_height;
                                 layoutContext.current_line_height = 0;
+                                layoutContext.text_line_index += 1;
+                                element.text_line_index = layoutContext.text_line_index;
                                 available_width = layoutContext.origin_pos.x + layoutContext.available_size.x - layoutContext.current_pos.x;
                             }
                         } else {
@@ -1319,9 +1565,10 @@ pub const SlideshowRenderer = struct {
                                 element.position = layoutContext.current_pos;
                                 element.position.x += boundaryLeadingOffset(boundary_spacing, rendered_slice_start);
                                 element.position.y += baseline_offset;
-                                // element.size = attempted_span_size;
                                 log.debug(">>>>>>> appending final text element: {?s} width={d:3.0}", .{ element.text, rendered_width });
                                 element.size.x = attempted_span_size.x + boundaryTrailingOffset(boundary_spacing, currentIdxOfSpace, span.text.?.len);
+                                element.size.y = attempted_span_size.y;
+                                element.text_line_index = layoutContext.text_line_index;
                                 try renderSlide.elements.append(self.allocator, element);
                                 // advance render pos
                                 layoutContext.current_pos.x += rendered_width;
@@ -1409,9 +1656,10 @@ pub const SlideshowRenderer = struct {
 
     fn createImg(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
         if (item.img_path) |p| {
-            const result = self.texture_cache.getImageTexture(p, slideshow_filp) catch |err| {
+            const result = self.texture_cache.getImageTexture(p, slideshow_filp, item.size) catch |err| {
                 log.warn("Could not load image {s}: {}", .{ p, err });
-                return; // Skip element
+                try appendUnavailableMediaElement(renderSlide, self.allocator, item, classifyImageLoadFailure(err));
+                return;
             };
 
             if (result) |tex_info| {
@@ -1457,8 +1705,13 @@ pub const SlideshowRenderer = struct {
                     .position = item.position,
                     .size = final_size,
                     .texture = tex_info.texture,
+                    .media_fit = item.media_fit,
+                    .media_focus = item.media_focus,
+                    .media_source_size = .{ .x = natural_w, .y = natural_h },
                     .reveal_step = reveal_step,
                 });
+            } else {
+                try appendUnavailableMediaElement(renderSlide, self.allocator, item, .image_decode_failed);
             }
         }
     }
@@ -1467,53 +1720,79 @@ pub const SlideshowRenderer = struct {
         if (item.vid_path) |p| {
             const poster_time: f64 = if (item.vid_poster) |poster| @max(0, poster) else 0;
             const result = self.video_cache.getVideoPlayer(p, slideshow_filp, poster_time) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 log.warn("Could not load video {s}: {}", .{ p, err });
-                return; // Skip element
+                try appendUnavailableMediaElement(renderSlide, self.allocator, item, .video_file_unreadable);
+                return;
             };
 
-            if (result) |player| {
-                const reveal_step = try self.wholeItemStep(renderSlide, item);
-                var final_size = item.size;
+            switch (result) {
+                .disabled => return,
+                .failure => |failure| {
+                    try appendUnavailableMediaElement(
+                        renderSlide,
+                        self.allocator,
+                        item,
+                        mediaAvailabilityForVideoFailure(failure),
+                    );
+                    return;
+                },
+                .player => |player| {
+                    const reveal_step = try self.wholeItemStep(renderSlide, item);
+                    var final_size = item.size;
 
-                // Calculate dimensions if needed
-                const natural_w: f32 = @floatFromInt(player.width);
-                const natural_h: f32 = @floatFromInt(player.height);
-                const aspect_ratio = natural_w / natural_h;
+                    // Calculate dimensions if needed
+                    const natural_w: f32 = @floatFromInt(player.width);
+                    const natural_h: f32 = @floatFromInt(player.height);
+                    const aspect_ratio = natural_w / natural_h;
 
-                const has_w = item.size.x > 0;
-                const has_h = item.size.y > 0;
+                    const has_w = item.size.x > 0;
+                    const has_h = item.size.y > 0;
 
-                if (!has_w and !has_h) {
-                    // Neither specified: use natural dimensions with scale and ratio
-                    var w = natural_w;
-                    var h = natural_h;
+                    if (!has_w and !has_h) {
+                        // Neither specified: use natural dimensions with scale and ratio
+                        var w = natural_w;
+                        var h = natural_h;
 
-                    if (item.scale) |scale| {
-                        w *= scale;
-                        h *= scale;
+                        if (item.scale) |scale| {
+                            w *= scale;
+                            h *= scale;
+                        }
+
+                        if (item.ratio) |ratio| {
+                            h = w / ratio;
+                        }
+
+                        final_size = .{ .x = w, .y = h };
+                    } else if (has_w and !has_h) {
+                        final_size.y = final_size.x / aspect_ratio;
+                    } else if (!has_w and has_h) {
+                        final_size.x = final_size.y * aspect_ratio;
                     }
+                    // else: both specified, use as-is
 
-                    if (item.ratio) |ratio| {
-                        h = w / ratio;
-                    }
-
-                    final_size = .{ .x = w, .y = h };
-                } else if (has_w and !has_h) {
-                    final_size.y = final_size.x / aspect_ratio;
-                } else if (!has_w and has_h) {
-                    final_size.x = final_size.y * aspect_ratio;
-                }
-                // else: both specified, use as-is
-
-                try renderSlide.elements.append(self.allocator, RenderElement{
-                    .kind = .video,
-                    .position = item.position,
-                    .size = final_size,
-                    .video = player,
-                    .video_autoplay = item.vid_autoplay,
-                    .video_loop = item.vid_loop,
-                    .reveal_step = reveal_step,
-                });
+                    try renderSlide.elements.append(self.allocator, RenderElement{
+                        .kind = .video,
+                        .position = item.position,
+                        .size = final_size,
+                        .video = player,
+                        .video_autoplay = item.vid_autoplay,
+                        .video_loop = item.vid_loop,
+                        .video_default_volume = item.vid_volume,
+                        .video_default_muted = item.vid_muted,
+                        .media_fit = item.media_fit,
+                        .media_focus = item.media_focus,
+                        .media_source_size = .{ .x = natural_w, .y = natural_h },
+                        .media_duration = @floatCast(player.duration),
+                        .media_availability = switch (player.poster_status) {
+                            .exact => .ready,
+                            .out_of_range => .video_poster_out_of_range,
+                            .fallback_to_first => .video_poster_fallback,
+                        },
+                        .media_audio = if (player.has_audio) .available else .unavailable,
+                        .reveal_step = reveal_step,
+                    });
+                },
             }
         }
     }
@@ -1532,10 +1811,16 @@ pub const SlideshowRenderer = struct {
         return self.renderedSlides.items[@intCast(slide_number)].elements.items;
     }
 
+    fn applyVideoPlaybackDefaults(element: RenderElement, player: *videoplayer.VideoPlayer) void {
+        player.setVolume(element.video_default_volume);
+        player.setMuted(element.video_default_muted);
+    }
+
     pub fn autoplayVideosOnSlide(self: *SlideshowRenderer, slide_number: i32, now: f64) void {
         for (self.videoPlayersOnSlide(slide_number)) |element| {
             if (element.kind != .video) continue;
             const player = element.video orelse continue;
+            applyVideoPlaybackDefaults(element, player);
             if (element.video_autoplay) {
                 player.loop = element.video_loop;
                 player.play(now);
@@ -1888,6 +2173,36 @@ pub const SlideshowRenderer = struct {
         try self.renderOneSlide(slide_number, reveal, transforms.incoming, pos, size, internal_render_size, crowd_snapshot, crowd_url);
     }
 
+    /// Render presentation geometry with authored video posters even if the
+    /// same cached player is actively decoding for the audience view.
+    pub fn renderWithVideoPosters(
+        self: *SlideshowRenderer,
+        slide_number: i32,
+        reveal: RevealState,
+        transition: TransitionState,
+        pos: rl.Vector2,
+        size: rl.Vector2,
+        internal_render_size: rl.Vector2,
+        crowd_snapshot: ?crowdplay.Snapshot,
+        previous_crowd_snapshot: ?crowdplay.Snapshot,
+        crowd_url: []const u8,
+    ) !void {
+        const previous = self.render_video_posters;
+        self.render_video_posters = true;
+        defer self.render_video_posters = previous;
+        try self.render(
+            slide_number,
+            reveal,
+            transition,
+            pos,
+            size,
+            internal_render_size,
+            crowd_snapshot,
+            previous_crowd_snapshot,
+            crowd_url,
+        );
+    }
+
     /// Paint the final stable scene of one slide into a small Studio card.
     /// Thumbnail rendering deliberately ignores a live canvas geometry preview
     /// (item identities restart on every slide) and audience-only Crowdplay
@@ -1902,6 +2217,9 @@ pub const SlideshowRenderer = struct {
         const preview_count = self.item_geometry_preview_count;
         self.item_geometry_preview_count = 0;
         defer self.item_geometry_preview_count = preview_count;
+        const previous_posters = self.render_video_posters;
+        self.render_video_posters = true;
+        defer self.render_video_posters = previous_posters;
         try self.renderOneSlide(
             slide_number,
             .{ .visible_through = self.stepCount(slide_number) },
@@ -1954,6 +2272,9 @@ pub const SlideshowRenderer = struct {
         const preview_count = self.item_geometry_preview_count;
         self.item_geometry_preview_count = 0;
         defer self.item_geometry_preview_count = preview_count;
+        const previous_posters = self.render_video_posters;
+        self.render_video_posters = true;
+        defer self.render_video_posters = previous_posters;
         try self.renderRenderedSlide(
             preview,
             .{ .visible_through = preview.steps.items.len },
@@ -1976,6 +2297,9 @@ pub const SlideshowRenderer = struct {
         internal_render_size: rl.Vector2,
     ) !void {
         const preview = self.studio_preview orelse return;
+        const previous_posters = self.render_video_posters;
+        self.render_video_posters = true;
+        defer self.render_video_posters = previous_posters;
         try self.renderRenderedSlide(
             preview,
             .{ .visible_through = preview.steps.items.len },
@@ -2175,7 +2499,7 @@ pub const SlideshowRenderer = struct {
         const connected_text = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{d} live", .{snapshot.connected}) catch return;
         const pulse = @as(f32, 0.72) + @as(f32, 0.28) * std.math.sin(@as(f32, @floatCast(rl.getTime())) * 3.0);
         rl.drawCircleV(.{ .x = panel.x + panel.width - 194 * scale, .y = panel.y + 54 * scale }, (7.0 + pulse * 2.0) * scale, colorWithOpacity(.{ .r = 77, .g = 255, .b = 181, .a = 255 }, opacity));
-        drawCrowdText(self.fonts.bold, connected_text, .{ .x = panel.x + panel.width - 172 * scale, .y = panel.y + 35 * scale }, 30 * scale, colorWithOpacity(.{ .r = 205, .g = 255, .b = 232, .a = 255 }, opacity));
+        drawCrowdText(self.fonts, self.fonts.bold, connected_text, .{ .x = panel.x + panel.width - 172 * scale, .y = panel.y + 35 * scale }, 30 * scale, colorWithOpacity(.{ .r = 205, .g = 255, .b = 232, .a = 255 }, opacity));
 
         switch (spec.kind) {
             .join => self.renderCrowdJoin(spec, snapshot, crowd_url, panel, scale, opacity),
@@ -2185,10 +2509,10 @@ pub const SlideshowRenderer = struct {
 
     fn renderCrowdJoin(self: *SlideshowRenderer, spec: slides.CrowdSpec, snapshot: crowdplay.Snapshot, crowd_url: []const u8, panel: rl.Rectangle, scale: f32, opacity: f32) void {
         const eyebrow = "CROWDPLAY\x00";
-        drawCrowdText(self.fonts.bold, eyebrow, .{ .x = panel.x + 72 * scale, .y = panel.y + 52 * scale }, 24 * scale, colorWithOpacity(.{ .r = 147, .g = 156, .b = 255, .a = 255 }, opacity));
+        drawCrowdText(self.fonts, self.fonts.bold, eyebrow, .{ .x = panel.x + 72 * scale, .y = panel.y + 52 * scale }, 24 * scale, colorWithOpacity(.{ .r = 147, .g = 156, .b = 255, .a = 255 }, opacity));
         const prompt = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{s}", .{spec.prompt}) catch return;
-        drawCrowdTextFitted(self.fonts.bold, prompt, .{ .x = panel.x + 72 * scale, .y = panel.y + 116 * scale }, 62 * scale, panel.width - 144 * scale, colorWithOpacity(.white, opacity));
-        drawCrowdText(self.fonts.normal, "Open this address on your phone\x00", .{ .x = panel.x + 74 * scale, .y = panel.y + 214 * scale }, 28 * scale, colorWithOpacity(.{ .r = 177, .g = 185, .b = 214, .a = 255 }, opacity));
+        drawCrowdTextFitted(self.fonts, self.fonts.bold, prompt, .{ .x = panel.x + 72 * scale, .y = panel.y + 116 * scale }, 62 * scale, panel.width - 144 * scale, colorWithOpacity(.white, opacity));
+        drawCrowdText(self.fonts, self.fonts.normal, "Open this address on your phone\x00", .{ .x = panel.x + 74 * scale, .y = panel.y + 214 * scale }, 28 * scale, colorWithOpacity(.{ .r = 177, .g = 185, .b = 214, .a = 255 }, opacity));
 
         const qr_side = @min(panel.width * 0.30, panel.height * 0.55);
         const qr_region = rl.Rectangle{
@@ -2200,7 +2524,7 @@ pub const SlideshowRenderer = struct {
         const url_panel = rl.Rectangle{ .x = panel.x + 72 * scale, .y = panel.y + 278 * scale, .width = panel.width - qr_side - 190 * scale, .height = 116 * scale };
         rl.drawRectangleRounded(url_panel, 0.16, 12, colorWithOpacity(.{ .r = 24, .g = 29, .b = 54, .a = 255 }, opacity));
         const url = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{if (crowd_url.len > 0) crowd_url else "Crowdplay server unavailable"}) catch return;
-        drawCrowdTextFitted(self.fonts.bold, url, .{ .x = url_panel.x + 34 * scale, .y = url_panel.y + 34 * scale }, 34 * scale, url_panel.width - 68 * scale, colorWithOpacity(.{ .r = 113, .g = 242, .b = 255, .a = 255 }, opacity));
+        drawCrowdTextFitted(self.fonts, self.fonts.bold, url, .{ .x = url_panel.x + 34 * scale, .y = url_panel.y + 34 * scale }, 34 * scale, url_panel.width - 68 * scale, colorWithOpacity(.{ .r = 113, .g = 242, .b = 255, .a = 255 }, opacity));
         if (crowd_url.len > 0 and self.qr_code.ensure(crowd_url)) drawQrCode(&self.qr_code, qr_region, opacity);
 
         drawSwarm(snapshot, null, .{
@@ -2210,8 +2534,8 @@ pub const SlideshowRenderer = struct {
             .height = panel.height * 0.22,
         }, scale, opacity);
         const people = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d} {s} in the room", .{ snapshot.connected, if (snapshot.connected == 1) "person" else "people" }) catch return;
-        const measured = rl.measureTextEx(self.fonts.bold, people, 34 * scale, 0);
-        drawCrowdText(self.fonts.bold, people, .{ .x = panel.x + (panel.width - measured.x) / 2, .y = panel.y + panel.height - 92 * scale }, 34 * scale, colorWithOpacity(.{ .r = 205, .g = 211, .b = 239, .a = 255 }, opacity));
+        const measured = self.fonts.measureTextWithFallback(self.fonts.bold, people, 34 * scale, 0);
+        drawCrowdText(self.fonts, self.fonts.bold, people, .{ .x = panel.x + (panel.width - measured.x) / 2, .y = panel.y + panel.height - 92 * scale }, 34 * scale, colorWithOpacity(.{ .r = 205, .g = 211, .b = 239, .a = 255 }, opacity));
     }
 
     fn renderCrowdPoll(self: *SlideshowRenderer, spec: slides.CrowdSpec, snapshot: crowdplay.Snapshot, crowd_url: []const u8, panel: rl.Rectangle, scale: f32, opacity: f32) void {
@@ -2225,12 +2549,12 @@ pub const SlideshowRenderer = struct {
         const total = if (live_poll) |poll| poll.total else 0;
 
         const poll_label = if (!available) "POLL OFFLINE\x00" else if (open) "LIVE POLL\x00" else "POLL LOCKED\x00";
-        drawCrowdText(self.fonts.bold, poll_label, .{ .x = panel.x + 64 * scale, .y = panel.y + 42 * scale }, 23 * scale, colorWithOpacity(if (!available) .{ .r = 255, .g = 107, .b = 133, .a = 255 } else if (open) .{ .r = 77, .g = 255, .b = 181, .a = 255 } else .{ .r = 255, .g = 178, .b = 87, .a = 255 }, opacity));
+        drawCrowdText(self.fonts, self.fonts.bold, poll_label, .{ .x = panel.x + 64 * scale, .y = panel.y + 42 * scale }, 23 * scale, colorWithOpacity(if (!available) .{ .r = 255, .g = 107, .b = 133, .a = 255 } else if (open) .{ .r = 77, .g = 255, .b = 181, .a = 255 } else .{ .r = 255, .g = 178, .b = 87, .a = 255 }, opacity));
         const question = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{spec.prompt}) catch return;
-        drawCrowdTextFitted(self.fonts.bold, question, .{ .x = panel.x + 64 * scale, .y = panel.y + 92 * scale }, 48 * scale, panel.width - 128 * scale, colorWithOpacity(.white, opacity));
+        drawCrowdTextFitted(self.fonts, self.fonts.bold, question, .{ .x = panel.x + 64 * scale, .y = panel.y + 92 * scale }, 48 * scale, panel.width - 128 * scale, colorWithOpacity(.white, opacity));
 
         const total_text = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d} {s}", .{ total, if (total == 1) "vote" else "votes" }) catch return;
-        drawCrowdText(self.fonts.normal, total_text, .{ .x = panel.x + 66 * scale, .y = panel.y + 160 * scale }, 24 * scale, colorWithOpacity(.{ .r = 173, .g = 180, .b = 211, .a = 255 }, opacity));
+        drawCrowdText(self.fonts, self.fonts.normal, total_text, .{ .x = panel.x + 66 * scale, .y = panel.y + 160 * scale }, 24 * scale, colorWithOpacity(.{ .r = 173, .g = 180, .b = 211, .a = 255 }, opacity));
 
         const count: usize = @min(spec.choices.len, crowdplay.max_choices);
         if (count == 0) return;
@@ -2258,18 +2582,18 @@ pub const SlideshowRenderer = struct {
             rl.drawRectangleRoundedLinesEx(card, 0.14, 10, @max(1.0, 1.5 * scale), colorWithOpacity(accent, opacity * 0.52));
             const choice = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{choice_label}) catch continue;
             const label_width = card.width - (if (revealed) 245 * scale else 54 * scale);
-            drawCrowdTextFitted(self.fonts.bold, choice, .{ .x = card.x + 27 * scale, .y = card.y + (card.height - 30 * scale) / 2 }, 28 * scale, label_width, colorWithOpacity(.white, opacity));
+            drawCrowdTextFitted(self.fonts, self.fonts.bold, choice, .{ .x = card.x + 27 * scale, .y = card.y + (card.height - 30 * scale) / 2 }, 28 * scale, label_width, colorWithOpacity(.white, opacity));
             if (revealed) {
                 const percent: u32 = if (total > 0) @intFromFloat(@round(fraction * 100.0)) else 0;
                 const result = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d}%  ·  {d}", .{ percent, votes }) catch continue;
-                const measured = rl.measureTextEx(self.fonts.bold, result, 27 * scale, 0);
-                drawCrowdText(self.fonts.bold, result, .{ .x = card.x + card.width - measured.x - 26 * scale, .y = card.y + (card.height - 29 * scale) / 2 }, 27 * scale, colorWithOpacity(accent, opacity));
+                const measured = self.fonts.measureTextWithFallback(self.fonts.bold, result, 27 * scale, 0);
+                drawCrowdText(self.fonts, self.fonts.bold, result, .{ .x = card.x + card.width - measured.x - 26 * scale, .y = card.y + (card.height - 29 * scale) / 2 }, 27 * scale, colorWithOpacity(accent, opacity));
             }
         }
 
         drawPollSwarm(snapshot, card_rects[0..count], scale, opacity);
         const controls = if (crowd_url.len > 0) "O  open/lock     V  reveal     R  reset\x00" else "Crowdplay server unavailable\x00";
-        drawCrowdText(self.fonts.normal, controls, .{ .x = panel.x + 66 * scale, .y = panel.y + panel.height - 65 * scale }, 21 * scale, colorWithOpacity(.{ .r = 137, .g = 144, .b = 177, .a = 255 }, opacity));
+        drawCrowdText(self.fonts, self.fonts.normal, controls, .{ .x = panel.x + 66 * scale, .y = panel.y + panel.height - 65 * scale }, 21 * scale, colorWithOpacity(.{ .r = 137, .g = 144, .b = 177, .a = 255 }, opacity));
     }
 
     fn renderElement(
@@ -2293,6 +2617,19 @@ pub const SlideshowRenderer = struct {
         var transform = base_transform;
         transform.opacity *= displayed.opacity;
         if (transform.opacity <= 0) return;
+        const rotation_center = translated(
+            slidePosToRenderPos(displayed.rotation_center, pos, size, internal_render_size),
+            transform.offset,
+        );
+        const rotated = @abs(displayed.rotation) > 0.0001 and
+            displayed.kind != .background and displayed.kind != .crowd;
+        if (rotated) {
+            rlPushMatrix();
+            rlTranslatef(rotation_center.x, rotation_center.y, 0);
+            rlRotatef(displayed.rotation, 0, 0, 1);
+            rlTranslatef(-rotation_center.x, -rotation_center.y, 0);
+        }
+        defer if (rotated) rlPopMatrix();
         switch (displayed.kind) {
             .background => {
                 if (displayed.texture) |texture| {
@@ -2302,14 +2639,22 @@ pub const SlideshowRenderer = struct {
                 }
             },
             .text => self.renderText(displayed, pos, size, internal_render_size, transform),
+            .line => renderLine(displayed, pos, size, internal_render_size, transform),
             .image => {
                 if (displayed.texture) |texture| {
-                    renderImg(displayed.position, displayed.size, texture, .white, .blank, pos, size, internal_render_size, transform);
+                    renderMedia(displayed, texture, pos, size, internal_render_size, transform);
                 }
             },
             .video => {
                 if (displayed.video) |player| {
-                    renderImg(displayed.position, displayed.size, player.texture, .white, .blank, pos, size, internal_render_size, transform);
+                    renderMedia(
+                        displayed,
+                        videoTextureForRender(player, self.render_video_posters),
+                        pos,
+                        size,
+                        internal_render_size,
+                        transform,
+                    );
                 }
             },
             .crowd => self.renderCrowd(displayed, crowd_snapshot, crowd_url, pos, size, internal_render_size, transform),
@@ -2324,10 +2669,13 @@ pub const SlideshowRenderer = struct {
         if (item.text == null and item.color != null) {
             const startpos = translated(slidePosToRenderPos(item.position, slide_tl, slide_size, internal_render_size), transform.offset);
             const rendered_size = slideSizeToRenderSize(item.size, slide_size, internal_render_size);
-            rl.drawRectangleRec(
-                .{ .x = startpos.x, .y = startpos.y, .width = rendered_size.x, .height = rendered_size.y },
-                colorWithOpacity(item.color.?, transform.opacity),
-            );
+            const rect: rl.Rectangle = .{ .x = startpos.x, .y = startpos.y, .width = rendered_size.x, .height = rendered_size.y };
+            const color = colorWithOpacity(item.color.?, transform.opacity);
+            if (item.corner_radius > 0) {
+                const logical_short_side = @max(@as(f32, 1), @min(item.size.x, item.size.y));
+                const roundness = std.math.clamp(item.corner_radius * 2 / logical_short_side, 0, 1);
+                rl.drawRectangleRounded(rect, roundness, 16, color);
+            } else rl.drawRectangleRec(rect, color);
             return;
         }
 
@@ -2396,6 +2744,119 @@ pub const SlideshowRenderer = struct {
     }
 };
 
+fn renderLine(
+    item: *const RenderElement,
+    slide_tl: rl.Vector2,
+    slide_size: rl.Vector2,
+    internal_render_size: rl.Vector2,
+    transform: RenderTransform,
+) void {
+    const start = translated(slidePosToRenderPos(item.line_start, slide_tl, slide_size, internal_render_size), transform.offset);
+    const end = translated(slidePosToRenderPos(item.line_end, slide_tl, slide_size, internal_render_size), transform.offset);
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const length = @sqrt(dx * dx + dy * dy);
+    if (length <= 0.0001) return;
+    const color = colorWithOpacity(item.color orelse .white, transform.opacity);
+    const thickness = @max(@as(f32, 1), item.line_width * slide_size.y / internal_render_size.y);
+    rl.drawLineEx(start, end, thickness, color);
+    const direction: rl.Vector2 = .{ .x = dx / length, .y = dy / length };
+    if (item.line_arrow_end) drawArrowHead(end, direction, thickness, color);
+    if (item.line_arrow_start) drawArrowHead(start, .{ .x = -direction.x, .y = -direction.y }, thickness, color);
+}
+
+fn drawArrowHead(tip: rl.Vector2, direction: rl.Vector2, thickness: f32, color: rl.Color) void {
+    const vertices = arrowHeadVertices(tip, direction, thickness);
+    rl.drawTriangle(vertices[0], vertices[1], vertices[2], color);
+}
+
+fn arrowHeadVertices(tip: rl.Vector2, direction: rl.Vector2, thickness: f32) [3]rl.Vector2 {
+    const length = @max(@as(f32, 12), thickness * 4);
+    const half_width = @max(@as(f32, 7), thickness * 2.4);
+    const base: rl.Vector2 = .{ .x = tip.x - direction.x * length, .y = tip.y - direction.y * length };
+    const perpendicular: rl.Vector2 = .{ .x = -direction.y * half_width, .y = direction.x * half_width };
+    // raylib's screen-space front face follows the same winding used by its
+    // built-in UI triangles. Reversing these base vertices silently culls the
+    // arrowhead on the macOS OpenGL backend.
+    return .{
+        tip,
+        .{ .x = base.x - perpendicular.x, .y = base.y - perpendicular.y },
+        .{ .x = base.x + perpendicular.x, .y = base.y + perpendicular.y },
+    };
+}
+
+fn videoTextureForRender(player: *const videoplayer.VideoPlayer, poster_only: bool) rl.Texture2D {
+    return if (poster_only) player.poster_texture else player.texture;
+}
+
+fn unavailableMediaSize(item: slides.SlideItem) rl.Vector2 {
+    const fallback: rl.Vector2 = .{ .x = 640, .y = 360 };
+    var size = item.size;
+    if (size.x <= 0 and size.y <= 0) {
+        size = fallback;
+    } else if (size.x <= 0) {
+        size.x = size.y * fallback.x / fallback.y;
+    } else if (size.y <= 0) {
+        size.y = size.x * fallback.y / fallback.x;
+    }
+    return size;
+}
+
+fn appendUnavailableMediaElement(
+    render_slide: *RenderedSlide,
+    allocator: std.mem.Allocator,
+    item: slides.SlideItem,
+    availability: slides.MediaAvailability,
+) !void {
+    try render_slide.elements.append(allocator, .{
+        .kind = if (item.kind == .img) .image else .video,
+        .position = item.position,
+        .size = unavailableMediaSize(item),
+        .media_availability = availability,
+        .media_audio = if (item.kind == .vid) .unknown else .not_applicable,
+    });
+}
+
+fn appendUnavailableBackgroundElement(
+    render_slide: *RenderedSlide,
+    allocator: std.mem.Allocator,
+    availability: slides.MediaAvailability,
+) !void {
+    // A null-texture/null-color background emits no pixels in presentation or
+    // export, but remains in the renderer graph so Studio and Showtime can
+    // explain the exact missing dependency without making pre-render fail.
+    try render_slide.elements.append(allocator, .{
+        .kind = .background,
+        .position = .zero(),
+        .size = .{ .x = 1920, .y = 1080 },
+        .color = null,
+        .media_availability = availability,
+    });
+}
+
+fn classifyImageLoadFailure(err: anyerror) slides.MediaAvailability {
+    const name = @errorName(err);
+    if (std.mem.eql(u8, name, "FileNotFound") or std.mem.eql(u8, name, "NotDir"))
+        return .image_file_missing;
+    if (std.mem.eql(u8, name, "AccessDenied") or
+        std.mem.eql(u8, name, "PermissionDenied") or
+        std.mem.eql(u8, name, "IsDir"))
+    {
+        return .image_file_unreadable;
+    }
+    return .image_decode_failed;
+}
+
+fn mediaAvailabilityForVideoFailure(failure: videoplayer.VideoLoadFailure) slides.MediaAvailability {
+    return switch (failure) {
+        .file_missing => .video_file_missing,
+        .file_unreadable => .video_file_unreadable,
+        .tools_missing => .video_tools_missing,
+        .probe_failed => .video_probe_failed,
+        .poster_decode_failed => .video_poster_decode_failed,
+    };
+}
+
 fn itemBackgroundElement(item: slides.SlideItem) ?RenderElement {
     if (item.kind == .background) return null;
     const color = item.background_color orelse return null;
@@ -2409,12 +2870,95 @@ fn itemBackgroundElement(item: slides.SlideItem) ?RenderElement {
         .text = null,
         .color = color,
         .is_item_background = true,
+        .corner_radius = item.corner_radius,
     };
+}
+
+fn ownerRotationCenter(elements: []const RenderElement, item: slides.SlideItem) rl.Vector2 {
+    if (item.kind == .line) return .{
+        .x = item.position.x + item.size.x / 2,
+        .y = item.position.y + item.size.y / 2,
+    };
+    if (item.size.x > 0 and item.size.y > 0) return .{
+        .x = item.position.x + item.size.x / 2,
+        .y = item.position.y + item.size.y / 2,
+    };
+    var min_x = std.math.inf(f32);
+    var min_y = std.math.inf(f32);
+    var max_x = -std.math.inf(f32);
+    var max_y = -std.math.inf(f32);
+    for (elements) |element| {
+        if (element.kind == .background or element.size.x <= 0 or element.size.y <= 0) continue;
+        min_x = @min(min_x, element.position.x);
+        min_y = @min(min_y, element.position.y);
+        max_x = @max(max_x, element.position.x + element.size.x);
+        max_y = @max(max_y, element.position.y + element.size.y);
+    }
+    if (!std.math.isFinite(min_x)) return item.position;
+    return .{ .x = (min_x + max_x) / 2, .y = (min_y + max_y) / 2 };
 }
 
 /// Fill omitted dimensions from the content fragments produced for the same
 /// owner. This keeps `bg=` useful for naturally-sized images without turning
 /// an omitted image width or height into an explicit source value.
+fn alignTextElements(elements: []RenderElement, item: slides.SlideItem) void {
+    if (elements.len == 0) return;
+
+    if (item.text_alignment != .left) {
+        var line_index: usize = 0;
+        while (true) : (line_index += 1) {
+            var found = false;
+            var min_x: f32 = std.math.inf(f32);
+            var max_x: f32 = -std.math.inf(f32);
+            var highest_line = line_index;
+            for (elements) |element| {
+                if (element.kind != .text or element.text == null) continue;
+                highest_line = @max(highest_line, element.text_line_index);
+                if (element.text_line_index != line_index) continue;
+                found = true;
+                min_x = @min(min_x, element.position.x);
+                max_x = @max(max_x, element.position.x + element.size.x);
+            }
+            if (found) {
+                const line_width = max_x - min_x;
+                const target_x = switch (item.text_alignment) {
+                    .left => unreachable,
+                    .center => item.position.x + (item.size.x - line_width) * 0.5,
+                    .right => item.position.x + item.size.x - line_width,
+                };
+                const shift = target_x - min_x;
+                for (elements) |*element| {
+                    if (element.kind == .text and element.text != null and element.text_line_index == line_index)
+                        element.position.x += shift;
+                }
+            }
+            if (line_index >= highest_line) break;
+        }
+    }
+
+    if (item.text_vertical_alignment != .top) {
+        var found = false;
+        var content_bottom = item.position.y;
+        for (elements) |element| {
+            if (element.kind != .text or element.text == null) continue;
+            found = true;
+            content_bottom = @max(content_bottom, element.position.y + element.size.y);
+        }
+        if (found) {
+            const content_height = @max(@as(f32, 0), content_bottom - item.position.y);
+            const spare_height = @max(@as(f32, 0), item.size.y - content_height);
+            const shift = switch (item.text_vertical_alignment) {
+                .top => unreachable,
+                .middle => spare_height * 0.5,
+                .bottom => spare_height,
+            };
+            for (elements) |*element| {
+                if (element.kind == .text and element.text != null) element.position.y += shift;
+            }
+        }
+    }
+}
+
 fn resolveItemBackgroundGeometry(background: *RenderElement, content: []const RenderElement) void {
     if (background.size.x > 0 and background.size.y > 0) return;
 
@@ -2456,18 +3000,25 @@ fn elementWithGeometryPreview(element: RenderElement, preview: ItemGeometryPrevi
     if (element.kind == .background or element.owner_identity != preview.owner_identity) return element;
 
     var result = element;
+    if (preview.rotation) |rotation| result.rotation = rotation;
     const move = rl.Vector2{
         .x = preview.after_position.x - preview.before_position.x,
         .y = preview.after_position.y - preview.before_position.y,
     };
     result.position.x += move.x;
     result.position.y += move.y;
+    result.rotation_center.x += move.x;
+    result.rotation_center.y += move.y;
+    if (element.kind == .line) {
+        result.line_start = .{ .x = element.line_start.x + move.x, .y = element.line_start.y + move.y };
+        result.line_end = .{ .x = element.line_end.x + move.x, .y = element.line_end.y + move.y };
+    }
     if (!preview.resized) return result;
 
     // Images, Crowdplay panels, and color-only rectangles can be resized
     // faithfully without rebuilding layout. Text keeps its glyph metrics and
     // reflows once the completed gesture is reparsed.
-    const scalable = element.kind == .image or element.kind == .crowd or
+    const scalable = element.kind == .image or element.kind == .crowd or element.kind == .line or
         (element.kind == .text and element.text == null);
     if (!scalable or preview.before_size.x <= 0 or preview.before_size.y <= 0) return result;
 
@@ -2478,6 +3029,20 @@ fn elementWithGeometryPreview(element: RenderElement, preview: ItemGeometryPrevi
         .y = preview.after_position.y + (element.position.y - preview.before_position.y) * scale_y,
     };
     result.size = .{ .x = element.size.x * scale_x, .y = element.size.y * scale_y };
+    result.rotation_center = .{
+        .x = preview.after_position.x + (element.rotation_center.x - preview.before_position.x) * scale_x,
+        .y = preview.after_position.y + (element.rotation_center.y - preview.before_position.y) * scale_y,
+    };
+    if (element.kind == .line) {
+        result.line_start = .{
+            .x = preview.after_position.x + (element.line_start.x - preview.before_position.x) * scale_x,
+            .y = preview.after_position.y + (element.line_start.y - preview.before_position.y) * scale_y,
+        };
+        result.line_end = .{
+            .x = preview.after_position.x + (element.line_end.x - preview.before_position.x) * scale_x,
+            .y = preview.after_position.y + (element.line_end.y - preview.before_position.y) * scale_y,
+        };
+    }
     return result;
 }
 
@@ -2655,6 +3220,48 @@ fn lerpF32(from: f32, to: f32, progress: f32) f32 {
     return from + (to - from) * progress;
 }
 
+fn lerpDegrees(from: f32, to: f32, progress: f32) f32 {
+    var delta = @mod(to - from, 360.0);
+    if (delta > 180) delta -= 360;
+    if (delta < -180) delta += 360;
+    return from + delta * progress;
+}
+
+fn rotatePoint(point: rl.Vector2, center: rl.Vector2, degrees: f32) rl.Vector2 {
+    if (@abs(degrees) <= 0.0001) return point;
+    const radians = degrees * std.math.pi / 180.0;
+    const cosine = std.math.cos(radians);
+    const sine = std.math.sin(radians);
+    const dx = point.x - center.x;
+    const dy = point.y - center.y;
+    return .{
+        .x = center.x + dx * cosine - dy * sine,
+        .y = center.y + dx * sine + dy * cosine,
+    };
+}
+
+fn rotatedRectangleBounds(bounds: rl.Rectangle, center: rl.Vector2, degrees: f32) rl.Rectangle {
+    const corners = [_]rl.Vector2{
+        .{ .x = bounds.x, .y = bounds.y },
+        .{ .x = bounds.x + bounds.width, .y = bounds.y },
+        .{ .x = bounds.x + bounds.width, .y = bounds.y + bounds.height },
+        .{ .x = bounds.x, .y = bounds.y + bounds.height },
+    };
+    const first = rotatePoint(corners[0], center, degrees);
+    var min_x = first.x;
+    var min_y = first.y;
+    var max_x = first.x;
+    var max_y = first.y;
+    for (corners[1..]) |corner| {
+        const rotated = rotatePoint(corner, center, degrees);
+        min_x = @min(min_x, rotated.x);
+        min_y = @min(min_y, rotated.y);
+        max_x = @max(max_x, rotated.x);
+        max_y = @max(max_y, rotated.y);
+    }
+    return .{ .x = min_x, .y = min_y, .width = max_x - min_x, .height = max_y - min_y };
+}
+
 fn lerpVector(from: rl.Vector2, to: rl.Vector2, progress: f32) rl.Vector2 {
     return .{
         .x = lerpF32(from.x, to.x, progress),
@@ -2716,6 +3323,13 @@ fn interpolateElement(from: *const RenderElement, to: *const RenderElement, prog
     result.size.x = @max(0.0, result.size.x);
     result.size.y = @max(0.0, result.size.y);
     result.opacity = lerpF32(from.opacity, to.opacity, clamped);
+    result.media_focus = lerpVector(from.media_focus, to.media_focus, clamped);
+    result.corner_radius = @max(0, lerpF32(from.corner_radius, to.corner_radius, clamped));
+    result.line_start = lerpVector(from.line_start, to.line_start, clamped);
+    result.line_end = lerpVector(from.line_end, to.line_end, clamped);
+    result.line_width = @max(0.1, lerpF32(from.line_width, to.line_width, clamped));
+    result.rotation = lerpDegrees(from.rotation, to.rotation, clamped);
+    result.rotation_center = lerpVector(from.rotation_center, to.rotation_center, progress);
     if (from.color != null and to.color != null) result.color = lerpColor(from.color.?, to.color.?, clamped);
     if (from.fontSize != null and to.fontSize != null) result.fontSize = @max(1.0, lerpF32(from.fontSize.?, to.fontSize.?, progress));
     if (from.underline_width != null and to.underline_width != null) {
@@ -2802,15 +3416,15 @@ fn combineTransforms(a: RenderTransform, b: RenderTransform) RenderTransform {
 var crowd_text_buffer_a: [512]u8 = undefined;
 var crowd_text_buffer_b: [512]u8 = undefined;
 
-fn drawCrowdText(font: rl.Font, text: [:0]const u8, pos: rl.Vector2, size: f32, color: rl.Color) void {
-    rl.drawTextEx(font, text, pos, @max(1.0, size), 0, color);
+fn drawCrowdText(available: *const my_fonts.AvailableFonts, font: rl.Font, text: [:0]const u8, pos: rl.Vector2, size: f32, color: rl.Color) void {
+    available.drawTextWithFallback(font, text, pos, @max(1.0, size), 0, color);
 }
 
-fn drawCrowdTextFitted(font: rl.Font, text: [:0]const u8, pos: rl.Vector2, size: f32, max_width: f32, color: rl.Color) void {
+fn drawCrowdTextFitted(available: *const my_fonts.AvailableFonts, font: rl.Font, text: [:0]const u8, pos: rl.Vector2, size: f32, max_width: f32, color: rl.Color) void {
     const base_size = @max(1.0, size);
-    const measured = rl.measureTextEx(font, text, base_size, 0).x;
+    const measured = available.measureTextWithFallback(font, text, base_size, 0).x;
     const fitted = if (measured > max_width and measured > 0) @max(1.0, base_size * max_width / measured) else base_size;
-    rl.drawTextEx(font, text, pos, fitted, 0, color);
+    available.drawTextWithFallback(font, text, pos, fitted, 0, color);
 }
 
 fn drawQrCode(code: *const qrcode.Code, region: rl.Rectangle, opacity: f32) void {
@@ -3362,6 +3976,7 @@ test "semantic morph interpolation preserves identity and continuous properties"
         .text = same_text,
         .fontSize = 20,
         .opacity = 0.5,
+        .corner_radius = 8,
     };
     const target = RenderElement{
         .kind = .text,
@@ -3373,6 +3988,7 @@ test "semantic morph interpolation preserves identity and continuous properties"
         .text = same_text,
         .fontSize = 60,
         .opacity = 1.0,
+        .corner_radius = 40,
         .text_shadow = .{ .color = .{ .r = 20, .g = 30, .b = 40, .a = 200 }, .offset = .{ .x = 8, .y = 10 } },
     };
 
@@ -3382,6 +3998,7 @@ test "semantic morph interpolation preserves identity and continuous properties"
     try std.testing.expectApproxEqAbs(@as(f32, 300), halfway.position.y, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 40), halfway.fontSize.?, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), halfway.opacity, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 24), halfway.corner_radius, 0.0001);
     try std.testing.expectEqual(@as(u8, 50), halfway.color.?.r);
     try std.testing.expectEqual(@as(u8, 100), halfway.text_shadow.?.color.a);
     try std.testing.expectEqual(source.position, interpolateElement(&source, &target, 0).position);
@@ -3545,6 +4162,46 @@ test "Studio geometry preview moves all fragments and resizes visual surfaces" {
     try std.testing.expectEqual(text.size, text_resize.size);
 }
 
+test "rotation previews and morphs use the rendered owner center and shortest arc" {
+    const preview: ItemGeometryPreview = .{
+        .owner_identity = 7,
+        .before_position = .{ .x = 100, .y = 200 },
+        .before_size = .{ .x = 400, .y = 300 },
+        .after_position = .{ .x = 100, .y = 200 },
+        .after_size = .{ .x = 400, .y = 300 },
+        .resized = false,
+        .rotation = 37,
+    };
+    const element: RenderElement = .{
+        .kind = .image,
+        .owner_identity = 7,
+        .position = .{ .x = 100, .y = 200 },
+        .size = .{ .x = 400, .y = 300 },
+        .rotation = 0,
+        .rotation_center = .{ .x = 300, .y = 350 },
+    };
+    const rotated = elementWithGeometryPreview(element, preview);
+    try std.testing.expectApproxEqAbs(@as(f32, 37), rotated.rotation, 0.0001);
+    try std.testing.expectEqual(element.rotation_center, rotated.rotation_center);
+
+    var from = element;
+    from.rotation = 350;
+    var to = element;
+    to.rotation = 10;
+    const midpoint = interpolateElement(&from, &to, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 360), midpoint.rotation, 0.0001);
+
+    const bounds = rotatedRectangleBounds(
+        .{ .x = 100, .y = 200, .width = 400, .height = 200 },
+        .{ .x = 300, .y = 300 },
+        90,
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 200), bounds.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), bounds.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), bounds.width, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), bounds.height, 0.0001);
+}
+
 test "Studio geometry preview batches resolve by item identity" {
     const previews = [_]ItemGeometryPreview{
         .{
@@ -3593,6 +4250,27 @@ test "item-owned background is a bounded color part behind its content" {
     try std.testing.expect(itemBackgroundElement(slide_background) == null);
 }
 
+test "text fragments align per line and as a vertical block" {
+    var elements = [_]RenderElement{
+        .{ .kind = .text, .position = .{ .x = 100, .y = 100 }, .size = .{ .x = 40, .y = 20 }, .text = "One", .text_line_index = 0 },
+        .{ .kind = .text, .position = .{ .x = 140, .y = 100 }, .size = .{ .x = 60, .y = 20 }, .text = " two", .text_line_index = 0 },
+        .{ .kind = .text, .position = .{ .x = 100, .y = 130 }, .size = .{ .x = 50, .y = 20 }, .text = "Three", .text_line_index = 1 },
+    };
+    alignTextElements(&elements, .{
+        .kind = .textbox,
+        .position = .{ .x = 100, .y = 100 },
+        .size = .{ .x = 300, .y = 200 },
+        .text_alignment = .right,
+        .text_vertical_alignment = .bottom,
+    });
+
+    try std.testing.expectApproxEqAbs(@as(f32, 300), elements[0].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 340), elements[1].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 350), elements[2].position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 250), elements[0].position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 280), elements[2].position.y, 0.0001);
+}
+
 test "item-owned background resolves omitted image dimensions from content" {
     var background: RenderElement = .{
         .kind = .text,
@@ -3623,6 +4301,142 @@ test "item-owned background resolves omitted image dimensions from content" {
     try std.testing.expectApproxEqAbs(@as(f32, 500), background.size.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 240), background.position.y, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 360), background.size.y, 0.0001);
+}
+
+test "arrowhead vertices use raylib visible screen-space winding" {
+    const directions = [_]rl.Vector2{
+        .{ .x = 1, .y = 0 },
+        .{ .x = -1, .y = 0 },
+        .{ .x = 0, .y = 1 },
+        .{ .x = 0, .y = -1 },
+    };
+    for (directions) |direction| {
+        const vertices = arrowHeadVertices(.{ .x = 100, .y = 100 }, direction, 6);
+        const a = .{ .x = vertices[1].x - vertices[0].x, .y = vertices[1].y - vertices[0].y };
+        const b = .{ .x = vertices[2].x - vertices[0].x, .y = vertices[2].y - vertices[0].y };
+        try std.testing.expect(a.x * b.y - a.y * b.x < 0);
+    }
+}
+
+test "image and video fit modes share deterministic contain and cover geometry" {
+    const box: rl.Rectangle = .{ .x = 100, .y = 200, .width = 400, .height = 400 };
+    const source: rl.Vector2 = .{ .x = 1920, .y = 1080 };
+
+    const stretched = mediaDrawRects(box, source, .stretch, .{ .x = 0.5, .y = 0.5 });
+    try std.testing.expectEqual(box, stretched.destination);
+    try std.testing.expectApproxEqAbs(@as(f32, 1920), stretched.source.width, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1080), stretched.source.height, 0.0001);
+
+    const contained = mediaDrawRects(box, source, .contain, .{ .x = 0.5, .y = 0.75 });
+    try std.testing.expectApproxEqAbs(@as(f32, 400), contained.destination.width, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 225), contained.destination.height, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 331.25), contained.destination.y, 0.0001);
+    try std.testing.expectEqual(stretched.source, contained.source);
+
+    const covered = mediaDrawRects(box, source, .cover, .{ .x = 0.25, .y = 1 });
+    try std.testing.expectEqual(box, covered.destination);
+    try std.testing.expectApproxEqAbs(@as(f32, 210), covered.source.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), covered.source.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1080), covered.source.width, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1080), covered.source.height, 0.0001);
+}
+
+test "passive video rendering selects the immutable poster texture" {
+    var live_texture: rl.Texture2D = undefined;
+    live_texture.id = 11;
+    var poster_texture: rl.Texture2D = undefined;
+    poster_texture.id = 22;
+    var poster: [0]u8 = .{};
+    var player: videoplayer.VideoPlayer = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .path = "demo.mp4",
+        .width = 640,
+        .height = 360,
+        .fps = 30,
+        .has_audio = false,
+        .duration = 6,
+        .texture = live_texture,
+        .poster_texture = poster_texture,
+        .poster = &poster,
+    };
+    try std.testing.expectEqual(@as(c_uint, 11), videoTextureForRender(&player, false).id);
+    try std.testing.expectEqual(@as(c_uint, 22), videoTextureForRender(&player, true).id);
+}
+
+test "media diagnostics retain fallback bounds warnings and audio capability" {
+    try std.testing.expectEqual(slides.MediaAvailability.image_file_missing, classifyImageLoadFailure(error.FileNotFound));
+    try std.testing.expectEqual(slides.MediaAvailability.image_file_unreadable, classifyImageLoadFailure(error.AccessDenied));
+    try std.testing.expectEqual(slides.MediaAvailability.image_decode_failed, classifyImageLoadFailure(error.InvalidData));
+    try std.testing.expectEqual(
+        slides.MediaAvailability.video_tools_missing,
+        mediaAvailabilityForVideoFailure(.tools_missing),
+    );
+
+    var rendered = try RenderedSlide.new(std.testing.allocator);
+    defer {
+        rendered.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(rendered);
+    }
+    const missing_image: slides.SlideItem = .{
+        .identity = 10,
+        .kind = .img,
+        .img_path = "missing.png",
+        .position = .{ .x = 20, .y = 30 },
+    };
+    try appendUnavailableMediaElement(rendered, std.testing.allocator, missing_image, .image_decode_failed);
+    try rendered.elements.append(std.testing.allocator, .{
+        .kind = .video,
+        .owner_identity = 20,
+        .position = .{ .x = 100, .y = 200 },
+        .size = .{ .x = 640, .y = 360 },
+        .media_source_size = .{ .x = 1280, .y = 720 },
+        .media_duration = 12,
+        .media_availability = .video_poster_out_of_range,
+        .media_audio = .unavailable,
+    });
+    // preRenderItem supplies ownership after the media constructor returns.
+    rendered.elements.items[0].owner_identity = missing_image.identity;
+    var bounds = std.ArrayList(SlideshowRenderer.ItemRenderBounds).empty;
+    defer bounds.deinit(std.testing.allocator);
+    _ = try SlideshowRenderer.collectRenderedItemBounds(std.testing.allocator, &bounds, rendered.elements.items);
+    try std.testing.expectEqual(@as(usize, 2), bounds.items.len);
+    try std.testing.expectEqual(rl.Rectangle{ .x = 20, .y = 30, .width = 640, .height = 360 }, bounds.items[0].bounds);
+    try std.testing.expectEqual(slides.MediaAvailability.image_decode_failed, bounds.items[0].media_availability);
+    try std.testing.expectEqual(slides.MediaAvailability.video_poster_out_of_range, bounds.items[1].media_availability);
+    try std.testing.expectEqual(slides.MediaAudioAvailability.unavailable, bounds.items[1].media_audio);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), bounds.items[1].media_duration, 0.0001);
+}
+
+test "authored video audio defaults replace temporary presenter adjustments on entry" {
+    var poster: [0]u8 = .{};
+    var player: videoplayer.VideoPlayer = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .path = "demo.mp4",
+        .width = 640,
+        .height = 360,
+        .fps = 30,
+        .has_audio = false,
+        .duration = 6,
+        .texture = undefined,
+        .poster_texture = undefined,
+        .poster = &poster,
+        .volume = 0.2,
+        .muted = false,
+    };
+    const element: RenderElement = .{
+        .kind = .video,
+        .video_default_volume = 0.65,
+        .video_default_muted = true,
+    };
+
+    player.setVolume(0.9);
+    player.setMuted(false);
+    SlideshowRenderer.applyVideoPlaybackDefaults(element, &player);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), player.volume, 0.0001);
+    try std.testing.expect(player.muted);
 }
 
 pub fn slidePosToRenderPos(pos: rl.Vector2, slide_tl: rl.Vector2, slide_size: rl.Vector2, internal_render_size: rl.Vector2) rl.Vector2 {
@@ -3669,6 +4483,106 @@ fn renderImg(pos: rl.Vector2, size: rl.Vector2, texture: rl.Texture2D, tint_colo
 
     // TODO: Border
     _ = border_color;
+}
+
+const MediaDrawRects = struct {
+    source: rl.Rectangle,
+    destination: rl.Rectangle,
+};
+
+/// Resolve source cropping and destination letterboxing without touching GPU
+/// state. Keeping this pure gives image and video identical fit/fill/focal
+/// semantics and makes the exact crop math testable.
+fn mediaDrawRects(
+    destination_box: rl.Rectangle,
+    source_size: rl.Vector2,
+    fit: slides.MediaFit,
+    raw_focus: rl.Vector2,
+) MediaDrawRects {
+    const source_w = @max(@as(f32, 1), source_size.x);
+    const source_h = @max(@as(f32, 1), source_size.y);
+    const box_w = @max(@as(f32, 0), destination_box.width);
+    const box_h = @max(@as(f32, 0), destination_box.height);
+    const focus = rl.Vector2{
+        .x = std.math.clamp(raw_focus.x, 0, 1),
+        .y = std.math.clamp(raw_focus.y, 0, 1),
+    };
+    var result: MediaDrawRects = .{
+        .source = .{ .x = 0, .y = 0, .width = source_w, .height = source_h },
+        .destination = destination_box,
+    };
+    if (box_w <= 0 or box_h <= 0 or fit == .stretch) return result;
+
+    const scale_x = box_w / source_w;
+    const scale_y = box_h / source_h;
+    switch (fit) {
+        .stretch => unreachable,
+        .contain => {
+            const scale = @min(scale_x, scale_y);
+            const drawn_w = source_w * scale;
+            const drawn_h = source_h * scale;
+            result.destination = .{
+                .x = destination_box.x + (box_w - drawn_w) * focus.x,
+                .y = destination_box.y + (box_h - drawn_h) * focus.y,
+                .width = drawn_w,
+                .height = drawn_h,
+            };
+        },
+        .cover => {
+            const scale = @max(scale_x, scale_y);
+            const visible_w = box_w / scale;
+            const visible_h = box_h / scale;
+            result.source = .{
+                .x = (source_w - visible_w) * focus.x,
+                .y = (source_h - visible_h) * focus.y,
+                .width = visible_w,
+                .height = visible_h,
+            };
+        },
+    }
+    return result;
+}
+
+fn renderMedia(
+    element: *const RenderElement,
+    texture: rl.Texture2D,
+    slide_tl: rl.Vector2,
+    slide_size: rl.Vector2,
+    internal_render_size: rl.Vector2,
+    transform: RenderTransform,
+) void {
+    const top_left = translated(
+        slidePosToRenderPos(element.position, slide_tl, slide_size, internal_render_size),
+        transform.offset,
+    );
+    const rendered_size = slideSizeToRenderSize(element.size, slide_size, internal_render_size);
+    var rects = mediaDrawRects(
+        .{ .x = top_left.x, .y = top_left.y, .width = rendered_size.x, .height = rendered_size.y },
+        if (element.media_source_size.x > 0 and element.media_source_size.y > 0)
+            element.media_source_size
+        else
+            .{ .x = @floatFromInt(texture.width), .y = @floatFromInt(texture.height) },
+        element.media_fit,
+        element.media_focus,
+    );
+    // SVG textures are rasterized above their intrinsic/viewBox dimensions.
+    // Fit/crop math remains in natural coordinates for truthful metadata, then
+    // maps the source rectangle onto the actual high-resolution texture.
+    if (element.media_source_size.x > 0 and element.media_source_size.y > 0) {
+        const texture_scale_x = @as(f32, @floatFromInt(texture.width)) / element.media_source_size.x;
+        const texture_scale_y = @as(f32, @floatFromInt(texture.height)) / element.media_source_size.y;
+        rects.source.x *= texture_scale_x;
+        rects.source.y *= texture_scale_y;
+        rects.source.width *= texture_scale_x;
+        rects.source.height *= texture_scale_y;
+    }
+    texture.drawPro(
+        rects.source,
+        rects.destination,
+        .zero(),
+        0,
+        colorWithOpacity(.white, transform.opacity),
+    );
 }
 
 fn renderBgColor(bgcol: rl.Color, slide_tl: rl.Vector2, slide_size: rl.Vector2, transform: RenderTransform) void {

@@ -170,6 +170,60 @@ const fontdata_bolditalic = @embedFile("assets/Calibri Italic.ttf"); // Calibri 
 const fontdata_zig = @embedFile("assets/press-start-2p.ttf");
 const fontdata_emoji = @embedFile("assets/NotoEmoji.ttf");
 
+// SDF reconstruction, unlike a bitmap atlas, remains scale-independent; a
+// 32-pixel source keeps startup and custom-font replacement responsive while
+// the derivative-aware shader supplies crisp edges at every output scale.
+const minimum_sdf_base_size: i32 = 32;
+const sdf_fragment_shader: [:0]const u8 =
+    "#version 330\n" ++
+    "in vec2 fragTexCoord;\n" ++
+    "in vec4 fragColor;\n" ++
+    "uniform sampler2D texture0;\n" ++
+    "uniform vec4 colDiffuse;\n" ++
+    "out vec4 finalColor;\n" ++
+    "void main() {\n" ++
+    "  float distance = texture(texture0, fragTexCoord).a;\n" ++
+    "  float smoothing = max(fwidth(distance), 0.0001);\n" ++
+    "  float alpha = smoothstep(0.5 - smoothing, 0.5 + smoothing, distance);\n" ++
+    "  finalColor = vec4(fragColor.rgb * colDiffuse.rgb, fragColor.a * colDiffuse.a * alpha);\n" ++
+    "}\n";
+
+fn sdfBaseSize(requested: i32) i32 {
+    return @max(minimum_sdf_base_size, requested);
+}
+
+/// Raylib's ordinary TTF loader bakes a bitmap atlas at one size. Building the
+/// same Font object from signed-distance glyph data keeps presentation text
+/// crisp when Studio zoom, HiDPI output, fullscreen, or export scales it far
+/// away from that source size.
+fn loadSdfFontFromMemory(data: []const u8, requested_size: i32, codepoints: ?[]const i32) !rl.Font {
+    const base_size = sdfBaseSize(requested_size);
+    const glyphs = try rl.loadFontData(data, base_size, codepoints, .sdf);
+    errdefer rl.unloadFontData(glyphs);
+    const atlas = try rl.genImageFontAtlas(glyphs, base_size, 0, 1);
+    errdefer {
+        rl.unloadImage(atlas[0]);
+        rl.memFree(@ptrCast(atlas[1].ptr));
+    }
+    const texture = try rl.loadTextureFromImage(atlas[0]);
+    rl.unloadImage(atlas[0]);
+    rl.setTextureFilter(texture, .bilinear);
+    return .{
+        .baseSize = base_size,
+        .glyphCount = @intCast(glyphs.len),
+        .glyphPadding = 0,
+        .texture = texture,
+        .recs = atlas[1].ptr,
+        .glyphs = glyphs.ptr,
+    };
+}
+
+fn loadSdfFontFile(path: [:0]const u8, requested_size: i32, codepoints: ?[]const i32) !rl.Font {
+    const data = try rl.loadFileData(path);
+    defer rl.unloadFileData(data);
+    return loadSdfFontFromMemory(data, requested_size, codepoints);
+}
+
 // gui font = try rl.getDefaultFont()
 
 pub const AvailableFonts = struct {
@@ -180,6 +234,7 @@ pub const AvailableFonts = struct {
     zig: rl.Font = undefined,
     symbols: rl.Font = undefined,
     emoji: rl.Font = undefined,
+    sdf_shader: rl.Shader = undefined,
     /// Optical correction for the display/code face. Fonts such as Press
     /// Start 2P use almost the entire em square while presentation fonts use
     /// considerably less, so equal nominal sizes do not look equal.
@@ -189,27 +244,33 @@ pub const AvailableFonts = struct {
     zig_baseline_offset: f32 = 0.0,
 
     pub fn init(opts: FontConfig.Opts) !AvailableFonts {
+        const normal = try loadSdfFontFromMemory(fontdata_normal, opts.fontSize, opts.fontChars);
+        errdefer rl.unloadFont(normal);
+        const bold = try loadSdfFontFromMemory(fontdata_bold, opts.fontSize, opts.fontChars);
+        errdefer rl.unloadFont(bold);
+        const italic = try loadSdfFontFromMemory(fontdata_italic, opts.fontSize, opts.fontChars);
+        errdefer rl.unloadFont(italic);
+        const bolditalic = try loadSdfFontFromMemory(fontdata_bolditalic, opts.fontSize, opts.fontChars);
+        errdefer rl.unloadFont(bolditalic);
+        const zig = try loadSdfFontFromMemory(fontdata_zig, opts.fontSize, opts.fontChars);
+        errdefer rl.unloadFont(zig);
+        const symbols = try loadSdfFontFromMemory(fontdata_normal, opts.fontSize, symbol_fontchars[0..]);
+        errdefer rl.unloadFont(symbols);
+        const emoji = try loadSdfFontFromMemory(fontdata_emoji, opts.fontSize, emoji_fontchars[0..]);
+        errdefer rl.unloadFont(emoji);
+        const shader = try rl.loadShaderFromMemory(null, sdf_fragment_shader);
+        errdefer rl.unloadShader(shader);
         var ret: AvailableFonts = .{
-            .normal = try rl.loadFontFromMemory(".ttf", fontdata_normal, opts.fontSize, opts.fontChars),
-            .bold = try rl.loadFontFromMemory(".ttf", fontdata_bold, opts.fontSize, opts.fontChars),
-            .italic = try rl.loadFontFromMemory(".ttf", fontdata_italic, opts.fontSize, opts.fontChars),
-            .bolditalic = try rl.loadFontFromMemory(".ttf", fontdata_bolditalic, opts.fontSize, opts.fontChars),
-            .zig = try rl.loadFontFromMemory(".ttf", fontdata_zig, opts.fontSize, opts.fontChars),
-            .symbols = try rl.loadFontFromMemory(".ttf", fontdata_normal, opts.fontSize, symbol_fontchars[0..]),
-            .emoji = try rl.loadFontFromMemory(".ttf", fontdata_emoji, opts.fontSize, emoji_fontchars[0..]),
+            .normal = normal,
+            .bold = bold,
+            .italic = italic,
+            .bolditalic = bolditalic,
+            .zig = zig,
+            .symbols = symbols,
+            .emoji = emoji,
+            .sdf_shader = shader,
         };
         ret.updateStyleScales();
-
-        // Morphing font sizes is dramatically cleaner with filtered atlases.
-        // Custom fonts already received the same treatment after loading.
-        rl.setTextureFilter(ret.normal.texture, .bilinear);
-        rl.setTextureFilter(ret.bold.texture, .bilinear);
-        rl.setTextureFilter(ret.italic.texture, .bilinear);
-        rl.setTextureFilter(ret.bolditalic.texture, .bilinear);
-        rl.setTextureFilter(ret.zig.texture, .bilinear);
-        rl.setTextureFilter(ret.symbols.texture, .bilinear);
-        rl.setTextureFilter(ret.emoji.texture, .bilinear);
-
         return ret;
     }
 
@@ -219,7 +280,7 @@ pub const AvailableFonts = struct {
         if (fontConfig.normal) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.normal);
             self.normal = replacement;
             log.debug("Font {s} is ready: {}", .{ fontfile.ttf_filn, self.normal.isReady() });
@@ -228,7 +289,7 @@ pub const AvailableFonts = struct {
         if (fontConfig.bold) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.bold);
             self.bold = replacement;
         }
@@ -236,7 +297,7 @@ pub const AvailableFonts = struct {
         if (fontConfig.italic) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.italic);
             self.italic = replacement;
         }
@@ -244,7 +305,7 @@ pub const AvailableFonts = struct {
         if (fontConfig.bolditalic) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.bolditalic);
             self.bolditalic = replacement;
         }
@@ -252,18 +313,11 @@ pub const AvailableFonts = struct {
         if (fontConfig.zig) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
             const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
-            const replacement = try rl.loadFontEx(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
+            const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.zig);
             self.zig = replacement;
         }
         self.updateStyleScales();
-        rl.setTextureFilter(self.normal.texture, .bilinear);
-        rl.setTextureFilter(self.bold.texture, .bilinear);
-        rl.setTextureFilter(self.italic.texture, .bilinear);
-        rl.setTextureFilter(self.bolditalic.texture, .bilinear);
-        rl.setTextureFilter(self.zig.texture, .bilinear);
-        rl.setTextureFilter(self.symbols.texture, .bilinear);
-        rl.setTextureFilter(self.emoji.texture, .bilinear);
     }
 
     pub fn displaySizeForStyle(self: *const AvailableFonts, style: FontStyle, nominal_size: f32) f32 {
@@ -327,6 +381,8 @@ pub const AvailableFonts = struct {
         spacing: f32,
         tint: rl.Color,
     ) void {
+        rl.beginShaderMode(self.sdf_shader);
+        defer rl.endShaderMode();
         var cursor = position;
         var byte_index: usize = 0;
         while (byte_index < text.len) {
@@ -346,6 +402,24 @@ pub const AvailableFonts = struct {
         }
     }
 
+    /// Whether the exact runtime face selected for a rendered text fragment
+    /// contains `codepoint`. Showtime uses this after markdown/style
+    /// expansion, so it reports the face rayslides will actually draw rather
+    /// than guessing from the source text. Curated symbol and emoji
+    /// codepoints are checked against their embedded fallback atlases.
+    pub fn supportsCodepointForStyle(self: *const AvailableFonts, style: FontStyle, codepoint: u21) bool {
+        const choice = codepointFontChoice(codepoint);
+        if (choice == .ignore or codepoint == '\n' or codepoint == '\r' or codepoint == '\t' or codepoint == ' ') return true;
+        const primary = switch (style) {
+            .normal => self.normal,
+            .bold => self.bold,
+            .italic => self.italic,
+            .bolditalic => self.bolditalic,
+            .zig => self.zig,
+        };
+        return fontContainsCodepoint(self.fontForChoice(primary, choice), codepoint);
+    }
+
     fn fontForChoice(self: *const AvailableFonts, primary: rl.Font, choice: CodepointFontChoice) rl.Font {
         return switch (choice) {
             .primary => primary,
@@ -363,8 +437,15 @@ pub const AvailableFonts = struct {
         rl.unloadFont(self.zig);
         rl.unloadFont(self.symbols);
         rl.unloadFont(self.emoji);
+        rl.unloadShader(self.sdf_shader);
     }
 };
+
+test "presentation font atlases use a derivative-aware SDF floor" {
+    try std.testing.expectEqual(@as(i32, 32), sdfBaseSize(16));
+    try std.testing.expectEqual(@as(i32, 96), sdfBaseSize(96));
+    try std.testing.expect(std.mem.indexOf(u8, sdf_fragment_shader, "fwidth(distance)") != null);
+}
 
 const CodepointFontChoice = enum {
     primary,
@@ -413,6 +494,13 @@ fn glyphAdvance(font: rl.Font, codepoint: u21, font_size: f32) f32 {
     const advance = font.glyphs[index].advanceX;
     if (advance != 0) return @as(f32, @floatFromInt(advance)) * scale;
     return font.recs[index].width * scale;
+}
+
+fn fontContainsCodepoint(font: rl.Font, codepoint: u21) bool {
+    if (font.baseSize <= 0 or font.glyphCount <= 0) return false;
+    const raw_index = rl.getGlyphIndex(font, codepoint);
+    if (raw_index < 0 or raw_index >= font.glyphCount) return false;
+    return font.glyphs[@intCast(raw_index)].value == codepoint;
 }
 
 fn normalizedGlyphHeight(font: rl.Font, codepoint: u21) f32 {

@@ -96,16 +96,33 @@ Pause before the final point.
             </div>
           </div>
 
+          <p>Rotate the phone to landscape when you want a larger Pointer or Draw surface. On a short landscape screen, the companion temporarily hides the header, instructions, and compact notes so the complete 16:9 surface and Clear drawing action stay above Previous and Next. Notes mode keeps its normal full layout.</p>
+
           <h2>Stop the Presenter server</h2>
           <p>Press <kbd>Shift</kbd> + <kbd>P</kbd> to unpair the phone and stop the server.</p>
           <p>Pressing <kbd>P</kbd> only hides the setup screen. It does not end the connection.</p>
 
+          <h2>Use a laptop companion</h2>
+          <p>When you intentionally use extended displays, press <kbd>L</kbd> on the pairing screen. Rayslides copies the complete private companion link; paste it into a browser on the presenter laptop, then hide pairing.</p>
+          <p>At laptop-sized viewports of at least 900×600 pixels, current and next notes appear side by side. Requiring laptop-like height keeps a large phone in the phone layout when rotated to landscape. Pointer and Draw put the slide surface beside the current notes. Use <kbd>←</kbd>/<kbd>→</kbd>, <kbd>Page Up</kbd>/<kbd>Page Down</kbd>, or <kbd>Space</kbd> to navigate, and <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> to switch modes.</p>
+          <div class="callout callout-warning"><p><strong>The copied URL is private.</strong> It contains the same bearer capability as the QR code. Do not paste it into chat or a shared browser profile.</p></div>
+
+          <h2>Measure the real connection</h2>
+          <p>Open <strong>Connection health</strong> at the bottom of the companion during a venue rehearsal. It keeps the newest 80 samples and reports median and p95 browser-to-laptop delivery for state polling, commands, pointer updates, and drawing updates, plus failure counts. The browser sends only those bounded numeric summaries back to the local Presenter service so Showtime can verify the rehearsal; re-pairing clears them.</p>
+          <p>The report contains no notes or pairing secrets. Pointer and drawing values confirm authenticated delivery to the laptop; use a camera or observer when you need to measure all the way to projected pixels.</p>
+
+          <h2>Choose the projector explicitly</h2>
+          <p>Press <kbd>D</kbd>, or choose <strong>Choose presentation display</strong> from Studio Commands. Rayslides lists each active display by name, resolution, refresh rate, and desktop position. It marks the saved selection and the display containing the window, but never assumes an external screen is the projector.</p>
+          <p>Choose a row with <kbd>↑</kbd>/<kbd>↓</kbd>, press <kbd>Space</kbd> to move the window there and identify it physically, then press <kbd>Enter</kbd> to keep it. <kbd>Esc</kbd> returns to the previously confirmed display. You can also click a row to identify it and click it again to confirm. If you opened the picker from fullscreen, Rayslides restores the same fullscreen mode after confirm or cancel.</p>
+
           <h2>Set the network address</h2>
-          <p>Rayslides uses port 7332 by default. You can set the advertised host and port.</p>
+          <p>Rayslides uses port 7332 by default. The setup screen detects active IPv4 interfaces, prefers a private physical LAN, and explains when an address is VPN, link-local, or local to the computer. Press <kbd>N</kbd> to cycle the available addresses.</p>
+          <p>If you change from venue Wi-Fi to a phone hotspot, Rayslides detects the new address, invalidates the old private capability, and generates a fresh QR. Scan the new code; the obsolete link cannot become valid again if you later return to that network. Opening the fresh QR in an existing Presenter tab reloads that tab with the new private session.</p>
+          <p>You can still override the advertised host and port for a policy-managed network.</p>
           <pre><code>zig-out/bin/rayslides talk.sld \
   --presenter-host=192.168.1.42 \
   --presenter-port=7332</code></pre>
-          <p>Windows requires an explicit local network address. Pair again after you change networks.</p>
+          <p>Use an explicit address when native adapter discovery cannot see the intended interface.</p>
 
           <h2>Use a trusted network</h2>
           <p>The QR link contains a random access code. Keep the complete link private.</p>

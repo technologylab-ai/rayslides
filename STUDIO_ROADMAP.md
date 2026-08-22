@@ -25,8 +25,9 @@ sessions.
   dirty-state recovery, and hot-reload protection.
 - Direct manipulation with move, resize, smart guides, grid snapping, aspect
   lock, exact geometry, alignment, distribution, multi-select, and marquee.
-- Text, bullets, images, rectangles, item colors/backgrounds, font size,
-  opacity, locks, paint-order changes, copy/paste, duplication, and deletion.
+- Text, bullets, raster/SVG images, videos, rounded rectangles, lines/arrows,
+  alignment, rotation, item colors/backgrounds, font size, opacity, locks,
+  paint-order changes, copy/paste, duplication, and deletion.
 - Slide organization, reusable element and slide-template libraries, template
   promotion, local template-instance overrides, shared edits, and semantic
   morph-state editing.
@@ -46,8 +47,9 @@ sessions.
 - Safe layer-order operations, pinned background barriers, and actionable
   explanations when another source barrier atomically refuses an operation.
 - Inline Properties fields for text, exact geometry, foreground/background,
-  font size, and opacity, with keyboard traversal, caret-following scrolling,
-  and validation that retains invalid drafts without touching source/history.
+  font size, corner radius, stroke, alignment, rotation, media behavior, and
+  opacity, with keyboard traversal, caret-following scrolling, and validation
+  that retains invalid drafts without touching source/history.
 - Compact color editing, truthful common/Mixed multi-selection values, and
   selection/focus preservation across non-structural property edits.
 - Synchronized redraw, atomic render-graph replacement, explicit render-text
@@ -92,7 +94,7 @@ definitions to a fixed point and commits one undoable rewrite. Definitions
 whose parser-context ownership cannot be proven remain in source and are
 reported as blocked rather than guessed away.
 
-## Active tranche: Visual reusable definitions
+## Completed tranche: Visual reusable definitions
 
 This tranche makes the source-backed Library visible and directly editable
 without inserting disposable instances into the authored deck. Work is split
@@ -384,10 +386,15 @@ open-source project's scope. The local ad-hoc seal merely keeps the assembled
 bundle internally valid; the app is a build convenience, not a replacement for
 the portable command-line application or a second document format.
 
-## Planned tranches
+## Cross-product completion and release gates
 
-The next tranche will be selected after this distribution boundary has shipped
-and accumulated real first-run feedback.
+The next phase is tracked in the top-level [product roadmap](ROADMAP.md).
+First-class image/video authoring, the software side of Presenter venue
+resilience and Showtime preflight, and the bounded authoring floor are now
+implemented. Physical phone/projector rehearsals and the final cross-platform
+release checks remain explicit release gates. The product roadmap defines the
+vertical completion contract for every source, renderer, Studio, export,
+documentation, test, and live-QA surface.
 
 ## Deliberate non-goals
 

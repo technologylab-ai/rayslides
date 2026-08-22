@@ -56,8 +56,8 @@
           <h2>Create an object</h2>
           <p>Choose a creation tool, then click the canvas. Studio returns to Select after one placement.</p>
           <figure class="shot shot-toolbar">
-            <img src="images/studio-creation-toolbar.png" alt="Studio toolbar with Select, Text, Bullets, Image, Rectangle, and Library tools" width="690" height="72" loading="lazy">
-            <figcaption><strong>The first six buttons are canvas tools.</strong> Each new object becomes source-backed content.</figcaption>
+            <img src="images/studio-creation-toolbar.png" alt="Studio toolbar with Select, Text, Bullets, Image, Video, Rectangle, Line, and Library tools" width="690" height="72" loading="lazy">
+            <figcaption><strong>The creation buttons are source-native canvas tools.</strong> Each new object becomes source-backed content.</figcaption>
           </figure>
           <div class="table-wrap">
             <table>
@@ -67,18 +67,22 @@
                 <tr><td>T · Text</td><td>Place a text box with a suggested size.</td></tr>
                 <tr><td>B · Bullets</td><td>Place a bulleted text box.</td></tr>
                 <tr><td>IMG · Image</td><td>Choose an image file, then place it on the canvas.</td></tr>
+                <tr><td>VID · Video</td><td>Choose a video file, then place it on the canvas.</td></tr>
                 <tr><td>RECT · Rectangle</td><td>Place a filled rectangle.</td></tr>
+                <tr><td>LINE · Line</td><td>Place a plain line; press <kbd>A</kbd> to place one with an end arrow.</td></tr>
                 <tr><td>LIB · Library</td><td>Choose a reusable item, then place it on the canvas.</td></tr>
               </tbody>
             </table>
           </div>
+          <p>Image and Video share the same path behavior: macOS provides a native picker, every platform accepts manual path entry, and a file drop over the canvas creates the matching media item. Paths become deck-relative when the deck has a saved location and that conversion is safe.</p>
+          <p>SVG files follow the Image path, including picker, replacement, fitting, reusable ownership, diagnostics, and export. The embedded vector subset does not render SVG <code>&lt;text&gt;</code>; convert type to paths first.</p>
 
           <h2>Select and move objects</h2>
           <ol class="steps">
             <li><strong>Choose the Select tool.</strong><p>Press <kbd>V</kbd> or click the first toolbar button.</p></li>
-            <li><strong>Click an object.</strong><p>Studio draws a cyan outline and a resize handle.</p></li>
+            <li><strong>Click an object.</strong><p>Studio draws a cyan painted-geometry outline plus resize and rotation handles.</p></li>
             <li><strong>Drag the object.</strong><p>Magenta guides show nearby edges, centers, and snap points.</p></li>
-            <li><strong>Drag the handle.</strong><p>Hold <kbd>Shift</kbd> to keep the displayed aspect ratio.</p></li>
+            <li><strong>Drag a handle.</strong><p>Use the corner to resize or the connected handle above the object to rotate. <kbd>Shift</kbd> keeps the aspect ratio or snaps rotation to 15°.</p></li>
           </ol>
           <p>Use the arrow keys for a one-pixel nudge. Hold <kbd>Shift</kbd> for ten pixels.</p>
           <div class="callout"><p><strong>Hold <kbd>Cmd/Ctrl</kbd> during a drag to bypass snapping.</strong> Press <kbd>G</kbd> to show the 20-pixel grid.</p></div>
@@ -110,7 +114,12 @@
 
           <h2>Set exact values</h2>
           <p>Open the Properties tab after you select one object.</p>
-          <p>Edit its text, position, size, font size, opacity, and colors. Press <kbd>Enter</kbd> to save a value.</p>
+          <p>Edit its text, position, size, font size, alignment, corner or stroke style, rotation, opacity, and colors. Press <kbd>Enter</kbd> to save a value.</p>
+          <p>For an image or video, the first field shows <strong>IMAGE</strong> or <strong>VIDEO</strong>, the effective filename/path, and a separate <strong>Replace</strong> button. Click Replace, or press <kbd>Enter</kbd> while Properties is visible, to choose a new file through the same picker and deck-relative path policy used for insertion. The object's geometry, ID, ordering, and other properties stay unchanged. An amber <strong>R</strong> beside a local source override restores the inherited asset.</p>
+          <p>Use <strong>Stretch</strong> to fill the box without preserving aspect ratio, <strong>Fit</strong> to show the complete picture inside the box, or <strong>Fill</strong> to cover the box with an aspect-preserving crop. <code>FX</code> and <code>FY</code> move that crop or fitted picture from <code>0</code> (left/top) to <code>1</code> (right/bottom); <code>0.5</code> is centered. Natural pixel dimensions remain visible beside the box size for images and videos alike.</p>
+          <p>For videos, choose <strong>Playback</strong> to edit <strong>Auto</strong>, <strong>Loop</strong>, <strong>Mute</strong>, poster time, volume, and opacity. The duration-aware scrubber previews the authored poster without changing the playback start. Slide cards, Library and Definition previews, Presenter preview, PNG screenshots, and PDF export use that immutable poster without interrupting live playback. Authored volume and mute return each time the slide is entered; presenter adjustments remain temporary for the current visit. Choose <strong>Layout</strong> to return to fitting and geometry. Amber <strong>R</strong> markers reset local source, Fit, focus, poster, volume, and playback-toggle overrides one at a time.</p>
+          <p>When media cannot load, Studio retains a selectable repair box while Properties keeps the filename and <strong>Replace</strong> action live. Diagnostics distinguish missing or unreadable files, unsupported image data, missing ffmpeg/ffprobe, probe or codec failures, and poster decode failures. Out-of-range or recoverable poster choices receive amber warnings while retaining their pixels, and silent videos are identified without being treated as broken. These overlays are editor-only and never appear on the projected or exported slide.</p>
+          <p>Text boxes provide left/center/right and top/middle/bottom alignment. Rectangle <strong>Radius</strong> is measured in logical pixels. Lines expose stroke width, up/down direction, and no/start/end/both arrow heads; their endpoint handles follow the painted stroke. <strong>ROT</strong> accepts any finite clockwise degree value around the object's effective center. These values remain source-native through reusable definitions, local overrides, morph states, Showtime, and export.</p>
           <p>Press <kbd>Esc</kbd> to cancel the current value. Invalid values stay in the field and show an explanation.</p>
           <div class="table-wrap">
             <table>
@@ -120,6 +129,11 @@
                 <tr><td>FG, BG</td><td>A hex color or <code>none</code></td><td><code>#61dafbff</code></td></tr>
                 <tr><td>Opacity</td><td>A value from 0 to 1, or a percent</td><td><code>75%</code></td></tr>
                 <tr><td>Font</td><td>A positive font size</td><td><code>52</code></td></tr>
+                <tr><td>Radius, Stroke</td><td>A non-negative radius or positive stroke width</td><td><code>24</code></td></tr>
+                <tr><td>ROT</td><td>A finite clockwise degree value</td><td><code>-12.5</code></td></tr>
+                <tr><td>FX, FY</td><td>A normalized media focal position from 0 to 1</td><td><code>0.75</code></td></tr>
+                <tr><td>Poster</td><td>Seconds from 0 through the video's duration</td><td><code>6.2</code></td></tr>
+                <tr><td>Volume</td><td>A value from 0 to 1</td><td><code>0.65</code></td></tr>
               </tbody>
             </table>
           </div>
@@ -141,7 +155,7 @@
               </dl>
             </div>
           </div>
-          <p>Duplicate and Delete can act on a multi-selection. Studio rejects the complete action when any member is unsafe.</p>
+          <p>Duplicate and Delete can act on a multi-selection. Compatible common Properties also commit to the complete selection as one source transaction. Mixed values remain explicit, and Studio rejects the complete action when any member is unsafe.</p>
 
           <h2>Align and distribute objects</h2>
           <p>Select one object to align it to a slide edge or center.</p>
@@ -306,6 +320,7 @@
           <h2>Find a command</h2>
           <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> to open the command list.</p>
           <p>Type an action, tool, category, or shortcut. Disabled commands stay visible and explain why they cannot run.</p>
+          <p>The <strong>Present</strong> commands include speaker notes, private Presenter Companion pairing, <strong>Choose presentation display</strong>, <strong>Showtime preflight</strong>, and <strong>Create portable show</strong>. The display picker names and identifies active screens before you explicitly choose one; it never assumes an external monitor is the projector. Showtime checks the exact parser, renderer, assets, reusable definitions, display, and local services without changing the deck or playback. Portable show writes an ordinary copied <code>.sld</code> and assets, then independently re-opens and preflights the copy.</p>
           <figure class="shot">
             <img src="images/command-palette.png" alt="Studio command list showing save, history, and tool commands" width="1600" height="900" loading="lazy">
             <figcaption><strong>The list uses the current context.</strong> It can explain an unavailable action without changing the source.</figcaption>
@@ -363,6 +378,7 @@
           <h2>Local and shared edits</h2>
           <p>A normal edit changes the selected instance. An inherited template item gets a local override.</p>
           <p>Hold <kbd>Alt</kbd> to edit the shared template definition. Every resolved use can then change.</p>
+          <p>Image and video source, fit, focal position, opacity, and video playback properties follow the same ownership rules. A GROUP member on an ordinary slide is edited through its shared Definition or after <strong>Detach</strong>; a morph scene can override that member through its qualified ID.</p>
           <figure class="diagram">
             <div class="diagram-frame edit-scope-compare">
               <div class="edit-scope-card local-scope">

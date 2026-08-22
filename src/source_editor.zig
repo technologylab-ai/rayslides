@@ -164,7 +164,24 @@ pub const InheritedProperty = enum {
     color,
     bg,
     fontsize,
+    text_align,
+    valign,
+    radius,
+    stroke_width,
+    direction,
+    arrow,
+    rotation,
     opacity,
+    img,
+    vid,
+    fit,
+    focus_x,
+    focus_y,
+    poster,
+    volume,
+    autoplay,
+    loop,
+    muted,
     visible,
     locked,
 };
@@ -189,7 +206,7 @@ pub const MutationOwner = union(enum) {
 
 /// Read-only Inspector capability summary. A set bit means this exact authored
 /// scope contributes the property and can therefore reset it to inheritance.
-pub const InheritedPropertyOverrides = packed struct(u16) {
+pub const InheritedPropertyOverrides = packed struct(u32) {
     x: bool = false,
     y: bool = false,
     w: bool = false,
@@ -198,10 +215,27 @@ pub const InheritedPropertyOverrides = packed struct(u16) {
     color: bool = false,
     bg: bool = false,
     fontsize: bool = false,
+    text_align: bool = false,
+    valign: bool = false,
+    radius: bool = false,
+    stroke_width: bool = false,
+    direction: bool = false,
+    arrow: bool = false,
+    rotation: bool = false,
     opacity: bool = false,
+    img: bool = false,
+    vid: bool = false,
+    fit: bool = false,
+    focus_x: bool = false,
+    focus_y: bool = false,
+    poster: bool = false,
+    volume: bool = false,
+    autoplay: bool = false,
+    loop: bool = false,
+    muted: bool = false,
     visible: bool = false,
     locked: bool = false,
-    _padding: u5 = 0,
+    _padding: u4 = 0,
 
     pub fn contains(self: InheritedPropertyOverrides, property: InheritedProperty) bool {
         return switch (property) {
@@ -213,7 +247,24 @@ pub const InheritedPropertyOverrides = packed struct(u16) {
             .color => self.color,
             .bg => self.bg,
             .fontsize => self.fontsize,
+            .text_align => self.text_align,
+            .valign => self.valign,
+            .radius => self.radius,
+            .stroke_width => self.stroke_width,
+            .direction => self.direction,
+            .arrow => self.arrow,
+            .rotation => self.rotation,
             .opacity => self.opacity,
+            .img => self.img,
+            .vid => self.vid,
+            .fit => self.fit,
+            .focus_x => self.focus_x,
+            .focus_y => self.focus_y,
+            .poster => self.poster,
+            .volume => self.volume,
+            .autoplay => self.autoplay,
+            .loop => self.loop,
+            .muted => self.muted,
             .visible => self.visible,
             .locked => self.locked,
         };
@@ -3586,6 +3637,9 @@ pub fn patchLiteralAttributes(
     var spans = try allocator.alloc(?Span, patches.len);
     defer allocator.free(spans);
     @memset(spans, null);
+    var whole_token_spans = try allocator.alloc(?Span, patches.len);
+    defer allocator.free(whole_token_spans);
+    @memset(whole_token_spans, null);
 
     var text_token_start: ?usize = null;
     var cursor = line.start;
@@ -3597,7 +3651,16 @@ pub fn patchLiteralAttributes(
         while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
         const token_end = cursor;
         const token = source[token_start..token_end];
-        const equals_index = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const equals_index = std.mem.indexOfScalar(u8, token, '=') orelse {
+            for (patches, 0..) |patch, patch_index| {
+                if (std.mem.eql(u8, patch.key, token)) {
+                    spans[patch_index] = null;
+                    whole_token_spans[patch_index] = .{ .start = token_start, .end = token_end };
+                    break;
+                }
+            }
+            continue;
+        };
         const key = token[0..equals_index];
 
         if (std.mem.eql(u8, key, "text")) {
@@ -3618,6 +3681,7 @@ pub fn patchLiteralAttributes(
             if (std.mem.eql(u8, patch.key, key)) {
                 // Match parser semantics: for malformed duplicates, the last
                 // token before text= is the effective value.
+                whole_token_spans[patch_index] = null;
                 spans[patch_index] = .{
                     .start = token_start + equals_index + 1,
                     .end = token_end,
@@ -3635,7 +3699,7 @@ pub fn patchLiteralAttributes(
 
     // Token attributes must precede text= because text owns the remainder.
     for (patches, 0..) |patch, patch_index| {
-        if (spans[patch_index] != null or std.mem.eql(u8, patch.key, "text")) continue;
+        if (spans[patch_index] != null or whole_token_spans[patch_index] != null or std.mem.eql(u8, patch.key, "text")) continue;
         if (emitted == 0 and
             (insertion_point == line.start or !isHorizontalWhitespace(source[insertion_point - 1])))
         {
@@ -3666,12 +3730,25 @@ pub fn patchLiteralAttributes(
 
     var edits = std.ArrayList(Edit).empty;
     defer edits.deinit(allocator);
+    var whole_replacements = std.ArrayList([]u8).empty;
+    defer {
+        for (whole_replacements.items) |replacement| allocator.free(replacement);
+        whole_replacements.deinit(allocator);
+    }
     for (patches, 0..) |patch, patch_index| {
         if (spans[patch_index]) |span| {
             try edits.append(allocator, .{
                 .start = span.start,
                 .end = span.end,
                 .replacement = patch.value,
+            });
+        } else if (whole_token_spans[patch_index]) |span| {
+            const replacement = try std.fmt.allocPrint(allocator, "{s}={s}", .{ patch.key, patch.value });
+            try whole_replacements.append(allocator, replacement);
+            try edits.append(allocator, .{
+                .start = span.start,
+                .end = span.end,
+                .replacement = replacement,
             });
         }
     }
@@ -4360,14 +4437,19 @@ fn validateSlideTemplateOverrideDirectiveLine(line: []const u8) PatchError![]con
         const token_start = cursor;
         while (cursor < line.len and !isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
         const token = line[token_start..cursor];
-        const equals = std.mem.indexOfScalar(u8, token, '=') orelse return error.InvalidLiteralValue;
-        const key = token[0..equals];
+        const equals = std.mem.indexOfScalar(u8, token, '=');
+        const key = if (equals) |index| token[0..index] else token;
+        if (equals == null) {
+            if (!isBareBooleanAttribute(key)) return error.InvalidLiteralValue;
+            continue;
+        }
+        const equals_index = equals.?;
         if (std.mem.eql(u8, key, "id")) return error.InvalidLiteralValue;
         if (std.mem.eql(u8, key, "text")) {
-            try validateLiteralPatch(.{ .key = key, .value = line[token_start + equals + 1 ..] });
+            try validateLiteralPatch(.{ .key = key, .value = line[token_start + equals_index + 1 ..] });
             break;
         }
-        try validateLiteralPatch(.{ .key = key, .value = token[equals + 1 ..] });
+        try validateLiteralPatch(.{ .key = key, .value = token[equals_index + 1 ..] });
     }
     return target;
 }
@@ -4657,10 +4739,35 @@ fn propertyKey(property: InheritedProperty) []const u8 {
         .color => "color",
         .bg => "bg",
         .fontsize => "fontsize",
+        .text_align => "align",
+        .valign => "valign",
+        .radius => "radius",
+        .stroke_width => "stroke_width",
+        .direction => "direction",
+        .arrow => "arrow",
+        .rotation => "rotation",
         .opacity => "opacity",
+        .img => "img",
+        .vid => "vid",
+        .fit => "fit",
+        .focus_x => "focus_x",
+        .focus_y => "focus_y",
+        .poster => "poster",
+        .volume => "volume",
+        .autoplay => "autoplay",
+        .loop => "loop",
+        .muted => "muted",
         .visible => "visible",
         .locked => "locked",
     };
+}
+
+fn isBareBooleanAttribute(key: []const u8) bool {
+    return std.mem.eql(u8, key, "autoplay") or
+        std.mem.eql(u8, key, "loop") or
+        std.mem.eql(u8, key, "muted") or
+        std.mem.eql(u8, key, "visible") or
+        std.mem.eql(u8, key, "locked");
 }
 
 fn directiveAttributesStart(text: []const u8) PatchError!usize {
@@ -4700,7 +4807,24 @@ fn setPropertyOverride(overrides: *InheritedPropertyOverrides, property: Inherit
         .color => overrides.color = true,
         .bg => overrides.bg = true,
         .fontsize => overrides.fontsize = true,
+        .text_align => overrides.text_align = true,
+        .valign => overrides.valign = true,
+        .radius => overrides.radius = true,
+        .stroke_width => overrides.stroke_width = true,
+        .direction => overrides.direction = true,
+        .arrow => overrides.arrow = true,
+        .rotation => overrides.rotation = true,
         .opacity => overrides.opacity = true,
+        .img => overrides.img = true,
+        .vid => overrides.vid = true,
+        .fit => overrides.fit = true,
+        .focus_x => overrides.focus_x = true,
+        .focus_y => overrides.focus_y = true,
+        .poster => overrides.poster = true,
+        .volume => overrides.volume = true,
+        .autoplay => overrides.autoplay = true,
+        .loop => overrides.loop = true,
+        .muted => overrides.muted = true,
         .visible => overrides.visible = true,
         .locked => overrides.locked = true,
     }
@@ -4729,8 +4853,9 @@ fn propertyOverridesOnDirective(
         const token_start = cursor;
         while (cursor < text.len and !isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
         const token = text[token_start..cursor];
-        const equals = std.mem.indexOfScalar(u8, token, '=') orelse return error.InvalidLiteralValue;
-        const key = token[0..equals];
+        const equals = std.mem.indexOfScalar(u8, token, '=');
+        const key = if (equals) |index| token[0..index] else token;
+        if (equals == null and !isBareBooleanAttribute(key)) return error.InvalidLiteralValue;
         if (propertyForKey(key)) |property| setPropertyOverride(&overrides, property);
         if (std.mem.eql(u8, key, "text")) break;
     }
@@ -4775,8 +4900,9 @@ fn rewriteMutationWithoutProperty(
         while (cursor < text.len and !isHorizontalWhitespace(text[cursor])) : (cursor += 1) {}
         var token_end = cursor;
         const token = text[token_start..token_end];
-        const equals = std.mem.indexOfScalar(u8, token, '=') orelse return error.InvalidLiteralValue;
-        const key = token[0..equals];
+        const equals = std.mem.indexOfScalar(u8, token, '=');
+        const key = if (equals) |index| token[0..index] else token;
+        if (equals == null and !isBareBooleanAttribute(key)) return error.InvalidLiteralValue;
         if (std.mem.eql(u8, key, "text")) token_end = text.len;
         if (std.mem.eql(u8, key, key_to_remove)) {
             try removals.append(allocator, .{ .start = token_start, .end = token_end });
@@ -5431,14 +5557,15 @@ fn validateClipboardDirectiveAttributes(line: []const u8, attributes_start: usiz
         const token_start = cursor;
         while (cursor < line.len and !isHorizontalWhitespace(line[cursor])) : (cursor += 1) {}
         const token = line[token_start..cursor];
-        const equals = std.mem.indexOfScalar(u8, token, '=') orelse
-            return error.UnsupportedClipboardItem;
-        const key = token[0..equals];
-        const value = token[equals + 1 ..];
+        const equals = std.mem.indexOfScalar(u8, token, '=');
+        const key = if (equals) |index| token[0..index] else token;
         if (!isAttributeName(key)) return error.UnsupportedClipboardItem;
+        if (equals == null and !isBareBooleanAttribute(key)) return error.UnsupportedClipboardItem;
         if (std.mem.eql(u8, key, "text")) return;
-        validateLiteralPatch(.{ .key = key, .value = value }) catch
-            return error.UnsupportedClipboardItem;
+        if (equals) |index| {
+            validateLiteralPatch(.{ .key = key, .value = token[index + 1 ..] }) catch
+                return error.UnsupportedClipboardItem;
+        }
 
         var earlier_cursor = attributes_start;
         while (earlier_cursor < token_start) {
@@ -5447,9 +5574,11 @@ fn validateClipboardDirectiveAttributes(line: []const u8, attributes_start: usiz
             const earlier_start = earlier_cursor;
             while (earlier_cursor < token_start and !isHorizontalWhitespace(line[earlier_cursor])) : (earlier_cursor += 1) {}
             const earlier = line[earlier_start..earlier_cursor];
-            const earlier_equals = std.mem.indexOfScalar(u8, earlier, '=') orelse
+            const earlier_equals = std.mem.indexOfScalar(u8, earlier, '=');
+            const earlier_key = if (earlier_equals) |index| earlier[0..index] else earlier;
+            if (earlier_equals == null and !isBareBooleanAttribute(earlier_key))
                 return error.UnsupportedClipboardItem;
-            if (std.mem.eql(u8, earlier[0..earlier_equals], key)) {
+            if (std.mem.eql(u8, earlier_key, key)) {
                 return error.UnsupportedClipboardItem;
             }
         }
@@ -7858,6 +7987,117 @@ test "image duplication offsets position without materializing automatic dimensi
     try std.testing.expectApproxEqAbs(@as(f32, 0), items[1].size.y, 0.0001);
 }
 
+test "media clipboard and duplication preserve complete image and video authoring" {
+    const parser = @import("parser.zig");
+    const slides = @import("slides.zig");
+    const source =
+        "@slide\n" ++
+        "@box id=photo img=assets/hero.png x=10 y=20 w=500 h=300 fit=contain focus_x=0.2 focus_y=0.8 opacity=0.7 locked=true\n" ++
+        "@box id=clip vid=assets/demo.mp4 x=600 y=20 w=640 h=360 fit=cover focus_x=0.9 focus_y=0.1 poster=1.25 autoplay loop volume=0.65 muted opacity=0.8 locked=true\n" ++
+        "@slide\n" ++
+        "@box id=target text=Target\n";
+    const first_slide = std.mem.indexOf(u8, source, "@slide").?;
+    const second_slide = std.mem.lastIndexOf(u8, source, "@slide").?;
+    const photo_offset = std.mem.indexOf(u8, source, "@box id=photo").?;
+    const clip_offset = std.mem.indexOf(u8, source, "@box id=clip").?;
+
+    const captured_photo = try captureItemSnippet(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = first_slide },
+        photo_offset,
+    );
+    defer std.testing.allocator.free(captured_photo);
+    const captured_clip = try captureItemSnippet(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = first_slide },
+        clip_offset,
+    );
+    defer std.testing.allocator.free(captured_clip);
+    const pasted = try pasteCapturedItems(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = second_slide },
+        &.{
+            .{ .snippet = captured_photo, .new_id = "photo_copy", .placement = .{ .x = 30, .y = 40 } },
+            .{ .snippet = captured_clip, .new_id = "clip_copy", .placement = .{ .x = 50, .y = 60 } },
+        },
+    );
+    defer pasted.deinit(std.testing.allocator);
+
+    var paste_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer paste_arena.deinit();
+    const paste_deck = try slides.SlideShow.new(paste_arena.allocator());
+    const paste_context = try parser.constructSlidesFromBuf(pasted.source, paste_deck, paste_arena.allocator());
+    defer paste_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), paste_context.parser_errors.items.len);
+    const pasted_items = paste_deck.slides.items[1].items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), pasted_items.len);
+    const pasted_photo = pasted_items[1];
+    const pasted_clip = pasted_items[2];
+    try std.testing.expectEqualStrings("photo_copy", pasted_photo.id.?);
+    try std.testing.expectEqualStrings("assets/hero.png", pasted_photo.img_path.?);
+    try std.testing.expectEqual(slides.MediaFit.contain, pasted_photo.media_fit);
+    try std.testing.expectEqual(@as(f32, 0.2), pasted_photo.media_focus.x);
+    try std.testing.expectEqual(@as(f32, 0.8), pasted_photo.media_focus.y);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), pasted_photo.opacity, 0.0001);
+    try std.testing.expect(!pasted_photo.locked);
+    try std.testing.expectEqualStrings("clip_copy", pasted_clip.id.?);
+    try std.testing.expectEqualStrings("assets/demo.mp4", pasted_clip.vid_path.?);
+    try std.testing.expectEqual(slides.MediaFit.cover, pasted_clip.media_fit);
+    try std.testing.expectEqual(@as(f32, 0.9), pasted_clip.media_focus.x);
+    try std.testing.expectEqual(@as(f32, 0.1), pasted_clip.media_focus.y);
+    try std.testing.expectEqual(@as(?f32, 1.25), pasted_clip.vid_poster);
+    try std.testing.expect(pasted_clip.vid_autoplay);
+    try std.testing.expect(pasted_clip.vid_loop);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), pasted_clip.vid_volume, 0.0001);
+    try std.testing.expect(pasted_clip.vid_muted);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), pasted_clip.opacity, 0.0001);
+    try std.testing.expect(!pasted_clip.locked);
+
+    const duplicated = try duplicateItems(
+        std.testing.allocator,
+        source,
+        .{ .base_slide = first_slide },
+        .{ .base_slide = first_slide },
+        &.{
+            .{ .directive_offset = photo_offset, .new_id = "photo_dup", .placement = .{ .x = 70, .y = 80 } },
+            .{ .directive_offset = clip_offset, .new_id = "clip_dup", .placement = .{ .x = 90, .y = 100 } },
+        },
+    );
+    defer duplicated.deinit(std.testing.allocator);
+    var duplicate_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer duplicate_arena.deinit();
+    const duplicate_deck = try slides.SlideShow.new(duplicate_arena.allocator());
+    const duplicate_context = try parser.constructSlidesFromBuf(
+        duplicated.source,
+        duplicate_deck,
+        duplicate_arena.allocator(),
+    );
+    defer duplicate_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), duplicate_context.parser_errors.items.len);
+    const duplicated_items = duplicate_deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 4), duplicated_items.len);
+    const duplicated_photo = duplicated_items[2];
+    const duplicated_clip = duplicated_items[3];
+    try std.testing.expectEqualStrings("photo_dup", duplicated_photo.id.?);
+    try std.testing.expectEqualStrings("assets/hero.png", duplicated_photo.img_path.?);
+    try std.testing.expectEqual(slides.MediaFit.contain, duplicated_photo.media_fit);
+    try std.testing.expectEqual(@as(f32, 0.2), duplicated_photo.media_focus.x);
+    try std.testing.expectEqual(@as(f32, 0.8), duplicated_photo.media_focus.y);
+    try std.testing.expectEqualStrings("clip_dup", duplicated_clip.id.?);
+    try std.testing.expectEqualStrings("assets/demo.mp4", duplicated_clip.vid_path.?);
+    try std.testing.expectEqual(slides.MediaFit.cover, duplicated_clip.media_fit);
+    try std.testing.expectEqual(@as(?f32, 1.25), duplicated_clip.vid_poster);
+    try std.testing.expect(duplicated_clip.vid_autoplay);
+    try std.testing.expect(duplicated_clip.vid_loop);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), duplicated_clip.vid_volume, 0.0001);
+    try std.testing.expect(duplicated_clip.vid_muted);
+    try std.testing.expect(!duplicated_photo.locked);
+    try std.testing.expect(!duplicated_clip.locked);
+}
+
 test "item duplication rejects structural mutation crowd generated and colliding source" {
     const placement: DuplicateItemPlacement = .{ .x = 20, .y = 20 };
     const structural =
@@ -9633,6 +9873,154 @@ test "template property reset removes complete local history and preserves unrel
     try std.testing.expectEqual(@as(u8, 4), item.background_color.?.a);
     try std.testing.expect(item.locked);
     try std.testing.expectEqualStrings("Local", item.text.?);
+}
+
+test "media fit and focal overrides are independently discoverable and resettable" {
+    const source =
+        "@box id=hero img=assets/hero.png fit=contain focus_x=0.5 focus_y=0.5\n" ++
+        "@pushslide base\n" ++
+        "@popslide base\n" ++
+        "@set hero img=assets/local.png fit=cover focus_x=0.2 focus_y=0.8 poster=1.5 volume=0.6 autoplay loop muted opacity=0.9\n";
+    const owner: MutationOwner = .{ .template_instance = .{
+        .slide_offset = std.mem.indexOf(u8, source, "@popslide base").?,
+        .effective_mutation_offset = std.mem.indexOf(u8, source, "@set hero").?,
+    } };
+    const overrides = try inheritedPropertyOverrides(source, owner, "hero");
+    try std.testing.expect(overrides.img);
+    try std.testing.expect(overrides.fit);
+    try std.testing.expect(overrides.focus_x);
+    try std.testing.expect(overrides.focus_y);
+    try std.testing.expect(overrides.poster);
+    try std.testing.expect(overrides.volume);
+    try std.testing.expect(overrides.autoplay);
+    try std.testing.expect(overrides.loop);
+    try std.testing.expect(overrides.muted);
+    try std.testing.expect(overrides.opacity);
+
+    const reset_focus = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .focus_x);
+    defer reset_focus.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset_focus.source, "focus_x=0.2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_focus.source, "fit=cover") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_focus.source, "focus_y=0.8") != null);
+
+    const reset_fit = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .fit);
+    defer reset_fit.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset_fit.source, "fit=cover") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_fit.source, "focus_x=0.2") != null);
+
+    const reset_source = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .img);
+    defer reset_source.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset_source.source, "img=assets/local.png") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_source.source, "fit=cover") != null);
+
+    const reset_loop = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .loop);
+    defer reset_loop.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset_loop.source, " autoplay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_loop.source, " muted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_loop.source, " loop") == null);
+}
+
+test "text alignment overrides are independently discoverable and resettable" {
+    const source =
+        "@box id=hero align=center valign=middle text=Shared\n" ++
+        "@pushslide base\n" ++
+        "@popslide base\n" ++
+        "@set hero align=right valign=bottom\n";
+    const owner: MutationOwner = .{ .template_instance = .{
+        .slide_offset = std.mem.indexOf(u8, source, "@popslide base").?,
+        .effective_mutation_offset = std.mem.indexOf(u8, source, "@set hero").?,
+    } };
+    const overrides = try inheritedPropertyOverrides(source, owner, "hero");
+    try std.testing.expect(overrides.text_align);
+    try std.testing.expect(overrides.valign);
+
+    const reset = try resetInheritedProperty(std.testing.allocator, source, owner, "hero", .text_align);
+    defer reset.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset.source, "align=right") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reset.source, "valign=bottom") != null);
+}
+
+test "corner radius override is independently discoverable and resettable" {
+    const source =
+        "@box id=card radius=20 color=#224466ff\n" ++
+        "@pushslide base\n" ++
+        "@popslide base\n" ++
+        "@set card radius=48 opacity=0.8\n";
+    const owner: MutationOwner = .{ .template_instance = .{
+        .slide_offset = std.mem.indexOf(u8, source, "@popslide base").?,
+        .effective_mutation_offset = std.mem.indexOf(u8, source, "@set card").?,
+    } };
+    const overrides = try inheritedPropertyOverrides(source, owner, "card");
+    try std.testing.expect(overrides.radius);
+    try std.testing.expect(overrides.opacity);
+
+    const reset = try resetInheritedProperty(std.testing.allocator, source, owner, "card", .radius);
+    defer reset.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset.source, "radius=48") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reset.source, "opacity=0.8") != null);
+}
+
+test "rotation override is independently discoverable and resettable" {
+    const source =
+        "@box id=card rotation=-12 color=#224466ff\n" ++
+        "@pushslide base\n" ++
+        "@popslide base\n" ++
+        "@set card rotation=35 opacity=0.8\n";
+    const owner: MutationOwner = .{ .template_instance = .{
+        .slide_offset = std.mem.indexOf(u8, source, "@popslide base").?,
+        .effective_mutation_offset = std.mem.indexOf(u8, source, "@set card").?,
+    } };
+    const overrides = try inheritedPropertyOverrides(source, owner, "card");
+    try std.testing.expect(overrides.rotation);
+    try std.testing.expect(overrides.opacity);
+
+    const reset = try resetInheritedProperty(std.testing.allocator, source, owner, "card", .rotation);
+    defer reset.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset.source, "rotation=35") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reset.source, "opacity=0.8") != null);
+}
+
+test "line overrides are independently discoverable and resettable" {
+    const source =
+        "@line id=connector stroke_width=3 direction=down arrow=end color=#ffffffff\n" ++
+        "@pushslide base\n" ++
+        "@popslide base\n" ++
+        "@set connector stroke_width=8 direction=up arrow=both opacity=0.8\n";
+    const owner: MutationOwner = .{ .template_instance = .{
+        .slide_offset = std.mem.indexOf(u8, source, "@popslide base").?,
+        .effective_mutation_offset = std.mem.indexOf(u8, source, "@set connector").?,
+    } };
+    const overrides = try inheritedPropertyOverrides(source, owner, "connector");
+    try std.testing.expect(overrides.stroke_width);
+    try std.testing.expect(overrides.direction);
+    try std.testing.expect(overrides.arrow);
+
+    const reset_width = try resetInheritedProperty(std.testing.allocator, source, owner, "connector", .stroke_width);
+    defer reset_width.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset_width.source, "stroke_width=8") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_width.source, "direction=up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_width.source, "arrow=both") != null);
+
+    const reset_arrow = try resetInheritedProperty(std.testing.allocator, source, owner, "connector", .arrow);
+    defer reset_arrow.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, reset_arrow.source, "arrow=both") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_arrow.source, "stroke_width=8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reset_arrow.source, "direction=up") != null);
+}
+
+test "literal attribute patch canonicalizes a bare boolean token" {
+    const source = "@slide\n@box id=clip vid=demo.mp4 autoplay loop muted\n";
+    const offset = std.mem.indexOf(u8, source, "@box").?;
+    const patches = [_]LiteralAttributePatch{
+        .{ .key = "autoplay", .value = "false" },
+        .{ .key = "muted", .value = "false" },
+    };
+    const result = try patchLiteralAttributes(std.testing.allocator, source, offset, &patches);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@slide\n@box id=clip vid=demo.mp4 autoplay=false loop muted=false\n",
+        result.source,
+    );
 }
 
 test "visibility and text reset preserve other mutation semantics" {

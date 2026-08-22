@@ -79,6 +79,61 @@ fn scaledUiFont(scale: f32, base_size: i32) i32 {
 pub const SourceRef = slides.SourceRef;
 pub const SourceScope = slides.SourceScope;
 
+pub const MediaAvailability = slides.MediaAvailability;
+pub const MediaAudioAvailability = slides.MediaAudioAvailability;
+
+fn mediaAvailabilityLabel(value: MediaAvailability) []const u8 {
+    return switch (value) {
+        .ready => "MEDIA READY",
+        .image_unavailable => "IMAGE UNAVAILABLE · CHECK FILE OR FORMAT",
+        .image_file_missing => "IMAGE FILE MISSING · REPLACE OR RESTORE",
+        .image_file_unreadable => "IMAGE FILE UNREADABLE · CHECK ACCESS",
+        .image_decode_failed => "IMAGE DECODE FAILED · CHECK FORMAT",
+        .video_unavailable => "VIDEO UNAVAILABLE · CHECK FILE OR FFMPEG",
+        .video_file_missing => "VIDEO FILE MISSING · REPLACE OR RESTORE",
+        .video_file_unreadable => "VIDEO FILE UNREADABLE · CHECK ACCESS",
+        .video_tools_missing => "FFMPEG + FFPROBE MISSING · INSTALL TO ENABLE VIDEO",
+        .video_probe_failed => "VIDEO PROBE FAILED · CHECK FILE OR CODEC",
+        .video_poster_decode_failed => "VIDEO POSTER DECODE FAILED · CHECK CODEC",
+        .video_poster_out_of_range => "POSTER OUT OF RANGE · LAST FRAME",
+        .video_poster_fallback => "POSTER DECODE FAILED · FIRST FRAME",
+    };
+}
+
+/// Inspector metadata shares its row with the video Layout/Playback toggle,
+/// so keep the repair text complete at compact widths instead of ellipsizing
+/// the actionable word at the end. The canvas overlay retains the fuller
+/// diagnostic above.
+fn mediaAvailabilityInspectorLabel(value: MediaAvailability) []const u8 {
+    return switch (value) {
+        .ready => "MEDIA READY",
+        .image_unavailable => "IMAGE ERROR · CHECK FILE/FORMAT",
+        .image_file_missing => "MISSING IMAGE · REPLACE",
+        .image_file_unreadable => "IMAGE UNREADABLE · CHECK ACCESS",
+        .image_decode_failed => "IMAGE DECODE FAILED · CHECK FORMAT",
+        .video_unavailable => "VIDEO ERROR · CHECK FILE/FFMPEG",
+        .video_file_missing => "MISSING VIDEO · REPLACE",
+        .video_file_unreadable => "VIDEO UNREADABLE · CHECK ACCESS",
+        .video_tools_missing => "FFMPEG/FFPROBE MISSING · INSTALL",
+        .video_probe_failed => "VIDEO PROBE FAILED · CHECK CODEC",
+        .video_poster_decode_failed => "POSTER DECODE FAILED · CHECK CODEC",
+        .video_poster_out_of_range => "POSTER: LAST FRAME",
+        .video_poster_fallback => "POSTER: FIRST FRAME",
+    };
+}
+
+test "media availability labels prescribe distinct repairs" {
+    try std.testing.expect(std.mem.indexOf(u8, mediaAvailabilityLabel(.image_file_missing), "REPLACE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mediaAvailabilityLabel(.image_decode_failed), "FORMAT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mediaAvailabilityLabel(.video_tools_missing), "INSTALL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mediaAvailabilityLabel(.video_probe_failed), "CODEC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mediaAvailabilityLabel(.video_poster_out_of_range), "LAST FRAME") != null);
+    try std.testing.expect(!MediaAvailability.video_poster_out_of_range.blocksPixels());
+    try std.testing.expect(MediaAvailability.video_probe_failed.blocksPixels());
+    try std.testing.expectEqualStrings("MISSING VIDEO · REPLACE", mediaAvailabilityInspectorLabel(.video_file_missing));
+    try std.testing.expect(std.mem.indexOf(u8, mediaAvailabilityInspectorLabel(.video_tools_missing), "INSTALL") != null);
+}
+
 /// Concrete logical bounds resolved by the renderer. This is important for
 /// images whose source only specifies one dimension (or neither): their raw
 /// `SlideItem.size` contains zeroes even though the rendered image does not.
@@ -86,6 +141,10 @@ pub const ResolvedBounds = struct {
     identity: usize,
     position: rl.Vector2,
     size: rl.Vector2,
+    natural_size: rl.Vector2 = .zero(),
+    media_duration: f32 = 0,
+    media_availability: MediaAvailability = .ready,
+    media_audio: MediaAudioAvailability = .not_applicable,
 };
 
 pub const Geometry = struct {
@@ -178,6 +237,9 @@ pub const LivePreview = struct {
     before: Geometry,
     after: Geometry,
     resized: bool,
+    /// A canvas rotation gesture changes paint orientation without changing
+    /// the item's authored axis-aligned geometry.
+    rotation: ?f32 = null,
 };
 
 pub const FrameMode = enum {
@@ -520,6 +582,70 @@ fn pointInGeometry(point: rl.Vector2, geometry: Geometry) bool {
         point.y <= geometry.position.y + geometry.size.y;
 }
 
+fn rotatePointAround(point: rl.Vector2, center: rl.Vector2, degrees: f32) rl.Vector2 {
+    if (@abs(degrees) <= 0.0001) return point;
+    const radians = degrees * std.math.pi / 180.0;
+    const cosine = std.math.cos(radians);
+    const sine = std.math.sin(radians);
+    const dx = point.x - center.x;
+    const dy = point.y - center.y;
+    return .{
+        .x = center.x + dx * cosine - dy * sine,
+        .y = center.y + dx * sine + dy * cosine,
+    };
+}
+
+fn pointerAngleDegrees(center: rl.Vector2, point: rl.Vector2) f32 {
+    return std.math.atan2(point.y - center.y, point.x - center.x) * 180.0 / std.math.pi;
+}
+
+fn normalizeRotation(degrees: f32) f32 {
+    var result = degrees;
+    while (result > 180) result -= 360;
+    while (result <= -180) result += 360;
+    return if (@abs(result) < 0.0001) 0 else result;
+}
+
+fn geometryCenter(geometry: Geometry) rl.Vector2 {
+    return .{
+        .x = geometry.position.x + geometry.size.x / 2,
+        .y = geometry.position.y + geometry.size.y / 2,
+    };
+}
+
+fn rotatedGeometryCorners(geometry: Geometry, rotation: f32) [4]rl.Vector2 {
+    const center = geometryCenter(geometry);
+    return .{
+        rotatePointAround(geometry.position, center, rotation),
+        rotatePointAround(.{ .x = geometry.position.x + geometry.size.x, .y = geometry.position.y }, center, rotation),
+        rotatePointAround(add(geometry.position, geometry.size), center, rotation),
+        rotatePointAround(.{ .x = geometry.position.x, .y = geometry.position.y + geometry.size.y }, center, rotation),
+    };
+}
+
+fn rotatedGeometryBounds(geometry: Geometry, rotation: f32) Geometry {
+    if (@abs(rotation) <= 0.0001) return geometry;
+    const corners = rotatedGeometryCorners(geometry, rotation);
+    var min_x = corners[0].x;
+    var min_y = corners[0].y;
+    var max_x = corners[0].x;
+    var max_y = corners[0].y;
+    for (corners[1..]) |corner| {
+        min_x = @min(min_x, corner.x);
+        min_y = @min(min_y, corner.y);
+        max_x = @max(max_x, corner.x);
+        max_y = @max(max_y, corner.y);
+    }
+    return .{
+        .position = .{ .x = min_x, .y = min_y },
+        .size = .{ .x = max_x - min_x, .y = max_y - min_y },
+    };
+}
+
+fn pointInRotatedGeometry(point: rl.Vector2, geometry: Geometry, rotation: f32) bool {
+    return pointInGeometry(rotatePointAround(point, geometryCenter(geometry), -rotation), geometry);
+}
+
 fn clampLogicalPoint(point: rl.Vector2, logical_size: rl.Vector2) rl.Vector2 {
     return .{
         .x = std.math.clamp(point.x, 0, logical_size.x),
@@ -586,6 +712,7 @@ fn resolvedBoundsForIdentity(bounds: []const ResolvedBounds, identity: usize) ?R
 /// Keeps the authored position authoritative while filling missing image
 /// dimensions from the renderer's resolved bounds.
 pub fn itemGeometry(item: slides.SlideItem, resolved_bounds: []const ResolvedBounds) Geometry {
+    if (item.kind == .line) return Geometry.fromItem(item);
     const resolved = resolvedBoundsForIdentity(resolved_bounds, item.identity);
     return .{
         .position = item.position,
@@ -598,12 +725,135 @@ pub fn itemGeometry(item: slides.SlideItem, resolved_bounds: []const ResolvedBou
 
 fn isConcreteVisibleItem(item: slides.SlideItem, resolved_bounds: []const ResolvedBounds) bool {
     const geometry = itemGeometry(item, resolved_bounds);
-    return item.kind != .background and item.visible and item.opacity > 0 and
-        geometry.size.x > 0 and geometry.size.y > 0;
+    if (item.kind == .line) return item.visible and item.opacity > 0 and item.line_width > 0 and
+        geometry.size.x >= 0 and geometry.size.y >= 0 and (geometry.size.x > 0 or geometry.size.y > 0);
+    return item.kind != .background and item.visible and item.opacity > 0 and geometry.size.x > 0 and geometry.size.y > 0;
 }
 
 fn isSelectable(item: slides.SlideItem, resolved_bounds: []const ResolvedBounds) bool {
     return !item.locked and isConcreteVisibleItem(item, resolved_bounds);
+}
+
+const LineEndpoint = enum { start, end };
+
+const LineEndpoints = struct {
+    start: rl.Vector2,
+    end: rl.Vector2,
+};
+
+fn lineEndpoints(geometry: Geometry, direction: slides.LineDirection) LineEndpoints {
+    return switch (direction) {
+        .down => .{
+            .start = geometry.position,
+            .end = add(geometry.position, geometry.size),
+        },
+        .up => .{
+            .start = .{ .x = geometry.position.x, .y = geometry.position.y + geometry.size.y },
+            .end = .{ .x = geometry.position.x + geometry.size.x, .y = geometry.position.y },
+        },
+    };
+}
+
+fn pointToSegmentDistance(point: rl.Vector2, endpoints: LineEndpoints) f32 {
+    const segment = subtract(endpoints.end, endpoints.start);
+    const length_squared = segment.x * segment.x + segment.y * segment.y;
+    if (length_squared <= 0.000001) {
+        const delta = subtract(point, endpoints.start);
+        return @sqrt(delta.x * delta.x + delta.y * delta.y);
+    }
+    const relative = subtract(point, endpoints.start);
+    const projection = std.math.clamp((relative.x * segment.x + relative.y * segment.y) / length_squared, 0, 1);
+    const nearest = add(endpoints.start, .{ .x = segment.x * projection, .y = segment.y * projection });
+    const delta = subtract(point, nearest);
+    return @sqrt(delta.x * delta.x + delta.y * delta.y);
+}
+
+fn pointHitsLine(item: slides.SlideItem, geometry: Geometry, point: rl.Vector2) bool {
+    const local_point = rotatePointAround(point, geometryCenter(geometry), -item.rotation);
+    return pointToSegmentDistance(local_point, lineEndpoints(geometry, item.line_direction)) <= @max(@as(f32, 8), item.line_width / 2 + 4);
+}
+
+fn geometryAfterLineEndpoint(
+    before: Geometry,
+    direction: slides.LineDirection,
+    endpoint: LineEndpoint,
+    requested: rl.Vector2,
+) Geometry {
+    const fixed_endpoints = lineEndpoints(before, direction);
+    var moving = requested;
+    const fixed = if (endpoint == .start) fixed_endpoints.end else fixed_endpoints.start;
+    switch (direction) {
+        .down => if (endpoint == .start) {
+            moving.x = @min(moving.x, fixed.x);
+            moving.y = @min(moving.y, fixed.y);
+        } else {
+            moving.x = @max(moving.x, fixed.x);
+            moving.y = @max(moving.y, fixed.y);
+        },
+        .up => if (endpoint == .start) {
+            moving.x = @min(moving.x, fixed.x);
+            moving.y = @max(moving.y, fixed.y);
+        } else {
+            moving.x = @max(moving.x, fixed.x);
+            moving.y = @min(moving.y, fixed.y);
+        },
+    }
+    // Preserve a minimally visible segment if both endpoints coincide. One
+    // axis may still be zero, so true horizontal and vertical lines remain
+    // directly authorable.
+    if (@abs(moving.x - fixed.x) < 0.001 and @abs(moving.y - fixed.y) < 0.001) {
+        moving.x += if (endpoint == .start) -1 else 1;
+    }
+    const start = if (endpoint == .start) moving else fixed;
+    const end = if (endpoint == .end) moving else fixed;
+    return switch (direction) {
+        .down => .{
+            .position = start,
+            .size = subtract(end, start),
+        },
+        .up => .{
+            .position = .{ .x = start.x, .y = end.y },
+            .size = .{ .x = end.x - start.x, .y = start.y - end.y },
+        },
+    };
+}
+
+fn geometryAfterRotatedResize(
+    before: Geometry,
+    rotation: f32,
+    pointer: rl.Vector2,
+    minimum_size: f32,
+    lock_aspect_ratio: bool,
+) Geometry {
+    if (@abs(rotation) <= 0.0001) {
+        const delta = subtract(pointer, add(before.position, before.size));
+        return .{
+            .position = before.position,
+            .size = .{
+                .x = @max(minimum_size, before.size.x + delta.x),
+                .y = @max(minimum_size, before.size.y + delta.y),
+            },
+        };
+    }
+    const anchor = rotatedGeometryCorners(before, rotation)[0];
+    const local_pointer = rotatePointAround(pointer, anchor, -rotation);
+    var size = rl.Vector2{
+        .x = @max(minimum_size, local_pointer.x - anchor.x),
+        .y = @max(minimum_size, local_pointer.y - anchor.y),
+    };
+    if (lock_aspect_ratio and before.size.x > 0 and before.size.y > 0) {
+        const ratio = before.size.x / before.size.y;
+        if (size.x / ratio >= size.y)
+            size.y = @max(minimum_size, size.x / ratio)
+        else
+            size.x = @max(minimum_size, size.y * ratio);
+    }
+    size = roundVector(size);
+    const center = rotatePointAround(add(anchor, .{ .x = size.x / 2, .y = size.y / 2 }), anchor, rotation);
+    return .{
+        .position = .{ .x = center.x - size.x / 2, .y = center.y - size.y / 2 },
+        .size = size,
+    };
 }
 
 /// Returns the item index at `logical_point`, searching in reverse paint order.
@@ -614,7 +864,11 @@ pub fn hitTest(items: []const slides.SlideItem, resolved_bounds: []const Resolve
         i -= 1;
         const item = items[i];
         if (!isSelectable(item, resolved_bounds)) continue;
-        if (pointInGeometry(logical_point, itemGeometry(item, resolved_bounds))) return i;
+        const geometry = itemGeometry(item, resolved_bounds);
+        if (if (item.kind == .line)
+            pointHitsLine(item, geometry, logical_point)
+        else
+            pointInRotatedGeometry(logical_point, geometry, item.rotation)) return i;
     }
     return null;
 }
@@ -668,7 +922,7 @@ fn considerGeometryTargets(
                     considerAxisSnap(y_snap, bottom, target_value, threshold.y);
             }
         },
-        .idle => {},
+        .idle, .rotating => {},
     }
 }
 
@@ -725,7 +979,7 @@ fn snapGeometryExcluding(
     items: []const slides.SlideItem,
     resolved_bounds: []const ResolvedBounds,
 ) SnapResult {
-    if (interaction == .idle) return .{ .geometry = candidate };
+    if (interaction == .idle or interaction == .rotating) return .{ .geometry = candidate };
     const valid_aspect_ratio = if (aspect_ratio) |value|
         if (value > 0 and std.math.isFinite(value)) value else null
     else
@@ -758,7 +1012,7 @@ fn snapGeometryExcluding(
                 &y_snap,
                 interaction,
                 candidate,
-                itemGeometry(item, resolved_bounds),
+                rotatedGeometryBounds(itemGeometry(item, resolved_bounds), item.rotation),
                 threshold,
                 minimum_size,
                 valid_aspect_ratio,
@@ -855,7 +1109,7 @@ fn snapGeometryExcluding(
                 }
             }
         },
-        .idle => {},
+        .idle, .rotating => {},
     }
     return result;
 }
@@ -929,6 +1183,7 @@ fn objectDisplayName(item: slides.SlideItem, buffer: *[192]u8) []const u8 {
                 (std.fmt.bufPrint(buffer, "Text · line {d}", .{item.source.line_number}) catch "Text")
         else
             std.fmt.bufPrint(buffer, "Text · line {d}", .{item.source.line_number}) catch "Text",
+        .line => "Line",
         .img => if (item.img_path) |path| std.fs.path.basename(path) else "Image",
         .vid => if (item.vid_path) |path| std.fs.path.basename(path) else "Video",
         .crowd => if (item.crowd) |crowd|
@@ -946,6 +1201,7 @@ pub const Interaction = enum {
     idle,
     moving,
     resizing,
+    rotating,
 };
 
 pub const Status = enum {
@@ -954,6 +1210,7 @@ pub const Status = enum {
     selected,
     moving,
     resizing,
+    rotating,
 };
 
 pub const Notice = enum {
@@ -965,6 +1222,7 @@ pub const Notice = enum {
     open_refused_dirty,
     open_refused_editing,
     open_requires_sld,
+    media_drop_unsupported,
     source_changed_on_disk,
     edit_failed,
     undo_failed,
@@ -1009,7 +1267,10 @@ pub const Tool = enum {
     add_text,
     add_bullets,
     add_image,
+    add_video,
     add_shape,
+    add_line,
+    add_arrow,
     add_reusable,
 };
 
@@ -1017,7 +1278,10 @@ pub const NewItemKind = enum {
     text,
     bullets,
     image,
+    video,
     shape,
+    line,
+    arrow,
 };
 
 pub const PaletteColor = enum {
@@ -1146,6 +1410,57 @@ pub const NumericGeometryRequest = struct {
     field: GeometryField,
 };
 
+pub const MediaFitCommand = struct {
+    target: CommandTarget,
+    fit: slides.MediaFit,
+};
+
+pub const MediaFocusRequest = struct {
+    target: CommandTarget,
+    axis: enum { x, y },
+};
+
+pub const VideoScalarCommand = struct {
+    target: CommandTarget,
+    value: ?f32 = null,
+};
+
+pub const VideoToggle = enum { autoplay, loop, muted };
+
+pub const VideoToggleCommand = struct {
+    target: CommandTarget,
+    property: VideoToggle,
+    enabled: bool,
+};
+
+pub const TextAlignmentChange = union(enum) {
+    horizontal: slides.TextAlignment,
+    vertical: slides.TextVerticalAlignment,
+};
+
+pub const TextAlignmentCommand = struct {
+    target: CommandTarget,
+    change: TextAlignmentChange,
+};
+
+pub const LineStyleChange = union(enum) {
+    arrow_start: bool,
+    arrow_end: bool,
+    direction: slides.LineDirection,
+};
+
+pub const LineStyleCommand = struct {
+    target: CommandTarget,
+    change: LineStyleChange,
+};
+
+pub const RotationCommand = struct {
+    target: CommandTarget,
+    /// Null means an exact Properties value is supplied through the inline
+    /// commit boundary; the canvas handle carries its completed value here.
+    value: ?f32 = null,
+};
+
 pub const InlineField = enum {
     text,
     x,
@@ -1155,8 +1470,68 @@ pub const InlineField = enum {
     foreground,
     background,
     font_size,
+    corner_radius,
+    line_width,
+    rotation,
     opacity,
+    media_focus_x,
+    media_focus_y,
+    video_poster,
+    video_volume,
 };
+
+/// Source-authored properties that may be inherited from reusable content and
+/// reset independently. Most map to an editable InlineField; button-based
+/// media properties live here too so their ownership is equally explicit.
+pub const AuthoredProperty = enum {
+    text,
+    x,
+    y,
+    width,
+    height,
+    foreground,
+    background,
+    font_size,
+    corner_radius,
+    line_width,
+    line_direction,
+    line_arrows,
+    rotation,
+    text_alignment,
+    text_vertical_alignment,
+    opacity,
+    image_source,
+    video_source,
+    media_fit,
+    media_focus_x,
+    media_focus_y,
+    video_poster,
+    video_volume,
+    video_autoplay,
+    video_loop,
+    video_muted,
+};
+
+fn authoredPropertyForInlineField(field: InlineField) AuthoredProperty {
+    return switch (field) {
+        .text => .text,
+        .x => .x,
+        .y => .y,
+        .width => .width,
+        .height => .height,
+        .foreground => .foreground,
+        .background => .background,
+        .font_size => .font_size,
+        .corner_radius => .corner_radius,
+        .line_width => .line_width,
+        .rotation => .rotation,
+        .opacity => .opacity,
+        .media_focus_x => .media_focus_x,
+        .media_focus_y => .media_focus_y,
+        .video_poster => .video_poster,
+        .video_volume => .video_volume,
+    };
+}
 
 pub const InlineError = enum {
     invalid_utf8,
@@ -1165,7 +1540,12 @@ pub const InlineError = enum {
     non_positive_dimension,
     invalid_color,
     invalid_font_size,
+    invalid_corner_radius,
+    invalid_line_width,
+    invalid_rotation,
     invalid_opacity,
+    invalid_unit_interval,
+    invalid_video_poster,
     invalid_text,
     source_edit_failed,
 };
@@ -1175,27 +1555,60 @@ pub const InlineError = enum {
 /// update; accept/reject then completes the handshake without a modal prompt.
 pub const InlineCommit = struct {
     target: CommandTarget,
+    /// Populated for compatible multi-selection edits. The primary target is
+    /// retained above for inline focus/provenance and legacy single edits.
+    targets: ItemBatchCommand = .{},
     field: InlineField,
+    value: []const u8,
+};
+
+pub const CommonProperty = enum {
+    x,
+    y,
+    width,
+    height,
+    foreground,
+    background,
+    font_size,
+    corner_radius,
+    line_width,
+    rotation,
+    opacity,
+    text_alignment,
+    text_vertical_alignment,
+    media_fit,
+    media_focus_x,
+    media_focus_y,
+    video_poster,
+    video_volume,
+    video_autoplay,
+    video_loop,
+    video_muted,
+};
+
+pub const CommonPropertyCommand = struct {
+    targets: ItemBatchCommand,
+    property: CommonProperty,
     value: []const u8,
 };
 
 /// Exact Inspector properties whose effective value can be inherited from a
 /// reusable definition and selectively restored by removing one local key.
 pub const PropertyOverrideSet = struct {
-    bits: u16 = 0,
+    bits: u32 = 0,
 
-    pub fn fromFields(fields: []const InlineField) PropertyOverrideSet {
+    pub fn fromFields(fields: []const AuthoredProperty) PropertyOverrideSet {
         var result: PropertyOverrideSet = .{};
         for (fields) |field| result.set(field);
         return result;
     }
 
-    pub fn set(self: *PropertyOverrideSet, field: InlineField) void {
-        self.bits |= @as(u16, 1) << @intCast(@intFromEnum(field));
+    pub fn set(self: *PropertyOverrideSet, property: AuthoredProperty) void {
+        self.bits |= @as(u32, 1) << @intCast(@intFromEnum(property));
     }
 
-    pub fn contains(self: PropertyOverrideSet, field: InlineField) bool {
-        return self.bits & (@as(u16, 1) << @intCast(@intFromEnum(field))) != 0;
+    pub fn contains(self: PropertyOverrideSet, property: AuthoredProperty) bool {
+        return self.bits & (@as(u32, 1) << @intCast(@intFromEnum(property))) != 0;
     }
 
     pub fn empty(self: PropertyOverrideSet) bool {
@@ -1236,7 +1649,7 @@ pub const CompositionContext = struct {
 
 pub const ResetOverrideCommand = struct {
     target: CommandTarget,
-    field: InlineField,
+    property: AuthoredProperty,
 };
 
 pub const DetachInstanceCommand = struct {
@@ -1374,6 +1787,9 @@ pub const SemanticCommand = union(enum) {
     redo: void,
     edit_speaker_notes: void,
     pair_presenter_phone: void,
+    choose_presentation_display: void,
+    showtime_preflight: void,
+    create_portable_show: void,
     /// Replaces the pristine untitled placeholder with an ordinary starter
     /// `.sld` source in one undoable edit.
     create_starter_deck: NewDeckPreset,
@@ -1383,13 +1799,29 @@ pub const SemanticCommand = union(enum) {
     delete_item: CommandTarget,
     delete_items: ItemBatchCommand,
     edit_text: CommandTarget,
+    /// Replaces the selected image/video source while preserving the media
+    /// kind and every unrelated authored attribute.
+    replace_media: CommandTarget,
     edit_numeric_geometry: NumericGeometryRequest,
     set_foreground: ColorCommand,
     set_custom_foreground: CommandTarget,
     set_background: ColorCommand,
     set_custom_background: CommandTarget,
     set_font_size: CommandTarget,
+    set_corner_radius: CommandTarget,
+    set_line_width: CommandTarget,
+    set_line_style: LineStyleCommand,
+    set_rotation: RotationCommand,
+    set_text_alignment: TextAlignmentCommand,
     set_opacity: CommandTarget,
+    set_media_fit: MediaFitCommand,
+    set_media_focus: MediaFocusRequest,
+    set_video_poster: VideoScalarCommand,
+    set_video_volume: VideoScalarCommand,
+    set_video_toggle: VideoToggleCommand,
+    /// One preflighted value applied to every compatible selected item in a
+    /// single source transaction.
+    set_common_property: CommonPropertyCommand,
     /// Removes an item's authored fill (`bg=none`). This remains a distinct
     /// intention so integrations never have to overload a palette color.
     clear_background: CommandTarget,
@@ -1453,7 +1885,7 @@ pub const UiLayout = struct {
     /// and lock, while hiding lower layout groups that cannot fit safely.
     minimal_properties: bool = false,
     toolbar: rl.Rectangle,
-    tool_buttons: [6]rl.Rectangle,
+    tool_buttons: [8]rl.Rectangle,
     new_slide: rl.Rectangle,
     grid_toggle: rl.Rectangle,
     grid_settings_toggle: rl.Rectangle,
@@ -1476,7 +1908,10 @@ pub const UiLayout = struct {
     custom_background: rl.Rectangle = empty_ui_rectangle,
     clear_background: rl.Rectangle,
     font_size: rl.Rectangle = empty_ui_rectangle,
+    rotation: rl.Rectangle = empty_ui_rectangle,
     opacity: rl.Rectangle = empty_ui_rectangle,
+    media_fit_buttons: [3]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 3,
+    media_focus_fields: [2]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 2,
     inline_error: rl.Rectangle = empty_ui_rectangle,
     align_buttons: [6]rl.Rectangle,
     distribute_buttons: [2]rl.Rectangle,
@@ -1488,7 +1923,7 @@ fn emptyUiLayout(scale: f32) UiLayout {
     return .{
         .scale = scale,
         .toolbar = empty_ui_rectangle,
-        .tool_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 6,
+        .tool_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 8,
         .new_slide = empty_ui_rectangle,
         .grid_toggle = empty_ui_rectangle,
         .grid_settings_toggle = empty_ui_rectangle,
@@ -2157,13 +2592,13 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     const margin: f32 = 12 * scale;
     const docked = if (viewport.chrome) |chrome| chrome.visible else false;
     const compact_toolbar = if (viewport.chrome) |chrome| chrome.content.width < 1100 else false;
-    const gap: f32 = @as(f32, if (compact_toolbar) 5 else 8) * scale;
-    const tool_size: f32 = @as(f32, if (compact_toolbar) 40 else 46) * scale;
-    const new_slide_width: f32 = @as(f32, if (compact_toolbar) 70 else 82) * scale;
-    const grid_width: f32 = @as(f32, if (compact_toolbar) 58 else 66) * scale;
-    const grid_settings_width: f32 = @as(f32, if (compact_toolbar) 24 else 28) * scale;
-    const scene_width: f32 = @as(f32, if (compact_toolbar) 112 else 150) * scale;
-    const toolbar_width = margin * 2 + tool_size * 6 + gap * 5 + gap + new_slide_width + gap + grid_width + grid_settings_width + gap + scene_width;
+    const gap: f32 = @as(f32, if (compact_toolbar) 3 else 8) * scale;
+    const tool_size: f32 = @as(f32, if (compact_toolbar) 30 else 46) * scale;
+    const new_slide_width: f32 = @as(f32, if (compact_toolbar) 58 else 82) * scale;
+    const grid_width: f32 = @as(f32, if (compact_toolbar) 46 else 66) * scale;
+    const grid_settings_width: f32 = @as(f32, if (compact_toolbar) 20 else 28) * scale;
+    const scene_width: f32 = @as(f32, if (compact_toolbar) 92 else 150) * scale;
+    const toolbar_width = margin * 2 + tool_size * 8 + gap * 7 + gap + new_slide_width + gap + grid_width + grid_settings_width + gap + scene_width;
     const toolbar: rl.Rectangle = if (docked)
         viewport.chrome.?.toolbar
     else
@@ -2173,7 +2608,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .width = toolbar_width,
             .height = tool_size + margin * 2,
         };
-    var tool_buttons: [6]rl.Rectangle = undefined;
+    var tool_buttons: [8]rl.Rectangle = undefined;
     for (&tool_buttons, 0..) |*button, index| button.* = .{
         .x = toolbar.x + margin + @as(f32, @floatFromInt(index)) * (tool_size + gap),
         .y = toolbar.y + margin,
@@ -2181,7 +2616,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .height = tool_size,
     };
     const new_slide: rl.Rectangle = .{
-        .x = tool_buttons[5].x + tool_buttons[5].width + gap,
+        .x = tool_buttons[7].x + tool_buttons[7].width + gap,
         .y = toolbar.y + margin,
         .width = new_slide_width,
         .height = tool_size,
@@ -2201,19 +2636,19 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     const scene_previous: rl.Rectangle = .{
         .x = grid_settings_toggle.x + grid_settings_toggle.width + gap,
         .y = new_slide.y,
-        .width = 32 * scale,
+        .width = @as(f32, if (compact_toolbar) 27 else 32) * scale,
         .height = tool_size,
     };
     const scene_label: rl.Rectangle = .{
         .x = scene_previous.x + scene_previous.width,
         .y = new_slide.y,
-        .width = scene_width - 64 * scale,
+        .width = scene_width - @as(f32, if (compact_toolbar) 54 else 64) * scale,
         .height = tool_size,
     };
     const scene_next: rl.Rectangle = .{
         .x = scene_label.x + scene_label.width,
         .y = new_slide.y,
-        .width = 32 * scale,
+        .width = @as(f32, if (compact_toolbar) 27 else 32) * scale,
         .height = tool_size,
     };
 
@@ -2342,11 +2777,27 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .height = swatch_size,
         };
 
-        const scalar_gap: f32 = 8 * scale;
-        const scalar_width = (inner_width - scalar_gap) / 2;
+        const scalar_gap: f32 = 6 * scale;
+        const scalar_width = (inner_width - scalar_gap * 2) / 3;
         const scalar_y = background_swatches[0].y + swatch_size + 6 * scale;
         const font_size: rl.Rectangle = .{ .x = properties.x + inset, .y = scalar_y, .width = scalar_width, .height = field_height };
-        const opacity: rl.Rectangle = .{ .x = font_size.x + scalar_width + scalar_gap, .y = scalar_y, .width = scalar_width, .height = field_height };
+        const rotation: rl.Rectangle = .{ .x = font_size.x + scalar_width + scalar_gap, .y = scalar_y, .width = scalar_width, .height = field_height };
+        const opacity: rl.Rectangle = .{ .x = rotation.x + scalar_width + scalar_gap, .y = scalar_y, .width = scalar_width, .height = field_height };
+        const media_fit_gap: f32 = 5 * scale;
+        const media_fit_width = (inner_width - media_fit_gap * 2) / 3;
+        var media_fit_buttons: [3]rl.Rectangle = undefined;
+        for (&media_fit_buttons, 0..) |*button, index| button.* = .{
+            .x = properties.x + inset + @as(f32, @floatFromInt(index)) * (media_fit_width + media_fit_gap),
+            .y = custom_foreground.y,
+            .width = media_fit_width,
+            .height = field_height,
+        };
+        const media_focus_gap: f32 = 4 * scale;
+        const media_focus_width = (font_size.width - media_focus_gap) / 2;
+        const media_focus_fields = [2]rl.Rectangle{
+            .{ .x = font_size.x, .y = font_size.y, .width = media_focus_width, .height = font_size.height },
+            .{ .x = font_size.x + media_focus_width + media_focus_gap, .y = font_size.y, .width = media_focus_width, .height = font_size.height },
+        };
         const inline_error: rl.Rectangle = .{
             .x = properties.x + inset,
             .y = scalar_y + field_height + 4 * scale,
@@ -2410,7 +2861,10 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .custom_background = custom_background,
             .clear_background = clear_background,
             .font_size = font_size,
+            .rotation = rotation,
             .opacity = opacity,
+            .media_fit_buttons = media_fit_buttons,
+            .media_focus_fields = media_focus_fields,
             .inline_error = inline_error,
             .align_buttons = align_buttons,
             .distribute_buttons = distribute_buttons,
@@ -2485,19 +2939,23 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .height = custom_background.height,
     };
 
-    const scalar_gap: f32 = 8 * scale;
-    const scalar_width = if (minimal_properties)
-        (inner_width - scalar_gap * 2) / 3
-    else
-        (inner_width - scalar_gap) / 2;
+    const scalar_gap: f32 = 6 * scale;
+    const scalar_columns: f32 = if (minimal_properties) 4 else 3;
+    const scalar_width = (inner_width - scalar_gap * (scalar_columns - 1)) / scalar_columns;
     const font_size: rl.Rectangle = .{
         .x = properties.x + inset,
         .y = properties.y + @as(f32, if (minimal_properties) 264 else if (compact_properties) 270 else 334) * scale,
         .width = scalar_width,
         .height = @as(f32, if (minimal_properties) 32 else if (compact_properties) 34 else 36) * scale,
     };
-    const opacity: rl.Rectangle = .{
+    const rotation: rl.Rectangle = .{
         .x = font_size.x + scalar_width + scalar_gap,
+        .y = font_size.y,
+        .width = scalar_width,
+        .height = font_size.height,
+    };
+    const opacity: rl.Rectangle = .{
+        .x = rotation.x + scalar_width + scalar_gap,
         .y = font_size.y,
         .width = scalar_width,
         .height = font_size.height,
@@ -2564,6 +3022,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .custom_background = custom_background,
         .clear_background = clear_background,
         .font_size = font_size,
+        .rotation = rotation,
         .opacity = opacity,
         .align_buttons = align_buttons,
         .distribute_buttons = distribute_buttons,
@@ -2665,7 +3124,10 @@ pub const CommandId = enum {
     tool_text,
     tool_bullets,
     tool_image,
+    tool_video,
     tool_rectangle,
+    tool_line,
+    tool_arrow,
     tool_library,
     new_slide,
     previous_slide,
@@ -2685,6 +3147,9 @@ pub const CommandId = enum {
     show_properties,
     edit_speaker_notes,
     pair_presenter_phone,
+    choose_presentation_display,
+    showtime_preflight,
+    create_portable_show,
     find_slides,
     find_library,
     find_objects,
@@ -2719,7 +3184,10 @@ const command_specs = [_]CommandSpec{
     .{ .id = .tool_text, .category = "TOOLS", .title = "Add text", .description = "Place a new source-backed text box", .keywords = "textbox type label", .shortcut = "T" },
     .{ .id = .tool_bullets, .category = "TOOLS", .title = "Add bullet list", .description = "Place a new bulleted text box", .keywords = "list bullets", .shortcut = "B" },
     .{ .id = .tool_image, .category = "TOOLS", .title = "Add image", .description = "Place an image from a relative path", .keywords = "picture photo asset", .shortcut = "I" },
+    .{ .id = .tool_video, .category = "TOOLS", .title = "Add video", .description = "Choose and place a video asset", .keywords = "movie media clip asset", .shortcut = "M" },
     .{ .id = .tool_rectangle, .category = "TOOLS", .title = "Add rectangle", .description = "Place a colored shape", .keywords = "shape box background", .shortcut = "R" },
+    .{ .id = .tool_line, .category = "TOOLS", .title = "Add line", .description = "Place an editable presentation line", .keywords = "stroke connector endpoints", .shortcut = "L" },
+    .{ .id = .tool_arrow, .category = "TOOLS", .title = "Add arrow", .description = "Place a line with an end arrowhead", .keywords = "connector direction pointer endpoints", .shortcut = "A" },
     .{ .id = .tool_library, .category = "TOOLS", .title = "Place library element", .description = "Choose and place a reusable element", .keywords = "reuse component library", .shortcut = "U" },
     .{ .id = .new_slide, .category = "SLIDES", .title = "New slide", .description = "Append a blank authored slide", .keywords = "add page deck", .shortcut = "Cmd/Ctrl N" },
     .{ .id = .previous_slide, .category = "SLIDES", .title = "Previous slide", .description = "Select the previous slide in the deck", .keywords = "page back navigate", .shortcut = "Page Up" },
@@ -2739,6 +3207,9 @@ const command_specs = [_]CommandSpec{
     .{ .id = .show_properties, .category = "VIEW", .title = "Show Properties", .description = "Open precise inline object properties", .keywords = "inspector right dock values" },
     .{ .id = .edit_speaker_notes, .category = "PRESENT", .title = "Edit speaker notes", .description = "Edit private notes for the current slide", .keywords = "presenter companion phone notes cue" },
     .{ .id = .pair_presenter_phone, .category = "PRESENT", .title = "Pair presenter phone", .description = "Show the private Presenter Companion QR", .keywords = "mobile remote companion qr connect" },
+    .{ .id = .choose_presentation_display, .category = "PRESENT", .title = "Choose presentation display", .description = "Identify and explicitly select the projector display", .keywords = "monitor screen beamer projector output venue", .shortcut = "D" },
+    .{ .id = .showtime_preflight, .category = "PRESENT", .title = "Showtime preflight", .description = "Check every slide, asset, runtime, network, and display", .keywords = "ready readiness check validate venue report" },
+    .{ .id = .create_portable_show, .category = "PRESENT", .title = "Create portable show", .description = "Copy a normal deck and its assets into a verified folder", .keywords = "bundle package travel offline assets folder" },
     .{ .id = .find_slides, .category = "FIND", .title = "Find a slide", .description = "Filter the slide picker and jump to a result", .keywords = "search deck title number navigate", .shortcut = "Cmd/Ctrl F" },
     .{ .id = .find_library, .category = "FIND", .title = "Find a library entry", .description = "Filter reusable elements, groups, and slide templates", .keywords = "search reuse component group template" },
     .{ .id = .find_objects, .category = "FIND", .title = "Find an object", .description = "Filter the source-aware object stack", .keywords = "search layers id text image hidden locked" },
@@ -2995,8 +3466,14 @@ pub const FrameInput = struct {
             .add_bullets
         else if (rl.isKeyPressed(.i))
             .add_image
+        else if (rl.isKeyPressed(.m))
+            .add_video
         else if (rl.isKeyPressed(.r))
             .add_shape
+        else if (rl.isKeyPressed(.l))
+            .add_line
+        else if (rl.isKeyPressed(.a))
+            .add_arrow
         else if (rl.isKeyPressed(.u))
             .add_reusable
         else
@@ -3134,6 +3611,12 @@ const Drag = struct {
     },
     separate_source_geometry: bool = false,
     edit_scope: EditScope = .direct,
+    line_endpoint: ?LineEndpoint = null,
+    rotation_before: f32 = 0,
+    authored_before_rotation: f32 = 0,
+    source_before_rotation: f32 = 0,
+    source_after_rotation: f32 = 0,
+    pointer_angle_start: f32 = 0,
 };
 
 const SelectionMember = struct {
@@ -3223,6 +3706,7 @@ const InlineEditor = struct {
     active: bool = false,
     field: InlineField = .x,
     target: CommandTarget = .{ .item_identity = 0, .source = .{} },
+    targets: ItemBatchCommand = .{},
     buffer: [max_inline_input_bytes + 1]u8 = [_]u8{0} ** (max_inline_input_bytes + 1),
     opening_buffer: [max_inline_input_bytes + 1]u8 = [_]u8{0} ** (max_inline_input_bytes + 1),
     len: usize = 0,
@@ -3367,6 +3851,9 @@ pub const Studio = struct {
     /// Wide windows always reserve the right dock; this chooses its content.
     /// Compact windows remember the tab even while the inspector is closed.
     inspector_panel: InspectorPanel = .objects,
+    /// Videos divide their dense compact inspector into layout and playback
+    /// pages so every control remains usable at the 900×506 minimum.
+    video_properties_playback: bool = false,
     /// A dedicated, narrow UI face supplied by the integration layer. A null
     /// font retains raylib's built-in text path for lightweight embedders and
     /// unit tests.
@@ -3838,6 +4325,10 @@ pub const Studio = struct {
     pub fn acceptInlineCommit(self: *Studio, field: InlineField) void {
         if (!self.inline_editor.active or self.inline_editor.field != field or
             !self.inline_editor.awaiting_commit) return;
+        if (self.inline_editor.targets.count > 1) {
+            self.cancelInlineEdit();
+            return;
+        }
         self.inline_editor.awaiting_commit = false;
         self.inline_editor.refresh_pending = true;
         self.inline_editor.error_value = null;
@@ -3973,16 +4464,18 @@ pub const Studio = struct {
         pointer: rl.Vector2,
     ) ?TooltipTarget {
         const layout = uiLayout(viewport);
-        const tool_titles = [_][:0]const u8{ "Select tool", "Add text", "Add bullets", "Add image", "Add rectangle", "Place reusable" };
+        const tool_titles = [_][:0]const u8{ "Select tool", "Add text", "Add bullets", "Add image", "Add video", "Add rectangle", "Add line", "Place reusable" };
         const tool_details = [_][:0]const u8{
             "Move, resize, marquee, and inspect objects",
             "Place a new source-backed text box",
             "Place a source-backed bulleted list",
             "Choose and place an image asset",
+            "Choose and place a video asset",
             "Draw a filled presentation shape",
+            "Place a line with editable stroke and arrowheads",
             "Place an element from the reusable Library",
         };
-        const tool_shortcuts = [_][:0]const u8{ "V", "T", "B", "I", "R", "U" };
+        const tool_shortcuts = [_][:0]const u8{ "V", "T", "B", "I", "M", "R", "L", "U" };
         for (layout.tool_buttons, 0..) |button, index| {
             if (hoveredTooltip(pointer, @intCast(1 + index), button, tool_titles[index], tool_details[index], tool_shortcuts[index])) |target| return target;
         }
@@ -4027,7 +4520,7 @@ pub const Studio = struct {
             if (hoveredTooltip(pointer, 55, objects.page_next, "Next object page", "Show later Objects rows", "")) |target| return target;
         } else {
             const property_targets = [_]TooltipTarget{
-                .{ .key = 60, .anchor = layout.edit_text, .title = "Text", .detail = "Edit inline, or use ... for the roomy multiline editor", .shortcut = "Enter" },
+                .{ .key = 60, .anchor = layout.edit_text, .title = "Content source", .detail = "Edit text, or replace the selected image/video source", .shortcut = "Enter" },
                 .{ .key = 61, .anchor = layout.duplicate_item, .title = "Duplicate", .detail = "Clone the selection in one undoable transaction", .shortcut = "Cmd/Ctrl D" },
                 .{ .key = 62, .anchor = layout.delete_item, .title = "Delete", .detail = "Remove or locally hide the selected object", .shortcut = "Backspace" },
                 .{ .key = 63, .anchor = layout.promote, .title = "Reuse or detach", .detail = "Promote authored content or detach a safe instance", .shortcut = "P" },
@@ -4159,7 +4652,10 @@ pub const Studio = struct {
             .tool_text,
             .tool_bullets,
             .tool_image,
+            .tool_video,
             .tool_rectangle,
+            .tool_line,
+            .tool_arrow,
             .toggle_grid,
             .toggle_rulers,
             .toggle_safe_areas,
@@ -4171,6 +4667,9 @@ pub const Studio = struct {
             .show_slides,
             .show_objects,
             .show_properties,
+            .choose_presentation_display,
+            .showtime_preflight,
+            .create_portable_show,
             => .{ .enabled = true },
             .edit_speaker_notes,
             .pair_presenter_phone,
@@ -4578,7 +5077,10 @@ pub const Studio = struct {
             .tool_text => self.setTool(.add_text, items),
             .tool_bullets => self.setTool(.add_bullets, items),
             .tool_image => self.setTool(.add_image, items),
+            .tool_video => self.setTool(.add_video, items),
             .tool_rectangle => self.setTool(.add_shape, items),
+            .tool_line => self.setTool(.add_line, items),
+            .tool_arrow => self.setTool(.add_arrow, items),
             .tool_library => self.openReusablePicker(items, workspace),
             .new_slide => self.pending_semantic_command = .{ .new_slide = {} },
             .previous_slide, .next_slide => {
@@ -4615,6 +5117,9 @@ pub const Studio = struct {
             },
             .edit_speaker_notes => self.pending_semantic_command = .{ .edit_speaker_notes = {} },
             .pair_presenter_phone => self.pending_semantic_command = .{ .pair_presenter_phone = {} },
+            .choose_presentation_display => self.pending_semantic_command = .{ .choose_presentation_display = {} },
+            .showtime_preflight => self.pending_semantic_command = .{ .showtime_preflight = {} },
+            .create_portable_show => self.pending_semantic_command = .{ .create_portable_show = {} },
             .find_slides => self.activatePanelSearch(.slides),
             .find_library => self.activatePanelSearch(.library),
             .find_objects => self.activatePanelSearch(.objects),
@@ -4904,8 +5409,16 @@ pub const Studio = struct {
     fn inlineFieldApplies(field: InlineField, item: slides.SlideItem) bool {
         if (item.kind == .background) return false;
         return switch (field) {
-            .text, .foreground, .font_size => item.kind == .textbox,
-            .x, .y, .width, .height, .background, .opacity => true,
+            .text => item.kind == .textbox,
+            .foreground => item.kind == .textbox or item.kind == .line,
+            .font_size => item.kind == .textbox and item.text != null,
+            .corner_radius => item.kind == .textbox and item.text == null,
+            .line_width => item.kind == .line,
+            .rotation => item.kind == .textbox or item.kind == .line or item.kind == .img or item.kind == .vid,
+            .x, .y, .width, .height, .opacity => true,
+            .background => item.kind != .line,
+            .media_focus_x, .media_focus_y => item.kind == .img or item.kind == .vid,
+            .video_poster, .video_volume => item.kind == .vid,
         };
     }
 
@@ -4942,7 +5455,14 @@ pub const Studio = struct {
                 std.fmt.bufPrint(scalar_buffer, "{d}", .{size}) catch ""
             else
                 "",
+            .corner_radius => formatInlineFloat(scalar_buffer, if (shared) |values| values.corner_radius else item.corner_radius),
+            .line_width => formatInlineFloat(scalar_buffer, if (shared) |values| values.line_width else item.line_width),
+            .rotation => formatInlineFloat(scalar_buffer, if (shared) |values| values.rotation else item.rotation),
             .opacity => formatInlineFloat(scalar_buffer, if (shared) |values| values.opacity else item.opacity),
+            .media_focus_x => formatInlineFloat(scalar_buffer, if (shared) |values| values.media_focus.x else item.media_focus.x),
+            .media_focus_y => formatInlineFloat(scalar_buffer, if (shared) |values| values.media_focus.y else item.media_focus.y),
+            .video_poster => formatInlineFloat(scalar_buffer, if (shared) |values| values.vid_poster orelse 0 else item.vid_poster orelse 0),
+            .video_volume => formatInlineFloat(scalar_buffer, if (shared) |values| values.vid_volume else item.vid_volume),
         };
     }
 
@@ -4954,39 +5474,66 @@ pub const Studio = struct {
         allow_shared_edit: bool,
     ) bool {
         const index = self.selectedIndex(items) orelse return false;
-        if (self.selectionCount() != 1) {
+        const item = items[index];
+        const selection_count = self.selectionCount();
+        if (selection_count > 1 and field == .text) {
             self.notice = .multi_selection_property_unsupported;
             return true;
         }
-        const item = items[index];
-        if (item.locked) {
-            self.notice = .locked_item;
-            return true;
-        }
-        if (!inlineFieldApplies(field, item)) {
-            self.notice = .property_unavailable;
-            return true;
-        }
         if (self.interaction != .idle) self.cancelInteraction(items);
-        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
-        const target: CommandTarget = .{
-            .item_identity = item.identity,
-            .source = self.commandSource(item, edit_scope),
-            .edit_scope = edit_scope,
-        };
+        var targets: ItemBatchCommand = .{};
+        for (items, 0..) |candidate, candidate_index| {
+            if (!self.isIdentitySelected(candidate.identity)) continue;
+            if (candidate.locked) {
+                self.notice = .locked_item;
+                return true;
+            }
+            if (!inlineFieldApplies(field, candidate)) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            const edit_scope = self.editScopeForItem(items, candidate_index, allow_shared_edit) orelse return true;
+            const candidate_target: CommandTarget = .{
+                .item_identity = candidate.identity,
+                .source = self.commandSource(candidate, edit_scope),
+                .edit_scope = edit_scope,
+            };
+            if (batchHasNonLocalSource(targets.slice(), candidate_target)) {
+                self.notice = .multi_selection_property_unsupported;
+                return true;
+            }
+            targets.targets[targets.count] = candidate_target;
+            targets.count += 1;
+        }
+        if (targets.count != selection_count or targets.count == 0) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        var target = targets.targets[0];
+        for (targets.slice()) |candidate| {
+            if (candidate.item_identity == item.identity) {
+                target = candidate;
+                break;
+            }
+        }
         self.inline_editor = .{
             .active = true,
             .field = field,
             .target = target,
-            .stable_id_hash = if (item.id != null and itemIdIsUnique(items, index))
+            .targets = targets,
+            .stable_id_hash = if (selection_count == 1 and item.id != null and itemIdIsUnique(items, index))
                 std.hash.Wyhash.hash(0, item.id.?)
             else
                 null,
         };
         var scalar_buffer: [64]u8 = undefined;
         var color_buffer: [9]u8 = undefined;
-        const initial = self.inlineInitialValue(item, resolved_bounds, field, edit_scope, &scalar_buffer, &color_buffer);
+        const initial = if (selection_count > 1)
+            self.inlineDisplayValue(items, resolved_bounds, field, &scalar_buffer, &color_buffer)
+        else
+            self.inlineInitialValue(item, resolved_bounds, field, target.edit_scope, &scalar_buffer, &color_buffer);
         _ = self.setInlineBuffer(initial);
+        self.inline_editor.select_all = selection_count > 1;
         self.inline_editor.dirty = false;
         self.notice = .none;
         return true;
@@ -5024,6 +5571,20 @@ pub const Studio = struct {
                 const parsed = std.fmt.parseInt(i32, value, 10) catch break :blk .invalid_font_size;
                 break :blk if (parsed > 0 and parsed <= 4096) null else .invalid_font_size;
             },
+            .corner_radius => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_corner_radius;
+                if (!std.math.isFinite(parsed)) break :blk .invalid_corner_radius;
+                break :blk if (parsed >= 0) null else .invalid_corner_radius;
+            },
+            .line_width => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_line_width;
+                if (!std.math.isFinite(parsed)) break :blk .invalid_line_width;
+                break :blk if (parsed > 0) null else .invalid_line_width;
+            },
+            .rotation => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_rotation;
+                break :blk if (std.math.isFinite(parsed)) null else .invalid_rotation;
+            },
             .opacity => blk: {
                 if (value.len == 0) break :blk .invalid_opacity;
                 const percent = value[value.len - 1] == '%';
@@ -5032,6 +5593,21 @@ pub const Studio = struct {
                 if (!std.math.isFinite(parsed)) break :blk .invalid_opacity;
                 const maximum: f32 = if (percent) 100 else 1;
                 break :blk if (parsed >= 0 and parsed <= maximum) null else .invalid_opacity;
+            },
+            .media_focus_x, .media_focus_y => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_unit_interval;
+                if (!std.math.isFinite(parsed)) break :blk .invalid_unit_interval;
+                break :blk if (parsed >= 0 and parsed <= 1) null else .invalid_unit_interval;
+            },
+            .video_poster => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_video_poster;
+                if (!std.math.isFinite(parsed)) break :blk .invalid_video_poster;
+                break :blk if (parsed >= 0) null else .invalid_video_poster;
+            },
+            .video_volume => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_unit_interval;
+                if (!std.math.isFinite(parsed)) break :blk .invalid_unit_interval;
+                break :blk if (parsed >= 0 and parsed <= 1) null else .invalid_unit_interval;
             },
         };
     }
@@ -5156,14 +5732,24 @@ pub const Studio = struct {
         self.inline_editor.error_value = null;
         self.pending_semantic_command = .{ .commit_inline = .{
             .target = self.inline_editor.target,
+            .targets = self.inline_editor.targets,
             .field = self.inline_editor.field,
             .value = self.inline_editor.text(),
         } };
         return true;
     }
 
-    fn nextInlineField(field: InlineField, direction: i8, item: slides.SlideItem) InlineField {
-        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
+    fn inlineFieldVisible(field: InlineField, item: slides.SlideItem, video_playback: bool) bool {
+        if (!inlineFieldApplies(field, item)) return false;
+        if (item.kind != .vid) return true;
+        return if (video_playback)
+            field != .background and field != .media_focus_x and field != .media_focus_y
+        else
+            field != .video_poster and field != .video_volume;
+    }
+
+    fn nextInlineField(field: InlineField, direction: i8, item: slides.SlideItem, video_playback: bool) InlineField {
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .video_volume };
         var current: usize = 0;
         for (fields, 0..) |candidate, index| if (candidate == field) {
             current = index;
@@ -5175,7 +5761,7 @@ pub const Studio = struct {
                 if (current == 0) fields.len - 1 else current - 1
             else
                 (current + 1) % fields.len;
-            if (inlineFieldApplies(fields[current], item)) return fields[current];
+            if (inlineFieldVisible(fields[current], item, video_playback)) return fields[current];
         }
         return field;
     }
@@ -5190,14 +5776,20 @@ pub const Studio = struct {
             .foreground => layout.custom_foreground,
             .background => layout.custom_background,
             .font_size => layout.font_size,
+            .corner_radius, .line_width => layout.font_size,
+            .rotation => layout.rotation,
             .opacity => layout.opacity,
+            .media_focus_x => layout.media_focus_fields[0],
+            .media_focus_y => layout.media_focus_fields[1],
+            .video_poster => videoPosterFieldRect(layout),
+            .video_volume => layout.font_size,
         };
     }
 
-    fn inlineFieldAtPoint(layout: UiLayout, item: slides.SlideItem, pointer: rl.Vector2) ?InlineField {
-        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
+    fn inlineFieldAtPoint(layout: UiLayout, item: slides.SlideItem, pointer: rl.Vector2, video_playback: bool) ?InlineField {
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .video_volume };
         for (fields) |field| {
-            if (inlineFieldApplies(field, item) and pointInRectangle(pointer, inlineFieldRect(layout, field))) return field;
+            if (inlineFieldVisible(field, item, video_playback) and pointInRectangle(pointer, inlineFieldRect(layout, field))) return field;
         }
         return null;
     }
@@ -5209,12 +5801,82 @@ pub const Studio = struct {
         pointer: rl.Vector2,
     ) ?InlineField {
         const context = self.compositionContextForSelection(items) orelse return null;
-        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
+        const item_index = self.selectedIndex(items) orelse return null;
+        const item = items[item_index];
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .video_volume };
         for (fields) |field| {
-            if (!context.local_overrides.contains(field)) continue;
+            if (!context.local_overrides.contains(authoredPropertyForInlineField(field))) continue;
+            if (!inlineFieldVisible(field, item, self.video_properties_playback)) continue;
             if (pointInRectangle(pointer, inlineResetRect(inlineFieldRect(layout, field)))) return field;
         }
         return null;
+    }
+
+    fn mediaButtonOverrideAtPoint(
+        self: Studio,
+        items: []const slides.SlideItem,
+        layout: UiLayout,
+        pointer: rl.Vector2,
+    ) ?AuthoredProperty {
+        const context = self.compositionContextForSelection(items) orelse return null;
+        const item_index = self.selectedIndex(items) orelse return null;
+        const item = items[item_index];
+        if (item.kind == .textbox) {
+            const horizontal_index: usize = switch (item.text_alignment) {
+                .left => 0,
+                .center => 1,
+                .right => 2,
+            };
+            if (context.local_overrides.contains(.text_alignment) and
+                pointInRectangle(pointer, inlineResetRect(layout.align_buttons[horizontal_index])))
+                return .text_alignment;
+            const vertical_index: usize = 3 + switch (item.text_vertical_alignment) {
+                .top => @as(usize, 0),
+                .middle => 1,
+                .bottom => 2,
+            };
+            if (context.local_overrides.contains(.text_vertical_alignment) and
+                pointInRectangle(pointer, inlineResetRect(layout.align_buttons[vertical_index])))
+                return .text_vertical_alignment;
+            return null;
+        }
+        if (item.kind == .line) {
+            const buttons = lineStyleButtonRects(layout);
+            if (context.local_overrides.contains(.line_arrows)) {
+                for (buttons[0..2]) |button| {
+                    if (pointInRectangle(pointer, inlineResetRect(button))) return .line_arrows;
+                }
+            }
+            if (context.local_overrides.contains(.line_direction) and
+                pointInRectangle(pointer, inlineResetRect(buttons[2]))) return .line_direction;
+            return null;
+        }
+        if (item.kind != .img and item.kind != .vid) return null;
+
+        const source_property: AuthoredProperty = if (item.kind == .img) .image_source else .video_source;
+        const source_rect = inlineMediaSourceRect(inlineMediaFieldRect(layout), layout.scale);
+        if (context.local_overrides.contains(source_property) and
+            pointInRectangle(pointer, inlineResetRect(source_rect))) return source_property;
+
+        if (item.kind == .vid and self.video_properties_playback) {
+            const properties = [_]AuthoredProperty{ .video_autoplay, .video_loop, .video_muted };
+            for (layout.media_fit_buttons, properties) |button, property| {
+                if (context.local_overrides.contains(property) and
+                    pointInRectangle(pointer, inlineResetRect(button))) return property;
+            }
+            return null;
+        }
+
+        if (!context.local_overrides.contains(.media_fit)) return null;
+        const active_index: usize = switch (item.media_fit) {
+            .stretch => 0,
+            .contain => 1,
+            .cover => 2,
+        };
+        return if (pointInRectangle(pointer, inlineResetRect(layout.media_fit_buttons[active_index])))
+            .media_fit
+        else
+            null;
     }
 
     fn inlinePropertiesVisible(self: Studio, viewport: Viewport) bool {
@@ -5281,6 +5943,22 @@ pub const Studio = struct {
         return item.identity == self.inline_editor.target.item_identity;
     }
 
+    fn inlineSelectionStillMatches(self: Studio, items: []const slides.SlideItem, item_index: usize) bool {
+        if (self.inline_editor.targets.count <= 1) return self.inlineTargetStillMatches(items, item_index);
+        if (self.selectionCount() != self.inline_editor.targets.count) return false;
+        for (self.inline_editor.targets.slice()) |target| {
+            var found = false;
+            for (items) |item| {
+                if (item.identity == target.item_identity and self.isIdentitySelected(item.identity)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
     fn refreshInlineEditor(
         self: *Studio,
         items: []slides.SlideItem,
@@ -5296,7 +5974,7 @@ pub const Studio = struct {
             self.inline_editor.blur_after_accept = false;
             return;
         };
-        if (self.selectionCount() != 1 or !self.inlineTargetStillMatches(items, item_index)) {
+        if (!self.inlineSelectionStillMatches(items, item_index)) {
             self.inline_editor.error_value = .source_edit_failed;
             self.inline_editor.advance_after_accept = 0;
             self.inline_editor.next_field_after_accept = null;
@@ -5338,7 +6016,7 @@ pub const Studio = struct {
             return;
         }
         const next_field = requested_next orelse if (advance != 0)
-            nextInlineField(previous_field, advance, item)
+            nextInlineField(previous_field, advance, item, self.video_properties_playback)
         else
             return;
         const next_scope = requested_next_scope orelse previous_scope;
@@ -5370,7 +6048,7 @@ pub const Studio = struct {
             self.cancelInlineEdit();
             return true;
         };
-        if (self.selectionCount() != 1 or !self.inlineTargetStillMatches(items, item_index)) {
+        if (!self.inlineSelectionStillMatches(items, item_index)) {
             self.cancelInlineEdit();
             self.notice = .edit_failed;
             return true;
@@ -5384,16 +6062,25 @@ pub const Studio = struct {
                 false;
             if (pointInRectangle(input.pointer_screen, inlineTextExpandRect(layout.edit_text, text_local_override)))
                 return self.emitExpandedTextEditor(items, input.allow_shared_edit);
+            if (self.mediaButtonOverrideAtPoint(items, layout, input.pointer_screen)) |property| {
+                if (self.inline_editor.dirty) {
+                    self.inline_editor.blur_after_accept = true;
+                    return self.queueInlineCommit(0, null, null);
+                }
+                self.cancelInlineEdit();
+                _ = self.emitResetOverride(items, property);
+                return true;
+            }
             if (self.inlineOverrideFieldAtPoint(items, layout, input.pointer_screen)) |field| {
                 if (self.inline_editor.dirty) {
                     self.inline_editor.blur_after_accept = true;
                     return self.queueInlineCommit(0, null, null);
                 }
                 self.cancelInlineEdit();
-                _ = self.emitResetOverride(items, field);
+                _ = self.emitResetOverride(items, authoredPropertyForInlineField(field));
                 return true;
             }
-            if (inlineFieldAtPoint(layout, item, input.pointer_screen)) |field| {
+            if (inlineFieldAtPoint(layout, item, input.pointer_screen, self.video_properties_playback)) |field| {
                 if (field == self.inline_editor.field) {
                     self.inline_editor.select_all = true;
                     return true;
@@ -5448,7 +6135,7 @@ pub const Studio = struct {
                 self.inline_editor.blur_after_accept = false;
                 return self.queueInlineCommit(direction, null, null);
             }
-            const next_field = nextInlineField(self.inline_editor.field, direction, item);
+            const next_field = nextInlineField(self.inline_editor.field, direction, item, self.video_properties_playback);
             _ = self.beginInlineEdit(
                 items,
                 resolved_bounds,
@@ -5563,6 +6250,7 @@ pub const Studio = struct {
         return switch (self.interaction) {
             .moving => .moving,
             .resizing => .resizing,
+            .rotating => .rotating,
             .idle => if (self.selected_identity != null) .selected else .ready,
         };
     }
@@ -5664,6 +6352,27 @@ pub const Studio = struct {
         self.snap_guides = .{};
         self.selected_library_index = null;
         self.tool = .select;
+    }
+
+    /// Produces the same source-level image/video creation intent used by the
+    /// one-shot toolbar tools for a desktop file drop. The integration owns
+    /// the transient OS path, while Studio retains source-structure policy.
+    pub fn droppedMediaCommand(
+        self: *Studio,
+        kind: NewItemKind,
+        position: rl.Vector2,
+    ) ?SemanticCommand {
+        if (kind != .image and kind != .video) return null;
+        if (self.definition_mode != null and !self.definitionStructureAllowed()) {
+            self.notice = .definition_structure_locked;
+            return null;
+        }
+        self.tool = .select;
+        return .{ .add_item = .{
+            .kind = kind,
+            .position = roundVector(position),
+            .suggested_size = .{ .x = 640, .y = 360 },
+        } };
     }
 
     fn selectMorphScene(self: *Studio, items: []slides.SlideItem, state: ?usize) void {
@@ -5966,7 +6675,8 @@ pub const Studio = struct {
         for (0..count) |selection_index| {
             const identity = self.selectedIdentityAt(selection_index) orelse continue;
             const item_index = itemIndexByIdentity(items, identity) orelse continue;
-            const geometry = itemGeometry(items[item_index], resolved_bounds);
+            const item = items[item_index];
+            const geometry = rotatedGeometryBounds(itemGeometry(item, resolved_bounds), item.rotation);
             if (bounds) |*value| {
                 const max_x = @max(value.position.x + value.size.x, geometry.position.x + geometry.size.x);
                 const max_y = @max(value.position.y + value.size.y, geometry.position.y + geometry.size.y);
@@ -6003,6 +6713,10 @@ pub const Studio = struct {
             .before = self.drag.before,
             .after = self.preview,
             .resized = self.interaction == .resizing,
+            .rotation = if (self.interaction == .rotating and !self.drag.separate_source_geometry)
+                self.drag.source_after_rotation
+            else
+                null,
         };
     }
 
@@ -6012,13 +6726,81 @@ pub const Studio = struct {
     }
 
     pub fn resizeHandleRect(self: Studio, viewport: Viewport, geometry: Geometry) ?rl.Rectangle {
-        const rect = geometryToScreenRect(viewport, geometry) orelse return null;
+        return self.itemResizeHandleRect(viewport, geometry, 0);
+    }
+
+    fn itemResizeHandleRect(self: Studio, viewport: Viewport, geometry: Geometry, rotation: f32) ?rl.Rectangle {
+        const logical = rotatePointAround(add(geometry.position, geometry.size), geometryCenter(geometry), rotation);
+        const screen = logicalToScreen(viewport, logical) orelse return null;
         const half = self.handle_size_screen / 2;
         return .{
-            .x = rect.x + rect.width - half,
-            .y = rect.y + rect.height - half,
+            .x = screen.x - half,
+            .y = screen.y - half,
             .width = self.handle_size_screen,
             .height = self.handle_size_screen,
+        };
+    }
+
+    fn lineEndpointHandleRect(
+        self: Studio,
+        viewport: Viewport,
+        geometry: Geometry,
+        direction: slides.LineDirection,
+        rotation: f32,
+        endpoint: LineEndpoint,
+    ) ?rl.Rectangle {
+        const endpoints = lineEndpoints(geometry, direction);
+        const logical = rotatePointAround(
+            if (endpoint == .start) endpoints.start else endpoints.end,
+            geometryCenter(geometry),
+            rotation,
+        );
+        const screen = logicalToScreen(viewport, logical) orelse return null;
+        const half = self.handle_size_screen / 2;
+        return .{
+            .x = screen.x - half,
+            .y = screen.y - half,
+            .width = self.handle_size_screen,
+            .height = self.handle_size_screen,
+        };
+    }
+
+    const RotationHandle = struct {
+        connector_start: rl.Vector2,
+        center: rl.Vector2,
+        rect: rl.Rectangle,
+    };
+
+    fn rotationHandle(
+        self: Studio,
+        viewport: Viewport,
+        geometry: Geometry,
+        rotation: f32,
+    ) ?RotationHandle {
+        if (!viewport.valid()) return null;
+        const center = geometryCenter(geometry);
+        const top_middle: rl.Vector2 = .{
+            .x = center.x,
+            .y = geometry.position.y,
+        };
+        const connector_logical = rotatePointAround(top_middle, center, rotation);
+        const handle_gap = 30 * viewport.logical_size.y / viewport.slide_size.y;
+        const handle_logical = rotatePointAround(rl.Vector2{
+            .x = center.x,
+            .y = geometry.position.y - handle_gap,
+        }, center, rotation);
+        const connector_screen = logicalToScreen(viewport, connector_logical) orelse return null;
+        const handle_screen = logicalToScreen(viewport, handle_logical) orelse return null;
+        const half = self.handle_size_screen / 2;
+        return .{
+            .connector_start = connector_screen,
+            .center = handle_screen,
+            .rect = .{
+                .x = handle_screen.x - half,
+                .y = handle_screen.y - half,
+                .width = self.handle_size_screen,
+                .height = self.handle_size_screen,
+            },
         };
     }
 
@@ -6275,11 +7057,23 @@ pub const Studio = struct {
         }
         if (input.edit_text_pressed) {
             if (self.inlinePropertiesVisible(viewport)) {
-                _ = self.beginInlineEdit(items, resolved_bounds, .text, input.allow_shared_edit);
+                const selected = self.selectedIndex(items);
+                if (selected != null and (items[selected.?].kind == .img or items[selected.?].kind == .vid))
+                    _ = self.emitSelectedCommand(items, input.allow_shared_edit, .replace_media)
+                else
+                    _ = self.beginInlineEdit(items, resolved_bounds, .text, input.allow_shared_edit);
             } else if (viewport.chrome != null) {
                 self.revealInlineProperties();
             } else {
-                _ = self.emitSelectedCommand(items, input.allow_shared_edit, .edit_text);
+                const selected = self.selectedIndex(items);
+                _ = self.emitSelectedCommand(
+                    items,
+                    input.allow_shared_edit,
+                    if (selected != null and (items[selected.?].kind == .img or items[selected.?].kind == .vid))
+                        .replace_media
+                    else
+                        .edit_text,
+                );
             }
             return null;
         }
@@ -6332,14 +7126,64 @@ pub const Studio = struct {
             return null;
         }
 
-        // The resize handle wins over Shift-click membership toggling so
-        // Shift can retain its established aspect-lock meaning at gesture
+        // Transform handles win over Shift-click membership toggling so
+        // Shift can retain its established snap/aspect meaning at gesture
         // start.
         if (input.pointer_pressed and self.interaction == .idle and self.selectionCount() == 1) {
             if (self.selectedGeometry(items, resolved_bounds)) |selected_geometry| {
-                if (self.resizeHandleRect(viewport, selected_geometry)) |handle| {
+                const selected_index = self.selectedIndex(items) orelse return null;
+                if (inlineFieldApplies(.rotation, items[selected_index])) {
+                    if (self.rotationHandle(viewport, selected_geometry, items[selected_index].rotation)) |handle| {
+                        if (pointInRectangle(input.pointer_screen, handle.rect)) {
+                            if (items[selected_index].locked) {
+                                self.notice = .locked_item;
+                                return null;
+                            }
+                            const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
+                            self.beginRotationInteraction(
+                                items[selected_index],
+                                selected_geometry,
+                                pointer_logical orelse return null,
+                                edit_scope,
+                            );
+                            return null;
+                        }
+                    }
+                }
+                if (items[selected_index].kind == .line) {
+                    const endpoints = [_]LineEndpoint{ .start, .end };
+                    for (endpoints) |endpoint| {
+                        const handle = self.lineEndpointHandleRect(
+                            viewport,
+                            selected_geometry,
+                            items[selected_index].line_direction,
+                            items[selected_index].rotation,
+                            endpoint,
+                        ) orelse continue;
+                        if (!pointInRectangle(input.pointer_screen, handle)) continue;
+                        if (items[selected_index].locked) {
+                            self.notice = .locked_item;
+                            return null;
+                        }
+                        const edit_scope = self.editScopeForItem(items, selected_index, input.allow_shared_edit) orelse return null;
+                        if (!sharedResizeSupported(items[selected_index], edit_scope)) {
+                            self.notice = .shared_template_auto_size;
+                            return null;
+                        }
+                        self.beginInteraction(
+                            .resizing,
+                            selected_geometry,
+                            Geometry.fromItem(items[selected_index]),
+                            sourceGeometryForEdit(items[selected_index], selected_geometry, edit_scope),
+                            edit_scope == .shared_template and items[selected_index].instance_source != null,
+                            pointer_logical orelse return null,
+                            edit_scope,
+                        );
+                        self.drag.line_endpoint = endpoint;
+                        return null;
+                    }
+                } else if (self.itemResizeHandleRect(viewport, selected_geometry, items[selected_index].rotation)) |handle| {
                     if (pointInRectangle(input.pointer_screen, handle)) {
-                        const selected_index = self.selectedIndex(items) orelse return null;
                         if (items[selected_index].locked) {
                             self.notice = .locked_item;
                             return null;
@@ -6447,12 +7291,12 @@ pub const Studio = struct {
         };
     }
 
-    const TargetCommandKind = enum { delete_item, edit_text, promote_to_reusable };
+    const TargetCommandKind = enum { delete_item, edit_text, replace_media, promote_to_reusable };
 
     fn emitResetOverride(
         self: *Studio,
         items: []slides.SlideItem,
-        field: InlineField,
+        property: AuthoredProperty,
     ) bool {
         const item_index = self.selectedIndex(items) orelse return false;
         if (self.selectionCount() != 1) {
@@ -6467,8 +7311,8 @@ pub const Studio = struct {
             self.notice = .override_reset_unsupported;
             return true;
         };
-        if (!context.local_overrides.contains(field) or
-            !context.resettable_overrides.contains(field) or
+        if (!context.local_overrides.contains(property) or
+            !context.resettable_overrides.contains(property) or
             context.reset_target == null or
             context.reset_target.?.item_identity != items[item_index].identity)
         {
@@ -6478,7 +7322,7 @@ pub const Studio = struct {
         self.notice = .none;
         self.pending_semantic_command = .{ .reset_local_override = .{
             .target = context.reset_target.?,
-            .field = field,
+            .property = property,
         } };
         return true;
     }
@@ -6706,7 +7550,9 @@ pub const Studio = struct {
         kind: TargetCommandKind,
     ) bool {
         const index = self.selectedIndex(items) orelse return false;
-        if (self.definition_mode != null and kind != .edit_text and !self.definitionStructureAllowed()) {
+        if (self.definition_mode != null and kind != .edit_text and kind != .replace_media and
+            !self.definitionStructureAllowed())
+        {
             self.notice = .definition_structure_locked;
             return true;
         }
@@ -6722,6 +7568,10 @@ pub const Studio = struct {
         }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         if (kind == .edit_text and items[index].kind != .textbox and items[index].kind != .crowd) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        if (kind == .replace_media and items[index].kind != .img and items[index].kind != .vid) {
             self.notice = .property_unavailable;
             return true;
         }
@@ -6741,6 +7591,7 @@ pub const Studio = struct {
         self.pending_semantic_command = switch (kind) {
             .delete_item => .{ .delete_item = target },
             .edit_text => .{ .edit_text = target },
+            .replace_media => .{ .replace_media = target },
             .promote_to_reusable => .{ .promote_to_reusable = target },
         };
         return true;
@@ -6763,6 +7614,230 @@ pub const Studio = struct {
         return self.emitSelectedCommand(items, allow_shared_edit, .edit_text);
     }
 
+    fn emitMediaFit(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+        fit: slides.MediaFit,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() != 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (item.kind != .img and item.kind != .vid) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_media_fit = .{ .target = target, .fit = fit } };
+        return true;
+    }
+
+    fn emitTextAlignment(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+        change: TextAlignmentChange,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() > 1) {
+            var targets: ItemBatchCommand = .{};
+            for (items, 0..) |candidate, candidate_index| {
+                if (!self.isIdentitySelected(candidate.identity)) continue;
+                if (candidate.locked) {
+                    self.notice = .locked_item;
+                    return true;
+                }
+                if (candidate.kind != .textbox) {
+                    self.notice = .property_unavailable;
+                    return true;
+                }
+                const edit_scope = self.editScopeForItem(items, candidate_index, allow_shared_edit) orelse return true;
+                const target: CommandTarget = .{
+                    .item_identity = candidate.identity,
+                    .source = self.commandSource(candidate, edit_scope),
+                    .edit_scope = edit_scope,
+                };
+                if (batchHasNonLocalSource(targets.slice(), target)) {
+                    self.notice = .multi_selection_property_unsupported;
+                    return true;
+                }
+                targets.targets[targets.count] = target;
+                targets.count += 1;
+            }
+            if (targets.count != self.selectionCount()) {
+                self.notice = .multi_selection_property_unsupported;
+                return true;
+            }
+            const property: CommonProperty = switch (change) {
+                .horizontal => .text_alignment,
+                .vertical => .text_vertical_alignment,
+            };
+            const value: []const u8 = switch (change) {
+                .horizontal => |alignment| switch (alignment) {
+                    .left => "left",
+                    .center => "center",
+                    .right => "right",
+                },
+                .vertical => |alignment| switch (alignment) {
+                    .top => "top",
+                    .middle => "middle",
+                    .bottom => "bottom",
+                },
+            };
+            self.notice = .none;
+            self.pending_semantic_command = .{ .set_common_property = .{
+                .targets = targets,
+                .property = property,
+                .value = value,
+            } };
+            return true;
+        }
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (item.kind != .textbox) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_text_alignment = .{ .target = target, .change = change } };
+        return true;
+    }
+
+    fn selectionAllTextboxes(self: Studio, items: []const slides.SlideItem) bool {
+        if (self.selectionCount() == 0) return false;
+        var found: usize = 0;
+        for (items) |item| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            if (item.kind != .textbox) return false;
+            found += 1;
+        }
+        return found == self.selectionCount();
+    }
+
+    fn selectionTextAlignmentHomogeneous(
+        self: Studio,
+        items: []const slides.SlideItem,
+        vertical: bool,
+    ) bool {
+        const primary_index = self.selectedIndex(items) orelse return false;
+        const primary = items[primary_index];
+        for (items) |item| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            if (vertical) {
+                if (item.text_vertical_alignment != primary.text_vertical_alignment) return false;
+            } else if (item.text_alignment != primary.text_alignment) return false;
+        }
+        return true;
+    }
+
+    fn emitVideoToggle(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+        property: VideoToggle,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() != 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (item.kind != .vid) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
+        const shared = if (edit_scope == .shared_template) item.sharedTemplateValues() else null;
+        const current = switch (property) {
+            .autoplay => if (shared) |values| values.vid_autoplay else item.vid_autoplay,
+            .loop => if (shared) |values| values.vid_loop else item.vid_loop,
+            .muted => if (shared) |values| values.vid_muted else item.vid_muted,
+        };
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_video_toggle = .{
+            .target = target,
+            .property = property,
+            .enabled = !current,
+        } };
+        return true;
+    }
+
+    fn emitLineStyle(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+        control: enum { start, end, direction },
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() != 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (item.kind != .line) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
+        const shared = if (edit_scope == .shared_template) item.sharedTemplateValues() else null;
+        const change: LineStyleChange = switch (control) {
+            .start => .{ .arrow_start = !(if (shared) |values| values.line_arrow_start else item.line_arrow_start) },
+            .end => .{ .arrow_end = !(if (shared) |values| values.line_arrow_end else item.line_arrow_end) },
+            .direction => .{ .direction = switch (if (shared) |values| values.line_direction else item.line_direction) {
+                .down => .up,
+                .up => .down,
+            } },
+        };
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_line_style = .{ .target = target, .change = change } };
+        return true;
+    }
+
+    fn emitVideoPoster(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+        poster: f32,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() != 1) return true;
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (item.kind != .vid) return true;
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_video_poster = .{ .target = target, .value = poster } };
+        return true;
+    }
+
     fn emitColorCommand(
         self: *Studio,
         items: []slides.SlideItem,
@@ -6781,7 +7856,9 @@ pub const Studio = struct {
             return true;
         }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
-        if (!background and items[index].kind != .textbox) {
+        if ((!background and items[index].kind != .textbox and items[index].kind != .line) or
+            (background and (items[index].kind == .background or items[index].kind == .line)))
+        {
             self.notice = .property_unavailable;
             return true;
         }
@@ -6811,6 +7888,10 @@ pub const Studio = struct {
             self.notice = .locked_item;
             return true;
         }
+        if (items[index].kind == .background or items[index].kind == .line) {
+            self.notice = .property_unavailable;
+            return true;
+        }
         const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
         self.pending_semantic_command = .{
             .clear_background = self.selectedTarget(items, edit_scope) orelse return true,
@@ -6823,6 +7904,7 @@ pub const Studio = struct {
         custom_foreground,
         custom_background,
         font_size,
+        rotation,
         opacity,
     };
 
@@ -6844,8 +7926,11 @@ pub const Studio = struct {
             return true;
         }
         const applies = switch (request) {
-            .numeric_geometry, .custom_background, .opacity => item.kind != .background,
-            .custom_foreground, .font_size => item.kind == .textbox,
+            .numeric_geometry, .opacity => item.kind != .background,
+            .rotation => inlineFieldApplies(.rotation, item),
+            .custom_background => item.kind != .background and item.kind != .line,
+            .custom_foreground => item.kind == .textbox or item.kind == .line,
+            .font_size => item.kind == .textbox,
         };
         if (!applies) {
             self.notice = .property_unavailable;
@@ -6858,6 +7943,7 @@ pub const Studio = struct {
             .custom_foreground => .{ .set_custom_foreground = target },
             .custom_background => .{ .set_custom_background = target },
             .font_size => .{ .set_font_size = target },
+            .rotation => .{ .set_rotation = .{ .target = target } },
             .opacity => .{ .set_opacity = target },
         };
         return true;
@@ -7155,7 +8241,10 @@ pub const Studio = struct {
             .add_text => .text,
             .add_bullets => .bullets,
             .add_image => .image,
+            .add_video => .video,
             .add_shape => .shape,
+            .add_line => .line,
+            .add_arrow => .arrow,
             .add_reusable => unreachable,
         };
         self.pending_semantic_command = .{ .add_item = .{
@@ -7164,10 +8253,11 @@ pub const Studio = struct {
             .suggested_size = switch (kind) {
                 .text => .{ .x = 600, .y = 120 },
                 .bullets => .{ .x = 720, .y = 320 },
-                .image => .{ .x = 640, .y = 360 },
+                .image, .video => .{ .x = 640, .y = 360 },
                 .shape => .{ .x = 480, .y = 270 },
+                .line, .arrow => .{ .x = 480, .y = 180 },
             },
-            .suggested_color = if (kind == .shape) .blue else null,
+            .suggested_color = if (kind == .shape or kind == .line or kind == .arrow) .blue else null,
         } };
         self.tool = .select;
     }
@@ -7954,9 +9044,9 @@ pub const Studio = struct {
                 self.grid_contrast_dragging = false;
                 return true;
             }
-            for (layout.tool_buttons, 0..) |button, index| {
+            const toolbar_tools = [_]Tool{ .select, .add_text, .add_bullets, .add_image, .add_video, .add_shape, .add_line, .add_reusable };
+            for (layout.tool_buttons, toolbar_tools) |button, tool| {
                 if (pointInRectangle(pointer, button)) {
-                    const tool: Tool = @enumFromInt(index);
                     if (self.definition_mode != null and tool != .select and !self.definitionStructureAllowed())
                         self.notice = .definition_structure_locked
                     else if (tool == .add_reusable)
@@ -8063,18 +9153,29 @@ pub const Studio = struct {
             if (self.selected_identity == null) return true;
         }
         const inline_properties = viewport.chrome != null;
+        const selected_item = if (self.selectedIndex(items)) |index| items[index] else null;
+        const selected_media = if (selected_item) |item| item.kind == .img or item.kind == .vid else false;
+        const selected_line = if (selected_item) |item| item.kind == .line else false;
+        const selected_video_playback = if (selected_item) |item| item.kind == .vid and self.video_properties_playback else false;
         if (inline_properties) {
             const text_local_override = if (self.compositionContextForSelection(items)) |context|
                 context.local_overrides.contains(.text)
             else
                 false;
-            if (pointInRectangle(pointer, inlineTextExpandRect(layout.edit_text, text_local_override)))
+            if (!selected_media and pointInRectangle(pointer, inlineTextExpandRect(layout.edit_text, text_local_override)))
                 return self.emitExpandedTextEditor(items, allow_shared_edit);
+            if (self.mediaButtonOverrideAtPoint(items, layout, pointer)) |property|
+                return self.emitResetOverride(items, property);
             if (self.inlineOverrideFieldAtPoint(items, layout, pointer)) |field|
-                return self.emitResetOverride(items, field);
+                return self.emitResetOverride(items, authoredPropertyForInlineField(field));
         }
-        if (pointInRectangle(pointer, layout.edit_text))
-            return if (inline_properties)
+        const media_field = inlineMediaFieldRect(layout);
+        if (selected_media and pointInRectangle(pointer, inlineMediaReplaceRect(media_field)))
+            return self.emitSelectedCommand(items, allow_shared_edit, .replace_media);
+        if (pointInRectangle(pointer, if (selected_media) media_field else layout.edit_text))
+            return if (selected_media)
+                true
+            else if (inline_properties)
                 self.beginInlineEdit(items, resolved_bounds, .text, allow_shared_edit)
             else
                 self.emitSelectedCommand(items, allow_shared_edit, .edit_text);
@@ -8090,6 +9191,77 @@ pub const Studio = struct {
                     self.beginInlineEdit(items, resolved_bounds, @enumFromInt(index + 1), allow_shared_edit)
                 else
                     self.emitPropertyRequest(items, allow_shared_edit, .{ .numeric_geometry = @enumFromInt(index) });
+        }
+        if (selected_media) {
+            if (selected_item.?.kind == .vid and pointInRectangle(pointer, mediaPageToggleRect(layout))) {
+                self.video_properties_playback = !self.video_properties_playback;
+                self.notice = .none;
+                return true;
+            }
+            if (selected_video_playback) {
+                const toggles = [_]VideoToggle{ .autoplay, .loop, .muted };
+                for (layout.media_fit_buttons, toggles) |button, property| {
+                    if (pointInRectangle(pointer, button)) return self.emitVideoToggle(items, allow_shared_edit, property);
+                }
+                if (pointInRectangle(pointer, videoPosterFieldRect(layout)))
+                    return self.beginInlineEdit(items, resolved_bounds, .video_poster, allow_shared_edit);
+                const timeline = videoTimelineRect(layout);
+                if (pointInRectangle(pointer, timeline)) {
+                    const resolved = resolvedBoundsForIdentity(resolved_bounds, selected_item.?.identity);
+                    if (resolved) |value| {
+                        if (value.media_duration > 0) {
+                            const fraction = std.math.clamp((pointer.x - timeline.x) / @max(@as(f32, 1), timeline.width), 0, 1);
+                            return self.emitVideoPoster(items, allow_shared_edit, fraction * value.media_duration);
+                        }
+                    }
+                    self.notice = .property_unavailable;
+                    return true;
+                }
+                if (pointInRectangle(pointer, layout.font_size))
+                    return self.beginInlineEdit(items, resolved_bounds, .video_volume, allow_shared_edit);
+            } else {
+                const fits = [_]slides.MediaFit{ .stretch, .contain, .cover };
+                for (layout.media_fit_buttons, fits) |button, fit| {
+                    if (pointInRectangle(pointer, button)) return self.emitMediaFit(items, allow_shared_edit, fit);
+                }
+                const focus_fields = [_]InlineField{ .media_focus_x, .media_focus_y };
+                for (layout.media_focus_fields, focus_fields) |field_rect, field| {
+                    if (pointInRectangle(pointer, field_rect))
+                        return self.beginInlineEdit(items, resolved_bounds, field, allow_shared_edit);
+                }
+            }
+            // The foreground row becomes read-only intrinsic-size metadata for
+            // media, so it must not fall through to text color actions.
+            for (layout.foreground_swatches) |swatch|
+                if (pointInRectangle(pointer, swatch)) return true;
+            if (pointInRectangle(pointer, layout.custom_foreground)) return true;
+            if (pointInRectangle(pointer, layout.font_size)) return true;
+            if (selected_video_playback) {
+                if (pointInRectangle(pointer, layout.custom_background) or
+                    pointInRectangle(pointer, layout.clear_background)) return true;
+                for (layout.background_swatches) |swatch|
+                    if (pointInRectangle(pointer, swatch)) return true;
+            }
+        }
+        if (selected_line) {
+            const buttons = lineStyleButtonRects(layout);
+            for (buttons, 0..) |button, index| {
+                if (!pointInRectangle(pointer, button)) continue;
+                return self.emitLineStyle(
+                    items,
+                    allow_shared_edit,
+                    switch (index) {
+                        0 => .start,
+                        1 => .end,
+                        2 => .direction,
+                        else => unreachable,
+                    },
+                );
+            }
+            if (pointInRectangle(pointer, layout.custom_background) or
+                pointInRectangle(pointer, layout.clear_background)) return true;
+            for (layout.background_swatches) |swatch|
+                if (pointInRectangle(pointer, swatch)) return true;
         }
         if (pointInRectangle(pointer, layout.custom_foreground))
             return if (inline_properties)
@@ -8113,9 +9285,27 @@ pub const Studio = struct {
             return self.emitClearBackgroundCommand(items, allow_shared_edit);
         if (pointInRectangle(pointer, layout.font_size))
             return if (inline_properties)
-                self.beginInlineEdit(items, resolved_bounds, .font_size, allow_shared_edit)
+                self.beginInlineEdit(
+                    items,
+                    resolved_bounds,
+                    if (selected_item) |item|
+                        if (inlineFieldApplies(.corner_radius, item))
+                            .corner_radius
+                        else if (inlineFieldApplies(.line_width, item))
+                            .line_width
+                        else
+                            .font_size
+                    else
+                        .font_size,
+                    allow_shared_edit,
+                )
             else
                 self.emitPropertyRequest(items, allow_shared_edit, .font_size);
+        if (pointInRectangle(pointer, layout.rotation))
+            return if (inline_properties)
+                self.beginInlineEdit(items, resolved_bounds, .rotation, allow_shared_edit)
+            else
+                self.emitPropertyRequest(items, allow_shared_edit, .rotation);
         if (pointInRectangle(pointer, layout.opacity))
             return if (inline_properties)
                 self.beginInlineEdit(items, resolved_bounds, .opacity, allow_shared_edit)
@@ -8123,6 +9313,14 @@ pub const Studio = struct {
                 self.emitPropertyRequest(items, allow_shared_edit, .opacity);
         for (layout.align_buttons, 0..) |button, index| {
             if (pointInRectangle(pointer, button)) {
+                if (selected_line) return true;
+                if (self.selectionAllTextboxes(items)) {
+                    const change: TextAlignmentChange = if (index < 3)
+                        .{ .horizontal = @enumFromInt(index) }
+                    else
+                        .{ .vertical = @enumFromInt(index - 3) };
+                    return self.emitTextAlignment(items, allow_shared_edit, change);
+                }
                 self.pending_geometry_command = self.alignSelected(
                     items,
                     resolved_bounds,
@@ -8273,7 +9471,20 @@ pub const Studio = struct {
         if (self.tool != .select) return .crosshair;
         if (self.selectionCount() == 1) {
             if (self.selectedIndex(items)) |index| {
-                if (self.resizeHandleRect(viewport, itemGeometry(items[index], resolved_bounds))) |handle| {
+                const geometry = itemGeometry(items[index], resolved_bounds);
+                if (inlineFieldApplies(.rotation, items[index])) {
+                    if (self.rotationHandle(viewport, geometry, items[index].rotation)) |handle| {
+                        if (pointInRectangle(pointer, handle.rect)) return if (items[index].locked) .not_allowed else .crosshair;
+                    }
+                }
+                if (items[index].kind == .line) {
+                    const endpoints = [_]LineEndpoint{ .start, .end };
+                    for (endpoints) |endpoint| {
+                        if (self.lineEndpointHandleRect(viewport, geometry, items[index].line_direction, items[index].rotation, endpoint)) |handle| {
+                            if (pointInRectangle(pointer, handle)) return .resize_nwse;
+                        }
+                    }
+                } else if (self.itemResizeHandleRect(viewport, geometry, items[index].rotation)) |handle| {
                     if (pointInRectangle(pointer, handle)) return .resize_nwse;
                 }
             }
@@ -8284,7 +9495,11 @@ pub const Studio = struct {
             index -= 1;
             const item = items[index];
             if (!isConcreteVisibleItem(item, resolved_bounds)) continue;
-            if (!pointInGeometry(logical, itemGeometry(item, resolved_bounds))) continue;
+            const geometry = itemGeometry(item, resolved_bounds);
+            if (if (item.kind == .line)
+                !pointHitsLine(item, geometry, logical)
+            else
+                !pointInRotatedGeometry(logical, geometry, item.rotation)) continue;
             return if (item.locked) .not_allowed else .resize_all;
         }
         return .arrow;
@@ -8462,7 +9677,10 @@ pub const Studio = struct {
     ) bool {
         _ = self;
         if (!isSelectable(item, resolved_bounds)) return false;
-        const clipped_item = clipGeometryToSlide(itemGeometry(item, resolved_bounds), logical_size) orelse return false;
+        const clipped_item = clipGeometryToSlide(
+            rotatedGeometryBounds(itemGeometry(item, resolved_bounds), item.rotation),
+            logical_size,
+        ) orelse return false;
         return geometriesOverlap(marqueeGeometry(marquee), clipped_item);
     }
 
@@ -8719,6 +9937,16 @@ pub const Studio = struct {
             return null;
         }
 
+        // A @popgroup line accepts only its instance id; patching a selected
+        // generated member there would make the deck invalid. Base-scene
+        // member edits therefore go through Library definition mode or an
+        // explicit Detach. Morph scenes remain unambiguous because qualified
+        // member IDs can receive ordinary state-local @set directives.
+        if (item.source.scope == .group_instance_member) {
+            self.notice = .generated_source_read_only;
+            return null;
+        }
+
         if (item.source.scope == .slide_template) {
             if (allow_shared_edit) {
                 if (item.instance_source != null) {
@@ -8763,6 +9991,13 @@ pub const Studio = struct {
         return displayed;
     }
 
+    fn sourceRotationForEdit(item: slides.SlideItem, edit_scope: EditScope) f32 {
+        if (edit_scope == .shared_template) {
+            if (item.sharedTemplateValues()) |shared| return shared.rotation;
+        }
+        return item.rotation;
+    }
+
     fn selectionLayoutGeometry(entry: SelectionGeometry) Geometry {
         return if (entry.separate_source_geometry) entry.source_geometry else entry.geometry;
     }
@@ -8805,6 +10040,7 @@ pub const Studio = struct {
             return item.id != null;
         }
         if (item.source.scope == .slide_template) return item.id != null or item.source.patchable;
+        if (item.source.scope == .group_instance_member) return false;
         return item.source.scope != .none and item.source.patchable;
     }
 
@@ -8828,6 +10064,8 @@ pub const Studio = struct {
             if (item.source.patchable) return "shared template; add id for local edit (Alt edits shared)";
             return "generated shared template; add a literal id for local editing";
         }
+        if (self.active_morph_state == null and item.source.scope == .group_instance_member)
+            return "group instance · Detach or edit its Library definition";
         const source = if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource();
         return sourceScopeLabel(source.scope);
     }
@@ -9100,6 +10338,34 @@ pub const Studio = struct {
         self.preview = geometry;
     }
 
+    fn beginRotationInteraction(
+        self: *Studio,
+        item: slides.SlideItem,
+        geometry: Geometry,
+        pointer: rl.Vector2,
+        edit_scope: EditScope,
+    ) void {
+        const source_rotation = sourceRotationForEdit(item, edit_scope);
+        self.interaction = .rotating;
+        self.group_drag_count = 0;
+        self.snap_guides = .{};
+        self.drag = .{
+            .pointer_start = pointer,
+            .before = geometry,
+            .authored_before = Geometry.fromItem(item),
+            .source_before = sourceGeometryForEdit(item, geometry, edit_scope),
+            .source_after = sourceGeometryForEdit(item, geometry, edit_scope),
+            .separate_source_geometry = edit_scope == .shared_template and item.instance_source != null,
+            .edit_scope = edit_scope,
+            .rotation_before = item.rotation,
+            .authored_before_rotation = item.rotation,
+            .source_before_rotation = source_rotation,
+            .source_after_rotation = source_rotation,
+            .pointer_angle_start = pointerAngleDegrees(geometryCenter(geometry), pointer),
+        };
+        self.preview = geometry;
+    }
+
     fn applyPointer(
         self: *Studio,
         items: []slides.SlideItem,
@@ -9110,15 +10376,47 @@ pub const Studio = struct {
         disable_snapping: bool,
     ) void {
         const index = self.selectedIndex(items) orelse return;
+        if (self.interaction == .rotating) {
+            const current_angle = pointerAngleDegrees(geometryCenter(self.drag.before), pointer);
+            var rotation = normalizeRotation(
+                self.drag.source_before_rotation + current_angle - self.drag.pointer_angle_start,
+            );
+            if (lock_aspect_ratio) rotation = normalizeRotation(@round(rotation / 15) * 15);
+            self.drag.source_after_rotation = rotation;
+            if (!self.drag.separate_source_geometry) items[index].rotation = rotation;
+            return;
+        }
         const delta = subtract(pointer, self.drag.pointer_start);
         const moving_shared_source = self.drag.separate_source_geometry and self.interaction == .moving;
         var geometry = if (moving_shared_source) self.drag.source_before else self.drag.before;
         var aspect_ratio: ?f32 = null;
+        const rotated_resize = self.interaction == .resizing and self.drag.line_endpoint == null and
+            @abs(items[index].rotation) > 0.0001;
         switch (self.interaction) {
             .idle => return,
             .moving => geometry.position = roundVector(add(geometry.position, delta)),
             .resizing => {
-                if (lock_aspect_ratio and self.drag.before.size.x > 0 and self.drag.before.size.y > 0) {
+                if (self.drag.line_endpoint) |endpoint| {
+                    var requested = roundVector(pointer);
+                    if (!disable_snapping and self.grid_snapping) {
+                        requested.x = nearestGrid(requested.x, self.grid_spacing);
+                        requested.y = nearestGrid(requested.y, self.grid_spacing);
+                    }
+                    geometry = geometryAfterLineEndpoint(
+                        self.drag.before,
+                        items[index].line_direction,
+                        endpoint,
+                        requested,
+                    );
+                } else if (rotated_resize) {
+                    geometry = geometryAfterRotatedResize(
+                        self.drag.before,
+                        items[index].rotation,
+                        pointer,
+                        self.min_item_size,
+                        lock_aspect_ratio,
+                    );
+                } else if (lock_aspect_ratio and self.drag.before.size.x > 0 and self.drag.before.size.y > 0) {
                     const ratio = self.drag.before.size.x / self.drag.before.size.y;
                     aspect_ratio = ratio;
                     if (@abs(delta.x) >= @abs(delta.y * ratio)) {
@@ -9135,15 +10433,21 @@ pub const Studio = struct {
                     });
                 }
             },
+            .rotating => unreachable,
         }
         self.snap_guides = .{};
-        if (!disable_snapping and (delta.x != 0 or delta.y != 0)) {
+        if (self.drag.line_endpoint == null and !rotated_resize and !disable_snapping and (delta.x != 0 or delta.y != 0)) {
             const threshold: rl.Vector2 = if (viewport.valid()) .{
                 .x = self.snap_threshold_screen * viewport.logical_size.x / viewport.slide_size.x,
                 .y = self.snap_threshold_screen * viewport.logical_size.y / viewport.slide_size.y,
             } else .zero();
+            const rotated_move = self.interaction == .moving and @abs(items[index].rotation) > 0.0001;
+            const snap_candidate = if (rotated_move)
+                rotatedGeometryBounds(geometry, items[index].rotation)
+            else
+                geometry;
             const snapped = snapGeometry(
-                geometry,
+                snap_candidate,
                 self.interaction,
                 viewport.logical_size,
                 threshold,
@@ -9156,7 +10460,11 @@ pub const Studio = struct {
                 items,
                 resolved_bounds,
             );
-            geometry = snapped.geometry;
+            if (rotated_move) {
+                geometry.position = add(geometry.position, subtract(snapped.geometry.position, snap_candidate.position));
+            } else {
+                geometry = snapped.geometry;
+            }
             self.snap_guides = snapped.guides;
         }
         if (self.drag.separate_source_geometry) {
@@ -9187,6 +10495,21 @@ pub const Studio = struct {
         self.snap_guides = .{};
         const identity = self.selected_identity orelse return null;
         const index = itemIndexByIdentity(items, identity) orelse return null;
+        if (interaction == .rotating) {
+            items[index].rotation = self.drag.authored_before_rotation;
+            if (@abs(self.drag.source_before_rotation - self.drag.source_after_rotation) <= 0.0001) return null;
+            self.dirty = true;
+            self.copy_is_current = false;
+            self.pending_semantic_command = .{ .set_rotation = .{
+                .target = .{
+                    .item_identity = identity,
+                    .source = self.commandSource(items[index], self.drag.edit_scope),
+                    .edit_scope = self.drag.edit_scope,
+                },
+                .value = self.drag.source_after_rotation,
+            } };
+            return null;
+        }
         const after = self.preview;
         const source_after = if (self.drag.separate_source_geometry)
             self.drag.source_after
@@ -9236,6 +10559,7 @@ pub const Studio = struct {
     fn restoreBefore(self: Studio, item: *slides.SlideItem) void {
         item.position = self.drag.authored_before.position;
         if (self.interaction == .resizing) item.size = self.drag.authored_before.size;
+        if (self.interaction == .rotating) item.rotation = self.drag.authored_before_rotation;
     }
 
     fn applyNudge(
@@ -9488,6 +10812,19 @@ pub const Studio = struct {
         return a.identity < b.identity;
     }
 
+    fn drawGeometryOutline(
+        viewport: Viewport,
+        geometry: Geometry,
+        rotation: f32,
+        thickness: f32,
+        color: rl.Color,
+    ) void {
+        const logical = rotatedGeometryCorners(geometry, rotation);
+        var screen: [4]rl.Vector2 = undefined;
+        for (logical, 0..) |corner, index| screen[index] = logicalToScreen(viewport, corner) orelse return;
+        for (screen, 0..) |start, index| rl.drawLineEx(start, screen[(index + 1) % screen.len], thickness, color);
+    }
+
     /// Draw after the slide itself. While dragging, the original bounds remain
     /// visible as a subdued outline and the live geometry gets the accent.
     pub fn draw(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
@@ -9505,6 +10842,7 @@ pub const Studio = struct {
         if (self.grid_snapping) self.drawLogicalGrid(viewport);
         if (self.safe_areas_visible) self.drawSafeAreas(viewport);
         if (self.measurements_visible) self.drawSelectionMeasurements(items, resolved_bounds, viewport);
+        self.drawMediaAvailabilityWarnings(items, resolved_bounds, viewport);
 
         if (self.marquee.active) {
             if (geometryToScreenRect(viewport, marqueeGeometry(self.marquee))) |rect| {
@@ -9530,13 +10868,17 @@ pub const Studio = struct {
         if (self.interaction != .idle) {
             self.drawSnapGuides(viewport);
             const original_geometry = if (self.group_drag_count > 1) self.group_bounds_before else self.drag.before;
-            if (geometryToScreenRect(viewport, original_geometry)) |original| {
-                rl.drawRectangleLinesEx(original, 1, .{ .r = 255, .g = 255, .b = 255, .a = 105 });
-            }
+            drawGeometryOutline(
+                viewport,
+                original_geometry,
+                if (self.group_drag_count > 1) 0 else self.drag.rotation_before,
+                1,
+                .{ .r = 255, .g = 255, .b = 255, .a = 105 },
+            );
             if (self.group_drag_count <= 1 and self.drag.separate_source_geometry) {
                 if (geometryToScreenRect(viewport, self.drag.source_after)) |source_rect| {
                     const shared_accent: rl.Color = .{ .r = 255, .g = 92, .b = 198, .a = 235 };
-                    rl.drawRectangleLinesEx(source_rect, 2, shared_accent);
+                    drawGeometryOutline(viewport, self.drag.source_after, self.drag.source_after_rotation, 2, shared_accent);
                     self.drawUiText(
                         "SHARED SOURCE",
                         .{ .x = source_rect.x + 5, .y = source_rect.y + 5 },
@@ -9551,9 +10893,7 @@ pub const Studio = struct {
         for (self.additional_selection[0..self.additional_selection_count]) |member| {
             const item_index = itemIndexByIdentity(items, member.identity) orelse continue;
             const geometry = itemGeometry(items[item_index], resolved_bounds);
-            if (geometryToScreenRect(viewport, geometry)) |rect| {
-                rl.drawRectangleLinesEx(rect, 2, .{ .r = 80, .g = 215, .b = 255, .a = 190 });
-            }
+            drawGeometryOutline(viewport, geometry, items[item_index].rotation, 2, .{ .r = 80, .g = 215, .b = 255, .a = 190 });
         }
 
         if (self.selectedGeometry(items, resolved_bounds)) |geometry| {
@@ -9568,10 +10908,31 @@ pub const Studio = struct {
                         .{ .r = 80, .g = 215, .b = 255, .a = 255 }
                 else
                     .{ .r = 80, .g = 215, .b = 255, .a = 255 };
-                rl.drawRectangleLinesEx(rect, 3, accent);
+                const display_rotation = if (self.interaction == .rotating and !self.drag.separate_source_geometry)
+                    self.drag.source_after_rotation
+                else if (selected_index) |index|
+                    items[index].rotation
+                else
+                    0;
+                drawGeometryOutline(viewport, geometry, display_rotation, 3, accent);
                 if (selected_index) |index| {
                     if (self.selectionCount() == 1 and !items[index].locked and self.itemEditableInScene(items[index])) {
-                        if (self.resizeHandleRect(viewport, geometry)) |handle| {
+                        if (inlineFieldApplies(.rotation, items[index])) {
+                            if (self.rotationHandle(viewport, geometry, display_rotation)) |handle| {
+                                rl.drawLineEx(handle.connector_start, handle.center, 2, accent);
+                                rl.drawRectangleRec(handle.rect, accent);
+                                rl.drawRectangleLinesEx(handle.rect, 1, .white);
+                            }
+                        }
+                        if (items[index].kind == .line) {
+                            const endpoints = [_]LineEndpoint{ .start, .end };
+                            for (endpoints) |endpoint| {
+                                if (self.lineEndpointHandleRect(viewport, geometry, items[index].line_direction, display_rotation, endpoint)) |handle| {
+                                    rl.drawRectangleRec(handle, accent);
+                                    rl.drawRectangleLinesEx(handle, 1, .white);
+                                }
+                            }
+                        } else if (self.itemResizeHandleRect(viewport, geometry, display_rotation)) |handle| {
                             rl.drawRectangleRec(handle, accent);
                             rl.drawRectangleLinesEx(handle, 1, .white);
                         }
@@ -9610,6 +10971,38 @@ pub const Studio = struct {
                 self.drawProperties(items, resolved_bounds, viewport, selected_locked);
             }
             self.drawStatus(items, resolved_bounds, viewport);
+        }
+    }
+
+    fn drawMediaAvailabilityWarnings(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+    ) void {
+        for (items) |item| {
+            if (item.kind != .img and item.kind != .vid) continue;
+            const resolved = resolvedBoundsForIdentity(resolved_bounds, item.identity) orelse continue;
+            if (resolved.media_availability == .ready) continue;
+            const rect = geometryToScreenRect(viewport, .{ .position = resolved.position, .size = resolved.size }) orelse continue;
+            if (rect.width <= 0 or rect.height <= 0) continue;
+
+            const unavailable = resolved.media_availability.blocksPixels();
+            const accent: rl.Color = if (resolved.media_availability.isWarning())
+                .{ .r = 255, .g = 181, .b = 71, .a = 245 }
+            else
+                .{ .r = 255, .g = 128, .b = 114, .a = 245 };
+            if (unavailable) rl.drawRectangleRec(rect, .{ .r = 44, .g = 20, .b = 27, .a = 150 });
+            rl.drawRectangleLinesEx(rect, 2, accent);
+            if (unavailable) {
+                rl.drawLineEx(.{ .x = rect.x, .y = rect.y }, .{ .x = rect.x + rect.width, .y = rect.y + rect.height }, 1, .{ .r = 255, .g = 128, .b = 114, .a = 110 });
+                rl.drawLineEx(.{ .x = rect.x + rect.width, .y = rect.y }, .{ .x = rect.x, .y = rect.y + rect.height }, 1, .{ .r = 255, .g = 128, .b = 114, .a = 110 });
+            }
+            const raw_label = mediaAvailabilityLabel(resolved.media_availability);
+            const font = scaledUiFont(uiScale(viewport), UiTypography.compact);
+            var label_buffer: [96]u8 = undefined;
+            const label = self.fitUiText(&label_buffer, raw_label, font, @max(0, rect.width - 16));
+            self.drawUiText(label, .{ .x = rect.x + 8, .y = rect.y + 8 }, font, accent);
         }
     }
 
@@ -10075,6 +11468,12 @@ pub const Studio = struct {
             if (item.fill) |fill| rl.drawRectangleRounded(rect, 0.05, 4, fill);
             switch (item.kind) {
                 .background => rl.drawRectangleRec(rect, item.color),
+                .line => rl.drawLineEx(
+                    .{ .x = rect.x, .y = rect.y },
+                    .{ .x = rect.x + rect.width, .y = rect.y + rect.height },
+                    @max(1, visual_rect.height * 0.025),
+                    item.color,
+                ),
                 .img, .vid => {
                     rl.drawRectangleRounded(rect, 0.05, 4, .{ .r = 44, .g = 57, .b = 77, .a = 255 });
                     rl.drawLineEx(
@@ -11349,6 +12748,7 @@ pub const Studio = struct {
             const type_badge: []const u8 = switch (item.kind) {
                 .background => "BG",
                 .textbox => "Text",
+                .line => "Line",
                 .img => "Image",
                 .vid => "Video",
                 .crowd => if (item.crowd) |crowd| switch (crowd.kind) {
@@ -11428,7 +12828,7 @@ pub const Studio = struct {
         const body_font = scaledUiFont(layout.scale, UiTypography.body);
         const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
         drawStudioPanel(layout.toolbar);
-        const tools = [_]Tool{ .select, .add_text, .add_bullets, .add_image, .add_shape, .add_reusable };
+        const tools = [_]Tool{ .select, .add_text, .add_bullets, .add_image, .add_video, .add_shape, .add_line, .add_reusable };
         for (layout.tool_buttons, tools) |button, tool| {
             const active = self.tool == tool;
             rl.drawRectangleRec(button, if (active)
@@ -11504,7 +12904,14 @@ pub const Studio = struct {
             .foreground => std.meta.eql(a.color, b.color),
             .background => std.meta.eql(a.background_color, b.background_color),
             .font_size => a.fontSize == b.fontSize,
+            .corner_radius => a.corner_radius == b.corner_radius,
+            .line_width => a.line_width == b.line_width,
+            .rotation => a.rotation == b.rotation,
             .opacity => a.opacity == b.opacity,
+            .media_focus_x => a.media_focus.x == b.media_focus.x,
+            .media_focus_y => a.media_focus.y == b.media_focus.y,
+            .video_poster => a.vid_poster == b.vid_poster,
+            .video_volume => a.vid_volume == b.vid_volume,
         };
     }
 
@@ -11738,6 +13145,146 @@ pub const Studio = struct {
         };
     }
 
+    fn inlineMediaReplaceRect(rect: rl.Rectangle) rl.Rectangle {
+        const width = @min(@as(f32, 72), @max(@as(f32, 0), rect.width * 0.36));
+        return .{ .x = rect.x + rect.width - width, .y = rect.y, .width = width, .height = rect.height };
+    }
+
+    fn inlineMediaFieldRect(layout: UiLayout) rl.Rectangle {
+        if (@abs(layout.duplicate_item.y - layout.edit_text.y) > 0.5) return layout.edit_text;
+        return .{
+            .x = layout.edit_text.x,
+            .y = layout.edit_text.y,
+            .width = layout.duplicate_item.x + layout.duplicate_item.width - layout.edit_text.x,
+            .height = layout.edit_text.height,
+        };
+    }
+
+    fn inlineMediaSourceRect(rect: rl.Rectangle, scale: f32) rl.Rectangle {
+        const replace = inlineMediaReplaceRect(rect);
+        return .{
+            .x = rect.x,
+            .y = rect.y,
+            .width = @max(0, replace.x - rect.x - 4 * scale),
+            .height = rect.height,
+        };
+    }
+
+    fn lineStyleButtonRects(layout: UiLayout) [3]rl.Rectangle {
+        const row_start = layout.background_swatches[0];
+        const row_end = layout.background_swatches[layout.background_swatches.len - 1];
+        const gap: f32 = 5 * layout.scale;
+        const total_width = row_end.x + row_end.width - row_start.x;
+        const width = @max(0, (total_width - gap * 2) / 3);
+        var result: [3]rl.Rectangle = undefined;
+        for (&result, 0..) |*rect, index| rect.* = .{
+            .x = row_start.x + @as(f32, @floatFromInt(index)) * (width + gap),
+            .y = row_start.y,
+            .width = width,
+            .height = row_start.height,
+        };
+        return result;
+    }
+
+    fn mediaSourcePlaceholder(kind_label: [:0]const u8, path: []const u8) [:0]const u8 {
+        return if (path.len == 0) kind_label else "";
+    }
+
+    fn mediaMetadataRect(layout: UiLayout) rl.Rectangle {
+        return .{
+            .x = layout.foreground_swatches[0].x,
+            .y = layout.foreground_swatches[0].y,
+            .width = layout.foreground_swatches[layout.foreground_swatches.len - 1].x +
+                layout.foreground_swatches[layout.foreground_swatches.len - 1].width - layout.foreground_swatches[0].x,
+            .height = layout.foreground_swatches[0].height,
+        };
+    }
+
+    fn mediaPageToggleRect(layout: UiLayout) rl.Rectangle {
+        const row = mediaMetadataRect(layout);
+        const width = @min(@as(f32, 82) * layout.scale, row.width * 0.34);
+        return .{ .x = row.x + row.width - width, .y = row.y, .width = width, .height = row.height };
+    }
+
+    fn mediaMetadataTextRect(layout: UiLayout, has_page_toggle: bool) rl.Rectangle {
+        var row = mediaMetadataRect(layout);
+        if (has_page_toggle) row.width = @max(0, mediaPageToggleRect(layout).x - row.x - 5 * layout.scale);
+        return row;
+    }
+
+    fn videoPosterFieldRect(layout: UiLayout) rl.Rectangle {
+        return .{
+            .x = layout.clear_background.x,
+            .y = layout.clear_background.y,
+            .width = layout.custom_background.x + layout.custom_background.width - layout.clear_background.x,
+            .height = layout.custom_background.height,
+        };
+    }
+
+    fn videoTimelineRect(layout: UiLayout) rl.Rectangle {
+        return .{
+            .x = layout.background_swatches[0].x,
+            .y = layout.background_swatches[0].y,
+            .width = layout.background_swatches[layout.background_swatches.len - 1].x +
+                layout.background_swatches[layout.background_swatches.len - 1].width - layout.background_swatches[0].x,
+            .height = layout.background_swatches[0].height,
+        };
+    }
+
+    fn drawMediaSourceField(
+        self: Studio,
+        rect: rl.Rectangle,
+        kind_label: [:0]const u8,
+        path: []const u8,
+        local_override: bool,
+        resettable_override: bool,
+        viewport: Viewport,
+    ) void {
+        const layout = uiLayout(viewport);
+        const replace = inlineMediaReplaceRect(rect);
+        const source_rect = inlineMediaSourceRect(rect, layout.scale);
+        const label_font = @max(@as(i32, 14), scaledUiFont(layout.scale, UiTypography.compact));
+        const value_font = @max(@as(i32, 16), scaledUiFont(layout.scale, UiTypography.body));
+        const reserved_right = if (local_override) inlineResetRect(source_rect).width else 0;
+        const placeholder = mediaSourcePlaceholder(kind_label, path);
+        // Once a source is known, its tail (normally the filename) owns the
+        // whole field. IMAGE/VIDEO is only an empty-source placeholder; the
+        // adjacent Replace button already communicates the available action.
+        const multiline = inlineTextIsMultiline(layout) and path.len == 0;
+        const path_width = @max(0, source_rect.width - 7 -
+            (if (multiline or placeholder.len == 0) 0 else self.measureUiText(placeholder, label_font) + 7) - reserved_right - 6);
+        var fitted_path_buffer: [max_inline_input_bytes + 1]u8 = undefined;
+        const fitted_path = self.fitUiTextTail(&fitted_path_buffer, path, value_font, path_width);
+        self.drawInlineField(
+            source_rect,
+            placeholder,
+            fitted_path,
+            false,
+            false,
+            multiline,
+            false,
+            local_override,
+            resettable_override,
+            viewport,
+        );
+        drawCompactButton(self, replace, "Replace");
+    }
+
+    fn drawVideoPosterTimeline(_: Studio, rect: rl.Rectangle, poster: f32, duration: f32) void {
+        rl.drawRectangleRec(rect, .{ .r = 21, .g = 29, .b = 45, .a = 255 });
+        rl.drawRectangleLinesEx(rect, 1, .{ .r = 91, .g = 108, .b = 137, .a = 255 });
+        const track: rl.Rectangle = .{
+            .x = rect.x + 8,
+            .y = rect.y + rect.height / 2 - 2,
+            .width = @max(0, rect.width - 16),
+            .height = 4,
+        };
+        rl.drawRectangleRec(track, .{ .r = 65, .g = 77, .b = 99, .a = 255 });
+        const fraction = if (duration > 0) std.math.clamp(poster / duration, 0, 1) else 0;
+        rl.drawRectangleRec(.{ .x = track.x, .y = track.y, .width = track.width * fraction, .height = track.height }, .{ .r = 80, .g = 215, .b = 255, .a = 255 });
+        rl.drawCircleV(.{ .x = track.x + track.width * fraction, .y = track.y + track.height / 2 }, @max(@as(f32, 4), rect.height * 0.25), .{ .r = 235, .g = 246, .b = 255, .a = 255 });
+    }
+
     fn compositionKindLabel(kind: ReusableInstanceKind) []const u8 {
         return switch (kind) {
             .none => "Direct item",
@@ -11760,8 +13307,8 @@ pub const Studio = struct {
     }
 
     fn formatOverrideFields(buffer: []u8, overrides: PropertyOverrideSet) []const u8 {
-        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
-        const labels = [_][]const u8{ "Text", "X", "Y", "W", "H", "FG", "BG", "Font", "Opacity" };
+        const fields = [_]AuthoredProperty{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .line_direction, .line_arrows, .rotation, .text_alignment, .text_vertical_alignment, .opacity, .image_source, .video_source, .media_fit, .media_focus_x, .media_focus_y, .video_poster, .video_volume, .video_autoplay, .video_loop, .video_muted };
+        const labels = [_][]const u8{ "Text", "X", "Y", "W", "H", "FG", "BG", "Font", "Radius", "Stroke", "Direction", "Arrows", "Rotation", "Text H", "Text V", "Opacity", "Image", "Video", "Fit", "Focus X", "Focus Y", "Poster", "Volume", "Auto", "Loop", "Mute" };
         var used: usize = 0;
         for (fields, labels) |field, label| {
             if (!overrides.contains(field)) continue;
@@ -11851,10 +13398,46 @@ pub const Studio = struct {
         }
         drawCompactButton(self, layout.lock_item, if (selected_locked) "Unlock" else "Lock");
 
-        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .opacity };
-        const labels = [_][:0]const u8{ "TEXT", "X", "Y", "W", "H", "FG", "BG", "FONT", "OPACITY" };
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity };
+        const labels = [_][:0]const u8{ "TEXT", "X", "Y", "W", "H", "FG", "BG", "FONT", "RADIUS", "STROKE", "ROT", "OP" };
+        const selected_item: ?slides.SlideItem = if (self.selectionCount() == 1)
+            if (self.selectedIndex(items)) |index| items[index] else null
+        else
+            null;
+        const selected_media = if (selected_item) |item| item.kind == .img or item.kind == .vid else false;
+        const selected_line = if (selected_item) |item| item.kind == .line else false;
+        const selected_video_playback = if (selected_item) |item| item.kind == .vid and self.video_properties_playback else false;
         const composition = self.compositionContextForSelection(items);
         for (fields, labels) |field, label| {
+            if (selected_item) |item| {
+                const media_source = field == .text and (item.kind == .img or item.kind == .vid);
+                if (!media_source and !inlineFieldVisible(field, item, selected_video_playback)) continue;
+            }
+            if (selected_media and (field == .foreground or field == .font_size or
+                (selected_video_playback and field == .background))) continue;
+            if (field == .text) {
+                if (selected_item) |item| switch (item.kind) {
+                    .img, .vid => {
+                        const path = if (item.kind == .img) item.img_path orelse "" else item.vid_path orelse "";
+                        const source_property: AuthoredProperty = if (item.kind == .img) .image_source else .video_source;
+                        const source_override = if (composition) |context| context.local_overrides.contains(source_property) else false;
+                        const source_resettable = if (composition) |context|
+                            context.reset_target != null and context.resettable_overrides.contains(source_property)
+                        else
+                            false;
+                        self.drawMediaSourceField(
+                            inlineMediaFieldRect(layout),
+                            if (item.kind == .img) "IMAGE" else "VIDEO",
+                            path,
+                            source_override,
+                            source_resettable,
+                            viewport,
+                        );
+                        continue;
+                    },
+                    else => {},
+                };
+            }
             var scalar_buffer: [max_inline_input_bytes]u8 = undefined;
             var color_buffer: [9]u8 = undefined;
             const active = self.inline_editor.active and self.inline_editor.field == field;
@@ -11862,9 +13445,10 @@ pub const Studio = struct {
                 self.inline_editor.text()
             else
                 self.inlineDisplayValue(items, resolved_bounds, field, &scalar_buffer, &color_buffer);
-            const local_override = if (composition) |context| context.local_overrides.contains(field) else false;
+            const property = authoredPropertyForInlineField(field);
+            const local_override = if (composition) |context| context.local_overrides.contains(property) else false;
             const resettable_override = if (composition) |context|
-                context.reset_target != null and context.resettable_overrides.contains(field)
+                context.reset_target != null and context.resettable_overrides.contains(property)
             else
                 false;
             self.drawInlineField(
@@ -11880,13 +13464,213 @@ pub const Studio = struct {
                 viewport,
             );
         }
-        const selected_item: ?slides.SlideItem = if (self.selectionCount() == 1)
-            if (self.selectedIndex(items)) |index| items[index] else null
-        else
-            null;
-        drawSwatches(layout.foreground_swatches, if (selected_item) |item| item.color else null);
-        drawCompactButton(self, layout.clear_background, "None");
-        drawSwatches(layout.background_swatches, if (selected_item) |item| item.background_color else null);
+        if (selected_media) {
+            const item = selected_item.?;
+            const resolved = resolvedBoundsForIdentity(resolved_bounds, item.identity);
+            const has_page_toggle = item.kind == .vid;
+            const metadata_rect = mediaMetadataTextRect(layout, has_page_toggle);
+            var metadata_buffer: [96]u8 = undefined;
+            const metadata: [:0]const u8 = if (resolved) |value| metadata: {
+                if (value.media_availability != .ready)
+                    break :metadata std.fmt.bufPrintZ(
+                        &metadata_buffer,
+                        "{s}",
+                        .{mediaAvailabilityInspectorLabel(value.media_availability)},
+                    ) catch "MEDIA UNAVAILABLE";
+                if (selected_video_playback) {
+                    if (value.media_duration <= 0) break :metadata "DURATION UNAVAILABLE";
+                    break :metadata if (value.media_audio == .unavailable)
+                        std.fmt.bufPrintZ(
+                            &metadata_buffer,
+                            "DURATION {d:.1}s · {d:.0}×{d:.0} · NO AUDIO STREAM",
+                            .{ value.media_duration, value.natural_size.x, value.natural_size.y },
+                        ) catch "VIDEO METADATA"
+                    else
+                        std.fmt.bufPrintZ(
+                            &metadata_buffer,
+                            "DURATION {d:.1}s · {d:.0}×{d:.0}",
+                            .{ value.media_duration, value.natural_size.x, value.natural_size.y },
+                        ) catch "VIDEO METADATA";
+                }
+                break :metadata if (value.natural_size.x > 0 and value.natural_size.y > 0)
+                    std.fmt.bufPrintZ(
+                        &metadata_buffer,
+                        "NATURAL {d:.0}×{d:.0} · BOX {d:.0}×{d:.0}",
+                        .{ value.natural_size.x, value.natural_size.y, value.size.x, value.size.y },
+                    ) catch "MEDIA DIMENSIONS"
+                else
+                    std.fmt.bufPrintZ(&metadata_buffer, "BOX {d:.0}×{d:.0}", .{ value.size.x, value.size.y }) catch "MEDIA DIMENSIONS";
+            } else if (selected_video_playback)
+                "VIDEO METADATA UNAVAILABLE"
+            else
+                "MEDIA DIMENSIONS UNAVAILABLE";
+            var fitted_metadata_buffer: [96]u8 = undefined;
+            const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, scaledUiFont(layout.scale, UiTypography.compact), metadata_rect.width);
+            self.drawUiText(
+                fitted_metadata,
+                .{ .x = metadata_rect.x, .y = metadata_rect.y + 3 * layout.scale },
+                scaledUiFont(layout.scale, UiTypography.compact),
+                if (resolved) |value|
+                    if (value.media_availability == .ready and value.media_audio != .unavailable)
+                        .{ .r = 177, .g = 192, .b = 214, .a = 255 }
+                    else if (value.media_availability.isWarning() or value.media_audio == .unavailable)
+                        .{ .r = 255, .g = 181, .b = 71, .a = 255 }
+                    else
+                        .{ .r = 255, .g = 128, .b = 114, .a = 255 }
+                else
+                    .{ .r = 177, .g = 192, .b = 214, .a = 255 },
+            );
+            if (has_page_toggle)
+                drawCompactButton(self, mediaPageToggleRect(layout), if (selected_video_playback) "Layout" else "Playback");
+
+            if (selected_video_playback) {
+                const toggle_labels = [_][:0]const u8{ "Auto", "Loop", "Mute" };
+                const toggle_values = [_]bool{ item.vid_autoplay, item.vid_loop, item.vid_muted };
+                const toggle_properties = [_]AuthoredProperty{ .video_autoplay, .video_loop, .video_muted };
+                for (layout.media_fit_buttons, toggle_labels, toggle_values, toggle_properties) |button, label, enabled, property| {
+                    const local_override = if (composition) |context| context.local_overrides.contains(property) else false;
+                    const resettable_override = if (composition) |context|
+                        context.reset_target != null and context.resettable_overrides.contains(property)
+                    else
+                        false;
+                    drawPropertyToggleButton(self, button, label, enabled, local_override, resettable_override);
+                }
+
+                const poster_field = InlineField.video_poster;
+                var poster_buffer: [64]u8 = undefined;
+                var poster_color_buffer: [9]u8 = undefined;
+                const poster_active = self.inline_editor.active and self.inline_editor.field == poster_field;
+                const poster_value = if (poster_active)
+                    self.inline_editor.text()
+                else
+                    self.inlineDisplayValue(items, resolved_bounds, poster_field, &poster_buffer, &poster_color_buffer);
+                const poster_property = authoredPropertyForInlineField(poster_field);
+                const poster_override = if (composition) |context| context.local_overrides.contains(poster_property) else false;
+                const poster_resettable = if (composition) |context|
+                    context.reset_target != null and context.resettable_overrides.contains(poster_property)
+                else
+                    false;
+                self.drawInlineField(
+                    videoPosterFieldRect(layout),
+                    "POSTER",
+                    poster_value,
+                    poster_active,
+                    poster_active and self.inline_editor.error_value != null,
+                    false,
+                    false,
+                    poster_override,
+                    poster_resettable,
+                    viewport,
+                );
+                self.drawVideoPosterTimeline(videoTimelineRect(layout), item.vid_poster orelse 0, if (resolved) |value| value.media_duration else 0);
+
+                const volume_field = InlineField.video_volume;
+                var volume_buffer: [64]u8 = undefined;
+                var volume_color_buffer: [9]u8 = undefined;
+                const volume_active = self.inline_editor.active and self.inline_editor.field == volume_field;
+                const volume_value = if (volume_active)
+                    self.inline_editor.text()
+                else
+                    self.inlineDisplayValue(items, resolved_bounds, volume_field, &volume_buffer, &volume_color_buffer);
+                const volume_property = authoredPropertyForInlineField(volume_field);
+                const volume_override = if (composition) |context| context.local_overrides.contains(volume_property) else false;
+                const volume_resettable = if (composition) |context|
+                    context.reset_target != null and context.resettable_overrides.contains(volume_property)
+                else
+                    false;
+                self.drawInlineField(
+                    layout.font_size,
+                    "VOLUME",
+                    volume_value,
+                    volume_active,
+                    volume_active and self.inline_editor.error_value != null,
+                    false,
+                    false,
+                    volume_override,
+                    volume_resettable,
+                    viewport,
+                );
+            } else {
+                const fits = [_]slides.MediaFit{ .stretch, .contain, .cover };
+                const fit_labels = [_][:0]const u8{ "Stretch", "Fit", "Fill" };
+                const fit_override = if (composition) |context| context.local_overrides.contains(.media_fit) else false;
+                const fit_resettable = if (composition) |context|
+                    context.reset_target != null and context.resettable_overrides.contains(.media_fit)
+                else
+                    false;
+                for (layout.media_fit_buttons, fits, fit_labels) |button, fit, label| {
+                    const active = item.media_fit == fit;
+                    drawPropertyToggleButton(self, button, label, active, fit_override and active, fit_resettable and active);
+                }
+
+                const focus_fields = [_]InlineField{ .media_focus_x, .media_focus_y };
+                const focus_labels = [_][:0]const u8{ "FX", "FY" };
+                for (focus_fields, focus_labels) |field, label| {
+                    var scalar_buffer: [64]u8 = undefined;
+                    var color_buffer: [9]u8 = undefined;
+                    const active = self.inline_editor.active and self.inline_editor.field == field;
+                    const value = if (active)
+                        self.inline_editor.text()
+                    else
+                        self.inlineDisplayValue(items, resolved_bounds, field, &scalar_buffer, &color_buffer);
+                    const property = authoredPropertyForInlineField(field);
+                    const local_override = if (composition) |context| context.local_overrides.contains(property) else false;
+                    const resettable_override = if (composition) |context|
+                        context.reset_target != null and context.resettable_overrides.contains(property)
+                    else
+                        false;
+                    self.drawInlineField(
+                        inlineFieldRect(layout, field),
+                        label,
+                        value,
+                        active,
+                        active and self.inline_editor.error_value != null,
+                        false,
+                        false,
+                        local_override,
+                        resettable_override,
+                        viewport,
+                    );
+                }
+            }
+        } else {
+            drawSwatches(layout.foreground_swatches, if (selected_item) |item| item.color else null);
+        }
+        if (selected_line) {
+            const item = selected_item.?;
+            const buttons = lineStyleButtonRects(layout);
+            const line_labels = [_][:0]const u8{ "Start arrow", "End arrow", "Flip" };
+            const arrow_override = if (composition) |context| context.local_overrides.contains(.line_arrows) else false;
+            const arrow_resettable = if (composition) |context|
+                context.reset_target != null and context.resettable_overrides.contains(.line_arrows)
+            else
+                false;
+            const direction_override = if (composition) |context| context.local_overrides.contains(.line_direction) else false;
+            const direction_resettable = if (composition) |context|
+                context.reset_target != null and context.resettable_overrides.contains(.line_direction)
+            else
+                false;
+            for (buttons, line_labels, 0..) |button, label, index| {
+                const active = switch (index) {
+                    0 => item.line_arrow_start,
+                    1 => item.line_arrow_end,
+                    2 => item.line_direction == .up,
+                    else => false,
+                };
+                drawPropertyToggleButton(
+                    self,
+                    button,
+                    label,
+                    active,
+                    if (index < 2) arrow_override else direction_override,
+                    if (index < 2) arrow_resettable else direction_resettable,
+                );
+            }
+        }
+        if (!selected_video_playback and !selected_line) {
+            drawCompactButton(self, layout.clear_background, "None");
+            drawSwatches(layout.background_swatches, if (selected_item) |item| item.background_color else null);
+        }
 
         const error_font = @max(@as(i32, 14), scaledUiFont(layout.scale, UiTypography.compact));
         var composition_buffer: [192]u8 = undefined;
@@ -11919,7 +13703,44 @@ pub const Studio = struct {
 
         if (!layout.minimal_properties) {
             const align_labels = [_][:0]const u8{ "L", "HC", "R", "T", "VC", "B" };
-            for (layout.align_buttons, align_labels) |button, label| drawCompactButton(self, button, label);
+            if (selected_item) |item| {
+                if (item.kind == .line) {
+                    // Line style lives in the otherwise inapplicable BG row,
+                    // keeping it visible even in the minimal inspector.
+                } else if (self.selectionAllTextboxes(items)) {
+                    const primary = items[self.selectedIndex(items).?];
+                    const horizontal_homogeneous = self.selectionTextAlignmentHomogeneous(items, false);
+                    const vertical_homogeneous = self.selectionTextAlignmentHomogeneous(items, true);
+                    const horizontal_override = if (composition) |context| context.local_overrides.contains(.text_alignment) else false;
+                    const horizontal_resettable = if (composition) |context|
+                        context.reset_target != null and context.resettable_overrides.contains(.text_alignment)
+                    else
+                        false;
+                    const vertical_override = if (composition) |context| context.local_overrides.contains(.text_vertical_alignment) else false;
+                    const vertical_resettable = if (composition) |context|
+                        context.reset_target != null and context.resettable_overrides.contains(.text_vertical_alignment)
+                    else
+                        false;
+                    for (layout.align_buttons, align_labels, 0..) |button, label, index| {
+                        const active = if (index < 3)
+                            horizontal_homogeneous and @intFromEnum(primary.text_alignment) == index
+                        else
+                            vertical_homogeneous and @intFromEnum(primary.text_vertical_alignment) == index - 3;
+                        drawPropertyToggleButton(
+                            self,
+                            button,
+                            label,
+                            active,
+                            if (index < 3) horizontal_override and active else vertical_override and active,
+                            if (index < 3) horizontal_resettable and active else vertical_resettable and active,
+                        );
+                    }
+                } else {
+                    for (layout.align_buttons, align_labels) |button, label| drawCompactButton(self, button, label);
+                }
+            } else {
+                for (layout.align_buttons, align_labels) |button, label| drawCompactButton(self, button, label);
+            }
             const distribute_labels = [_][:0]const u8{ "H EQUAL GAP", "V EQUAL GAP" };
             for (layout.distribute_buttons, distribute_labels) |button, label| drawCompactButton(self, button, label);
             const layer_labels = [_][:0]const u8{ "Back", "Down", "Up", "Front" };
@@ -11993,7 +13814,7 @@ pub const Studio = struct {
         drawCompactButton(self, layout.custom_background, "Custom");
         drawSwatches(layout.background_swatches, if (selected_item) |item| item.background_color else null);
 
-        self.drawUiText("TYPE & OPACITY", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + @as(f32, if (layout.compact_properties) 251 else 315) * layout.scale }, body_font, secondary);
+        self.drawUiText("TYPE · ROTATION · OPACITY", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + @as(f32, if (layout.compact_properties) 251 else 315) * layout.scale }, body_font, secondary);
         var font_buffer: [32]u8 = undefined;
         const font_label: [:0]const u8 = if (selected_item) |item|
             if (item.kind == .textbox and item.fontSize != null)
@@ -12003,6 +13824,15 @@ pub const Studio = struct {
         else
             "Font --";
         drawActionButton(self, layout.font_size, font_label);
+        var rotation_buffer: [32]u8 = undefined;
+        const rotation_label: [:0]const u8 = if (selected_item) |item|
+            if (inlineFieldApplies(.rotation, item))
+                std.fmt.bufPrintZ(&rotation_buffer, "Rot {d:.0}°", .{item.rotation}) catch "Rot"
+            else
+                "Rot --"
+        else
+            "Rot --";
+        drawActionButton(self, layout.rotation, rotation_label);
         var opacity_buffer: [32]u8 = undefined;
         const opacity_label: [:0]const u8 = if (selected_item) |item|
             if (layout.minimal_properties)
@@ -12108,6 +13938,7 @@ pub const Studio = struct {
             .open_refused_dirty => "Open refused - save or copy the current Studio changes first",
             .open_refused_editing => "Finish or cancel the active text edit before opening another deck",
             .open_requires_sld => "Open a Rayslides .sld document",
+            .media_drop_unsupported => "Drop a supported image, video, or .sld deck file",
             .source_changed_on_disk => "Original changed on disk - use Save Copy to preserve this version",
             .edit_failed => "Edit rejected - the original source is unchanged",
             .undo_failed => "Undo/redo failed - see the log for details",
@@ -12272,7 +14103,10 @@ fn toolLabel(tool: Tool) [:0]const u8 {
         .add_text => "T",
         .add_bullets => "B",
         .add_image => "IMG",
+        .add_video => "VID",
         .add_shape => "RECT",
+        .add_line => "LINE",
+        .add_arrow => "ARROW",
         .add_reusable => "LIB",
     };
 }
@@ -12285,7 +14119,12 @@ fn inlineErrorMessage(reason: InlineError) [:0]const u8 {
         .non_positive_dimension => "Width and height must be at least 8",
         .invalid_color => "Use #RRGGBB, #RRGGBBAA, or none for BG",
         .invalid_font_size => "Font size must be a positive whole number",
+        .invalid_corner_radius => "Corner radius must be zero or greater",
+        .invalid_line_width => "Stroke width must be greater than zero",
+        .invalid_rotation => "Rotation must be a finite number of degrees",
         .invalid_opacity => "Use 0–1 or 0–100%",
+        .invalid_unit_interval => "Use a value from 0 to 1",
+        .invalid_video_poster => "Poster time must be within the video duration",
         .invalid_text => "Text value is invalid; correct it and press Enter",
         .source_edit_failed => "Source changed; Esc cancels this guarded draft",
     };
@@ -12355,6 +14194,66 @@ fn drawToggleButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8, act
         .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
         font_size,
         .white,
+    );
+}
+
+fn drawPropertyToggleButton(
+    studio: Studio,
+    rect: rl.Rectangle,
+    label: [:0]const u8,
+    active: bool,
+    local_override: bool,
+    resettable_override: bool,
+) void {
+    if (!local_override) {
+        drawToggleButton(studio, rect, label, active);
+        return;
+    }
+    if (rect.width <= 0 or rect.height <= 0) return;
+    rl.drawRectangleRec(rect, if (active)
+        .{ .r = 43, .g = 123, .b = 151, .a = 255 }
+    else
+        .{ .r = 31, .g = 38, .b = 55, .a = 245 });
+    rl.drawRectangleLinesEx(rect, if (active) 2 else 1, if (active)
+        .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+    else
+        .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+
+    const reset_rect = Studio.inlineResetRect(rect);
+    const label_rect: rl.Rectangle = .{
+        .x = rect.x,
+        .y = rect.y,
+        .width = @max(0, rect.width - reset_rect.width),
+        .height = rect.height,
+    };
+    const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
+    const width = studio.measureUiText(label, font_size);
+    studio.drawUiText(
+        label,
+        .{ .x = label_rect.x + (label_rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
+        font_size,
+        .white,
+    );
+
+    rl.drawRectangleRec(reset_rect, if (resettable_override)
+        .{ .r = 99, .g = 67, .b = 25, .a = 255 }
+    else
+        .{ .r = 50, .g = 45, .b = 39, .a = 255 });
+    rl.drawRectangleLinesEx(reset_rect, 1, if (resettable_override)
+        .{ .r = 247, .g = 164, .b = 29, .a = 255 }
+    else
+        .{ .r = 133, .g = 117, .b = 93, .a = 255 });
+    const marker: [:0]const u8 = if (resettable_override) "R" else "L";
+    const marker_font: i32 = 14;
+    const marker_width = studio.measureUiText(marker, marker_font);
+    studio.drawUiText(
+        marker,
+        .{
+            .x = reset_rect.x + (reset_rect.width - marker_width) / 2,
+            .y = reset_rect.y + (reset_rect.height - @as(f32, @floatFromInt(marker_font))) / 2,
+        },
+        marker_font,
+        if (resettable_override) .{ .r = 255, .g = 205, .b = 116, .a = 255 } else .{ .r = 181, .g = 168, .b = 145, .a = 255 },
     );
 }
 
@@ -12470,6 +14369,7 @@ fn objectMatchesSearch(item: slides.SlideItem, query: []const u8) bool {
     if (containsAsciiInsensitive(sourceScopeLabel(item.source.scope), query)) return true;
     const type_name: []const u8 = switch (item.kind) {
         .textbox => "text textbox",
+        .line => "line arrow connector",
         .img => "image picture",
         .vid => "video movie",
         .crowd => "crowd crowdplay",
@@ -12806,6 +14706,31 @@ test "smart snapping preserves fractional centers exactly" {
     );
     try std.testing.expectApproxEqAbs(@as(f32, 449.5), result.geometry.position.x, 0.0001);
     try std.testing.expectEqual(@as(?f32, 500), result.guides.vertical);
+}
+
+test "smart guides use the painted bounds of rotated targets" {
+    var items = [_]slides.SlideItem{
+        testItem(1, .textbox, 174, 100, 100, 100),
+        testItem(2, .textbox, 300, 300, 100, 100),
+    };
+    items[1].rotation = 45;
+    const result = snapGeometry(
+        .{ .position = .{ .x = 174, .y = 100 }, .size = .{ .x = 100, .y = 100 } },
+        .moving,
+        default_logical_size,
+        .{ .x = 8, .y = 8 },
+        false,
+        default_grid_spacing,
+        default_min_item_size,
+        null,
+        true,
+        1,
+        &items,
+        &.{},
+    );
+    const painted_target = rotatedGeometryBounds(itemGeometry(items[1], &.{}), items[1].rotation);
+    try std.testing.expectApproxEqAbs(painted_target.position.x, result.geometry.position.x + result.geometry.size.x, 0.0001);
+    try std.testing.expectApproxEqAbs(painted_target.position.x, result.guides.vertical.?, 0.0001);
 }
 
 test "shared template snapping excludes instance-local object guides" {
@@ -13800,6 +15725,115 @@ test "hit testing uses reverse z order and skips non-selectable items" {
     try std.testing.expectEqual(@as(?usize, null), hitTest(&items, &.{}, .{ .x = 20, .y = 20 }));
 }
 
+test "line hit testing follows the stroke instead of its bounding box" {
+    var diagonal = [_]slides.SlideItem{testItem(1, .line, 100, 100, 300, 200)};
+    diagonal[0].line_width = 6;
+    try std.testing.expectEqual(@as(?usize, 0), hitTest(&diagonal, &.{}, .{ .x = 250, .y = 200 }));
+    try std.testing.expectEqual(@as(?usize, null), hitTest(&diagonal, &.{}, .{ .x = 110, .y = 285 }));
+
+    var horizontal = [_]slides.SlideItem{testItem(2, .line, 200, 400, 320, 0)};
+    horizontal[0].line_width = 4;
+    try std.testing.expectEqual(@as(?usize, 0), hitTest(&horizontal, &.{}, .{ .x = 360, .y = 404 }));
+    try std.testing.expectEqual(@as(?usize, null), hitTest(&horizontal, &.{}, .{ .x = 360, .y = 420 }));
+}
+
+test "rotated hit testing follows painted geometry and selection bounds" {
+    var items = [_]slides.SlideItem{testItem(6, .textbox, 100, 100, 200, 100)};
+    items[0].rotation = 45;
+    try std.testing.expectEqual(@as(?usize, 0), hitTest(&items, &.{}, .{ .x = 200, .y = 80 }));
+    try std.testing.expectEqual(@as(?usize, null), hitTest(&items, &.{}, .{ .x = 100, .y = 100 }));
+
+    var studio: Studio = .{ .enabled = true, .selected_identity = 6 };
+    const bounds = studio.selectedBounds(&items, &.{}).?;
+    try std.testing.expect(bounds.position.x < 100);
+    try std.testing.expect(bounds.position.y < 100);
+    try std.testing.expect(bounds.position.x + bounds.size.x > 300);
+    try std.testing.expect(bounds.position.y + bounds.size.y > 200);
+}
+
+test "canvas rotation handle emits an exact semantic edit and Shift snaps" {
+    var items = [_]slides.SlideItem{testItem(61, .textbox, 100, 300, 200, 100)};
+    items[0].source = .{ .scope = .direct, .line_number = 3, .line_offset = 40, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 61 };
+    const geometry = itemGeometry(items[0], &.{});
+    const handle = studio.rotationHandle(viewport, geometry, 0).?;
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = handle.center,
+        .pointer_pressed = true,
+        .pointer_down = true,
+    }) == null);
+    try std.testing.expectEqual(Interaction.rotating, studio.interaction);
+    try std.testing.expectEqual(Status.rotating, studio.status());
+
+    // The handle starts directly above the center. Moving directly right is
+    // a clockwise quarter-turn in the slide's y-down coordinate system.
+    const right_of_center = rl.Vector2{ .x = 300, .y = 350 };
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = right_of_center,
+        .pointer_down = true,
+    }) == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 90), items[0].rotation, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 90), studio.livePreview().?.rotation.?, 0.0001);
+
+    try std.testing.expect(studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = right_of_center,
+        .pointer_released = true,
+    }) == null);
+    // Runtime mutation is restored before the semantic source transaction.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), items[0].rotation, 0.0001);
+    switch (studio.takeSemanticCommand().?) {
+        .set_rotation => |change| {
+            try std.testing.expectEqual(EditScope.direct, change.target.edit_scope);
+            try std.testing.expectApproxEqAbs(@as(f32, 90), change.value.?, 0.0001);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.selected_identity = 61;
+    const snap_handle = studio.rotationHandle(viewport, geometry, 0).?;
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = snap_handle.center,
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    const twenty_degrees = rotatePointAround(.{ .x = 200, .y = 250 }, geometryCenter(geometry), 20);
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = twenty_degrees,
+        .pointer_released = true,
+        .lock_aspect_ratio = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_rotation => |change| try std.testing.expectApproxEqAbs(@as(f32, 15), change.value.?, 0.0001),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "line endpoint handles resize the authored segment and allow horizontal lines" {
+    var items = [_]slides.SlideItem{testItem(7, .line, 100, 100, 200, 100)};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 7 };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 300, .y = 200 },
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(Interaction.resizing, studio.interaction);
+    try std.testing.expectEqual(@as(?LineEndpoint, .end), studio.drag.line_endpoint);
+
+    const command = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 420, .y = 100 },
+        .pointer_released = true,
+        .disable_snapping = true,
+    }).?;
+    try std.testing.expect(command.resized);
+    try expectVector(.{ .x = 100, .y = 100 }, command.after_position);
+    try expectVector(.{ .x = 320, .y = 0 }, command.after_size);
+    try expectVector(command.after_size, items[0].size);
+}
+
 test "move drag emits before and after geometry with layout clone provenance" {
     var items = [_]slides.SlideItem{testItem(42, .textbox, 100, 200, 400, 180)};
     items[0].source = .{ .line_number = 12, .line_offset = 812, .scope = .slide_template, .patchable = true };
@@ -13914,6 +15948,18 @@ test "resolved renderer bounds make an auto-sized image selectable" {
     try std.testing.expectEqual(@as(?usize, 0), hitTest(&items, &bounds, .{ .x = 700, .y = 400 }));
     const geometry = itemGeometry(items[0], &bounds);
     try expectVector(.{ .x = 640, .y = 360 }, geometry.size);
+}
+
+test "unavailable media fallback bounds remain selectable for repair" {
+    const items = [_]slides.SlideItem{testItem(22, .vid, 400, 250, 0, 0)};
+    const bounds = [_]ResolvedBounds{.{
+        .identity = 22,
+        .position = .{ .x = 400, .y = 250 },
+        .size = .{ .x = 640, .y = 360 },
+        .media_availability = .video_unavailable,
+    }};
+    try std.testing.expectEqual(@as(?usize, 0), hitTest(&items, &bounds, .{ .x = 700, .y = 400 }));
+    try std.testing.expectEqual(MediaAvailability.video_unavailable, resolvedBoundsForIdentity(&bounds, 22).?.media_availability);
 }
 
 test "selection rebinds by source after item identities change" {
@@ -14365,6 +16411,26 @@ test "let-expanded source stays selectable but cannot emit an edit" {
     try expectVector(.{ .x = 100, .y = 100 }, items[0].position);
 }
 
+test "group instance members require definition edit detach or a morph override" {
+    var items = [_]slides.SlideItem{testItem(73, .vid, 100, 100, 640, 360)};
+    items[0].id = "feature.clip";
+    items[0].vid_path = "assets/demo.mp4";
+    items[0].source = .{ .scope = .group_instance_member, .line_number = 8, .line_offset = 120, .patchable = true };
+    items[0].group_member_source = .{ .scope = .direct, .line_number = 3, .line_offset = 30, .patchable = true };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .selected_identity = 73 };
+
+    _ = studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } });
+    try std.testing.expectEqual(Notice.generated_source_read_only, studio.notice);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqualStrings("group instance · Detach or edit its Library definition", studio.editDestinationLabel(items[0]));
+
+    studio.active_morph_state = 0;
+    const command = studio.update(&items, &.{}, viewport, .{ .nudge = .{ .x = 1, .y = 0 } }).?;
+    try std.testing.expectEqual(EditScope.direct, command.edit_scope);
+    try std.testing.expectEqual(@as(f32, 101), command.after_position.x);
+}
+
 test "one-shot creation tool emits placement without mutating slide items" {
     var items = [_]slides.SlideItem{testItem(80, .textbox, 10, 20, 100, 40)};
     const original = items[0];
@@ -14410,6 +16476,44 @@ test "shape tool suggests a colored rectangle-sized item" {
         else => return error.UnexpectedSemanticCommand,
     }
     try std.testing.expectEqual(Tool.select, studio.tool);
+}
+
+test "video tool emits a media-sized source creation intent" {
+    var items: [0]slides.SlideItem = .{};
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    var studio: Studio = .{ .enabled = true, .tool = .add_video };
+
+    _ = studio.update(&items, &.{}, viewport, .{
+        .pointer_screen = .{ .x = 640.4, .y = 360.6 },
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .add_item => |command| {
+            try std.testing.expectEqual(NewItemKind.video, command.kind);
+            try expectVector(.{ .x = 640, .y = 361 }, command.position);
+            try expectVector(.{ .x = 640, .y = 360 }, command.suggested_size);
+            try std.testing.expectEqual(@as(?PaletteColor, null), command.suggested_color);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+    try std.testing.expectEqual(Tool.select, studio.tool);
+}
+
+test "dropped image and video use the same rounded creation contract" {
+    var studio: Studio = .{ .enabled = true, .tool = .add_text };
+    for ([_]NewItemKind{ .image, .video }) |kind| {
+        const semantic = studio.droppedMediaCommand(kind, .{ .x = 100.4, .y = 200.6 }).?;
+        switch (semantic) {
+            .add_item => |command| {
+                try std.testing.expectEqual(kind, command.kind);
+                try expectVector(.{ .x = 100, .y = 201 }, command.position);
+                try expectVector(.{ .x = 640, .y = 360 }, command.suggested_size);
+            },
+            else => return error.UnexpectedSemanticCommand,
+        }
+        try std.testing.expectEqual(Tool.select, studio.tool);
+    }
+    try std.testing.expect(studio.droppedMediaCommand(.shape, .zero()) == null);
 }
 
 test "reusable library tool emits a positioned pop-insertion intent" {
@@ -16285,10 +18389,7 @@ test "property requests honor local shared lock group and item-kind guards" {
 
     studio.setSingleSelection(items[0]);
     items[0].kind = .img;
-    _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = rectangleCenter(layout.font_size),
-        .pointer_pressed = true,
-    });
+    _ = studio.emitPropertyRequest(&items, false, .font_size);
     try std.testing.expect(studio.takeSemanticCommand() == null);
     try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
 }
@@ -16319,6 +18420,11 @@ test "property layout stays contained and typography remains legible" {
         };
         for (fixed) |rect| try expectRectangleContained(layout.properties, rect);
         for (layout.geometry_fields) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.media_fit_buttons) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.media_focus_fields) |rect| try expectRectangleContained(layout.properties, rect);
+        try expectRectangleContained(layout.properties, Studio.mediaPageToggleRect(layout));
+        try expectRectangleContained(layout.properties, Studio.videoPosterFieldRect(layout));
+        try expectRectangleContained(layout.properties, Studio.videoTimelineRect(layout));
         for (layout.foreground_swatches) |rect| try expectRectangleContained(layout.properties, rect);
         for (layout.background_swatches) |rect| try expectRectangleContained(layout.properties, rect);
         for (layout.align_buttons) |rect| try expectRectangleContained(layout.properties, rect);
@@ -16631,6 +18737,11 @@ test "inline property layout stays legible and contained at compact minimum" {
     try std.testing.expect(layout.inline_error.height >= 14);
     for (layout.foreground_swatches) |swatch| try expectRectangleContained(layout.properties, swatch);
     for (layout.background_swatches) |swatch| try expectRectangleContained(layout.properties, swatch);
+    for (Studio.lineStyleButtonRects(layout)) |button| {
+        try expectRectangleContained(layout.properties, button);
+        try std.testing.expect(button.width >= 70);
+        try std.testing.expect(button.height >= 24);
+    }
 }
 
 test "inline text ellipsis control is contained and leaves local reset reachable" {
@@ -16644,6 +18755,188 @@ test "inline text ellipsis control is contained and leaves local reset reachable
     try std.testing.expect(local.x + local.width <= reset.x);
     try std.testing.expectEqual(@as(f32, 36), ordinary.width);
     try std.testing.expectEqual(@as(f32, 36), local.width);
+}
+
+test "textbox alignment controls emit horizontal and vertical source commands" {
+    var items = [_]slides.SlideItem{testItem(646, .textbox, 100, 120, 500, 180)};
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 646,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1920, .height = 1080 });
+    const layout = uiLayout(frame.viewport);
+    try std.testing.expect(!layout.minimal_properties);
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.align_buttons[2]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_text_alignment => |command| switch (command.change) {
+            .horizontal => |alignment| try std.testing.expectEqual(slides.TextAlignment.right, alignment),
+            else => return error.UnexpectedSemanticCommand,
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.align_buttons[4]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_text_alignment => |command| switch (command.change) {
+            .vertical => |alignment| try std.testing.expectEqual(slides.TextVerticalAlignment.middle, alignment),
+            else => return error.UnexpectedSemanticCommand,
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "shape Properties exposes corner radius with local validation" {
+    var items = [_]slides.SlideItem{testItem(649, .textbox, 100, 120, 500, 180)};
+    items[0].text = null;
+    items[0].color = paletteColor(.blue);
+    items[0].corner_radius = 18;
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 649,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const radius_field = uiLayout(frame.viewport).font_size;
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(radius_field),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?InlineField, .corner_radius), studio.inlineEditField());
+    try std.testing.expectEqualStrings("18", studio.inline_editor.text());
+
+    studio.inline_editor.select_all = true;
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_paste = "-4" });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_submit_pressed = true });
+    try std.testing.expectEqual(@as(?InlineError, .invalid_corner_radius), studio.inline_editor.error_value);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    studio.inline_editor.select_all = true;
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_paste = "32" });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_submit_pressed = true });
+    const commit = switch (studio.takeSemanticCommand().?) {
+        .commit_inline => |value| value,
+        else => return error.UnexpectedSemanticCommand,
+    };
+    try std.testing.expectEqual(InlineField.corner_radius, commit.field);
+    try std.testing.expectEqualStrings("32", commit.value);
+}
+
+test "line Properties expose stroke arrows direction and foreground" {
+    var items = [_]slides.SlideItem{testItem(650, .line, 100, 120, 500, 180)};
+    items[0].line_width = 6;
+    items[0].color = paletteColor(.blue);
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 650,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+    const line_style = Studio.lineStyleButtonRects(layout);
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.font_size),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?InlineField, .line_width), studio.inlineEditField());
+    try std.testing.expectEqualStrings("6", studio.inline_editor.text());
+    studio.inline_editor.select_all = true;
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_paste = "0" });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_submit_pressed = true });
+    try std.testing.expectEqual(@as(?InlineError, .invalid_line_width), studio.inline_editor.error_value);
+    studio.inline_editor.select_all = true;
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_paste = "10" });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_submit_pressed = true });
+    const width_commit = switch (studio.takeSemanticCommand().?) {
+        .commit_inline => |value| value,
+        else => return error.UnexpectedSemanticCommand,
+    };
+    try std.testing.expectEqual(InlineField.line_width, width_commit.field);
+    try std.testing.expectEqualStrings("10", width_commit.value);
+    studio.acceptInlineCommit(.line_width);
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(line_style[0]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_line_style => |command| switch (command.change) {
+            .arrow_start => |enabled| try std.testing.expect(enabled),
+            else => return error.UnexpectedSemanticCommand,
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(line_style[2]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_line_style => |command| switch (command.change) {
+            .direction => |direction| try std.testing.expectEqual(slides.LineDirection.up, direction),
+            else => return error.UnexpectedSemanticCommand,
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.foreground_swatches[0]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_foreground => |command| try std.testing.expectEqual(PaletteColor.white, command.color),
+        else => return error.UnexpectedSemanticCommand,
+    }
+}
+
+test "compatible common properties batch while one incompatible target refuses the whole edit" {
+    var items = [_]slides.SlideItem{
+        testItem(647, .textbox, 100, 120, 300, 80),
+        testItem(648, .textbox, 500, 120, 300, 80),
+    };
+    items[0].source = .{ .scope = .direct, .line_offset = 10, .patchable = true };
+    items[1].source = .{ .scope = .direct, .line_offset = 20, .patchable = true };
+    var studio: Studio = .{ .enabled = true, .active_dock = .properties, .inspector_panel = .properties };
+    setTestSelection(&studio, &items, &.{ 647, 648 });
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1920, .height = 1080 });
+    const layout = uiLayout(frame.viewport);
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.align_buttons[1]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_common_property => |command| {
+            try std.testing.expectEqual(@as(usize, 2), command.targets.count);
+            try std.testing.expectEqual(CommonProperty.text_alignment, command.property);
+            try std.testing.expectEqualStrings("center", command.value);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    items[1].kind = .img;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.font_size),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(!studio.inlineEditActive());
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
 }
 
 test "inline text ellipsis emits the large editor command and preserves its draft" {
@@ -16678,6 +18971,231 @@ test "inline text ellipsis emits the large editor command and preserves its draf
     try std.testing.expectEqualStrings("Draft\nwith another line", studio.inlineTextForModal(target).?);
     studio.dismissInlineTextForModal();
     try std.testing.expect(!studio.inlineEditActive());
+}
+
+test "image and video Properties source control emits the same Replace command" {
+    try std.testing.expectEqualStrings("IMAGE", Studio.mediaSourcePlaceholder("IMAGE", ""));
+    try std.testing.expectEqualStrings("VIDEO", Studio.mediaSourcePlaceholder("VIDEO", ""));
+    try std.testing.expectEqualStrings("", Studio.mediaSourcePlaceholder("IMAGE", "assets/hero.png"));
+    try std.testing.expectEqualStrings("", Studio.mediaSourcePlaceholder("VIDEO", "assets/demo.mp4"));
+
+    const kinds = [_]slides.SlideItemKind{ .img, .vid };
+    for (kinds, 0..) |kind, index| {
+        var items = [_]slides.SlideItem{testItem(700 + index, kind, 100, 120, 640, 360)};
+        items[0].source = .{ .scope = .direct, .line_offset = 20 + index * 10, .patchable = true };
+        if (kind == .img) items[0].img_path = "assets/hero.png" else items[0].vid_path = "assets/demo.mp4";
+        var studio: Studio = .{
+            .enabled = true,
+            .active_dock = .properties,
+            .inspector_panel = .properties,
+            .selected_identity = 700 + index,
+        };
+        const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+        const properties_layout = uiLayout(frame.viewport);
+        const source_field = Studio.inlineMediaFieldRect(properties_layout);
+        try std.testing.expect(source_field.width >= properties_layout.edit_text.width);
+        if (@abs(properties_layout.duplicate_item.y - properties_layout.edit_text.y) <= 0.5) {
+            try std.testing.expect(source_field.width > properties_layout.edit_text.width);
+            try std.testing.expectApproxEqAbs(
+                properties_layout.duplicate_item.x + properties_layout.duplicate_item.width,
+                source_field.x + source_field.width,
+                0.0001,
+            );
+        }
+        _ = studio.update(&items, &.{}, frame.viewport, .{
+            .pointer_screen = .{ .x = source_field.x + 10, .y = source_field.y + source_field.height / 2 },
+            .pointer_pressed = true,
+        });
+        try std.testing.expect(studio.takeSemanticCommand() == null);
+        _ = studio.update(&items, &.{}, frame.viewport, .{
+            .pointer_screen = rectangleCenter(Studio.inlineMediaReplaceRect(source_field)),
+            .pointer_pressed = true,
+        });
+        switch (studio.takeSemanticCommand().?) {
+            .replace_media => |target| {
+                try std.testing.expectEqual(items[0].identity, target.item_identity);
+                try std.testing.expectEqual(items[0].source.line_offset, target.source.line_offset);
+                try std.testing.expectEqual(EditScope.direct, target.edit_scope);
+            },
+            else => return error.UnexpectedSemanticCommand,
+        }
+        try std.testing.expect(!studio.inlineEditActive());
+
+        _ = studio.update(&items, &.{}, frame.viewport, .{ .edit_text_pressed = true });
+        switch (studio.takeSemanticCommand().?) {
+            .replace_media => {},
+            else => return error.UnexpectedSemanticCommand,
+        }
+    }
+}
+
+test "image and video Properties share fit and focal controls" {
+    const kinds = [_]slides.SlideItemKind{ .img, .vid };
+    for (kinds, 0..) |kind, index| {
+        var items = [_]slides.SlideItem{testItem(720 + index, kind, 100, 120, 640, 360)};
+        items[0].source = .{ .scope = .direct, .line_offset = 40 + index * 10, .patchable = true };
+        var studio: Studio = .{
+            .enabled = true,
+            .active_dock = .properties,
+            .inspector_panel = .properties,
+            .selected_identity = 720 + index,
+        };
+        const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+        const layout = uiLayout(frame.viewport);
+
+        _ = studio.update(&items, &.{}, frame.viewport, .{
+            .pointer_screen = rectangleCenter(layout.media_fit_buttons[2]),
+            .pointer_pressed = true,
+        });
+        switch (studio.takeSemanticCommand().?) {
+            .set_media_fit => |change| {
+                try std.testing.expectEqual(slides.MediaFit.cover, change.fit);
+                try std.testing.expectEqual(items[0].identity, change.target.item_identity);
+            },
+            else => return error.UnexpectedSemanticCommand,
+        }
+
+        _ = studio.update(&items, &.{}, frame.viewport, .{
+            .pointer_screen = rectangleCenter(layout.media_focus_fields[0]),
+            .pointer_pressed = true,
+        });
+        try std.testing.expectEqual(@as(?InlineField, .media_focus_x), studio.inlineEditField());
+        _ = studio.update(&items, &.{}, frame.viewport, .{ .select_all_pressed = true });
+        var typed = FrameInput{};
+        @memcpy(typed.inline_chars[0..4], "0.75");
+        typed.inline_chars_len = 4;
+        _ = studio.update(&items, &.{}, frame.viewport, typed);
+        _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_submit_pressed = true });
+        switch (studio.takeSemanticCommand().?) {
+            .commit_inline => |commit| {
+                try std.testing.expectEqual(InlineField.media_focus_x, commit.field);
+                try std.testing.expectEqualStrings("0.75", commit.value);
+            },
+            else => return error.UnexpectedSemanticCommand,
+        }
+        studio.acceptInlineCommit(.media_focus_x);
+    }
+}
+
+test "video Playback Properties expose toggles poster scrubber and volume" {
+    var items = [_]slides.SlideItem{testItem(740, .vid, 100, 120, 640, 360)};
+    items[0].vid_path = "assets/demo.mp4";
+    items[0].vid_loop = true;
+    items[0].source = .{ .scope = .direct, .line_offset = 50, .patchable = true };
+    const bounds = [_]ResolvedBounds{.{
+        .identity = 740,
+        .position = items[0].position,
+        .size = items[0].size,
+        .natural_size = .{ .x = 640, .y = 360 },
+        .media_duration = 12,
+    }};
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 740,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.mediaPageToggleRect(layout)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.video_properties_playback);
+
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.media_fit_buttons[1]),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_video_toggle => |change| {
+            try std.testing.expectEqual(VideoToggle.loop, change.property);
+            try std.testing.expect(!change.enabled);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    const timeline = Studio.videoTimelineRect(layout);
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = .{ .x = timeline.x + timeline.width * 0.5, .y = timeline.y + timeline.height * 0.5 },
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_video_poster => |change| try std.testing.expectApproxEqAbs(@as(f32, 6), change.value.?, 0.0001),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.videoPosterFieldRect(layout)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?InlineField, .video_poster), studio.inlineEditField());
+    _ = studio.update(&items, &bounds, frame.viewport, .{ .cancel_pressed = true });
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = rectangleCenter(layout.font_size),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?InlineField, .video_volume), studio.inlineEditField());
+}
+
+test "media fit and video toggles expose exact local override resets" {
+    var items = [_]slides.SlideItem{testItem(745, .vid, 100, 120, 640, 360)};
+    items[0].id = "hero";
+    items[0].vid_path = "assets/demo.mp4";
+    items[0].media_fit = .cover;
+    items[0].vid_loop = true;
+    items[0].source = .{ .scope = .slide_template, .line_offset = 10, .patchable = true };
+    items[0].instance_source = .{ .scope = .slide_instance_override, .line_offset = 40, .patchable = true };
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 745,
+    };
+    studio.setCompositionContext(.{
+        .item_identity = 745,
+        .selection_source = items[0].instance_source.?,
+        .kind = .slide_template,
+        .local_overrides = PropertyOverrideSet.fromFields(&.{ .video_source, .media_fit, .video_loop }),
+        .resettable_overrides = PropertyOverrideSet.fromFields(&.{ .video_source, .media_fit, .video_loop }),
+        .reset_target = .{
+            .item_identity = 745,
+            .source = items[0].instance_source.?,
+            .edit_scope = .local_instance,
+        },
+    });
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+
+    const source_rect = Studio.inlineMediaSourceRect(Studio.inlineMediaFieldRect(layout), layout.scale);
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.inlineResetRect(source_rect)),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .reset_local_override => |command| try std.testing.expectEqual(AuthoredProperty.video_source, command.property),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.inlineResetRect(layout.media_fit_buttons[2])),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .reset_local_override => |command| try std.testing.expectEqual(AuthoredProperty.media_fit, command.property),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    studio.video_properties_playback = true;
+    _ = studio.update(&items, &.{}, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.inlineResetRect(layout.media_fit_buttons[1])),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .reset_local_override => |command| try std.testing.expectEqual(AuthoredProperty.video_loop, command.property),
+        else => return error.UnexpectedSemanticCommand,
+    }
 }
 
 test "LIB shortcut opens the reusable picker with manual fallback for empty catalogs" {
@@ -16955,7 +19473,7 @@ test "local override reset targets one exact property and explains ownership" {
     });
     switch (studio.takeSemanticCommand().?) {
         .reset_local_override => |command| {
-            try std.testing.expectEqual(InlineField.x, command.field);
+            try std.testing.expectEqual(AuthoredProperty.x, command.property);
             try std.testing.expectEqual(@as(usize, 655), command.target.item_identity);
             try std.testing.expectEqual(@as(usize, 40), command.target.source.line_offset);
             try std.testing.expectEqual(EditScope.local_instance, command.target.edit_scope);
@@ -17403,7 +19921,7 @@ test "oversized UTF-8 replacement preserves dirty inline draft and selection" {
     try std.testing.expectEqual(@as(?InlineError, .too_long), studio.inlineEditError());
 }
 
-test "inline multi-selection reports homogeneous and Mixed values but refuses edits" {
+test "inline multi-selection reports truthful values and emits one compatible batch" {
     var items = [_]slides.SlideItem{
         testItem(645, .textbox, 100, 120, 300, 80),
         testItem(646, .textbox, 100, 220, 300, 80),
@@ -17422,8 +19940,19 @@ test "inline multi-selection reports homogeneous and Mixed values but refuses ed
         .pointer_screen = rectangleCenter(uiLayout(frame.viewport).geometry_fields[0]),
         .pointer_pressed = true,
     });
-    try std.testing.expect(!studio.inlineEditActive());
-    try std.testing.expectEqual(Notice.multi_selection_property_unsupported, studio.notice);
+    try std.testing.expect(studio.inlineEditActive());
+    try std.testing.expectEqualStrings("100", studio.inlineEditText());
+    try std.testing.expect(studio.inline_editor.select_all);
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_paste = "140" });
+    _ = studio.update(&items, &.{}, frame.viewport, .{ .inline_submit_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .commit_inline => |commit| {
+            try std.testing.expectEqual(@as(usize, 2), commit.targets.count);
+            try std.testing.expectEqual(InlineField.x, commit.field);
+            try std.testing.expectEqualStrings("140", commit.value);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
 }
 
 test "Crowd text click and Enter share the truthful unavailable result" {

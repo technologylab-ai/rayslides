@@ -99,6 +99,17 @@ This body can continue on later lines.
 shadow=<span class="code-value">#000000a0</span> shadow_x=3 shadow_y=5 text=<span class="code-string">A crisp shadow</span></code></pre>
           <p>Use <code class="inline-code">shadow_offset=4</code> when both offsets match. Use <code class="inline-code">shadow=none</code> to remove an inherited shadow.</p>
 
+          <h3>Align, round, connect, and rotate</h3>
+          <pre><code><span class="code-comment"># Align text inside an explicit box.</span>
+<span class="code-key">@box</span> x=120 y=140 w=900 h=180 align=center valign=middle text=<span class="code-string">Centered</span>
+
+<span class="code-comment"># A rounded color shape, rotated clockwise around its center.</span>
+<span class="code-key">@box</span> x=140 y=380 w=620 h=300 radius=36 rotation=-8 color=<span class="code-value">#245f78ff</span>
+
+<span class="code-comment"># A source-native connector with an arrow at its end.</span>
+<span class="code-key">@line</span> x=820 y=400 w=620 h=220 stroke_width=8 direction=down arrow=end color=<span class="code-value">#ff5cc6ff</span></code></pre>
+          <p><code class="inline-code">align</code> accepts <code class="inline-code">left</code>, <code class="inline-code">center</code>, or <code class="inline-code">right</code>; <code class="inline-code">valign</code> accepts <code class="inline-code">top</code>, <code class="inline-code">middle</code>, or <code class="inline-code">bottom</code>. A line's <code class="inline-code">direction</code> is <code class="inline-code">down</code> or <code class="inline-code">up</code>, and <code class="inline-code">arrow</code> is <code class="inline-code">none</code>, <code class="inline-code">start</code>, <code class="inline-code">end</code>, or <code class="inline-code">both</code>. <code class="inline-code">rotation</code> is any finite clockwise degree value.</p>
+
           <h2>Add images</h2>
           <p>Image paths are relative to the deck file.</p>
           <pre><code><span class="code-comment"># Keep the image's natural size.</span>
@@ -112,6 +123,7 @@ shadow=<span class="code-value">#000000a0</span> shadow_x=3 shadow_y=5 text=<spa
 
 <span class="code-comment"># Scale the natural size, then adjust its ratio.</span>
 <span class="code-key">@box</span> img=assets/photo.png x=1100 y=180 scale=0.5 ratio=1.2</code></pre>
+          <p>SVG files use the same <code class="inline-code">img=</code> directive, sizing, fitting, Studio picker/replacement, reuse, diagnostics, and export path. The embedded vector subset does not render SVG <code class="inline-code">&lt;text&gt;</code>; convert type to paths first.</p>
 
           <h2>Add videos</h2>
           <p>Videos are placed like images, with <code class="inline-code">vid=</code> instead of <code class="inline-code">img=</code>. Playback uses the installed <code class="inline-code">ffmpeg</code>, so every format ffmpeg reads plays — including its audio track.</p>
@@ -123,7 +135,7 @@ shadow=<span class="code-value">#000000a0</span> shadow_x=3 shadow_y=5 text=<spa
 
 <span class="code-comment"># Show the frame at 6.2 seconds as the still before playback.</span>
 <span class="code-key">@box</span> vid=assets/demo.mp4 x=320 y=200 w=1280 poster=6.2</code></pre>
-          <p>A video shows its first frame until it plays. <kbd>M</kbd> plays or pauses the videos on the current slide; <kbd>Shift</kbd> + <kbd>M</kbd> stops and rewinds them. Leaving the slide stops its videos. PDF export always captures the first frame.</p>
+          <p>A video shows its authored poster frame until it plays. <kbd>M</kbd> plays or pauses the videos on the current slide; <kbd>Shift</kbd> + <kbd>M</kbd> stops and rewinds them. Leaving the slide stops its videos. Thumbnails, screenshots, and PDF export use the same immutable poster.</p>
           <p>Moving the mouse into a video reveals hover controls — play/pause, stop, a mute toggle with a volume slider, and a seek bar — which fade out when the cursor leaves or rests. Clicking the video picture itself still advances the presentation; only the control bar consumes clicks.</p>
           <figure class="shot">
             <img src="images/video-controls.jpg" alt="A video with the hover control bar: play and stop buttons, mute toggle, volume slider, elapsed time, seek bar, and total duration" width="1067" height="600" loading="lazy">

@@ -96,7 +96,7 @@ size_t rayslides_macos_take_open_document(char *buffer, size_t capacity)
     return length;
 }
 
-size_t rayslides_macos_choose_image(const char *initial_directory, char *buffer, size_t capacity)
+size_t rayslides_macos_choose_media(bool video, const char *initial_directory, char *buffer, size_t capacity)
 {
     @autoreleasepool {
         NSOpenPanel *panel = [NSOpenPanel openPanel];
@@ -104,9 +104,11 @@ size_t rayslides_macos_choose_image(const char *initial_directory, char *buffer,
         [panel setCanChooseDirectories:NO];
         [panel setAllowsMultipleSelection:NO];
         [panel setResolvesAliases:YES];
-        [panel setTitle:@"Choose an image"];
+        [panel setTitle:video ? @"Choose a video" : @"Choose an image"];
         [panel setPrompt:@"Choose"];
-        [panel setAllowedFileTypes:@[@"png", @"jpg", @"jpeg", @"bmp", @"gif", @"tga", @"qoi", @"svg"]];
+        [panel setAllowedFileTypes:video
+            ? @[@"mp4", @"mov", @"m4v", @"webm", @"mkv", @"avi", @"mpg", @"mpeg"]
+            : @[@"png", @"jpg", @"jpeg", @"bmp", @"gif", @"tga", @"qoi", @"svg"]];
 
         if (initial_directory != NULL && initial_directory[0] != '\0') {
             NSString *directory = [NSString stringWithUTF8String:initial_directory];

@@ -14,6 +14,8 @@
     .shell { min-height: 100dvh; display: grid; grid-template-rows: auto 1fr auto; }
     header { position: sticky; top: 0; z-index: 2; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; padding: max(14px, env(safe-area-inset-top)) 18px 12px; background: rgba(7,11,24,.94); border-bottom: 1px solid #1b2d45; backdrop-filter: blur(14px); }
     .brand { color: #61dafb; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .client-context { display: block; margin-top: 3px; color: #7890a6; font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+    .desktop-only { display: none; }
     .meta { display: flex; align-items: baseline; gap: 12px; }
     #slideCount { color: #9db0c4; font-variant-numeric: tabular-nums; }
     #timer { min-width: 4.7ch; font-size: 24px; font-weight: 750; font-variant-numeric: tabular-nums; text-align: right; }
@@ -43,6 +45,13 @@
     .compact-notes .eyebrow { margin-bottom: 6px; color: #7892a8; }
     #compactNotes { max-height: min(23vh, 220px); margin: 0; overflow-y: auto; color: #d6e2ed; font-size: clamp(15px, 4vw, 19px); line-height: 1.4; font-weight: 570; white-space: pre-wrap; overflow-wrap: anywhere; overscroll-behavior: contain; }
     #compactNotes.empty { color: #71869c; font-weight: 520; }
+    .health { margin-top: 24px; border: 1px solid #1b3048; border-radius: 14px; background: #0a1320; color: #91a8bc; font-size: 13px; }
+    .health summary { display: flex; justify-content: space-between; gap: 16px; padding: 12px 14px; cursor: pointer; color: #a9bdd0; font-weight: 750; list-style-position: inside; }
+    #healthSummary { color: #7890a6; font-variant-numeric: tabular-nums; font-weight: 620; }
+    .health-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 9px 18px; padding: 2px 14px 14px; border-top: 1px solid #1b3048; }
+    .health-grid dt, .health-grid dd { margin: 0; padding-top: 8px; }
+    .health-grid dd { color: #d6e2ed; font-variant-numeric: tabular-nums; text-align: right; }
+    .health-copy { margin: 0; padding: 0 14px 14px; color: #71869c; font-size: 12px; line-height: 1.4; }
     .network { position: fixed; left: 18px; right: 18px; bottom: calc(92px + env(safe-area-inset-bottom)); z-index: 3; display: flex; justify-content: center; pointer-events: none; }
     #status { padding: 7px 11px; border-radius: 999px; background: #14243a; color: #a9bdd0; font-size: 12px; box-shadow: 0 8px 30px #0008; }
     #status.live { background: #113323; color: #82e6ae; }
@@ -59,6 +68,80 @@
       .modes { margin-bottom: 16px; }
       .pointer-surface { border-radius: 14px; }
     }
+    @media (orientation: landscape) and (max-height: 599px) {
+      body[data-presenter-mode="pointer"] header,
+      body[data-presenter-mode="draw"] header,
+      body[data-presenter-mode="pointer"] .compact-notes,
+      body[data-presenter-mode="draw"] .compact-notes,
+      body[data-presenter-mode="pointer"] .health,
+      body[data-presenter-mode="draw"] .health,
+      body[data-presenter-mode="pointer"] #toolEyebrow,
+      body[data-presenter-mode="draw"] #toolEyebrow,
+      body[data-presenter-mode="pointer"] #toolInstructions,
+      body[data-presenter-mode="draw"] #toolInstructions,
+      body[data-presenter-mode="pointer"] #toolFootnote,
+      body[data-presenter-mode="draw"] #toolFootnote { display: none; }
+      body[data-presenter-mode="pointer"] main,
+      body[data-presenter-mode="draw"] main {
+        --landscape-surface-width: clamp(240px, calc(177.7778dvh - 258px), 440px);
+        width: 100%;
+        padding: 8px 16px calc(94px + env(safe-area-inset-bottom));
+      }
+      body[data-presenter-mode="pointer"] .modes,
+      body[data-presenter-mode="draw"] .modes {
+        width: min(360px, 100%);
+        margin: 0 auto 8px;
+        padding: 3px;
+        border-radius: 12px;
+      }
+      body[data-presenter-mode="pointer"] .modes button,
+      body[data-presenter-mode="draw"] .modes button { min-height: 38px; font-size: 14px; }
+      body[data-presenter-mode="pointer"] .control-grid,
+      body[data-presenter-mode="draw"] .control-grid { display: block; }
+      body[data-presenter-mode="pointer"] .tool-pane {
+        width: min(var(--landscape-surface-width), 100%);
+        margin: 0 auto;
+      }
+      body[data-presenter-mode="draw"] .tool-pane {
+        display: grid;
+        grid-template-columns: min(var(--landscape-surface-width), calc(100% - 156px)) minmax(140px, 1fr);
+        gap: 16px;
+        align-items: center;
+        width: min(760px, 100%);
+        margin: 0 auto;
+      }
+      body[data-presenter-mode="pointer"] .pointer-surface,
+      body[data-presenter-mode="draw"] .pointer-surface { width: 100%; border-radius: 14px; }
+      body[data-presenter-mode="draw"] .drawing-actions { margin: 0; }
+      body[data-presenter-mode="draw"] .drawing-actions button { min-height: 64px; }
+      body[data-presenter-mode="pointer"] .network,
+      body[data-presenter-mode="draw"] .network {
+        top: max(10px, env(safe-area-inset-top));
+        right: 12px;
+        bottom: auto;
+        left: auto;
+      }
+    }
+    @media (min-width: 900px) and (min-height: 600px) {
+      .phone-only { display: none; }
+      .desktop-only { display: inline; }
+      header { grid-template-columns: minmax(0, 1fr) auto; padding: 18px max(32px, calc((100vw - 1400px) / 2)); }
+      main { width: min(1400px, 100%); padding: 24px 32px 118px; }
+      .modes { width: 470px; margin-bottom: 28px; }
+      #notesMode { display: grid; grid-template-columns: minmax(0, 1.75fr) minmax(300px, .8fr); gap: 28px; align-items: start; }
+      #notesMode > .eyebrow { grid-column: 1; }
+      #notes { grid-column: 1; min-height: 50vh; font-size: clamp(26px, 2.5vw, 38px); }
+      .next { grid-column: 2; grid-row: 1 / span 2; margin-top: 0; min-height: 50vh; }
+      #nextNotes { font-size: clamp(18px, 1.5vw, 23px); }
+      .control-grid { display: grid; grid-template-columns: minmax(520px, 1.8fr) minmax(300px, .75fr); gap: 28px; align-items: start; }
+      .compact-notes { margin-top: 0; min-height: 100%; }
+      #compactNotes { max-height: 62vh; font-size: clamp(17px, 1.5vw, 22px); }
+      .pointer-footnote { text-align: left; }
+      .health { width: min(760px, 100%); }
+      nav { left: 50%; right: auto; width: min(760px, calc(100vw - 64px)); transform: translateX(-50%); gap: 14px; padding: 12px 0 16px; background: transparent; border-top: 0; backdrop-filter: none; }
+      nav button { min-height: 66px; box-shadow: 0 10px 32px #000b; }
+      .network { bottom: 100px; }
+    }
     [hidden] { display: none !important; }
   </style>
 </head>
@@ -67,6 +150,7 @@
     <header>
       <div>
         <div class="brand">Rayslides Presenter</div>
+        <span class="client-context"><span class="phone-only">Phone companion</span><span class="desktop-only">Laptop companion · ←/→ navigate</span></span>
         <div id="slideCount">Slide — / —</div>
       </div>
       <div class="meta"><span id="timer">00:00</span></div>
@@ -86,23 +170,37 @@
         </section>
       </section>
       <section id="controlMode" role="tabpanel" aria-labelledby="pointerTab" hidden>
-        <p class="eyebrow" id="toolEyebrow">Software pointer</p>
-        <p class="pointer-copy" id="toolInstructions">Touch and hold the slide, then drag. Lift your finger to hide the laser.</p>
-        <div id="pointerSurface" class="pointer-surface disabled" aria-label="Current slide pointer surface">
-          <img id="slidePreview" alt="Current projected slide" draggable="false">
-          <canvas id="drawingCanvas" hidden></canvas>
-          <span id="pointerDot" hidden></span>
-          <span id="previewStatus">Preparing current slide…</span>
+        <div class="control-grid">
+          <div class="tool-pane">
+            <p class="eyebrow" id="toolEyebrow">Software pointer</p>
+            <p class="pointer-copy" id="toolInstructions">Touch and hold the slide, then drag. Lift your finger to hide the laser.</p>
+            <div id="pointerSurface" class="pointer-surface disabled" aria-label="Current slide pointer surface">
+              <img id="slidePreview" alt="Current projected slide" draggable="false">
+              <canvas id="drawingCanvas" hidden></canvas>
+              <span id="pointerDot" hidden></span>
+              <span id="previewStatus">Preparing current slide…</span>
+            </div>
+            <div id="drawingActions" class="drawing-actions" hidden>
+              <button id="clearDrawing" type="button">Clear drawing</button>
+            </div>
+            <p class="pointer-footnote" id="toolFootnote">For more precision, rotate the phone to landscape. Local mouse and drawing controls remain available.</p>
+          </div>
+          <section class="compact-notes" aria-labelledby="compactNotesLabel">
+            <p class="eyebrow" id="compactNotesLabel">Current notes</p>
+            <p id="compactNotes" class="empty">No notes for this slide.</p>
+          </section>
         </div>
-        <div id="drawingActions" class="drawing-actions" hidden>
-          <button id="clearDrawing" type="button">Clear drawing</button>
-        </div>
-        <section class="compact-notes" aria-labelledby="compactNotesLabel">
-          <p class="eyebrow" id="compactNotesLabel">Current notes</p>
-          <p id="compactNotes" class="empty">No notes for this slide.</p>
-        </section>
-        <p class="pointer-footnote" id="toolFootnote">For more precision, rotate the phone to landscape. Local mouse and drawing controls remain available.</p>
       </section>
+      <details class="health" id="health">
+        <summary><span>Connection health</span><span id="healthSummary">Collecting samples…</span></summary>
+        <dl class="health-grid">
+          <dt>State polling</dt><dd id="latencyState">Collecting…</dd>
+          <dt>Command accepted</dt><dd id="latencyCommand">No samples</dd>
+          <dt>Pointer accepted</dt><dd id="latencyPointer">No samples</dd>
+          <dt>Drawing accepted</dt><dd id="latencyDrawing">No samples</dd>
+        </dl>
+        <p class="health-copy">Values are browser-to-laptop round trips: median / p95 · samples · failures. No notes, link, capability, or session identity are included.</p>
+      </details>
     </main>
     <div class="network"><span id="status">Connecting…</span></div>
     <nav aria-label="Presentation controls">
@@ -130,6 +228,10 @@
         $("pairError").hidden = false;
       }
 
+      window.addEventListener("hashchange", () => {
+        const nextFragment = location.hash.length > 1 ? location.hash.slice(1) : "";
+        if (/^[a-f0-9]{64}$/.test(nextFragment) && nextFragment !== token) location.reload();
+      });
       if (!/^[a-f0-9]{64}$/.test(token)) {
         showPairError("Pairing link required", "Open the private QR code in rayslides and scan it again. No presenter information has been exposed.");
         return;
@@ -169,6 +271,87 @@
       let lastDrawingMoveAt = 0;
       let drawingStrokes = [];
       let currentDrawingStroke = null;
+      const latencySamples = { state: [], command: [], pointer: [], drawing: [] };
+      const latencyFailures = { state: 0, command: 0, pointer: 0, drawing: 0 };
+      const latencyLimit = 80;
+      let healthUploadTimer = 0;
+
+      function latencyPercentile(values, percentile) {
+        if (!values.length) return null;
+        const sorted = values.slice().sort((a, b) => a - b);
+        return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * percentile) - 1)];
+      }
+
+      function latencyStats(kind) {
+        const values = latencySamples[kind];
+        return {
+          samples: values.length,
+          failures: latencyFailures[kind],
+          median_ms: latencyPercentile(values, .5),
+          p95_ms: latencyPercentile(values, .95)
+        };
+      }
+
+      function latencyText(kind) {
+        const stats = latencyStats(kind);
+        if (!stats.samples) return stats.failures ? "No samples · " + stats.failures + " failed" : "No samples";
+        return stats.median_ms + " / " + stats.p95_ms + " ms · " + stats.samples + " · " + stats.failures + " failed";
+      }
+
+      function updateLatencyReport() {
+        $("latencyState").textContent = latencyText("state");
+        $("latencyCommand").textContent = latencyText("command");
+        $("latencyPointer").textContent = latencyText("pointer");
+        $("latencyDrawing").textContent = latencyText("drawing");
+        const controls = ["command", "pointer", "drawing"].flatMap((kind) => latencySamples[kind]);
+        const controlP95 = latencyPercentile(controls, .95);
+        const stateP95 = latencyPercentile(latencySamples.state, .95);
+        $("healthSummary").textContent = controlP95 !== null
+          ? "controls p95 " + controlP95 + " ms"
+          : stateP95 !== null ? "state p95 " + stateP95 + " ms" : "Collecting samples…";
+        scheduleHealthUpload();
+      }
+
+      function scheduleHealthUpload() {
+        if (healthUploadTimer) return;
+        healthUploadTimer = setTimeout(async () => {
+          healthUploadTimer = 0;
+          try {
+            await api("/api/v1/presenter/health", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                state: latencyStats("state"),
+                command: latencyStats("command"),
+                pointer: latencyStats("pointer"),
+                drawing: latencyStats("drawing")
+              })
+            });
+          } catch (_) {}
+        }, 1500);
+      }
+
+      function recordLatency(kind, startedAt) {
+        const elapsed = Math.max(0, Math.round(performance.now() - startedAt));
+        const values = latencySamples[kind];
+        values.push(elapsed);
+        if (values.length > latencyLimit) values.shift();
+        updateLatencyReport();
+      }
+
+      function recordLatencyFailure(kind) {
+        latencyFailures[kind] += 1;
+        updateLatencyReport();
+      }
+
+      window.rayslidesPresenterDiagnostics = () => ({
+        generated_at: new Date().toISOString(),
+        viewport: { width: innerWidth, height: innerHeight },
+        state: latencyStats("state"),
+        command: latencyStats("command"),
+        pointer: latencyStats("pointer"),
+        drawing: latencyStats("drawing")
+      });
 
       const apiUrl = (path) => path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token);
 
@@ -202,6 +385,15 @@
         $("status").textContent = message;
       }
 
+      function suspendDisconnectedControls() {
+        $("previous").disabled = true;
+        $("next").disabled = true;
+        $("pointerSurface").classList.add("disabled");
+        $("clearDrawing").disabled = true;
+        if (pointerActive) releasePointer(true);
+        if (drawingActive) releaseDrawing(true);
+      }
+
       function expirePairing() {
         sessionStorage.removeItem(tokenKey);
         pointerActive = false;
@@ -215,6 +407,7 @@
         if (mode === "pointer" && next !== "pointer") releasePointer(false);
         if (mode === "draw" && next !== "draw") releaseDrawing(false);
         mode = next;
+        document.body.dataset.presenterMode = mode;
         sessionStorage.setItem(tokenKey + ":mode", mode);
         const notes = mode === "notes";
         const pointer = mode === "pointer";
@@ -293,14 +486,18 @@
 
       async function refresh() {
         clearTimeout(pollTimer);
+        const startedAt = performance.now();
         try {
           applyState(await api("/api/v1/presenter/state"));
+          recordLatency("state", startedAt);
         } catch (error) {
+          recordLatencyFailure("state");
           if (error && error.status === 401) {
             expirePairing();
             return;
           }
           failures += 1;
+          if (failures > 2) suspendDisconnectedControls();
           setStatus(failures > 2 ? "error" : "", failures > 2 ? "Reconnecting…" : "Connection interrupted");
         }
         pollTimer = setTimeout(refresh, document.hidden ? 1800 : 500);
@@ -323,15 +520,18 @@
         commandSeq += 1;
         sessionStorage.setItem(tokenKey + ":seq", String(commandSeq));
         try {
+          const startedAt = performance.now();
           await api("/api/v1/presenter/command", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ command, seq: commandSeq })
           });
+          recordLatency("command", startedAt);
           if (navigator.vibrate) navigator.vibrate(18);
           setStatus("live", "Command sent");
           setTimeout(refresh, 30);
         } catch (error) {
+          recordLatencyFailure("command");
           if (error && error.status === 401) expirePairing();
           else setStatus("error", "Command not delivered");
         } finally {
@@ -356,13 +556,16 @@
         const update = pendingPointer;
         pendingPointer = null;
         pointerRequestInFlight = true;
+        const startedAt = performance.now();
         try {
           await api("/api/v1/presenter/pointer", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(update)
           });
+          recordLatency("pointer", startedAt);
         } catch (error) {
+          recordLatencyFailure("pointer");
           if (error && error.status === 401) expirePairing();
           else setStatus("error", "Pointer connection interrupted");
         } finally {
@@ -517,13 +720,16 @@
         const update = pendingDrawing;
         pendingDrawing = null;
         drawingRequestInFlight = true;
+        const startedAt = performance.now();
         try {
           await api("/api/v1/presenter/drawing", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(update)
           });
+          recordLatency("drawing", startedAt);
         } catch (error) {
+          recordLatencyFailure("drawing");
           if (error && error.status === 401) expirePairing();
           else setStatus("error", "Drawing connection interrupted");
         } finally {
@@ -588,6 +794,20 @@
       $("pointerTab").addEventListener("click", () => setMode("pointer"));
       $("drawTab").addEventListener("click", () => setMode("draw"));
       $("clearDrawing").addEventListener("click", () => sendCommand("clear_drawing"));
+      document.addEventListener("keydown", (event) => {
+        if (event.defaultPrevented || event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+        const target = event.target;
+        if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+        if (event.key === "ArrowLeft" || event.key === "PageUp") {
+          event.preventDefault();
+          sendCommand("previous");
+        } else if (event.key === "ArrowRight" || event.key === "PageDown" || event.key === " ") {
+          event.preventDefault();
+          sendCommand("next");
+        } else if (event.key === "1") setMode("notes");
+        else if (event.key === "2") setMode("pointer");
+        else if (event.key === "3") setMode("draw");
+      });
       $("slidePreview").addEventListener("load", () => {
         const enabled = state && (mode === "draw" ? state.drawing_enabled : state.pointer_enabled);
         if (enabled) $("previewStatus").hidden = true;

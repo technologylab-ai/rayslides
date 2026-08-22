@@ -66,7 +66,7 @@ fn requireTools(io: std.Io, gpa: std.mem.Allocator) !void {
 fn terminateChildProcess(child: *std.process.Child) void {
     const id = child.id orelse return;
     if (builtin.os.tag == .windows) {
-        std.os.windows.TerminateProcess(id, 1) catch {};
+        _ = std.os.windows.ntdll.NtTerminateProcess(id, .CONTROL_C_EXIT);
     } else {
         std.posix.kill(id, std.posix.SIG.KILL) catch {};
     }
@@ -77,6 +77,27 @@ pub const PlayState = enum {
     playing,
     paused,
     finished,
+};
+
+pub const PosterStatus = enum {
+    exact,
+    out_of_range,
+    fallback_to_first,
+};
+
+pub const VideoLoadFailure = enum {
+    file_missing,
+    file_unreadable,
+    tools_missing,
+    probe_failed,
+    poster_decode_failed,
+};
+
+pub const VideoLoadResult = union(enum) {
+    player: *VideoPlayer,
+    failure: VideoLoadFailure,
+    /// Renderer unit tests intentionally omit an I/O backend.
+    disabled,
 };
 
 const ProbeResult = struct {
@@ -97,11 +118,16 @@ fn parseFrameRate(value: []const u8) ?f64 {
     return num / den;
 }
 
+fn posterStatusForRequest(duration: f64, poster_time: f64) PosterStatus {
+    if (duration <= 0) return .exact;
+    return if (poster_time > @max(0, duration - 0.1) + 0.001) .out_of_range else .exact;
+}
+
 fn probe(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !ProbeResult {
     const video_result = try std.process.run(gpa, io, .{
         .argv = &.{
-            ffprobe_exe.?,          "-v",  "error",
-            "-select_streams",      "v:0", "-show_entries",
+            ffprobe_exe.?,                                                              "-v",  "error",
+            "-select_streams",                                                          "v:0", "-show_entries",
             "stream=width,height,avg_frame_rate,r_frame_rate,duration:format=duration", "-of", "default=noprint_wrappers=1",
             path,
         },
@@ -145,8 +171,8 @@ fn probe(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !ProbeResult {
 
     const audio_result = try std.process.run(gpa, io, .{
         .argv = &.{
-            ffprobe_exe.?,     "-v",  "error",
-            "-select_streams", "a:0", "-show_entries",
+            ffprobe_exe.?,       "-v",  "error",
+            "-select_streams",   "a:0", "-show_entries",
             "stream=codec_type", "-of", "default=noprint_wrappers=1",
             path,
         },
@@ -278,10 +304,15 @@ pub const VideoPlayer = struct {
     volume: f32 = 1.0,
     muted: bool = false,
 
+    /// Mutable presentation texture advanced by the decoder while playing.
     texture: rl.Texture2D,
-    /// First frame, kept so stop() can rewind the on-screen texture without
-    /// restarting ffmpeg, and so exports capture a deterministic poster.
+    /// Immutable GPU copy used by thumbnails, authoring previews, Presenter
+    /// preview, and export without disturbing an active decoder texture.
+    poster_texture: rl.Texture2D,
+    /// Poster pixels, kept so stop() can rewind the live on-screen texture
+    /// without restarting ffmpeg.
     poster: []u8,
+    poster_status: PosterStatus = .exact,
 
     state: PlayState = .stopped,
     /// Seconds since the current pipeline was spawned; the presented
@@ -328,18 +359,26 @@ pub const VideoPlayer = struct {
     }
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, poster_time: f64) !*Self {
+        {
+            const file = try std.Io.Dir.cwd().openFile(io, realpath, .{});
+            defer file.close(io);
+            _ = try file.stat(io);
+        }
         try requireTools(io, gpa);
         const meta = try probe(io, gpa, realpath);
         const frame_size: usize = @as(usize, @intCast(meta.width)) * @as(usize, @intCast(meta.height)) * 3;
 
+        const poster_limit = @max(0, meta.duration - 0.1);
         const poster_at = if (meta.duration > 0)
-            std.math.clamp(poster_time, 0, @max(0, meta.duration - 0.1))
+            std.math.clamp(poster_time, 0, poster_limit)
         else
             @max(0, poster_time);
+        var poster_status = posterStatusForRequest(meta.duration, poster_time);
         const poster = decodePosterFrame(gpa, io, realpath, poster_at, frame_size) catch |err| fallback: {
             if (poster_at <= 0.001) return err;
             // A poster= beyond what ffmpeg can reach must not lose the video.
             log.warn("poster at {d:.2}s failed for {s} ({}); using the first frame", .{ poster_at, realpath, err });
+            if (poster_status == .exact) poster_status = .fallback_to_first;
             break :fallback try decodePosterFrame(gpa, io, realpath, 0, frame_size);
         };
         errdefer gpa.free(poster);
@@ -353,6 +392,8 @@ pub const VideoPlayer = struct {
         };
         const texture = try rl.loadTextureFromImage(image);
         errdefer rl.unloadTexture(texture);
+        const poster_texture = try rl.loadTextureFromImage(image);
+        errdefer rl.unloadTexture(poster_texture);
 
         const self = try gpa.create(Self);
         errdefer gpa.destroy(self);
@@ -366,7 +407,9 @@ pub const VideoPlayer = struct {
             .has_audio = meta.has_audio,
             .duration = meta.duration,
             .texture = texture,
+            .poster_texture = poster_texture,
             .poster = poster,
+            .poster_status = poster_status,
         };
         log.info("video {s}: {d}x{d} @ {d:.2} fps, audio: {}", .{
             realpath, meta.width, meta.height, meta.fps, meta.has_audio,
@@ -377,6 +420,7 @@ pub const VideoPlayer = struct {
     pub fn deinit(self: *Self) void {
         self.killPipeline();
         rl.unloadTexture(self.texture);
+        rl.unloadTexture(self.poster_texture);
         self.allocator.free(self.poster);
         self.allocator.free(self.path);
         self.allocator.destroy(self);
@@ -421,6 +465,11 @@ pub const VideoPlayer = struct {
 
     pub fn toggleMute(self: *Self) void {
         self.muted = !self.muted;
+        self.applyVolume();
+    }
+
+    pub fn setMuted(self: *Self, muted: bool) void {
+        self.muted = muted;
         self.applyVolume();
     }
 
@@ -723,26 +772,28 @@ pub const VideoPlayer = struct {
 /// images. Lives on the renderer's long-lived allocator so playback state and
 /// decoded textures survive re-parses. Players hold decoder handles and one
 /// poster frame, never video content, so cost is per-file and
-/// duration-independent. A failed load is cached as null so Studio keystrokes
+/// duration-independent. Each player also owns an immutable GPU poster copy,
+/// allowing passive renders to remain deterministic during live playback. A
+/// failed load is cached as null so Studio keystrokes
 /// don't re-run ffprobe against a broken path.
 pub const VideoCache = struct {
     allocator: std.mem.Allocator,
     /// Set by the app after construction. Renderer unit tests leave it null,
     /// which turns video items into no-ops instead of spawning processes.
     io: ?std.Io = null,
-    path2player: std.StringHashMap(?*VideoPlayer),
+    path2player: std.StringHashMap(VideoLoadResult),
 
     const Self = @This();
 
     pub fn init(alloc: std.mem.Allocator) Self {
         return .{
             .allocator = alloc,
-            .path2player = std.StringHashMap(?*VideoPlayer).init(alloc),
+            .path2player = std.StringHashMap(VideoLoadResult).init(alloc),
         };
     }
 
-    pub fn getVideoPlayer(self: *Self, p: []const u8, refpath: ?[]const u8, poster_time: f64) !?*VideoPlayer {
-        const io = self.io orelse return null;
+    pub fn getVideoPlayer(self: *Self, p: []const u8, refpath: ?[]const u8, poster_time: f64) !VideoLoadResult {
+        const io = self.io orelse return .disabled;
         const realpath = try pathRelativeTo(p, refpath);
         // The poster is baked into a player's texture, so the same file with
         // different poster= stills becomes distinct cache entries.
@@ -753,34 +804,71 @@ pub const VideoCache = struct {
         // pathRelativeTo returns a shared static buffer; own the key now.
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
-        const player: ?*VideoPlayer = VideoPlayer.create(self.allocator, io, realpath, poster_time) catch |err| blk: {
+        const result: VideoLoadResult = if (VideoPlayer.create(self.allocator, io, realpath, poster_time)) |player|
+            .{ .player = player }
+        else |err| blk: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             log.warn("could not load video {s}: {}", .{ realpath, err });
-            break :blk null;
+            break :blk .{ .failure = classifyVideoLoadFailure(err) };
         };
-        try self.path2player.put(owned_key, player);
-        return player;
+        try self.path2player.put(owned_key, result);
+        return result;
     }
 
     pub fn tickAll(self: *Self, now: f64) void {
         var it = self.path2player.valueIterator();
         while (it.next()) |entry| {
-            if (entry.*) |player| player.tick(now);
+            switch (entry.*) {
+                .player => |player| player.tick(now),
+                .failure, .disabled => {},
+            }
         }
     }
 
     pub fn stopAll(self: *Self) void {
         var it = self.path2player.valueIterator();
         while (it.next()) |entry| {
-            if (entry.*) |player| player.stop();
+            switch (entry.*) {
+                .player => |player| player.stop(),
+                .failure, .disabled => {},
+            }
         }
     }
 
     pub fn deinit(self: *Self) void {
         var it = self.path2player.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.*) |player| player.deinit();
+            switch (entry.value_ptr.*) {
+                .player => |player| player.deinit(),
+                .failure, .disabled => {},
+            }
             self.allocator.free(entry.key_ptr.*);
         }
         self.path2player.deinit();
     }
 };
+
+fn classifyVideoLoadFailure(err: anyerror) VideoLoadFailure {
+    const name = @errorName(err);
+    if (std.mem.eql(u8, name, "FileNotFound") or std.mem.eql(u8, name, "NotDir")) return .file_missing;
+    if (std.mem.eql(u8, name, "AccessDenied") or
+        std.mem.eql(u8, name, "PermissionDenied") or
+        std.mem.eql(u8, name, "IsDir"))
+    {
+        return .file_unreadable;
+    }
+    if (err == error.FfmpegNotFound) return .tools_missing;
+    if (err == error.VideoProbeFailed) return .probe_failed;
+    return .poster_decode_failed;
+}
+
+test "video diagnostics distinguish tools probe poster and file failures" {
+    try std.testing.expectEqual(VideoLoadFailure.file_missing, classifyVideoLoadFailure(error.FileNotFound));
+    try std.testing.expectEqual(VideoLoadFailure.file_unreadable, classifyVideoLoadFailure(error.AccessDenied));
+    try std.testing.expectEqual(VideoLoadFailure.tools_missing, classifyVideoLoadFailure(error.FfmpegNotFound));
+    try std.testing.expectEqual(VideoLoadFailure.probe_failed, classifyVideoLoadFailure(error.VideoProbeFailed));
+    try std.testing.expectEqual(VideoLoadFailure.poster_decode_failed, classifyVideoLoadFailure(error.VideoPosterFailed));
+    try std.testing.expectEqual(PosterStatus.exact, posterStatusForRequest(10, 9.8));
+    try std.testing.expectEqual(PosterStatus.out_of_range, posterStatusForRequest(10, 10));
+    try std.testing.expectEqual(PosterStatus.exact, posterStatusForRequest(0, 100));
+}

@@ -44,6 +44,8 @@
                 <tr><td><code>--crowd-port=PORT</code></td><td>Change the Crowdplay port. The default is 7331.</td></tr>
                 <tr><td><code>--presenter-host=HOST</code></td><td>Advertise the given Presenter address.</td></tr>
                 <tr><td><code>--presenter-port=PORT</code></td><td>Change the Presenter port. The default is 7332.</td></tr>
+                <tr><td><code>--showtime-report=JSON</code></td><td>Preflight the exact deck, write stable JSON, and exit nonzero on blockers.</td></tr>
+                <tr><td><code>--portable-show=DIR</code></td><td>Create an ordinary deck-and-assets folder, independently re-open it, preflight it, and write its report.</td></tr>
                 <tr><td><code>-h, --help</code></td><td>Show the complete option list.</td></tr>
                 <tr><td><code>-v, --version</code></td><td>Show the version.</td></tr>
               </tbody>
@@ -61,6 +63,7 @@
                 <tr><td><kbd>1</kbd> or <kbd>G</kbd></td><td>Show the first slide.</td></tr>
                 <tr><td><kbd>0</kbd> or <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Show the last slide.</td></tr>
                 <tr><td><kbd>F</kbd></td><td>Turn fullscreen on or off.</td></tr>
+                <tr><td><kbd>D</kbd></td><td>Identify and explicitly choose the presentation display.</td></tr>
                 <tr><td><kbd>L</kbd></td><td>Turn the laser pointer on or off.</td></tr>
                 <tr><td><kbd>Shift</kbd> + <kbd>L</kbd></td><td>Select the next pointer size.</td></tr>
                 <tr><td><kbd>C</kbd></td><td>Clear the pointer drawing.</td></tr>
@@ -86,6 +89,23 @@
           </div>
           <p>The PDF contains one page for each logical slide. Rayslides uses the final reveal and morph state.</p>
 
+          <h2>Showtime preflight</h2>
+          <p>Open Studio's Commands menu and choose <strong>Showtime preflight</strong>. Showtime walks every base scene, reveal endpoint, cumulative morph scene, reusable definition, and deterministic poster-frame export graph without navigating, seeking, playing media, editing source, or changing history and selection.</p>
+          <p>Blockers include malformed source, unavailable presentation pixels, missing glyphs, and unavailable required services. Warnings identify reviewable conditions such as text overflow, off-canvas staging, non-portable paths, display mismatch, or an unmeasured Presenter rehearsal. Findings link to a slide/object or editable Library definition when possible.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Control</th><th>Action</th></tr></thead>
+              <tbody>
+                <tr><td><kbd>Up</kbd>/<kbd>Down</kbd> or wheel</td><td>Review findings.</td></tr>
+                <tr><td><kbd>Enter</kbd></td><td>Open the selected slide, object, definition, or source location.</td></tr>
+                <tr><td><kbd>R</kbd></td><td>Rerun against the current exact document and venue state.</td></tr>
+                <tr><td><kbd>P</kbd></td><td>Create a portable show folder.</td></tr>
+                <tr><td><kbd>Esc</kbd></td><td>Close Showtime.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p><strong>Create portable show</strong> copies literal image, video, and custom-font dependencies beneath <code>assets/</code>, handles equal basenames deterministically, rewrites only the copied references in a readable <code>.sld</code>, then re-opens and preflights the copy. It refuses an existing destination and never edits the original. Presenter latency evidence contains only bounded counts, median/p95 values, and failures—never notes, private URLs, capabilities, sessions, or client identity.</p>
+
           <h2>Studio tools</h2>
           <div class="table-wrap">
             <table>
@@ -94,12 +114,21 @@
                 <tr><td>Select</td><td><kbd>V</kbd></td><td>Select, move, and resize an object.</td></tr>
                 <tr><td>Text</td><td><kbd>T</kbd></td><td>Add a text box.</td></tr>
                 <tr><td>Bullets</td><td><kbd>B</kbd></td><td>Add one bullet for each source line.</td></tr>
-                <tr><td>Image</td><td><kbd>I</kbd></td><td>Add an image with a relative path.</td></tr>
+                <tr><td>Image</td><td><kbd>I</kbd></td><td>Browse for and place an image.</td></tr>
+                <tr><td>Video</td><td><kbd>M</kbd></td><td>Browse for and place a video.</td></tr>
                 <tr><td>Rectangle</td><td><kbd>R</kbd></td><td>Add a colored shape.</td></tr>
+                <tr><td>Line</td><td><kbd>L</kbd></td><td>Add a plain line; <kbd>A</kbd> adds one with an end arrow.</td></tr>
                 <tr><td>Library</td><td><kbd>U</kbd></td><td>Place a reusable item.</td></tr>
               </tbody>
             </table>
           </div>
+          <p>On macOS, Image and Video prompts include a native file picker. Manual path entry remains available everywhere. Dropping a supported image or video over the Studio canvas creates that media item at the drop position. Saved decks use a relative path when possible.</p>
+          <p>SVG files use the Image path, including picker, replacement, fitting, reusable ownership, diagnostics, and export. The embedded vector subset does not render SVG <code class="inline-code">&lt;text&gt;</code>; convert type to paths first.</p>
+          <p>When an image or video is selected, Properties shows its effective <strong>IMAGE</strong> or <strong>VIDEO</strong> kind, its filename/path, and a separate <strong>Replace</strong> button. Click Replace, or press <kbd>Enter</kbd> while Properties is visible, to choose a new source through the same picker and path policy without changing the object's geometry, ID, ordering, or other properties. On reusable instances, an amber <strong>R</strong> beside a local source override restores the inherited image or video.</p>
+          <p>Both media kinds share <strong>Stretch</strong>, <strong>Fit</strong>, and <strong>Fill</strong> controls. Fit preserves the complete picture inside the box; Fill preserves aspect ratio while cropping to cover it. <code>FX</code> and <code>FY</code> choose the normalized focal position from <code>0</code> to <code>1</code>, and the panel shows natural pixels beside the authored box size.</p>
+          <p>Video Properties also has a <strong>Playback</strong> page for <strong>Auto</strong>, <strong>Loop</strong>, <strong>Mute</strong>, poster time and scrubbing, volume, and opacity. Poster changes select the still shown before playback; playback itself still begins at the start. Authored volume and mute are restored on slide entry, while presenter adjustments remain temporary for that visit. Amber <strong>R</strong> markers reset local source, Fit, focus, poster, volume, and playback-toggle overrides independently.</p>
+          <p>If media cannot load, Studio keeps a selectable fallback box while the filename and <strong>Replace</strong> action remain available. It distinguishes missing or unreadable files, unsupported image data, missing ffmpeg/ffprobe, probe or codec failures, and poster decode failures. Out-of-range or recoverable poster choices receive amber warnings without losing their pixels, and silent videos are identified without being treated as broken. These diagnostics are Studio chrome and do not enter presentation or export pixels.</p>
+          <p>Properties also exposes text alignment, rectangle radius, line stroke/direction/arrow heads, and exact clockwise <code class="inline-code">rotation=</code>. Drag the connected handle above a selected text, shape, image, video, or line object to rotate it; hold <kbd>Shift</kbd> for 15° steps. Painted hit testing, bounds, smart-guide targets, reusable/local ownership, morphing, Showtime, screenshots, and PDF export use the same rotation.</p>
 
           <h2>Studio editing controls</h2>
           <div class="table-wrap">
@@ -146,6 +175,7 @@
                 <tr><td><kbd>Space</kbd> + drag or middle-button drag</td><td>Pan the canvas directly.</td></tr>
                 <tr><td>Hold <kbd>Cmd/Ctrl</kbd> while dragging</td><td>Bypass the guides and grid snapping.</td></tr>
                 <tr><td>Hold <kbd>Shift</kbd> while resizing</td><td>Preserve the displayed aspect ratio.</td></tr>
+                <tr><td>Drag the handle above an object</td><td>Rotate clockwise around its effective center; hold <kbd>Shift</kbd> for 15° steps.</td></tr>
                 <tr><td>Hold <kbd>Alt</kbd> while editing a template item</td><td>Edit the shared definition.</td></tr>
               </tbody>
             </table>
@@ -158,6 +188,9 @@
               <tbody>
                 <tr><td><kbd>P</kbd></td><td>Show or hide the private Presenter pairing panel.</td></tr>
                 <tr><td><kbd>Shift</kbd> + <kbd>P</kbd></td><td>Unpair the phone and stop the Presenter server.</td></tr>
+                <tr><td><kbd>N</kbd> while pairing</td><td>Select another active network address and rotate the private capability.</td></tr>
+                <tr><td><kbd>L</kbd> while pairing</td><td>Copy the complete private link for an intentional laptop companion.</td></tr>
+                <tr><td><kbd>D</kbd></td><td>List, identify, and choose the projector display without guessing.</td></tr>
                 <tr><td><kbd>O</kbd></td><td>Open or lock the active Crowdplay poll.</td></tr>
                 <tr><td><kbd>V</kbd></td><td>Show or hide the poll results.</td></tr>
                 <tr><td><kbd>R</kbd></td><td>Reset the active poll votes.</td></tr>

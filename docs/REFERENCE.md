@@ -30,6 +30,23 @@ Run `rayslides --help` for the complete option list or `rayslides --version`
 for the version. A positional `.sld` path works before or after options; use
 `--` before a filename that itself begins with a hyphen.
 
+Run the same exact parser/renderer readiness pass used by Studio without
+opening a visible window:
+
+```sh
+rayslides --showtime-report=showtime.json talk.sld
+rayslides --portable-show=talk-portable talk.sld
+```
+
+`--showtime-report` writes stable JSON and exits nonzero when blockers exist,
+including malformed source. `--portable-show` refuses an existing directory,
+copies the deck to an ordinary `.sld`, copies every literal image, video, and
+custom-font dependency beneath `assets/`, resolves basename collisions with a
+stable suffix, and rewrites only those copied references. Rayslides then opens
+the copied deck through an independent parser, font set, and renderer and
+writes `showtime-report.json` inside the folder. The original document,
+history, selection, playback, and dirty state remain untouched.
+
 On macOS, an additional build step creates a self-contained application bundle
 without replacing or changing the CLI executable:
 
@@ -55,10 +72,6 @@ over a live preview of the rendered slide. The accepted workflow and remaining
 guardrails are recorded in the
 [Presenter Companion roadmap](../PRESENTER_COMPANION_ROADMAP.md).
 
-Missing but maybe coming soon:
-
-- SDF-based font scaling
-
 Missing but probably not coming soon:
 
 - PPTX Export
@@ -76,6 +89,7 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>S</kbd> | Screen-Shot current slide  to PNG |
 | <kbd>SHIFT</kbd> + <kbd>S</kbd> | Screen-Shot and export slideshow to PDF |
 | <kbd>F</kbd> | Toggle fullscreen |
+| <kbd>D</kbd> | Identify and choose the presentation display |
 | <kbd>L</kbd> | Toggle laserpointer |
 | <kbd>SHIFT</kbd> + <kbd>L</kbd> | Iterate laserpointer sizes |
 | <kbd>C</kbd> | Clear laserpointer drawing |
@@ -186,8 +200,63 @@ visible. <kbd>Enter</kbd> commits, <kbd>Tab</kbd> and
 line, and <kbd>Esc</kbd> cancels the draft. Invalid values remain focused with
 a field-local explanation; neither source nor history changes until validation
 succeeds. Long and multiline values scroll with the caret. Multi-selection
-shows truthful common/Mixed values but property mutation remains deliberately
-single-object and atomic.
+shows truthful common/Mixed values. Compatible common fields commit as one
+atomic source transaction; Studio refuses the complete edit when any selected
+owner is unsafe or the field does not apply to every item.
+
+For an image or video selection, the first Properties field identifies the
+effective media kind and shows its source path. Click the separate
+**Replace** button (or press <kbd>Enter</kbd> while Properties is visible) to
+choose a replacement through the same native picker/manual-entry and
+deck-relative path policy used for insertion. Replacement changes only
+`img=` or `vid=`: geometry, opacity, ordering, IDs, and other authored
+properties remain intact, and the edit is one ordinary Undo step. On a
+reusable instance, an amber **R** beside a locally overridden source removes
+only that `img=` or `vid=` override and restores the inherited asset.
+
+Image and video selections share the same sizing controls. **Stretch** uses
+the complete source to fill the authored box, **Fit** preserves its aspect
+ratio inside the box, and **Fill** preserves its aspect ratio while cropping
+enough to cover the box. `FX` and `FY` are normalized focal positions from `0`
+(left/top) through `1` (right/bottom), with `0.5` centered. Properties also
+shows the source's natural pixel dimensions beside the current box size.
+Video Properties has a second **Playback** page. It exposes **Auto**, **Loop**,
+and **Mute**, an exact poster-time field and duration-aware poster scrubber,
+and authored volume and opacity fields. Choosing a poster changes the still
+frame shown before playback, not the playback start position.
+The same amber **R** marker identifies and resets local Fit, focal-position,
+poster, volume, Auto, Loop, and Mute overrides without changing their shared
+definition.
+
+Text boxes expose horizontal `align=left|center|right` and vertical
+`valign=top|middle|bottom` alignment. Color-only rectangles expose `radius=`
+in logical pixels. Lines use `stroke_width=`, `direction=down|up`, and
+`arrow=none|start|end|both`; drag either endpoint on the canvas, or use the
+exact Properties fields. Press <kbd>L</kbd> for a plain line or <kbd>A</kbd>
+for an arrow.
+
+Eligible text, shape, image, video, and line objects expose `rotation=` in
+clockwise degrees around the object's effective center. Drag the connected
+handle above the selected object for direct rotation, and hold
+<kbd>Shift</kbd> for 15° steps; use **ROT** in Properties for an exact value.
+Hit testing, selection bounds, smart-guide targets, reusable/local ownership,
+morphing, Showtime, screenshots, and PDF export all use the painted rotation.
+
+If Studio cannot load an image or probe/decode a video, the missing media does
+not become unselectable. Studio keeps a source-sized fallback box on the
+canvas and leaves the filename and **Replace** action live in Properties.
+Diagnostics distinguish a missing or unreadable file, unsupported image data,
+missing ffmpeg/ffprobe, video probe or codec failure, and poster decode failure,
+and prescribe the relevant repair. An out-of-range poster is clamped to the
+last frame with an amber warning; a failed requested poster that can fall back
+uses the first frame. Videos without an audio stream are identified without
+being treated as broken. These repair overlays are authoring chrome and never
+appear in presentation or export pixels.
+
+SVG files use the same `img=` syntax, Image picker, sizing, Fit/Fill behavior,
+replacement, reuse, diagnostics, and export path as raster images. Rayslides'
+embedded NanoSVG subset renders vector shapes and paths deterministically but
+does not implement SVG `<text>`; convert text to paths before presenting.
 
 The top toolbar contains these one-shot canvas tools:
 
@@ -196,19 +265,31 @@ The top toolbar contains these one-shot canvas tools:
 | Select | <kbd>V</kbd> | Select, move, and resize an existing object |
 | Text | <kbd>T</kbd> | Click, then enter text for a new text box |
 | Bullets | <kbd>B</kbd> | Click, then enter one bullet per line |
-| Image | <kbd>I</kbd> | Click, then enter a path relative to the slide file |
+| Image | <kbd>I</kbd> | Click, then browse for an image or enter its path |
+| Video | <kbd>M</kbd> | Click, then browse for a video or enter its path |
 | Rectangle | <kbd>R</kbd> | Click to add a colored shape |
+| Line | <kbd>L</kbd> | Click to add a plain line; use <kbd>A</kbd> for an arrow |
 | Library | <kbd>U</kbd> | Click, then name an existing reusable `@push` element |
 
-Click an object and drag it to move it, or drag the cyan handle at its
-bottom-right corner to resize it. The arrow keys nudge the selection by one
+On macOS, Image and Video prompts include a native **Browse…** picker rooted at
+the saved deck's directory. Other platforms retain the portable path-entry
+prompt. A chosen file is stored relative to a saved deck when possible;
+untitled decks retain the selected path. While Studio is open, dropping a
+supported image or video file over the canvas creates the corresponding media
+item at the drop position through the same source/history transaction. Drop
+one media file per gesture so each addition remains one visible Undo step.
+
+Click an object and drag it to move it, drag the cyan handle at its
+bottom-right corner to resize it, or drag the connected handle above it to
+rotate it. The arrow keys nudge the selection by one
 logical pixel; hold <kbd>Shift</kbd> to nudge by ten. Moves and resizes snap to
 the slide and nearby object edges and centers, with magenta guides and a live
 `x/y/w/h` readout. Hold <kbd>Cmd/Ctrl</kbd> during a drag to bypass snapping,
 or press <kbd>G</kbd> to toggle the visible 20-pixel grid. Holding
 <kbd>Shift</kbd> while resizing preserves the displayed aspect ratio, including
-for auto-sized images. The property panel edits text, exact `x/y/w/h` values,
-font size, opacity, foreground and item-background colors, duplicates or
+for auto-sized images; while rotating it snaps to 15° steps. The property panel
+edits text, exact `x/y/w/h` values, font size, alignment, corner/stroke values,
+rotation, opacity, foreground and item-background colors, duplicates or
 deletes the object, promotes it for reuse, and aligns it to any slide edge or
 center. Numeric width and height fields change only the chosen dimension, so
 the other dimension of an auto-sized image remains automatic. Custom colors
@@ -289,8 +370,12 @@ deleting a SLIDE member removes dependent local and morph mutations atomically.
 Generated structures and GROUPs nested transitively inside slide templates are
 refused with an explanation instead of being partially rewritten. ITEM
 definitions remain one-object definitions, while geometry, text, colors, font
-size, opacity, visibility, and locking use the normal source-backed undo/redo
-path for every kind. **Ren** changes that
+size, opacity, visibility, locking, and the complete image/video Properties
+surface use the normal source-backed undo/redo path for every kind. A GROUP
+member selected in an ordinary slide is generated by its `@popgroup` use, so
+edit that shared member in Definition mode or choose **Detach**; in a morph
+scene, its qualified ID can receive an unambiguous state-local override.
+**Ren** changes that
 definition and its source-order-resolved uses; **Del** removes only unused
 ITEM or GROUP definitions. Slide-template deletion and definitions with live
 uses are deliberately refused. Later or shadowed definitions are absent
@@ -331,6 +416,17 @@ limits.
 which makes compact/default/large screenshot regression checks deterministic.
 `--diagnostics-command-tooltip` similarly holds the Commands hover card open
 for deterministic typography and containment QA across macOS Spaces.
+`--diagnostics-confirm-display=N` validates the one-based active-monitor number
+and drives the real display picker identify/confirm functions before the QA
+frame. Pair it with `--diagnostics-display-picker` to capture the selected and
+current monitor labels, or with `--diagnostics-showtime` to preflight the exact
+confirmed display. This is a diagnostics-only venue harness; ordinary users
+still identify and confirm displays interactively.
+`--diagnostics-presenter-session` starts Presenter with the private pairing
+screen, then automatically hides setup and enters normal presentation after an
+authenticated client begins polling. It is a browser-QA harness that exercises
+the production server, queues, and renderer without logging the capability;
+ordinary pairing remains explicitly controlled with <kbd>P</kbd>.
 `--diagnostics-precision-view` enables rulers, both safe areas, measurements,
 and a 110% canvas view for deterministic precision-surface QA; pair it with
 `--diagnostics-select=ID` to measure a specific authored object.
@@ -567,6 +663,44 @@ and motion as its text. It is deliberately a crisp duplicate-text shadow, not
 a blurred raster effect. As with other box attributes, place shadow attributes
 before `text=` on an inline `@box` or `@pop` directive.
 
+## Showtime: preflight the exact show
+
+Open Studio's command palette and choose **Showtime preflight**. The overlay
+audits every base scene, reveal endpoint, cumulative morph scene, reusable
+ITEM/GROUP/SLIDE definition, and the deterministic poster-frame render graph
+used by previews, screenshots, and PDF export. It does not navigate, seek,
+play media, edit source, change selection/history, or touch Crowdplay state.
+
+Showtime treats missing or undecodable presentation pixels, malformed source,
+missing runtime glyphs, and required unavailable services as blockers. It uses
+warnings for conditions that may be deliberate but deserve review, including
+overflow, off-canvas staging, absolute or parent-escaping asset paths,
+non-16:9/low-refresh displays, and an untested Presenter connection. Each
+render finding carries a slide, object, morph state, reusable definition, or
+source line when that identity exists. Select a finding and press
+<kbd>Enter</kbd> to open its slide/object or editable Library definition.
+
+The selected presentation display is the one previously confirmed with
+<kbd>D</kbd>. Showtime checks its resolution, aspect ratio, refresh, and vsync;
+Rayslides letterboxes without stretching. Presenter and Crowdplay listeners
+must bind before they are reported ready. The private companion periodically
+uploads only its bounded latency counts, median/p95 values, and failures to the
+local Presenter server. No notes, URL, capability, session identity, or client
+identity enters the Showtime report. Exercise navigation, Pointer, and Draw on
+the intended venue network so the report has representative evidence.
+
+Overlay controls are <kbd>↑</kbd>/<kbd>↓</kbd> or the mouse wheel to review,
+<kbd>Enter</kbd> to open the selected source target, <kbd>R</kbd> to rerun,
+<kbd>P</kbd> to create a portable folder, and <kbd>Esc</kbd> to close. Warnings
+do not prevent **Ready for show**; blockers do.
+
+**Create portable show** is also available directly from Commands. Rayslides
+copies literal `img=`, `vid=`, and custom `@font*` dependencies—including
+unused reusable definitions—into `assets/`, handles equal basenames
+deterministically, writes an ordinary readable `.sld`, then independently
+re-opens and preflights that copy. The destination must not already exist, so
+no folder is silently merged or overwritten.
+
 ## Presenter Companion: private notes and phone control
 
 Speaker notes are ordinary per-slide `.sld` source. They do not become slide
@@ -592,20 +726,71 @@ To present with a phone:
 
 1. If desired, enable the phone's hotspot and join it from the laptop first.
 2. Press <kbd>P</kbd>, or choose **Pair presenter phone** in Studio.
-3. Scan the private QR code. The embedded companion needs no installation,
+3. Check the detected interface and reachability note beneath the QR. Rayslides
+   prefers a physical private LAN over public, VPN, link-local, and loopback
+   addresses. Press <kbd>N</kbd> to choose another active address when the phone
+   is on a different interface.
+4. Scan the private QR code. The embedded companion needs no installation,
    account, Internet access, or externally hosted assets.
-4. Press <kbd>P</kbd> again to hide setup, enable display mirroring, and put
+5. Press <kbd>P</kbd> again to hide setup, enable display mirroring, and put
    rayslides fullscreen. The phone shows current/next notes, talk time,
    connection status, and large Previous/Next controls.
-5. Switch between **Notes**, **Pointer**, and **Draw** on the phone. Pointer and
+6. Switch between **Notes**, **Pointer**, and **Draw** on the phone. Pointer and
    Draw keep a compact copy of the current speaker notes below their controls, so
    you can glance at the script without leaving the active tool. Pointer shows
    a compact preview of the current rendered slide; touch and hold anywhere on
    it, drag the software laser, and lift to hide it. Draw mirrors normalized
    strokes onto the projected slide and provides a deliberate **Clear drawing**
-   button. Rotate the phone to landscape for a larger control surface.
-6. Press <kbd>Shift-P</kbd> to invalidate the pairing capability and stop the
+   button. Rotate the phone to landscape for a larger control surface. On short
+   landscape screens, Pointer and Draw intentionally collapse the header,
+   instructions, and compact notes so the complete 16:9 surface and Clear
+   action remain above the fixed navigation bar; switching back to Notes
+   restores the full notes layout.
+7. Press <kbd>Shift-P</kbd> to invalidate the pairing capability and stop the
    Presenter server. Simply hiding setup leaves the paired phone connected.
+
+For an extended-display laptop workflow, show pairing and press <kbd>L</kbd>.
+Rayslides copies the complete private link without printing or logging its
+capability. Paste it into a browser on the presenter laptop, then hide pairing.
+At viewport sizes of at least 900×600 pixels the same self-contained companion
+deliberately uses a laptop layout. Requiring laptop-like height keeps large
+phones in the phone layout when rotated to landscape. Current and next notes
+sit side by side, Pointer and Draw keep the slide surface beside the notes, and
+<kbd>←</kbd>/<kbd>→</kbd>,
+<kbd>Page Up</kbd>/<kbd>Page Down</kbd>, or <kbd>Space</kbd> navigate. Number
+keys <kbd>1</kbd>, <kbd>2</kbd>, and <kbd>3</kbd> select Notes, Pointer, and Draw.
+The link remains a private bearer capability; do not paste it into chat or a
+shared browser profile.
+
+Open **Connection health** at the bottom of the companion when rehearsing on a
+real venue network. It retains the newest 80 browser-to-laptop samples for state
+polling, commands, pointer updates, and drawing updates, and reports median,
+p95, sample count, and failures for each. The report contains no notes, pairing
+link, capability, or session identity. Measure after the phone has settled on
+the actual Wi-Fi or hotspot; the pointer/drawing numbers cover authenticated
+delivery to the laptop, while a camera or observer is still required to judge
+phone-to-projector pixels. While the pairing remains current, the browser also
+sends just those bounded numeric summaries back to the local Presenter server
+so Showtime can distinguish a merely running listener from a measured venue
+rehearsal. Re-pairing or stopping Presenter clears the retained summary.
+
+Opening a fresh QR in an existing Presenter tab is supported. The client
+detects the new capability fragment, reloads itself, and replaces the expired
+session instead of continuing to poll with the previous capability.
+
+Press <kbd>D</kbd> before going fullscreen to open **Choose presentation
+display**. The same action is available from Studio’s Commands menu. Rayslides
+lists every active monitor by its operating-system name, resolution, refresh
+rate, and desktop coordinates, while separately marking the saved selection and
+the screen that currently holds the window. It never labels an external screen
+“projector” on your behalf. Use <kbd>↑</kbd>/<kbd>↓</kbd> to select a row and
+<kbd>Space</kbd> to move the window there with a large identification label;
+press <kbd>Enter</kbd> to keep it or <kbd>Esc</kbd> to return to the previously
+confirmed display. Clicking a row identifies it; clicking the identified row a
+second time confirms it. If the picker was opened from fullscreen, confirm or
+cancel restores the same borderless or exclusive fullscreen mode on the chosen
+or previous display. A disconnected choice is clamped to an active display,
+and the window is aspect-preservingly reduced if it would not fit.
 
 Phone navigation enters the same main-thread playback functions as keyboard,
 mouse, and clicker input, preserving reveal animations, reversal, transitions,
@@ -627,9 +812,13 @@ started only by explicit pairing on port `7332`, with a random capability kept
 in the QR URL fragment. Notes, rendered previews, navigation, pointer updates,
 and drawing events exist only on the authenticated Presenter server and are
 absent from Crowdplay. Use `--presenter-host=HOST` to advertise a specific LAN
-address and `--presenter-port=PORT` to change its port. Windows requires an
-explicit LAN IP via `--presenter-host`; after changing networks, unpair and pair
-again. Local HTTP and an unguessable capability prevent accidental audience
+address and `--presenter-port=PORT` to change its port. Use an explicit override
+when native adapter discovery cannot see an intended policy-managed network.
+While Presenter is running, Rayslides checks active
+interfaces every 1.5 seconds. Switching from venue Wi-Fi to a phone hotspot
+rotates the session ID and private capability, invalidates the obsolete phone
+session, and prepares a fresh QR on the new address without changing the server
+port. Local HTTP and an unguessable capability prevent accidental audience
 access but do not defend against a malicious observer on an untrusted network.
 
 ## Crowdplay: live audience participation
@@ -715,7 +904,31 @@ Videos are placed like images, with the `vid=` attribute instead of `img=`:
 
 # show the frame at 6.2 seconds as the still before playback:
 @box vid=assets/demo.mp4 x=320 y=200 w=1280 poster=6.2
+
+# author the audio defaults used whenever the slide is entered:
+@box vid=assets/demo.mp4 x=320 y=200 w=1280 volume=0.65 muted
 ```
+
+## Image and video fitting
+
+Images and videos use identical box-fitting syntax. The backward-compatible
+default is `fit=stretch`; `contain` corresponds to Studio's **Fit** control and
+`cover` corresponds to **Fill**:
+
+```text
+# preserve the complete image and center any letterboxing:
+@box img=assets/portrait.png x=120 y=180 w=760 h=520 fit=contain
+
+# fill the video box, cropping around a point toward the right and bottom:
+@box vid=assets/demo.mp4 x=1040 y=180 w=760 h=520 fit=cover focus_x=0.75 focus_y=0.8
+```
+
+`focus_x=` and `focus_y=` accept normalized values from `0` through `1` and
+default to `0.5`. With `cover`, they select the retained crop; with `contain`,
+they position the fitted picture in any spare space. When neither dimension is
+authored the natural size is retained, and when only one dimension is authored
+the other follows the natural aspect ratio. Hold <kbd>Shift</kbd> during a
+Studio resize to preserve the current displayed aspect ratio.
 
 Decoding is delegated to [ffmpeg](https://ffmpeg.org), which must be installed
 (`brew install ffmpeg` on macOS); any format ffmpeg can read plays, including
@@ -723,13 +936,26 @@ Decoding is delegated to [ffmpeg](https://ffmpeg.org), which must be installed
 too.
 
 A video shows its first frame until it plays; `poster=SECONDS` picks a
-prettier still from anywhere in the video instead (PDF export and Studio show
-the same frame, and playback still starts at the beginning). Use <kbd>M</kbd> to
+prettier still from anywhere in the video instead (Studio slide cards,
+Library/Definition previews, Presenter preview, PNG screenshots, and PDF
+export show the same frame, and playback still starts at the beginning). These
+passive views use an immutable poster texture, so capturing or browsing them
+does not stop, seek, or rewind a video playing for the audience. Use <kbd>M</kbd> to
 play/pause the videos on the current slide and <kbd>Shift</kbd>+<kbd>M</kbd>
 to stop and rewind them; `autoplay` starts playback on slide entry. Leaving
 the slide stops all videos, and re-entering starts them from the beginning.
 `loop` restarts the video when it ends; without it, the last frame stays on
-screen. PDF export and Studio always show the poster frame.
+screen. `volume=` accepts a value from `0` through `1`; `muted` is shorthand
+for `muted=true`. These authored audio defaults are restored whenever the
+slide is entered. Presenter mute and volume changes remain temporary for the
+current visit to that slide. PDF export and Studio always show the poster
+frame.
+
+In Studio, select a video and open Properties, then use **Playback** to set
+**Auto**, **Loop**, **Mute**, poster time, and volume. The poster scrubber uses
+the probed duration and previews the selected still without changing where
+playback begins. Use **Layout** to return to the shared geometry, fitting, and
+focal-position controls.
 
 Moving the mouse into a video also reveals on-demand player controls:
 play/pause and stop buttons, a mute toggle with a volume slider (for videos
@@ -950,12 +1176,14 @@ backward pauses automatic progression and reverses the same interpolation.
 Changing direction during a morph continues from the current frame.
 
 Morphable properties include position and size (`x`, `y`, `w`, `h`),
-`fontsize`, foreground `color`, item background `bg`, `bullet_color`,
-`line_height`, `underline_width`, image `scale` and `ratio`, text-shadow
-properties, and `opacity` from `0` to `1`. Use `bg=#rrggbbaa` for a bounded
+`fontsize`, `rotation`, `radius`, text `align`/`valign`, line stroke/direction/
+arrows, media fit/focus/playback defaults, foreground `color`, item background
+`bg`, `bullet_color`, `line_height`, `underline_width`, image `scale` and
+`ratio`, text-shadow properties, and `opacity` from `0` to `1`. Use
+`bg=#rrggbbaa` for a bounded
 fill behind that item and `bg=none` to clear it; this is distinct from the
-slide-wide `@bg` directive. Text content and an existing image object's `img=`
-path may also change.
+slide-wide `@bg` directive. Text content and existing image/video `img=`/`vid=`
+paths may also change.
 Rayslides interpolates geometry, font size, colors, opacity, and shadows when
 the rendered content is compatible. Changed text, changed images, wrapping
 changes, new objects, and removed objects use a cross-fade instead, avoiding
@@ -1051,6 +1279,15 @@ Example of the current text format - see [test_public.sld](../testslides/test_pu
 
 # Only specify width (height auto-calculated to preserve aspect ratio):
 # @box img=some_image.png x=800 y=100 w=320
+
+# SVG uses the same image directive, picker, sizing, and fitting path:
+# @box img=diagram.svg x=1000 y=120 w=720 h=520 fit=contain
+
+# Rounded shapes and clockwise rotation are ordinary item attributes:
+# @box x=120 y=240 w=600 h=300 radius=36 rotation=-8 color=#245f78ff
+
+# Lines support stroke width, direction, and optional arrow heads:
+# @line x=760 y=300 w=540 h=180 stroke_width=8 direction=down arrow=end color=#ff5cc6ff
 
 @box x=100 y=100 w=1720 h=880 color=#FFFFFFFF
 Here come the bullets:

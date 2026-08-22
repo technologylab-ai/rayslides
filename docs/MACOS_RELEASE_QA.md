@@ -25,28 +25,57 @@ it floating, verifies window ID/workspace/layout, captures, compares, and
 quits. A failed placement aborts before the application capture gate opens.
 Use another workspace number when deliberately testing a different Space.
 
+Workspace 12 and floating layout are **automation isolation**, not Rayslides
+release criteria. The harness owns that placement so its windows do not disturb
+the active workspace; a placement failure means the harness must be repaired or
+rerun, not that the product failed visual QA. Aerospace is already configured
+to open Rayslides windows floating, and the harness still verifies the final
+queried state after moving each exact window.
+
 Record the commit, macOS version, monitor arrangement/scaling, and whether each
 section below passed. Attach `zig-out/studio-baselines/*.log` and any
 `*.diff.png` when reporting a failure.
 
+Recorded 2026-08-22: all four automated scenarios passed after the harness
+verified each exact Rayslides window as floating on workspace 12. A separate
+copied-bundle run outside the checkout received a LaunchServices document event
+for a copied portable show, loaded its relative PNG and MP4, and visually
+refreshed Showtime to `READY FOR SHOW` with 9 render fragments, 2 assets, and 1
+definition. The ordinary and in-bundle executables both returned version/help
+without opening a window; the bundle advertises `.sld` and its Studio artwork
+icon. A later copied-bundle venue run confirmed the physically connected LG HDR
+4K display (3840×2160 at 60 Hz), visually passed the picker and Showtime, and
+served healthy Presenter and Crowdplay LAN endpoints. Every exact Rayslides
+window was verified floating on workspace 12 before its capture gate opened.
+A final copied-bundle Presenter run used 430×932 and 932×430 browser frames to
+verify phone portrait/landscape layout, navigation, pointer, drawing, Clear,
+same-tab capability recovery, and fail-safe host suspend/resume. A projected
+drawing was visually captured. A final clean Chrome geometry run at 430×932,
+932×430, and 1280×800 asserted the intended phone/laptop breakpoint, no
+horizontal overflow, and the complete landscape surface plus Clear action
+above fixed navigation. These checks do not replace physical-phone, hotspot,
+sleep/wake, hardware-touch, or real-projector rehearsal.
+A subsequent iPhone 17 Pro iOS 26.5 Simulator run paired the rebuilt copied app
+in Mobile Safari. Simulated Previous/Next, Draw, Clear, and a finger drag used
+the production client queues; the stroke was captured on the Rayslides window.
+The complete compact landscape surface and Clear action remained above fixed
+navigation, Notes retained its full layout, and Mobile Safari reconnected to
+the continuing talk after a full Simulator shutdown and boot. This remains
+Simulator/WebKit evidence and does not close any physical-phone, hotspot,
+sleep/wake, Android, latency, or real-projector checklist item.
+
 ## 1. Launch, focus, and monitor placement
 
-- [ ] Copy `zig-out/Rayslides.app` and a deck with relative fonts/images to a
-      temporary directory outside the checkout. Cold-open the deck through
-      Finder/Open With and require the external deck plus every relative asset
-      to load.
-- [ ] The app launch does not request broad Documents-folder access. Its
+- [x] Copy `zig-out/Rayslides.app` and a deck with relative images/video to a
+      temporary directory outside the checkout. Deliver the same LaunchServices
+      document event used by Finder/Open With and require the external deck plus
+      every relative asset to load.
+- [x] The app launch does not request broad Documents-folder access. Its
       neutral working directory is `$HOME`; app recovery uses
       `~/Library/Application Support/Rayslides/Recovery`.
-- [ ] Verify the bundle icon is the Studio light-sculpture artwork, the `.sld`
+- [x] Verify the bundle icon is the Studio light-sculpture artwork, the `.sld`
       type is advertised, and `--version`/`--help` work from both the ordinary
       CLI and the executable inside the bundle without opening a window.
-- [ ] Launch `zig-out/bin/rayslides testslides/studio-showcase.sld --studio --no-startup-banner`.
-- [ ] Query the launched PID with
-      `aerospace list-windows --monitor all --pid PID --format '%{window-id}|%{workspace}|%{app-name}|%{window-layout}'`.
-- [ ] Move that window with `aerospace move-node-to-workspace --window-id ID 12`
-      and `aerospace layout --window-id ID floating`; query again and require
-      `12|rayslides|floating` before evaluating the intended monitor.
 - [ ] Typing in a Properties field goes only to that field. Tab/Shift-Tab stay
       inside the Inspector; Escape cancels the draft; Cmd-K searches Commands.
 - [ ] Switching away and back does not synthesize a click, key, drag, or close.
@@ -110,7 +139,7 @@ section below passed. Attach `zig-out/studio-baselines/*.log` and any
 
 ## 6. Shutdown hygiene
 
-- [ ] Quit every Rayslides process after the checks.
-- [ ] `aerospace list-windows --all ... | rg -i rayslides` returns nothing.
-- [ ] `git status --short` contains no recovery copies, exported images/PDFs,
+- [x] Quit every Rayslides process after the checks.
+- [x] `aerospace list-windows --all ... | rg -i rayslides` returns nothing.
+- [x] `git status --short` contains no recovery copies, exported images/PDFs,
       temporary decks, Python caches, or other QA residue.

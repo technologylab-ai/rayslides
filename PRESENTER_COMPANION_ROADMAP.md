@@ -1,5 +1,9 @@
 # Rayslides Presenter Companion roadmap
 
+The remaining venue-resilience work in this document is sequenced by the
+top-level [product roadmap](ROADMAP.md), which then feeds those completed
+runtime capabilities into Showtime preflight.
+
 Status: accepted product direction, 2026-08-19.
 
 This file records the intended presenter workflow and implementation order so
@@ -215,7 +219,7 @@ projected/exported pixels.
 
 - [x] Introduce presentation state independently from Crowdplay poll state.
 - [x] Add explicit Pair Phone/start/stop lifecycle and private QR rendering.
-- [ ] Detect usable local addresses and refresh pairing after switching between
+- [x] Detect usable local addresses and refresh pairing after switching between
   venue Wi-Fi and a presenter-phone hotspot.
 - [x] Embed and serve the responsive Notes UI with no external dependencies.
 - [x] Synchronize slide, visible step, current/next notes, timer, and connection
@@ -244,6 +248,8 @@ animations, reversals, transitions, retries, and reconnects.
   logical-slide mapping.
 - [ ] Measure HTTP motion delivery before choosing the persistent transport;
   optimize for low latency without weakening boundedness or cancellation.
+  The self-contained companion now keeps a bounded, secret-free median/p95
+  delivery report; representative physical-phone runs remain required.
 - [x] Add begin/move/end handling, latest-value-wins coalescing, rate limits,
   disconnect release, and local/remote input arbitration.
 - [ ] Complete physical-phone portrait/landscape rotation and projector
@@ -261,9 +267,9 @@ LAN latency is under 150 ms at the 95th percentile.
   queue and render them without triggering preview captures.
 - [x] Add clear, slide-change cleanup, lost-touch timeout, and local-control
   arbitration.
-- [ ] Let the same responsive companion run in a laptop browser for presenters
+- [x] Let the same responsive companion run in a laptop browser for presenters
   who intentionally use extended displays.
-- [ ] Consider projector selection/identification for the single rayslides
+- [x] Add projector selection/identification for the single rayslides
   window; do not infer that every external display is necessarily the beamer.
 
 Native multi-window presenter mode remains a separate future decision and is
@@ -276,6 +282,51 @@ The final workflow must be exercised with macOS screen mirroring, a physical
 phone, a representative clicker, animations, local drawing/laser input, phone
 sleep/wake, browser reload, Wi-Fi interruption, iPhone and Android hotspot
 routing, and a complete offline talk.
+
+Host/browser evidence recorded 2026-08-22: a fresh packaged-app QR paired with
+the embedded client; a suspended host produced `Reconnecting…` with navigation
+and pointer input disabled, retained the selected Draw mode and synchronized
+notes, and recovered to `Connected` without re-pairing when the host resumed.
+The tested desktop layout had no horizontal overflow. This narrows the software
+and live-host risk while leaving every physical-phone, hotspot, sleep/wake,
+latency, clicker, and projector check below intact.
+
+Phone-viewport browser evidence recorded 2026-08-22: the copied packaged client
+was exercised at 430×932 portrait and 932×430 landscape. Both remained in the
+phone layout, kept tabs and fixed navigation visible, and had no horizontal
+overflow; 1280×800 still selected the laptop layout. Browser-driven
+Previous/Next, Pointer, Draw, and Clear reached the production queues, with a
+projected stroke visually verified. The bounded report measured p95 delivery of
+2 ms for three commands, 4 ms for four pointer updates, and 46 ms for seven
+drawing updates. Host suspension disabled stale controls and release state at
+`Reconnecting…`; resume restored them. Fresh and rotated capability fragments
+also recover in an already-open tab. A final clean Chrome geometry pass at
+430×932, 932×430, and 1280×800 asserted the intended phone/laptop breakpoint,
+no horizontal overflow, and the complete landscape surface plus Clear action
+above fixed navigation. This covers responsive layout and browser event paths
+only, not hardware touch, hotspot routing, or phone-to-projector latency.
+
+Mobile Safari Simulator evidence recorded 2026-08-22: the rebuilt copied app
+paired with an iPhone 17 Pro iOS 26.5 Simulator. Native simulated taps and a
+finger drag exercised navigation, mode switching, Draw, Clear, and production
+projected-stroke delivery. Portrait retained the full phone workflow; short
+landscape Pointer/Draw used a compact workspace with the complete 16:9 surface
+and Clear action above fixed navigation, while Notes retained its normal
+content layout. Mobile Safari reconnected to the still-running talk after a
+full Simulator shutdown and boot and showed the continuing timer. This proves
+WebKit rendering plus simulated orientation, gesture, and process-lifecycle
+behavior; it does not prove a physical digitizer, actual phone sleep/wake,
+mobile Chrome, venue Wi-Fi/hotspot behavior, representative physical latency,
+or phone-to-projector pixels, so the physical-device boxes remain open.
+
+Second-display evidence recorded 2026-08-22: a copied packaged app invoked the
+production display identify/confirm path on the physically connected LG HDR 4K
+display (3840×2160 at 60 Hz) and preflighted it through Showtime. In the same
+LAN/display setup, the Presenter page and health endpoint returned 200, an
+unauthenticated state request returned 401, and the independent Crowdplay page
+and health endpoint returned 200. This completes the representative-display
+and combined-host boundary, but does not replace the remaining physical-phone
+latency, orientation, sleep/wake, hotspot, and real-projector rehearsal.
 
 The feature is complete when:
 

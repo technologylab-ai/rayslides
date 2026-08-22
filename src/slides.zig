@@ -125,9 +125,77 @@ pub const max_speaker_notes_bytes: usize = 8192;
 pub const SlideItemKind = enum {
     background,
     textbox,
+    line,
     img,
     vid,
     crowd,
+};
+
+/// Diagonal orientation inside a line item's normalized x/y/w/h bounds.
+/// `down` runs top-left to bottom-right; `up` runs bottom-left to top-right.
+pub const LineDirection = enum {
+    down,
+    up,
+};
+
+/// How an image or video is mapped when both authored box dimensions are
+/// explicit. `stretch` preserves historical Rayslides rendering, `contain`
+/// letterboxes inside the box, and `cover` fills it by cropping.
+pub const MediaFit = enum {
+    stretch,
+    contain,
+    cover,
+};
+
+/// Horizontal placement of laid-out text within its authored box.
+pub const TextAlignment = enum {
+    left,
+    center,
+    right,
+};
+
+/// Vertical placement of laid-out text within its authored box.
+pub const TextVerticalAlignment = enum {
+    top,
+    middle,
+    bottom,
+};
+
+/// Renderer-derived media health shared with Studio and, later, Showtime.
+/// Warning states still have deterministic pixels; unavailable states retain
+/// editor-only fallback geometry but emit no presentation placeholder.
+pub const MediaAvailability = enum {
+    ready,
+    image_unavailable,
+    image_file_missing,
+    image_file_unreadable,
+    image_decode_failed,
+    video_unavailable,
+    video_file_missing,
+    video_file_unreadable,
+    video_tools_missing,
+    video_probe_failed,
+    video_poster_decode_failed,
+    video_poster_out_of_range,
+    video_poster_fallback,
+
+    pub fn blocksPixels(self: MediaAvailability) bool {
+        return switch (self) {
+            .ready, .video_poster_out_of_range, .video_poster_fallback => false,
+            else => true,
+        };
+    }
+
+    pub fn isWarning(self: MediaAvailability) bool {
+        return self == .video_poster_out_of_range or self == .video_poster_fallback;
+    }
+};
+
+pub const MediaAudioAvailability = enum {
+    not_applicable,
+    unknown,
+    unavailable,
+    available,
 };
 
 pub const SlideItemError = error{
@@ -140,6 +208,8 @@ pub const SlideItemError = error{
     UnderlineWidthNull,
     BulletColorNull,
     BulletSymbolNull,
+    LineWidthInvalid,
+    RotationInvalid,
     CrowdSpecNull,
     CrowdIdNull,
     CrowdPromptNull,
@@ -214,7 +284,24 @@ pub const SourceRef = struct {
 /// without accidentally baking an instance-local value into every clone.
 pub const TemplateItemValues = struct {
     text: ?[]const u8 = null,
+    img_path: ?[]const u8 = null,
+    vid_path: ?[]const u8 = null,
+    media_fit: MediaFit = .stretch,
+    media_focus: rl.Vector2 = .{ .x = 0.5, .y = 0.5 },
+    vid_autoplay: bool = false,
+    vid_loop: bool = false,
+    vid_poster: ?f32 = null,
+    vid_volume: f32 = 1.0,
+    vid_muted: bool = false,
     font_size: ?i32 = null,
+    text_alignment: TextAlignment = .left,
+    text_vertical_alignment: TextVerticalAlignment = .top,
+    corner_radius: f32 = 0,
+    line_width: f32 = 4,
+    line_direction: LineDirection = .down,
+    line_arrow_start: bool = false,
+    line_arrow_end: bool = false,
+    rotation: f32 = 0,
     color: ?rl.Color = null,
     background_color: ?rl.Color = null,
     position: rl.Vector2 = .zero(),
@@ -270,6 +357,18 @@ pub const SlideItem = struct {
     text: ?[]const u8 = null,
     fontSize: ?i32 = null,
     line_height_factor: ?f32 = null,
+    text_alignment: TextAlignment = .left,
+    text_vertical_alignment: TextVerticalAlignment = .top,
+    /// Rounded-corner radius in logical slide pixels for color boxes/fills.
+    corner_radius: f32 = 0,
+    /// Line geometry uses the ordinary normalized position/size box. The
+    /// direction chooses which diagonal owns the two editable endpoints.
+    line_width: f32 = 4,
+    line_direction: LineDirection = .down,
+    line_arrow_start: bool = false,
+    line_arrow_end: bool = false,
+    /// Clockwise rotation in degrees around the item's effective box center.
+    rotation: f32 = 0,
     color: ?rl.Color = .blank,
     /// Optional fill behind this individual item. This is separate from an
     /// `@bg` slide-background item and does not affect item ordering.
@@ -280,6 +379,14 @@ pub const SlideItem = struct {
     vid_loop: bool = false,
     /// Timestamp (seconds) of the still shown before playback; 0 = frame 0.
     vid_poster: ?f32 = null,
+    /// Authored defaults are restored on slide entry; presenter overlay
+    /// adjustments remain temporary for the current visit to the slide.
+    vid_volume: f32 = 1.0,
+    vid_muted: bool = false,
+    media_fit: MediaFit = .stretch,
+    /// Normalized focal/alignment point. For `cover` it chooses the retained
+    /// crop; for `contain` it positions the letterboxed picture in its box.
+    media_focus: rl.Vector2 = .{ .x = 0.5, .y = 0.5 },
     position: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
     size: rl.Vector2 = .{ .x = 0.0, .y = 0.0 },
 
@@ -331,7 +438,24 @@ pub const SlideItem = struct {
     pub fn captureSharedTemplateValues(self: *SlideItem) void {
         self.shared_template_values = .{
             .text = self.text,
+            .img_path = self.img_path,
+            .vid_path = self.vid_path,
+            .media_fit = self.media_fit,
+            .media_focus = self.media_focus,
+            .vid_autoplay = self.vid_autoplay,
+            .vid_loop = self.vid_loop,
+            .vid_poster = self.vid_poster,
+            .vid_volume = self.vid_volume,
+            .vid_muted = self.vid_muted,
             .font_size = self.fontSize,
+            .text_alignment = self.text_alignment,
+            .text_vertical_alignment = self.text_vertical_alignment,
+            .corner_radius = self.corner_radius,
+            .line_width = self.line_width,
+            .line_direction = self.line_direction,
+            .line_arrow_start = self.line_arrow_start,
+            .line_arrow_end = self.line_arrow_end,
+            .rotation = self.rotation,
             .color = self.color,
             .background_color = self.background_color,
             .position = self.position,
@@ -353,7 +477,20 @@ pub const SlideItem = struct {
         if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
         if (context.vid_poster) |vid_poster| self.vid_poster = vid_poster;
+        if (context.vid_volume) |vid_volume| self.vid_volume = vid_volume;
+        if (context.vid_muted) |vid_muted| self.vid_muted = vid_muted;
+        if (context.media_fit) |media_fit| self.media_fit = media_fit;
+        if (context.media_focus_x) |focus_x| self.media_focus.x = focus_x;
+        if (context.media_focus_y) |focus_y| self.media_focus.y = focus_y;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
+        if (context.text_alignment) |alignment| self.text_alignment = alignment;
+        if (context.text_vertical_alignment) |alignment| self.text_vertical_alignment = alignment;
+        if (context.corner_radius) |radius| self.corner_radius = radius;
+        if (context.line_width) |width| self.line_width = width;
+        if (context.line_direction) |direction| self.line_direction = direction;
+        if (context.line_arrow_start) |enabled| self.line_arrow_start = enabled;
+        if (context.line_arrow_end) |enabled| self.line_arrow_end = enabled;
+        if (context.rotation) |rotation| self.rotation = rotation;
         if (context.color) |color| self.color = color;
         if (context.has_background_color) self.background_color = context.background_color;
         if (context.position) |position| self.position = position;
@@ -381,7 +518,20 @@ pub const SlideItem = struct {
         if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
         if (context.vid_poster) |vid_poster| self.vid_poster = vid_poster;
+        if (context.vid_volume) |vid_volume| self.vid_volume = vid_volume;
+        if (context.vid_muted) |vid_muted| self.vid_muted = vid_muted;
+        if (context.media_fit) |media_fit| self.media_fit = media_fit;
+        if (context.media_focus_x) |focus_x| self.media_focus.x = focus_x;
+        if (context.media_focus_y) |focus_y| self.media_focus.y = focus_y;
         if (context.fontSize) |fontsize| self.fontSize = fontsize;
+        if (context.text_alignment) |alignment| self.text_alignment = alignment;
+        if (context.text_vertical_alignment) |alignment| self.text_vertical_alignment = alignment;
+        if (context.corner_radius) |radius| self.corner_radius = radius;
+        if (context.line_width) |width| self.line_width = width;
+        if (context.line_direction) |direction| self.line_direction = direction;
+        if (context.line_arrow_start) |enabled| self.line_arrow_start = enabled;
+        if (context.line_arrow_end) |enabled| self.line_arrow_end = enabled;
+        if (context.rotation) |rotation| self.rotation = rotation;
         if (context.color) |color| self.color = color;
         if (context.has_background_color) self.background_color = context.background_color;
         if (context.position) |position| {
@@ -439,6 +589,9 @@ pub const SlideItem = struct {
 
         if (self.img_path == null and (self.kind == .img)) return SlideItemError.ImgPathNull;
         if (self.vid_path == null and (self.kind == .vid)) return SlideItemError.VidPathNull;
+        if (self.kind == .line and (!std.math.isFinite(self.line_width) or self.line_width <= 0))
+            return SlideItemError.LineWidthInvalid;
+        if (!std.math.isFinite(self.rotation)) return SlideItemError.RotationInvalid;
         if (self.kind == .background) {
             if (self.img_path == null and self.color == null) {
                 return SlideItemError.ColorNull;
@@ -506,6 +659,12 @@ pub const SlideItem = struct {
                 log.info(indent ++ " shadow: {any}", .{self.text_shadow});
                 log.info(indent ++ "opacity: {d}", .{self.opacity});
             },
+            .line => {
+                log.info(indent ++ "Kind: Line", .{});
+                log.info(indent ++ "   pos: {any}", .{self.position});
+                log.info(indent ++ "  size: {any}", .{self.size});
+                log.info(indent ++ " width: {d}", .{self.line_width});
+            },
             .crowd => {
                 log.info(indent ++ "Kind: Crowdplay", .{});
                 log.info(indent ++ "  spec: {any}", .{self.crowd});
@@ -524,6 +683,14 @@ pub const ItemContext = struct {
     text: ?[]const u8 = null,
     fontSize: ?i32 = null,
     line_height_factor: ?f32 = null,
+    text_alignment: ?TextAlignment = null,
+    text_vertical_alignment: ?TextVerticalAlignment = null,
+    corner_radius: ?f32 = null,
+    line_width: ?f32 = null,
+    line_direction: ?LineDirection = null,
+    line_arrow_start: ?bool = null,
+    line_arrow_end: ?bool = null,
+    rotation: ?f32 = null,
     color: ?rl.Color = null,
     /// Tri-state item fill: `has_background_color == false` means omitted,
     /// while true pairs with a color or null for `bg=none`.
@@ -534,6 +701,11 @@ pub const ItemContext = struct {
     vid_autoplay: ?bool = null,
     vid_loop: ?bool = null,
     vid_poster: ?f32 = null,
+    vid_volume: ?f32 = null,
+    vid_muted: ?bool = null,
+    media_fit: ?MediaFit = null,
+    media_focus_x: ?f32 = null,
+    media_focus_y: ?f32 = null,
     position: ?rl.Vector2 = null,
     size: ?rl.Vector2 = null,
     has_x: bool = false,
@@ -586,9 +758,22 @@ pub const ItemContext = struct {
         if (self.vid_poster == null) {
             if (other.vid_poster) |vid_poster| self.vid_poster = vid_poster;
         }
+        if (self.vid_volume == null) self.vid_volume = other.vid_volume;
+        if (self.vid_muted == null) self.vid_muted = other.vid_muted;
+        if (self.media_fit == null) self.media_fit = other.media_fit;
+        if (self.media_focus_x == null) self.media_focus_x = other.media_focus_x;
+        if (self.media_focus_y == null) self.media_focus_y = other.media_focus_y;
         if (self.fontSize == null) {
             if (other.fontSize) |fontsize| self.fontSize = fontsize;
         }
+        if (self.text_alignment == null) self.text_alignment = other.text_alignment;
+        if (self.text_vertical_alignment == null) self.text_vertical_alignment = other.text_vertical_alignment;
+        if (self.corner_radius == null) self.corner_radius = other.corner_radius;
+        if (self.line_width == null) self.line_width = other.line_width;
+        if (self.line_direction == null) self.line_direction = other.line_direction;
+        if (self.line_arrow_start == null) self.line_arrow_start = other.line_arrow_start;
+        if (self.line_arrow_end == null) self.line_arrow_end = other.line_arrow_end;
+        if (self.rotation == null) self.rotation = other.rotation;
         if (self.color == null) {
             if (other.color) |color| self.color = color;
         }

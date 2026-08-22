@@ -12,6 +12,7 @@ pub const Kind = enum {
     bullets,
     speaker_notes,
     image_path,
+    video_path,
     reusable_name,
     coordinate,
     dimension,
@@ -19,6 +20,7 @@ pub const Kind = enum {
     font_size,
     opacity,
     document_path,
+    portable_folder,
 };
 
 pub const Outcome = enum {
@@ -139,7 +141,7 @@ pub const Prompt = struct {
         self: *Prompt,
         screen_size: rl.Vector2,
         ui_font: rl.Font,
-        image_browse_available: bool,
+        media_browse_available: bool,
     ) Outcome {
         if (!self.active) return .none;
         const layout = promptLayout(screen_size);
@@ -148,14 +150,14 @@ pub const Prompt = struct {
             .ibeam
         else if (!self.notice.blocksEditing() and pointInRectangle(pointer, layout.commit))
             .pointing_hand
-        else if (image_browse_available and self.kind == .image_path and pointInRectangle(pointer, layout.browse))
+        else if (media_browse_available and kindIsMediaPath(self.kind) and pointInRectangle(pointer, layout.browse))
             .pointing_hand
         else
             .arrow);
         if (rl.isMouseButtonPressed(.left)) {
             if (!self.notice.blocksEditing() and pointInRectangle(pointer, layout.commit))
                 return self.submit();
-            if (image_browse_available and self.kind == .image_path and
+            if (media_browse_available and kindIsMediaPath(self.kind) and
                 pointInRectangle(pointer, layout.browse))
                 return .browse_requested;
             if (!self.notice.blocksEditing() and pointInRectangle(pointer, layout.editor)) {
@@ -279,7 +281,7 @@ pub const Prompt = struct {
         self: *const Prompt,
         screen_size: rl.Vector2,
         ui_font: rl.Font,
-        image_browse_available: bool,
+        media_browse_available: bool,
     ) void {
         if (!self.active) return;
         rl.drawRectangle(0, 0, @intFromFloat(screen_size.x), @intFromFloat(screen_size.y), .{ .r = 2, .g = 5, .b = 12, .a = 175 });
@@ -335,7 +337,7 @@ pub const Prompt = struct {
         if (self.noticeMessage()) |message| {
             rl.drawTextEx(ui_font, message, .{ .x = panel.x + 24, .y = panel.y + panel.height - 36 }, 16, 0, .{ .r = 255, .g = 184, .b = 92, .a = 255 });
         }
-        if (image_browse_available and self.kind == .image_path) {
+        if (media_browse_available and kindIsMediaPath(self.kind)) {
             const hovered = pointInRectangle(rl.getMousePosition(), layout.browse);
             rl.drawRectangleRec(layout.browse, if (hovered)
                 .{ .r = 34, .g = 92, .b = 109, .a = 255 }
@@ -825,6 +827,7 @@ fn promptTitle(kind: Kind) [:0]const u8 {
         .bullets => "Edit bullet list",
         .speaker_notes => "Edit speaker notes",
         .image_path => "Choose image",
+        .video_path => "Choose video",
         .reusable_name => "Name reusable or template",
         .coordinate => "Set coordinate",
         .dimension => "Set object size",
@@ -832,6 +835,7 @@ fn promptTitle(kind: Kind) [:0]const u8 {
         .font_size => "Set font size",
         .opacity => "Set opacity",
         .document_path => "Name and save your deck",
+        .portable_folder => "Create portable show folder",
     };
 }
 
@@ -840,9 +844,23 @@ fn kindIsMultiline(kind: Kind) bool {
         kind == .bullets or kind == .speaker_notes;
 }
 
+fn kindIsMediaPath(kind: Kind) bool {
+    return kind == .image_path or kind == .video_path;
+}
+
+test "image and video prompts share browsing but retain specific copy" {
+    try std.testing.expect(kindIsMediaPath(.image_path));
+    try std.testing.expect(kindIsMediaPath(.video_path));
+    try std.testing.expect(!kindIsMediaPath(.document_path));
+    try std.testing.expectEqualStrings("Choose image", promptTitle(.image_path));
+    try std.testing.expectEqualStrings("Choose video", promptTitle(.video_path));
+    try std.testing.expect(std.mem.indexOf(u8, promptHint(.image_path), "image") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promptHint(.video_path), "video") != null);
+}
+
 fn promptCommitLabel(kind: Kind) [:0]const u8 {
     if (kindIsMultiline(kind)) return "COMMIT";
-    return if (kind == .document_path) "SAVE" else "OK";
+    return if (kind == .document_path) "SAVE" else if (kind == .portable_folder) "CREATE" else "OK";
 }
 
 fn promptHint(kind: Kind) [:0]const u8 {
@@ -852,6 +870,7 @@ fn promptHint(kind: Kind) [:0]const u8 {
         .bullets => "Enter adds a line · COMMIT applies changes · One item per line",
         .speaker_notes => "Enter adds a line · COMMIT applies private notes",
         .image_path => "Browse for an image or enter a path relative to the slide file · Enter commits · Esc cancels",
+        .video_path => "Browse for a video or enter a path relative to the slide file · Enter commits · Esc cancels",
         .reusable_name => "Use letters, numbers, '_' or '-' · Enter commits · Esc cancels",
         .coordinate => "Logical slide pixels · decimals and negative values are allowed · Enter commits",
         .dimension => "Logical slide pixels · use a positive value · Enter commits",
@@ -859,6 +878,7 @@ fn promptHint(kind: Kind) [:0]const u8 {
         .font_size => "Positive whole-number pixels · Enter commits · Esc cancels",
         .opacity => "Use 0–1 or 0–100% · transparent items remain selectable in Objects",
         .document_path => "Relative or absolute .sld path · Enter saves · Esc keeps it untitled",
+        .portable_folder => "New empty folder path · assets and a normal .sld copy will be created · Esc cancels",
     };
 }
 

@@ -11,9 +11,12 @@ plain-text `.sld` source. Both views stay in sync.
 With Rayslides, you can:
 
 - edit slides directly and reuse items;
+- author raster/SVG images, videos, rounded shapes, lines, arrows, aligned
+  text, and rotated objects through source-backed Studio controls;
 - add reveals, transitions, and semantic morph states;
 - read private notes and control a deck from a phone;
 - run Crowdplay polls on the local network;
+- preflight the exact deck and create a verified portable show folder;
 - save PNG screenshots and export a PDF; and
 - build native programs for macOS, Linux, and Windows.
 
@@ -33,12 +36,26 @@ Run the program without a file to open Studio's new-deck chooser. Use
 zig-out/bin/rayslides --studio talk.sld
 ```
 
+Before travel, run Showtime from Studio's Commands menu, write a CI-friendly
+report, or create a portable copy with ordinary source and assets:
+
+```sh
+zig-out/bin/rayslides --showtime-report=showtime.json talk.sld
+zig-out/bin/rayslides --portable-show=talk-portable talk.sld
+```
+
+Blockers make either command exit nonzero. The portable command refuses an
+existing destination, rewrites copied asset references under `assets/`, then
+re-opens and preflights the copy before it succeeds.
+
 During development, use `zig build run -- talk.sld`. On macOS,
 `zig build -Doptimize=ReleaseSafe macos-app` also creates
 `zig-out/Rayslides.app`.
 
 ## Documentation
 
+- [Follow the active product roadmap](ROADMAP.md)
+- [Read the unreleased four-topic release notes](RELEASE_NOTES.md)
 - [Explore the visual guide](https://technologylab-ai.github.io/rayslides/)
 - [Create your first deck](https://technologylab-ai.github.io/rayslides/getting-started.html)
 - [Learn the Studio interface](https://technologylab-ai.github.io/rayslides/studio.html)

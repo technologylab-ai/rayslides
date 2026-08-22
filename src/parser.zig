@@ -348,7 +348,14 @@ fn buildReusableGroupMember(
     };
     item.applySlideDefaultsIfNecessary(context.current_slide);
     item.applySlideShowDefaultsIfNecessary(context.slideshow);
-    item.kind = if (item.img_path != null) .img else if (item.vid_path != null) .vid else .textbox;
+    item.kind = if (std.mem.eql(u8, item_context.directive, "@line"))
+        .line
+    else if (item.img_path != null)
+        .img
+    else if (item.vid_path != null)
+        .vid
+    else
+        .textbox;
     item.sanityCheck() catch |err| {
         reportErrorInParsingContext(err, item_context, context, "reusable-group member sanity check failed");
         builder.valid = false;
@@ -380,6 +387,7 @@ fn commitReusableGroupParsingContext(builder: *ReusableGroupBuilder, context: *P
     }
 
     if (!std.mem.eql(u8, item_context.directive, "@box") and
+        !std.mem.eql(u8, item_context.directive, "@line") and
         !std.mem.eql(u8, item_context.directive, "@pop"))
     {
         builder.valid = false;
@@ -468,11 +476,12 @@ fn processReusableGroupLine(line: []const u8, context: *ParserContext) !void {
         return;
     }
     if (!std.mem.eql(u8, directive, "@box") and
+        !std.mem.eql(u8, directive, "@line") and
         !std.mem.eql(u8, directive, "@pop") and
         !std.mem.eql(u8, directive, "@anim") and
         !(std.mem.startsWith(u8, directive, "@anim(") and std.mem.endsWith(u8, directive, ")")))
     {
-        reportErrorInContext(ParserError.Syntax, context, "only literal @box/@pop members and their @anim are allowed in a reusable group");
+        reportErrorInContext(ParserError.Syntax, context, "only literal @box/@line/@pop members and their @anim are allowed in a reusable group");
         builder.valid = false;
         return;
     }
@@ -1121,6 +1130,104 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.fontSize = size;
                     }
                 }
+                if (std.mem.eql(u8, attrname, "radius")) {
+                    if (attr_it.next()) |radiusstr| {
+                        const radius = std.fmt.parseFloat(f32, radiusstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse radius=");
+                            continue;
+                        };
+                        if (!std.math.isFinite(radius) or radius < 0) {
+                            reportErrorInContext(ParserError.Syntax, context, "radius= must be zero or greater");
+                            continue;
+                        }
+                        item_context.corner_radius = radius;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "stroke_width")) {
+                    if (attr_it.next()) |widthstr| {
+                        const width = std.fmt.parseFloat(f32, widthstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse stroke_width=");
+                            continue;
+                        };
+                        if (!std.math.isFinite(width) or width <= 0) {
+                            reportErrorInContext(ParserError.Syntax, context, "stroke_width= must be greater than zero");
+                            continue;
+                        }
+                        item_context.line_width = width;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "direction")) {
+                    if (attr_it.next()) |direction| {
+                        item_context.line_direction = if (std.mem.eql(u8, direction, "down"))
+                            .down
+                        else if (std.mem.eql(u8, direction, "up"))
+                            .up
+                        else invalid: {
+                            reportErrorInContext(ParserError.Syntax, context, "direction= must be down or up");
+                            break :invalid null;
+                        };
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "arrow")) {
+                    if (attr_it.next()) |heads| {
+                        if (std.mem.eql(u8, heads, "none")) {
+                            item_context.line_arrow_start = false;
+                            item_context.line_arrow_end = false;
+                        } else if (std.mem.eql(u8, heads, "start")) {
+                            item_context.line_arrow_start = true;
+                            item_context.line_arrow_end = false;
+                        } else if (std.mem.eql(u8, heads, "end")) {
+                            item_context.line_arrow_start = false;
+                            item_context.line_arrow_end = true;
+                        } else if (std.mem.eql(u8, heads, "both")) {
+                            item_context.line_arrow_start = true;
+                            item_context.line_arrow_end = true;
+                        } else {
+                            reportErrorInContext(ParserError.Syntax, context, "arrow= must be none, start, end, or both");
+                        }
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "rotation")) {
+                    if (attr_it.next()) |rotationstr| {
+                        const rotation = std.fmt.parseFloat(f32, rotationstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse rotation=");
+                            continue;
+                        };
+                        if (!std.math.isFinite(rotation)) {
+                            reportErrorInContext(ParserError.Syntax, context, "rotation= must be a finite number of degrees");
+                            continue;
+                        }
+                        item_context.rotation = rotation;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "align")) {
+                    if (attr_it.next()) |alignment| {
+                        item_context.text_alignment = if (std.mem.eql(u8, alignment, "left"))
+                            .left
+                        else if (std.mem.eql(u8, alignment, "center"))
+                            .center
+                        else if (std.mem.eql(u8, alignment, "right"))
+                            .right
+                        else invalid: {
+                            reportErrorInContext(ParserError.Syntax, context, "align= must be left, center, or right");
+                            break :invalid null;
+                        };
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "valign")) {
+                    if (attr_it.next()) |alignment| {
+                        item_context.text_vertical_alignment = if (std.mem.eql(u8, alignment, "top"))
+                            .top
+                        else if (std.mem.eql(u8, alignment, "middle"))
+                            .middle
+                        else if (std.mem.eql(u8, alignment, "bottom"))
+                            .bottom
+                        else invalid: {
+                            reportErrorInContext(ParserError.Syntax, context, "valign= must be top, middle, or bottom");
+                            break :invalid null;
+                        };
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "color")) {
                     if (attr_it.next()) |colorstr| {
                         const color = parseColorLiteral(colorstr, context) catch |err| {
@@ -1290,6 +1397,46 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                             continue;
                         };
                         item_context.vid_poster = poster_val;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "volume")) {
+                    if (attr_it.next()) |volume_str| {
+                        const volume = std.fmt.parseFloat(f32, volume_str) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse volume=");
+                            continue;
+                        };
+                        if (!std.math.isFinite(volume) or volume < 0 or volume > 1) {
+                            reportErrorInContext(ParserError.Syntax, context, "volume= must be between 0 and 1");
+                            continue;
+                        }
+                        item_context.vid_volume = volume;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "muted")) {
+                    item_context.vid_muted = boolFromAttrValue(attr_it.next());
+                }
+                if (std.mem.eql(u8, attrname, "fit")) {
+                    if (attr_it.next()) |fitstr| {
+                        item_context.media_fit = mediaFitFromLiteral(fitstr) orelse {
+                            reportErrorInContext(ParserError.Syntax, context, "fit= must be stretch, contain, or cover");
+                            continue;
+                        };
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "focus_x") or std.mem.eql(u8, attrname, "focus_y")) {
+                    if (attr_it.next()) |focusstr| {
+                        const focus = std.fmt.parseFloat(f32, focusstr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse media focus coordinate");
+                            continue;
+                        };
+                        if (!std.math.isFinite(focus) or focus < 0 or focus > 1) {
+                            reportErrorInContext(ParserError.Syntax, context, "focus_x=/focus_y= must be between 0 and 1");
+                            continue;
+                        }
+                        if (std.mem.eql(u8, attrname, "focus_x"))
+                            item_context.media_focus_x = focus
+                        else
+                            item_context.media_focus_y = focus;
                     }
                 }
                 if (std.mem.eql(u8, attrname, "scale")) {
@@ -1482,10 +1629,25 @@ fn boolFromAttrValue(value: ?[]const u8) bool {
     return !(std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no") or std.mem.eql(u8, v, "0"));
 }
 
+fn mediaFitFromLiteral(value: []const u8) ?slides.MediaFit {
+    if (std.mem.eql(u8, value, "stretch")) return .stretch;
+    if (std.mem.eql(u8, value, "contain") or std.mem.eql(u8, value, "fit")) return .contain;
+    if (std.mem.eql(u8, value, "cover") or std.mem.eql(u8, value, "fill")) return .cover;
+    return null;
+}
+
 fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_context: *slides.ItemContext) void {
     if (parsing_item_context.id == null) parsing_item_context.id = item_context.id;
     if (parsing_item_context.text == null) parsing_item_context.text = item_context.text;
     if (parsing_item_context.fontSize == null) parsing_item_context.fontSize = item_context.fontSize;
+    if (parsing_item_context.text_alignment == null) parsing_item_context.text_alignment = item_context.text_alignment;
+    if (parsing_item_context.text_vertical_alignment == null) parsing_item_context.text_vertical_alignment = item_context.text_vertical_alignment;
+    if (parsing_item_context.corner_radius == null) parsing_item_context.corner_radius = item_context.corner_radius;
+    if (parsing_item_context.line_width == null) parsing_item_context.line_width = item_context.line_width;
+    if (parsing_item_context.line_direction == null) parsing_item_context.line_direction = item_context.line_direction;
+    if (parsing_item_context.line_arrow_start == null) parsing_item_context.line_arrow_start = item_context.line_arrow_start;
+    if (parsing_item_context.line_arrow_end == null) parsing_item_context.line_arrow_end = item_context.line_arrow_end;
+    if (parsing_item_context.rotation == null) parsing_item_context.rotation = item_context.rotation;
     if (parsing_item_context.color == null) parsing_item_context.color = item_context.color;
     if (!parsing_item_context.has_background_color and item_context.has_background_color) {
         parsing_item_context.background_color = item_context.background_color;
@@ -1522,6 +1684,11 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     if (parsing_item_context.vid_autoplay == null) parsing_item_context.vid_autoplay = item_context.vid_autoplay;
     if (parsing_item_context.vid_loop == null) parsing_item_context.vid_loop = item_context.vid_loop;
     if (parsing_item_context.vid_poster == null) parsing_item_context.vid_poster = item_context.vid_poster;
+    if (parsing_item_context.vid_volume == null) parsing_item_context.vid_volume = item_context.vid_volume;
+    if (parsing_item_context.vid_muted == null) parsing_item_context.vid_muted = item_context.vid_muted;
+    if (parsing_item_context.media_fit == null) parsing_item_context.media_fit = item_context.media_fit;
+    if (parsing_item_context.media_focus_x == null) parsing_item_context.media_focus_x = item_context.media_focus_x;
+    if (parsing_item_context.media_focus_y == null) parsing_item_context.media_focus_y = item_context.media_focus_y;
     if (parsing_item_context.underline_width == null) parsing_item_context.underline_width = item_context.underline_width;
     if (parsing_item_context.line_height_factor == null) parsing_item_context.line_height_factor = item_context.line_height_factor;
     if (parsing_item_context.bullet_color == null) parsing_item_context.bullet_color = item_context.bullet_color;
@@ -1801,6 +1968,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
     }
 
     const consumes_pending_animation = std.mem.eql(u8, parsing_item_context.directive, "@box") or
+        std.mem.eql(u8, parsing_item_context.directive, "@line") or
         std.mem.eql(u8, parsing_item_context.directive, "@pop") or
         std.mem.eql(u8, parsing_item_context.directive, "@bg") or
         std.mem.eql(u8, parsing_item_context.directive, "@crowd");
@@ -1979,6 +2147,11 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
         return;
     }
 
+    if (std.mem.eql(u8, parsing_item_context.directive, "@line")) {
+        _ = try commitItemToSlide(parsing_item_context, context);
+        return;
+    }
+
     if (std.mem.eql(u8, parsing_item_context.directive, "@crowd")) {
         if (context.active_morph_state != null) {
             reportErrorInParsingContext(
@@ -2030,7 +2203,9 @@ fn commitItemToSlide(parsing_item_context: *slides.ItemContext, parser_context: 
     parser_context.current_slide.next_item_identity += 1;
     slide_item.applySlideDefaultsIfNecessary(parser_context.*.current_slide);
     slide_item.applySlideShowDefaultsIfNecessary(parser_context.slideshow);
-    if (slide_item.img_path != null) {
+    if (std.mem.eql(u8, parsing_item_context.directive, "@line")) {
+        slide_item.kind = .line;
+    } else if (slide_item.img_path != null) {
         slide_item.kind = .img;
     } else if (slide_item.vid_path != null) {
         slide_item.kind = .vid;
@@ -2208,6 +2383,368 @@ test "animation annotations and slide transitions are parsed" {
     const inline_animation = second_slide.items.?.items[1].animation.?;
     try std.testing.expectEqual(animation.Effect.slide_right, inline_animation.effect);
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), inline_animation.duration, 0.0001);
+}
+
+test "image and video share fit fill crop and focal source semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        \\@slide
+        \\@box id=image img=assets/hero.png x=10 y=20 w=400 h=400 fit=contain focus_x=0.25 focus_y=0.75
+        \\@box id=video vid=assets/demo.mp4 x=500 y=20 w=400 h=400 fit=fill focus_x=1 focus_y=0 poster=1 volume=0.65 autoplay loop muted
+        \\@state(morph)
+        \\@set image fit=cover focus_y=0.1
+        \\@set video volume=0.4 autoplay=false loop=false muted=false
+    ;
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = slideshow.slides.items[0];
+    const image = slide.items.?.items[0];
+    const video = slide.items.?.items[1];
+    try std.testing.expectEqual(slides.MediaFit.contain, image.media_fit);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), image.media_focus.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), image.media_focus.y, 0.0001);
+    try std.testing.expectEqual(slides.MediaFit.cover, video.media_fit);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), video.media_focus.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), video.media_focus.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), video.vid_volume, 0.0001);
+    try std.testing.expect(video.vid_autoplay);
+    try std.testing.expect(video.vid_loop);
+    try std.testing.expect(video.vid_muted);
+    const morphed_image = slide.morph_states.items[0].items.items[0];
+    try std.testing.expectEqual(slides.MediaFit.cover, morphed_image.media_fit);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), morphed_image.media_focus.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), morphed_image.media_focus.y, 0.0001);
+    const morphed_video = slide.morph_states.items[0].items.items[1];
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), morphed_video.vid_volume, 0.0001);
+    try std.testing.expect(!morphed_video.vid_autoplay);
+    try std.testing.expect(!morphed_video.vid_loop);
+    try std.testing.expect(!morphed_video.vid_muted);
+}
+
+test "text alignment inherits and morphs through reusable content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        \\@box id=caption x=10 y=20 w=400 h=200 align=center valign=middle text=Shared
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set caption align=right valign=bottom
+        \\@state(morph)
+        \\@set caption align=left valign=top
+    ;
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const shared = context.push_slides.get("layout").?.items.?.items[0];
+    try std.testing.expectEqual(slides.TextAlignment.center, shared.text_alignment);
+    try std.testing.expectEqual(slides.TextVerticalAlignment.middle, shared.text_vertical_alignment);
+    try std.testing.expectEqual(slides.TextAlignment.center, shared.sharedTemplateValues().?.text_alignment);
+    try std.testing.expectEqual(slides.TextVerticalAlignment.middle, shared.sharedTemplateValues().?.text_vertical_alignment);
+
+    const instance = slideshow.slides.items[0];
+    try std.testing.expectEqual(slides.TextAlignment.right, instance.items.?.items[0].text_alignment);
+    try std.testing.expectEqual(slides.TextVerticalAlignment.bottom, instance.items.?.items[0].text_vertical_alignment);
+    try std.testing.expectEqual(slides.TextAlignment.left, instance.morph_states.items[0].items.items[0].text_alignment);
+    try std.testing.expectEqual(slides.TextVerticalAlignment.top, instance.morph_states.items[0].items.items[0].text_vertical_alignment);
+}
+
+test "invalid text alignment values are diagnosed" {
+    const cases = [_][]const u8{
+        "@slide\n@box align=wide text=Nope\n",
+        "@slide\n@box valign=center text=Nope\n",
+    };
+    for (cases) |input| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const slideshow = try slides.SlideShow.new(allocator);
+        const context = try constructSlidesFromBuf(input, slideshow, allocator);
+        defer context.deinit();
+        try std.testing.expect(context.parser_errors.items.len > 0);
+    }
+}
+
+test "rounded corners inherit and morph through reusable content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        \\@box id=card x=10 y=20 w=400 h=200 radius=24 color=#224466ff
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set card radius=40
+        \\@state(morph)
+        \\@set card radius=64
+    ;
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const shared = context.push_slides.get("layout").?.items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 24), shared.corner_radius, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 24), shared.sharedTemplateValues().?.corner_radius, 0.0001);
+    const slide = slideshow.slides.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 40), slide.items.?.items[0].corner_radius, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 64), slide.morph_states.items[0].items.items[0].corner_radius, 0.0001);
+}
+
+test "negative and non-finite corner radii are diagnosed" {
+    const cases = [_][]const u8{
+        "@slide\n@box radius=-1 color=#224466ff\n",
+        "@slide\n@box radius=nan color=#224466ff\n",
+    };
+    for (cases) |input| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const slideshow = try slides.SlideShow.new(allocator);
+        const context = try constructSlidesFromBuf(input, slideshow, allocator);
+        defer context.deinit();
+        try std.testing.expect(context.parser_errors.items.len > 0);
+    }
+}
+
+test "rotation inherits through reusable content and morphs semantically" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        \\@box id=card x=10 y=20 w=400 h=200 rotation=-15 color=#224466ff
+        \\@pushslide layout
+        \\@popslide layout
+        \\@set card rotation=30
+        \\@state(morph)
+        \\@set card rotation=95
+    ;
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const shared = context.push_slides.get("layout").?.items.?.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, -15), shared.rotation, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -15), shared.sharedTemplateValues().?.rotation, 0.0001);
+    const slide = slideshow.slides.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 30), slide.items.?.items[0].rotation, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 95), slide.morph_states.items[0].items.items[0].rotation, 0.0001);
+}
+
+test "non-finite rotation is diagnosed" {
+    const cases = [_][]const u8{
+        "@slide\n@box rotation=nan color=#224466ff\n",
+        "@slide\n@line rotation=inf color=#224466ff\n",
+    };
+    for (cases) |input| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const slideshow = try slides.SlideShow.new(allocator);
+        const context = try constructSlidesFromBuf(input, slideshow, allocator);
+        defer context.deinit();
+        try std.testing.expect(context.parser_errors.items.len > 0);
+    }
+}
+
+test "lines parse directly and retain stroke direction and arrow semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        \\@slide
+        \\@line id=connector x=100 y=120 w=600 h=0 stroke_width=7 direction=up arrow=both color=#33ccffff
+    ;
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const item = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SlideItemKind.line, item.kind);
+    try std.testing.expectEqualStrings("connector", item.id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), item.line_width, 0.0001);
+    try std.testing.expectEqual(slides.LineDirection.up, item.line_direction);
+    try std.testing.expect(item.line_arrow_start);
+    try std.testing.expect(item.line_arrow_end);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), item.size.y, 0.0001);
+}
+
+test "lines compose through reusable groups and semantic morph states" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        \\@pushgroup connector
+        \\@line id=stem x=40 y=50 w=300 h=160 stroke_width=3 direction=down arrow=end color=#ffffffff
+        \\@endgroup
+        \\@slide
+        \\@popgroup connector id=first
+        \\@state(morph)
+        \\@set first.stem stroke_width=9 direction=up arrow=both
+    ;
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = slideshow.slides.items[0];
+    const base = slide.items.?.items[0];
+    try std.testing.expectEqual(slides.SlideItemKind.line, base.kind);
+    try std.testing.expectEqualStrings("first.stem", base.id.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), base.line_width, 0.0001);
+    try std.testing.expectEqual(slides.LineDirection.down, base.line_direction);
+    try std.testing.expect(!base.line_arrow_start and base.line_arrow_end);
+    const morphed = slide.morph_states.items[0].items.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 9), morphed.line_width, 0.0001);
+    try std.testing.expectEqual(slides.LineDirection.up, morphed.line_direction);
+    try std.testing.expect(morphed.line_arrow_start and morphed.line_arrow_end);
+}
+
+test "invalid line stroke direction and arrow values are diagnosed" {
+    const cases = [_][]const u8{
+        "@slide\n@line w=100 h=100 stroke_width=0\n",
+        "@slide\n@line w=100 h=100 stroke_width=nan\n",
+        "@slide\n@line w=100 h=100 direction=sideways\n",
+        "@slide\n@line w=100 h=100 arrow=middle\n",
+    };
+    for (cases) |input| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const slideshow = try slides.SlideShow.new(allocator);
+        const context = try constructSlidesFromBuf(input, slideshow, allocator);
+        defer context.deinit();
+        try std.testing.expect(context.parser_errors.items.len > 0);
+    }
+}
+
+test "media properties compose through ITEM GROUP and SLIDE ownership layers" {
+    var reusable_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer reusable_arena.deinit();
+    const reusable_allocator = reusable_arena.allocator();
+    const reusable_deck = try slides.SlideShow.new(reusable_allocator);
+    const reusable_source =
+        "@push reusable_clip vid=assets/shared.mp4 x=20 y=30 w=640 h=360 fit=contain focus_x=0.2 focus_y=0.8 poster=0.5 volume=0.9\n" ++
+        "@pushgroup media_group\n" ++
+        "@box id=photo img=assets/group.png x=80 y=100 w=500 h=300 fit=contain focus_x=0.25 focus_y=0.75\n" ++
+        "@box id=clip vid=assets/group.mp4 x=700 y=100 w=640 h=360 fit=cover poster=0.75 autoplay loop volume=0.8 muted\n" ++
+        "@endgroup\n" ++
+        "@slide\n" ++
+        "@pop reusable_clip id=component vid=assets/local.mp4 fit=cover focus_x=0.6 poster=1.25 autoplay loop volume=0.6 muted\n" ++
+        "@popgroup media_group id=gallery\n" ++
+        "@state(morph)\n" ++
+        "@set component focus_y=0.1 volume=0.4 muted=false\n" ++
+        "@set gallery.photo fit=cover focus_x=0.9\n" ++
+        "@set gallery.clip poster=1.5 autoplay=false loop=false volume=0.3 muted=false\n";
+    const reusable_context = try constructSlidesFromBuf(
+        reusable_source,
+        reusable_deck,
+        reusable_allocator,
+    );
+    defer reusable_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reusable_context.parser_errors.items.len);
+    const reusable_slide = reusable_deck.slides.items[0];
+    const reusable_base = reusable_slide.items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), reusable_base.len);
+    const component = reusable_base[0];
+    try std.testing.expectEqualStrings("assets/local.mp4", component.vid_path.?);
+    try std.testing.expectEqual(slides.MediaFit.cover, component.media_fit);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), component.media_focus.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), component.media_focus.y, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 1.25), component.vid_poster);
+    try std.testing.expect(component.vid_autoplay);
+    try std.testing.expect(component.vid_loop);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), component.vid_volume, 0.0001);
+    try std.testing.expect(component.vid_muted);
+    const group_photo = reusable_base[1];
+    try std.testing.expectEqualStrings("gallery.photo", group_photo.id.?);
+    try std.testing.expectEqualStrings("assets/group.png", group_photo.img_path.?);
+    try std.testing.expectEqual(slides.MediaFit.contain, group_photo.media_fit);
+    const group_clip = reusable_base[2];
+    try std.testing.expectEqualStrings("gallery.clip", group_clip.id.?);
+    try std.testing.expectEqualStrings("assets/group.mp4", group_clip.vid_path.?);
+    try std.testing.expect(group_clip.vid_autoplay);
+    try std.testing.expect(group_clip.vid_loop);
+    try std.testing.expect(group_clip.vid_muted);
+
+    const reusable_morph = reusable_slide.morph_states.items[0].items.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), reusable_morph[0].media_focus.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), reusable_morph[0].vid_volume, 0.0001);
+    try std.testing.expect(!reusable_morph[0].vid_muted);
+    try std.testing.expectEqual(slides.MediaFit.cover, reusable_morph[1].media_fit);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), reusable_morph[1].media_focus.x, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 1.5), reusable_morph[2].vid_poster);
+    try std.testing.expect(!reusable_morph[2].vid_autoplay);
+    try std.testing.expect(!reusable_morph[2].vid_loop);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), reusable_morph[2].vid_volume, 0.0001);
+    try std.testing.expect(!reusable_morph[2].vid_muted);
+
+    var slide_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer slide_arena.deinit();
+    const slide_allocator = slide_arena.allocator();
+    const slide_deck = try slides.SlideShow.new(slide_allocator);
+    const slide_source =
+        "@box id=photo img=assets/shared.png x=20 y=30 w=500 h=300 fit=contain focus_x=0.2 focus_y=0.8\n" ++
+        "@box id=clip vid=assets/shared.mp4 x=600 y=30 w=640 h=360 fit=contain poster=0.5 volume=0.9\n" ++
+        "@pushslide media_slide\n" ++
+        "@popslide media_slide\n" ++
+        "@set photo img=assets/local.png fit=cover focus_x=0.6\n" ++
+        "@set clip vid=assets/local.mp4 fit=cover poster=1.25 autoplay loop volume=0.6 muted\n" ++
+        "@state(morph)\n" ++
+        "@set photo focus_y=0.1\n" ++
+        "@set clip poster=1.5 autoplay=false loop=false volume=0.3 muted=false\n";
+    const slide_context = try constructSlidesFromBuf(slide_source, slide_deck, slide_allocator);
+    defer slide_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), slide_context.parser_errors.items.len);
+    const slide = slide_deck.slides.items[0];
+    const slide_base = slide.items.?.items;
+    try std.testing.expectEqualStrings("assets/local.png", slide_base[0].img_path.?);
+    try std.testing.expectEqual(slides.MediaFit.cover, slide_base[0].media_fit);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), slide_base[0].media_focus.x, 0.0001);
+    try std.testing.expectEqualStrings("assets/local.mp4", slide_base[1].vid_path.?);
+    try std.testing.expectEqual(slides.MediaFit.cover, slide_base[1].media_fit);
+    try std.testing.expectEqual(@as(?f32, 1.25), slide_base[1].vid_poster);
+    try std.testing.expect(slide_base[1].vid_autoplay);
+    try std.testing.expect(slide_base[1].vid_loop);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), slide_base[1].vid_volume, 0.0001);
+    try std.testing.expect(slide_base[1].vid_muted);
+    try std.testing.expectEqualStrings("assets/shared.png", slide_base[0].sharedTemplateValues().?.img_path.?);
+    try std.testing.expectEqualStrings("assets/shared.mp4", slide_base[1].sharedTemplateValues().?.vid_path.?);
+
+    const slide_morph = slide.morph_states.items[0].items.items;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), slide_morph[0].media_focus.y, 0.0001);
+    try std.testing.expectEqual(@as(?f32, 1.5), slide_morph[1].vid_poster);
+    try std.testing.expect(!slide_morph[1].vid_autoplay);
+    try std.testing.expect(!slide_morph[1].vid_loop);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), slide_morph[1].vid_volume, 0.0001);
+    try std.testing.expect(!slide_morph[1].vid_muted);
+}
+
+test "invalid media fit and focal values are parser errors" {
+    const cases = [_][]const u8{
+        "@slide\n@box img=hero.png fit=squish\n",
+        "@slide\n@box vid=demo.mp4 focus_x=1.1\n",
+        "@slide\n@box img=hero.png focus_y=-0.1\n",
+        "@slide\n@box vid=demo.mp4 volume=1.1\n",
+        "@slide\n@box vid=demo.mp4 volume=-0.1\n",
+    };
+    for (cases) |input| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const slideshow = try slides.SlideShow.new(allocator);
+        const context = try constructSlidesFromBuf(input, slideshow, allocator);
+        defer context.deinit();
+        try std.testing.expect(context.parser_errors.items.len > 0);
+    }
 }
 
 test "inline text preserves equals signs after text attribute" {

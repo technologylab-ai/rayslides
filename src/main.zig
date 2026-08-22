@@ -24,6 +24,7 @@ const studio_new_deck = @import("studio_new_deck.zig");
 const studio_prompt = @import("studio_prompt.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const videoplayer = @import("videoplayer.zig");
+const showtime = @import("showtime.zig");
 const SlideShow = slides.SlideShow;
 const studio_ui_font_data = @embedFile("assets/Calibri Regular.ttf");
 const presenter_ui_font_data = @embedFile("assets/Calibri Light.ttf");
@@ -44,6 +45,8 @@ const cli_help =
     \\  --crowd-port=PORT                Bind Crowdplay to PORT (default 7331)
     \\  --presenter-host=HOST            Address advertised by Presenter Companion
     \\  --presenter-port=PORT            Bind Presenter Companion to PORT (default 7332)
+    \\  --showtime-report=JSON           Preflight the deck, write JSON, and exit
+    \\  --portable-show=DIR              Create and re-preflight a portable show folder
     \\  -h, --help                       Show this help and exit
     \\  -v, --version                    Show the version and exit
     \\
@@ -54,10 +57,15 @@ const cli_help =
     \\  --diagnostics-precision-view     Show rulers, guides, and precision tools
     \\  --diagnostics-grid-settings      Open the Studio grid appearance popover
     \\  --diagnostics-presenter-pairing  Show the Presenter pairing overlay
+    \\  --diagnostics-presenter-session  Pair, then enter presentation for browser QA
+    \\  --diagnostics-display-picker     Show the presentation display picker
+    \\  --diagnostics-confirm-display=N  Confirm active display N (1-based) before QA
+    \\  --diagnostics-showtime           Open the Showtime readiness overlay
     \\  --diagnostics-large-deck=N       Generate an N-slide stress deck (1-200)
     \\  --diagnostics-incremental-edit=N Edit slide N after the initial render
     \\  --diagnostics-window=WIDTHxHEIGHT
     \\  --diagnostics-select=ID
+    \\  --diagnostics-video-playback   Open a selected video's Playback page
     \\  --diagnostics-library-preview=NAME
     \\  --diagnostics-library-definition=NAME
     \\  --diagnostics-find-slide=QUERY
@@ -77,7 +85,7 @@ const cli_help =
 const MacOpenDocuments = struct {
     extern fn rayslides_macos_install_open_document_handler() void;
     extern fn rayslides_macos_take_open_document(buffer: [*]u8, capacity: usize) usize;
-    extern fn rayslides_macos_choose_image(initial_directory: [*:0]const u8, buffer: [*]u8, capacity: usize) usize;
+    extern fn rayslides_macos_choose_media(video: bool, initial_directory: [*:0]const u8, buffer: [*]u8, capacity: usize) usize;
 
     fn install() void {
         if (comptime builtin.os.tag == .macos) rayslides_macos_install_open_document_handler();
@@ -90,27 +98,66 @@ const MacOpenDocuments = struct {
         return 0;
     }
 
-    fn chooseImage(initial_directory: [:0]const u8, buffer: []u8) usize {
+    fn chooseMedia(kind: StudioMediaKind, initial_directory: [:0]const u8, buffer: []u8) usize {
         if (comptime builtin.os.tag == .macos) {
-            return rayslides_macos_choose_image(initial_directory.ptr, buffer.ptr, buffer.len);
+            return rayslides_macos_choose_media(kind == .video, initial_directory.ptr, buffer.ptr, buffer.len);
         }
         return 0;
     }
 };
 
-fn studioImagePathFromSelection(
+const StudioMediaKind = enum { image, video };
+
+fn studioMediaKindForPath(path: []const u8) ?StudioMediaKind {
+    const extension = std.fs.path.extension(path);
+    const image_extensions = [_][]const u8{ ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tga", ".qoi", ".svg" };
+    const video_extensions = [_][]const u8{ ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpg", ".mpeg" };
+    for (image_extensions) |candidate|
+        if (std.ascii.eqlIgnoreCase(extension, candidate)) return .image;
+    for (video_extensions) |candidate|
+        if (std.ascii.eqlIgnoreCase(extension, candidate)) return .video;
+    return null;
+}
+
+fn studioMediaPathFromSelection(
     allocator: std.mem.Allocator,
     cwd: []const u8,
     deck_path: ?[]const u8,
     selected_path: []const u8,
 ) ![]u8 {
     const deck_dir = if (deck_path) |path| std.fs.path.dirname(path) orelse "." else return allocator.dupe(u8, selected_path);
-    return std.fs.path.relative(allocator, cwd, null, deck_dir, selected_path);
+    return std.fs.path.relative(allocator, cwd, null, deck_dir, selected_path) catch
+        allocator.dupe(u8, selected_path);
 }
 
-test "image chooser stores paths relative to a saved deck" {
+fn studioMediaDirective(
+    buffer: []u8,
+    id: []const u8,
+    kind: StudioMediaKind,
+    path: []const u8,
+    position: rl.Vector2,
+    size: rl.Vector2,
+) ![]u8 {
+    const source_path = try studioMediaSourceValue(path);
+    return std.fmt.bufPrint(
+        buffer,
+        "@box id={s} {s}={s} x={d} y={d} w={d} h={d}",
+        .{ id, if (kind == .image) "img" else "vid", source_path, position.x, position.y, size.x, size.y },
+    );
+}
+
+/// Media paths are literal `.sld` attribute values today. Keep picker,
+/// insertion, drop, and replacement validation on one boundary so no UI path
+/// can accidentally become whitespace-separated source or a `$` expansion.
+fn studioMediaSourceValue(path: []const u8) ![]const u8 {
+    if (path.len == 0 or std.mem.indexOfAny(u8, path, " \t\r\n$") != null)
+        return error.InvalidStudioMediaPath;
+    return path;
+}
+
+test "media chooser stores paths relative to a saved deck" {
     const allocator = std.testing.allocator;
-    const relative = try studioImagePathFromSelection(
+    const relative = try studioMediaPathFromSelection(
         allocator,
         "/work/project",
         "decks/talk.sld",
@@ -119,9 +166,261 @@ test "image chooser stores paths relative to a saved deck" {
     defer allocator.free(relative);
     try std.testing.expectEqualStrings("assets/hero.png", relative);
 
-    const untitled = try studioImagePathFromSelection(allocator, "/work/project", null, "/tmp/hero.png");
+    const untitled = try studioMediaPathFromSelection(allocator, "/work/project", null, "/tmp/hero.png");
     defer allocator.free(untitled);
     try std.testing.expectEqualStrings("/tmp/hero.png", untitled);
+}
+
+test "Studio media directives distinguish image and video attributes" {
+    var buffer: [256]u8 = undefined;
+    const position: rl.Vector2 = .{ .x = 120, .y = 240 };
+    const size: rl.Vector2 = .{ .x = 640, .y = 360 };
+    try std.testing.expectEqualStrings(
+        "@box id=hero img=assets/hero.png x=120 y=240 w=640 h=360",
+        try studioMediaDirective(&buffer, "hero", .image, "assets/hero.png", position, size),
+    );
+    try std.testing.expectEqualStrings(
+        "@box id=clip vid=assets/demo.mp4 x=120 y=240 w=640 h=360",
+        try studioMediaDirective(&buffer, "clip", .video, "assets/demo.mp4", position, size),
+    );
+    try std.testing.expectError(
+        error.InvalidStudioMediaPath,
+        studioMediaDirective(&buffer, "clip", .video, "assets/demo clip.mp4", position, size),
+    );
+    try std.testing.expectError(
+        error.InvalidStudioMediaPath,
+        studioMediaSourceValue("assets/$demo.mp4"),
+    );
+}
+
+test "Studio media drop classification is case-insensitive and explicit" {
+    try std.testing.expectEqual(StudioMediaKind.image, studioMediaKindForPath("/tmp/hero.PNG").?);
+    try std.testing.expectEqual(StudioMediaKind.video, studioMediaKindForPath("assets/demo.WebM").?);
+    try std.testing.expect(studioMediaKindForPath("notes.txt") == null);
+    try std.testing.expect(studioMediaKindForPath("deck.sld") == null);
+}
+
+test "Studio media insertion stays selectable and undoable in every authored scene" {
+    const allocator = std.testing.allocator;
+    const Scene = enum { base, group_definition, slide_definition };
+    const Case = struct {
+        scene: Scene,
+        kind: StudioMediaKind,
+        source: []const u8,
+        local_id: []const u8,
+        effective_id: []const u8,
+        path: []const u8,
+    };
+    const Harness = struct {
+        fn expectAbsent(deck: *slides.SlideShow, id: []const u8) !void {
+            for (deck.slides.items) |slide| {
+                const items = if (slide.items) |list| list.items else continue;
+                for (items) |item| {
+                    if (item.id) |item_id| try std.testing.expect(!std.mem.eql(u8, item_id, id));
+                }
+            }
+        }
+
+        fn expectSelectable(
+            deck: *slides.SlideShow,
+            scene: Scene,
+            kind: StudioMediaKind,
+            local_id: []const u8,
+            effective_id: []const u8,
+            path: []const u8,
+        ) !void {
+            for (deck.slides.items) |slide| {
+                const items = if (slide.items) |list| list.items else continue;
+                var expected_index: ?usize = null;
+                for (items, 0..) |item, index| {
+                    const item_id = item.id orelse continue;
+                    if (std.mem.eql(u8, item_id, effective_id)) {
+                        expected_index = index;
+                        switch (kind) {
+                            .image => {
+                                try std.testing.expectEqual(slides.SlideItemKind.img, item.kind);
+                                try std.testing.expectEqualStrings(path, item.img_path.?);
+                            },
+                            .video => {
+                                try std.testing.expectEqual(slides.SlideItemKind.vid, item.kind);
+                                try std.testing.expectEqualStrings(path, item.vid_path.?);
+                            },
+                        }
+                        break;
+                    }
+                }
+                const wanted_index = expected_index orelse continue;
+
+                var studio_mode: studio.Studio = .{ .enabled = true };
+                switch (scene) {
+                    .base => studio_mode.selectItemsByIds(items, &.{local_id}),
+                    .group_definition, .slide_definition => {
+                        var authored: [0]slides.SlideItem = .{};
+                        try std.testing.expect(studio_mode.enterDefinitionMode(
+                            &authored,
+                            0,
+                            0,
+                            .{
+                                .kind = if (scene == .group_definition) .group else .slide_template,
+                                .name = if (scene == .group_definition) "media_group" else "media_slide",
+                            },
+                        ));
+                        studio_mode.queueDefinitionSelectionIds(&.{local_id});
+                        studio_mode.applyPendingDefinitionSelection(items);
+                    },
+                }
+                try std.testing.expectEqual(wanted_index, studio_mode.selectedIndex(items).?);
+                return;
+            }
+            return error.TestExpectedMediaItem;
+        }
+
+        fn parseAndExpectAbsent(
+            allocator_: std.mem.Allocator,
+            source: []const u8,
+            id: []const u8,
+        ) !void {
+            var arena = std.heap.ArenaAllocator.init(allocator_);
+            defer arena.deinit();
+            const deck = try slides.SlideShow.new(arena.allocator());
+            const context = try parser.constructSlidesFromBuf(source, deck, arena.allocator());
+            defer context.deinit();
+            try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+            try expectAbsent(deck, id);
+        }
+
+        fn parseAndExpectSelectable(
+            allocator_: std.mem.Allocator,
+            source: []const u8,
+            scene: Scene,
+            kind: StudioMediaKind,
+            local_id: []const u8,
+            effective_id: []const u8,
+            path: []const u8,
+        ) !void {
+            var arena = std.heap.ArenaAllocator.init(allocator_);
+            defer arena.deinit();
+            const deck = try slides.SlideShow.new(arena.allocator());
+            const context = try parser.constructSlidesFromBuf(source, deck, arena.allocator());
+            defer context.deinit();
+            try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+            try expectSelectable(deck, scene, kind, local_id, effective_id, path);
+        }
+    };
+
+    const base_source = "@slide\n";
+    const group_source =
+        "@pushgroup media_group\n" ++
+        "@box id=label x=80 y=80 w=500 h=80 text=Media\n" ++
+        "@endgroup\n" ++
+        "@slide\n" ++
+        "@popgroup media_group id=instance\n";
+    const slide_source =
+        "@box id=label x=80 y=80 w=500 h=80 text=Media\n" ++
+        "@pushslide media_slide\n" ++
+        "@popslide media_slide\n";
+    const cases = [_]Case{
+        .{ .scene = .base, .kind = .image, .source = base_source, .local_id = "hero", .effective_id = "hero", .path = "assets/hero.png" },
+        .{ .scene = .base, .kind = .video, .source = base_source, .local_id = "clip", .effective_id = "clip", .path = "assets/demo.mp4" },
+        .{ .scene = .group_definition, .kind = .image, .source = group_source, .local_id = "hero", .effective_id = "instance.hero", .path = "assets/hero.png" },
+        .{ .scene = .group_definition, .kind = .video, .source = group_source, .local_id = "clip", .effective_id = "instance.clip", .path = "assets/demo.mp4" },
+        .{ .scene = .slide_definition, .kind = .image, .source = slide_source, .local_id = "hero", .effective_id = "hero", .path = "assets/hero.png" },
+        .{ .scene = .slide_definition, .kind = .video, .source = slide_source, .local_id = "clip", .effective_id = "clip", .path = "assets/demo.mp4" },
+    };
+
+    for (cases) |case| {
+        const anchor: source_editor.ItemSceneAnchor = switch (case.scene) {
+            .base => .{ .base_slide = std.mem.indexOf(u8, case.source, "@slide").? },
+            .group_definition => .{ .group_definition = std.mem.indexOf(u8, case.source, "@pushgroup").? },
+            .slide_definition => .{ .slide_definition = std.mem.indexOf(u8, case.source, "@pushslide").? },
+        };
+        var directive_buffer: [512]u8 = undefined;
+        const directive = try studioMediaDirective(
+            &directive_buffer,
+            case.local_id,
+            case.kind,
+            case.path,
+            .{ .x = 120, .y = 180 },
+            .{ .x = 640, .y = 360 },
+        );
+        const patch = try source_editor.insertSnippetAt(
+            allocator,
+            case.source,
+            try source_editor.itemSceneInsertionOffset(case.source, anchor),
+            directive,
+        );
+        defer patch.deinit(allocator);
+
+        var selection_ids = StudioSelectionIds.init(allocator);
+        defer selection_ids.deinit();
+        try selection_ids.appendCopy(case.local_id);
+        try std.testing.expectEqual(@as(usize, 1), selection_ids.values.items.len);
+
+        var history = StudioHistory.init(allocator);
+        defer history.deinit();
+        try history.record(
+            try allocator.dupe(u8, case.source),
+            try allocator.dupe(u8, patch.source),
+            0,
+            0,
+        );
+
+        try Harness.parseAndExpectSelectable(
+            allocator,
+            patch.source,
+            case.scene,
+            case.kind,
+            selection_ids.values.items[0],
+            case.effective_id,
+            case.path,
+        );
+
+        const undo_restore = (try history.prepareRestore(.undo)).?;
+        try Harness.parseAndExpectAbsent(allocator, undo_restore.source, case.effective_id);
+        history.commitRestore(.undo);
+        try std.testing.expectEqual(@as(usize, 0), history.undo_stack.items.len);
+        try std.testing.expectEqual(@as(usize, 1), history.redo_stack.items.len);
+
+        const redo_restore = (try history.prepareRestore(.redo)).?;
+        try Harness.parseAndExpectSelectable(
+            allocator,
+            redo_restore.source,
+            case.scene,
+            case.kind,
+            selection_ids.values.items[0],
+            case.effective_id,
+            case.path,
+        );
+        history.commitRestore(.redo);
+        try std.testing.expectEqual(@as(usize, 1), history.undo_stack.items.len);
+        try std.testing.expectEqual(@as(usize, 0), history.redo_stack.items.len);
+    }
+}
+
+test "Studio gives unavailable media stable selectable fallback bounds" {
+    const allocator = std.testing.allocator;
+    const items = [_]slides.SlideItem{
+        .{ .identity = 1, .kind = .img, .img_path = "missing.png", .position = .{ .x = 20, .y = 30 } },
+        .{ .identity = 2, .kind = .vid, .vid_path = "missing.mp4", .position = .{ .x = 40, .y = 50 }, .size = .{ .x = 800, .y = 0 } },
+    };
+    var bounds = std.ArrayList(studio.ResolvedBounds).empty;
+    defer bounds.deinit(allocator);
+    try appendStudioUnavailableMediaBounds(&bounds, allocator, &items);
+    try std.testing.expectEqual(@as(usize, 2), bounds.items.len);
+    try std.testing.expectEqual(studio.MediaAvailability.image_unavailable, bounds.items[0].media_availability);
+    try std.testing.expectEqual(@as(f32, 640), bounds.items[0].size.x);
+    try std.testing.expectEqual(@as(f32, 360), bounds.items[0].size.y);
+    try std.testing.expectEqual(studio.MediaAvailability.video_unavailable, bounds.items[1].media_availability);
+    try std.testing.expectEqual(@as(f32, 800), bounds.items[1].size.x);
+    try std.testing.expectEqual(@as(f32, 450), bounds.items[1].size.y);
+
+    // A renderer-provided entry is authoritative and must never be shadowed
+    // by a fallback diagnostic.
+    bounds.clearRetainingCapacity();
+    try bounds.append(allocator, .{ .identity = 1, .position = .zero(), .size = .{ .x = 10, .y = 20 } });
+    try appendStudioUnavailableMediaBounds(&bounds, allocator, &items);
+    try std.testing.expectEqual(@as(usize, 2), bounds.items.len);
+    try std.testing.expectEqual(studio.MediaAvailability.ready, bounds.items[0].media_availability);
 }
 
 fn isMacosAppExecutable(path: []const u8) bool {
@@ -149,6 +448,7 @@ const log = std.log.scoped(.main);
 
 test {
     std.testing.refAllDecls(parser);
+    std.testing.refAllDecls(showtime);
     std.testing.refAllDecls(presenter);
     std.testing.refAllDecls(renderer);
     std.testing.refAllDecls(slides);
@@ -174,9 +474,121 @@ const PresenterOptions = struct {
     port: u16 = presenter.default_port,
 };
 
+const PresenterNetworkState = struct {
+    discovery: presenter.LocalAddressDiscovery = .{},
+    selected: presenter.LocalAddress = .{},
+    selected_index: usize = 0,
+    explicit: bool = false,
+    manually_selected: bool = false,
+
+    fn init(options: PresenterOptions) PresenterNetworkState {
+        var result: PresenterNetworkState = .{ .explicit = options.host_explicit };
+        if (options.host_explicit) {
+            const configured = presenter.LocalAddress.init(options.host, "--presenter-host", .explicit) orelse
+                presenter.LocalAddress.init("127.0.0.1", "invalid explicit host", .loopback).?;
+            result.discovery.add(configured);
+            result.selected = configured;
+            return result;
+        }
+        _ = result.refresh();
+        return result;
+    }
+
+    /// Returns true only when the advertised host changed and an existing
+    /// private capability must therefore be rotated.
+    fn refresh(self: *PresenterNetworkState) bool {
+        if (self.explicit) return false;
+        const old_host = self.selected.host;
+        const previous_host = old_host.slice();
+        const fresh = presenter.discoverLocalAddresses();
+        var next_index: usize = 0;
+        var next = fresh.preferred() orelse
+            presenter.LocalAddress.init("127.0.0.1", "loopback", .loopback).?;
+
+        if (self.manually_selected and previous_host.len > 0) {
+            for (fresh.addresses[0..fresh.len], 0..) |candidate, index| {
+                if (!candidate.host.eql(previous_host)) continue;
+                next = candidate;
+                next_index = index;
+                break;
+            } else self.manually_selected = false;
+        }
+        if (!self.manually_selected) {
+            for (fresh.addresses[0..fresh.len], 0..) |candidate, index| {
+                if (candidate.host.eql(next.host.slice())) {
+                    next_index = index;
+                    break;
+                }
+            }
+        }
+
+        self.discovery = fresh;
+        self.selected = next;
+        self.selected_index = next_index;
+        return previous_host.len > 0 and !self.selected.host.eql(previous_host);
+    }
+
+    fn cycle(self: *PresenterNetworkState) bool {
+        if (self.explicit or self.discovery.len < 2) return false;
+        const old_host = self.selected.host;
+        self.selected_index = (self.selected_index + 1) % self.discovery.len;
+        self.selected = self.discovery.addresses[self.selected_index];
+        self.manually_selected = true;
+        return !self.selected.host.eql(old_host.slice());
+    }
+
+    fn host(self: *const PresenterNetworkState) []const u8 {
+        return self.selected.host.slice();
+    }
+};
+
+test "Presenter network selection prefers LAN and preserves an intentional choice" {
+    var state: PresenterNetworkState = .{};
+    state.discovery.add(presenter.LocalAddress.init("127.0.0.1", "lo0", .loopback).?);
+    state.discovery.add(presenter.LocalAddress.init("192.168.8.10", "en0", .private_lan).?);
+    state.selected_index = 1;
+    state.selected = state.discovery.addresses[1];
+    try std.testing.expect(state.cycle());
+    try std.testing.expectEqualStrings("127.0.0.1", state.host());
+    try std.testing.expect(state.manually_selected);
+}
+
 const WindowDimensions = struct {
     width: i32,
     height: i32,
+};
+
+const FullscreenMode = enum {
+    windowed,
+    borderless,
+    exclusive,
+};
+
+const DisplayPicker = struct {
+    visible: bool = false,
+    candidate_monitor: i32 = 0,
+    confirmed_monitor: i32 = 0,
+    identified_monitor: ?i32 = null,
+    restore_fullscreen: FullscreenMode = .windowed,
+
+    fn monitorCount() i32 {
+        return @max(@as(i32, 1), rl.getMonitorCount());
+    }
+
+    fn clampMonitor(monitor: i32) i32 {
+        return std.math.clamp(monitor, 0, monitorCount() - 1);
+    }
+
+    fn init() DisplayPicker {
+        const current = clampMonitor(rl.getCurrentMonitor());
+        return .{ .candidate_monitor = current, .confirmed_monitor = current };
+    }
+
+    fn cycle(self: *DisplayPicker, delta: i32) void {
+        const count = monitorCount();
+        self.candidate_monitor = @mod(self.candidate_monitor + delta, count);
+        self.identified_monitor = null;
+    }
 };
 
 /// Studio benefits from more room than the presentation-only window, but a
@@ -196,12 +608,105 @@ fn studioStartupWindowSize(monitor_width: i32, monitor_height: i32) WindowDimens
     return .{ .width = width, .height = height };
 }
 
+fn fitWindowToMonitor(
+    requested_width: i32,
+    requested_height: i32,
+    monitor_width: i32,
+    monitor_height: i32,
+) WindowDimensions {
+    if (requested_width <= 0 or requested_height <= 0 or monitor_width <= 0 or monitor_height <= 0)
+        return .{ .width = 1280, .height = 720 };
+    const max_width = @max(@as(i32, 1), @divFloor(monitor_width * 9, 10));
+    const max_height = @max(@as(i32, 1), @divFloor(monitor_height * 9, 10));
+    if (requested_width <= max_width and requested_height <= max_height)
+        return .{ .width = requested_width, .height = requested_height };
+    const width_scale = @as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(requested_width));
+    const height_scale = @as(f64, @floatFromInt(max_height)) / @as(f64, @floatFromInt(requested_height));
+    const scale = @min(width_scale, height_scale);
+    return .{
+        .width = @max(@as(i32, 1), @as(i32, @intFromFloat(@floor(@as(f64, @floatFromInt(requested_width)) * scale)))),
+        .height = @max(@as(i32, 1), @as(i32, @intFromFloat(@floor(@as(f64, @floatFromInt(requested_height)) * scale)))),
+    };
+}
+
+fn moveWindowToMonitor(
+    monitor_unchecked: i32,
+    requested_width: i32,
+    requested_height: i32,
+) WindowDimensions {
+    const monitor = DisplayPicker.clampMonitor(monitor_unchecked);
+    const dimensions = fitWindowToMonitor(
+        requested_width,
+        requested_height,
+        rl.getMonitorWidth(monitor),
+        rl.getMonitorHeight(monitor),
+    );
+    rl.setWindowMonitor(monitor);
+    rl.setWindowSize(dimensions.width, dimensions.height);
+    const position = rl.getMonitorPosition(monitor);
+    rl.setWindowPosition(
+        @intFromFloat(position.x + @as(f32, @floatFromInt(rl.getMonitorWidth(monitor) - dimensions.width)) / 2),
+        @intFromFloat(position.y + @as(f32, @floatFromInt(rl.getMonitorHeight(monitor) - dimensions.height)) / 2),
+    );
+    return dimensions;
+}
+
+fn leavePresentationFullscreen(
+    mode: *FullscreenMode,
+    monitor: i32,
+    windowed_width: i32,
+    windowed_height: i32,
+    screen_width: *i32,
+    screen_height: *i32,
+) void {
+    switch (mode.*) {
+        .windowed => return,
+        .borderless => rl.toggleBorderlessWindowed(),
+        .exclusive => rl.toggleFullscreen(),
+    }
+    const dimensions = moveWindowToMonitor(monitor, windowed_width, windowed_height);
+    screen_width.* = dimensions.width;
+    screen_height.* = dimensions.height;
+    mode.* = .windowed;
+}
+
+fn enterPresentationFullscreen(
+    mode: *FullscreenMode,
+    desired: FullscreenMode,
+    monitor_unchecked: i32,
+    windowed_width: *i32,
+    windowed_height: *i32,
+    screen_width: *i32,
+    screen_height: *i32,
+) void {
+    if (desired == .windowed or mode.* != .windowed) return;
+    const monitor = DisplayPicker.clampMonitor(monitor_unchecked);
+    windowed_width.* = rl.getScreenWidth();
+    windowed_height.* = rl.getScreenHeight();
+    _ = moveWindowToMonitor(monitor, windowed_width.*, windowed_height.*);
+    rl.setWindowSize(rl.getMonitorWidth(monitor), rl.getMonitorHeight(monitor));
+    screen_width.* = rl.getMonitorWidth(monitor);
+    screen_height.* = rl.getMonitorHeight(monitor);
+    switch (desired) {
+        .windowed => unreachable,
+        .borderless => rl.toggleBorderlessWindowed(),
+        .exclusive => rl.toggleFullscreen(),
+    }
+    mode.* = desired;
+}
+
 fn parseDiagnosticWindowSize(value: []const u8) ?WindowDimensions {
     const separator = std.mem.indexOfScalar(u8, value, 'x') orelse return null;
     const width = std.fmt.parseInt(i32, value[0..separator], 10) catch return null;
     const height = std.fmt.parseInt(i32, value[separator + 1 ..], 10) catch return null;
     if (width < 900 or height < 506 or width > 7680 or height > 4320) return null;
     return .{ .width = width, .height = height };
+}
+
+fn parseDiagnosticDisplayNumber(value: []const u8) ?i32 {
+    const one_based = std.fmt.parseInt(i32, value, 10) catch return null;
+    if (one_based <= 0) return null;
+    return one_based - 1;
 }
 
 test "Studio startup window fits common monitor sizes" {
@@ -211,12 +716,27 @@ test "Studio startup window fits common monitor sizes" {
     try std.testing.expectEqual(WindowDimensions{ .width = 1280, .height = 720 }, studioStartupWindowSize(0, 0));
 }
 
+test "display selection keeps a usable aspect-preserving window" {
+    try std.testing.expectEqual(WindowDimensions{ .width = 1280, .height = 720 }, fitWindowToMonitor(1280, 720, 1920, 1080));
+    try std.testing.expectEqual(WindowDimensions{ .width = 1152, .height = 648 }, fitWindowToMonitor(1920, 1080, 1280, 720));
+    try std.testing.expectEqual(WindowDimensions{ .width = 1024, .height = 768 }, fitWindowToMonitor(1024, 768, 1920, 1080));
+    try std.testing.expectEqual(WindowDimensions{ .width = 1280, .height = 720 }, fitWindowToMonitor(0, 0, 0, 0));
+}
+
 test "diagnostic window size is explicit and safely bounded" {
     try std.testing.expectEqual(WindowDimensions{ .width = 900, .height = 600 }, parseDiagnosticWindowSize("900x600").?);
     try std.testing.expectEqual(WindowDimensions{ .width = 1920, .height = 1080 }, parseDiagnosticWindowSize("1920x1080").?);
     try std.testing.expect(parseDiagnosticWindowSize("899x600") == null);
     try std.testing.expect(parseDiagnosticWindowSize("900x500") == null);
     try std.testing.expect(parseDiagnosticWindowSize("wide") == null);
+}
+
+test "diagnostic display number is one-based and rejects invalid input" {
+    try std.testing.expectEqual(@as(i32, 0), parseDiagnosticDisplayNumber("1").?);
+    try std.testing.expectEqual(@as(i32, 11), parseDiagnosticDisplayNumber("12").?);
+    try std.testing.expect(parseDiagnosticDisplayNumber("0") == null);
+    try std.testing.expect(parseDiagnosticDisplayNumber("-1") == null);
+    try std.testing.expect(parseDiagnosticDisplayNumber("display") == null);
 }
 
 const SourceChange = struct {
@@ -640,6 +1160,363 @@ fn slideshowHasCrowd(slideshow: *const SlideShow) bool {
     return false;
 }
 
+fn showtimeRuntimeSnapshot(
+    picker: *const DisplayPicker,
+    fullscreen_mode: FullscreenMode,
+    presenter_runtime: *presenter.Runtime,
+    presenter_network: *const PresenterNetworkState,
+    crowd_runtime: *const crowdplay.Runtime,
+) showtime.RuntimeSnapshot {
+    const monitor_count: usize = @intCast(@max(@as(i32, 0), DisplayPicker.monitorCount()));
+    const selected = DisplayPicker.clampMonitor(picker.confirmed_monitor);
+    const presenter_kind = presenter_network.selected.kind;
+    const presenter_health = presenter_runtime.clientHealth();
+    var presenter_health_samples: u32 = 0;
+    var presenter_health_failures: u32 = 0;
+    var presenter_health_p95_ms: ?u32 = null;
+    if (presenter_health) |health| {
+        const metrics = [_]presenter.LatencyMetric{ health.state, health.command, health.pointer, health.drawing };
+        for (metrics) |metric| {
+            presenter_health_samples += metric.samples;
+            presenter_health_failures += metric.failures;
+            if (metric.p95_ms) |value|
+                presenter_health_p95_ms = @max(presenter_health_p95_ms orelse 0, value);
+        }
+    }
+    return .{
+        .monitor_count = monitor_count,
+        .selected_monitor = @intCast(@max(@as(i32, 0), selected)),
+        .display_width = if (monitor_count > 0) rl.getMonitorWidth(selected) else 0,
+        .display_height = if (monitor_count > 0) rl.getMonitorHeight(selected) else 0,
+        .refresh_rate = if (monitor_count > 0) rl.getMonitorRefreshRate(selected) else 0,
+        .vsync_enabled = true,
+        .fullscreen = fullscreen_mode != .windowed,
+        .presenter_running = presenter_runtime.isRunning(),
+        .presenter_reachable = switch (presenter_kind) {
+            .explicit, .private_lan, .public_lan, .vpn => true,
+            .link_local, .loopback => false,
+        },
+        .presenter_connected = presenter_runtime.phoneConnected(),
+        .presenter_address = presenter_network.host(),
+        .presenter_health_samples = presenter_health_samples,
+        .presenter_health_p95_ms = presenter_health_p95_ms,
+        .presenter_health_failures = presenter_health_failures,
+        .crowdplay_required = slideshowHasCrowd(G.slideshow),
+        .crowdplay_running = crowd_runtime.isRunning(),
+    };
+}
+
+fn replaceShowtimeReport(destination: *?showtime.Report, replacement: showtime.Report) void {
+    if (destination.*) |*current| current.deinit();
+    destination.* = replacement;
+}
+
+/// A visible Showtime overlay describes the exact live document and renderer.
+/// Once a different document commits, discard that cached analysis so the
+/// post-render path cannot keep presenting findings from the previous deck.
+fn invalidateShowtimeForDocumentReplacement(
+    overlay: *const ShowtimeOverlay,
+    destination: *?showtime.Report,
+) void {
+    if (!overlay.visible) return;
+    if (destination.*) |*current| current.deinit();
+    destination.* = null;
+}
+
+test "visible Showtime report is invalidated when the live document is replaced" {
+    var cached: ?showtime.Report = showtime.Report.init(std.testing.allocator);
+    if (cached) |*report| try report.add(
+        .info,
+        .portable,
+        .portable_verified,
+        null,
+        null,
+        null,
+        null,
+        "old deck",
+        "cached analysis",
+    );
+
+    const hidden: ShowtimeOverlay = .{};
+    invalidateShowtimeForDocumentReplacement(&hidden, &cached);
+    try std.testing.expect(cached != null);
+
+    const visible: ShowtimeOverlay = .{ .visible = true };
+    invalidateShowtimeForDocumentReplacement(&visible, &cached);
+    try std.testing.expect(cached == null);
+}
+
+fn buildLiveShowtimeReport(runtime: showtime.RuntimeSnapshot) !showtime.Report {
+    var report = try showtime.analyze(
+        G.allocator,
+        G.slideshow,
+        G.slide_renderer,
+        G.editor_memory[0..G.source_len],
+        runtime,
+    );
+    errdefer report.deinit();
+    try appendReusableDefinitionShowtime(
+        &report,
+        G.editor_memory[0..G.source_len],
+        G.slideshow_filp orelse "untitled.sld",
+    );
+    return report;
+}
+
+fn readFileAllocLimited(allocator: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ![]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var read_buffer: [8192]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    return reader.interface.allocRemaining(allocator, .limited(limit));
+}
+
+/// Turn a rejected document load into the same stable report shape used by a
+/// successful renderer-backed preflight. This path deliberately reparses in
+/// isolation: malformed source never replaces the live Studio document.
+fn buildLoadFailureShowtimeReport(deck_path: []const u8, load_error: anyerror) !showtime.Report {
+    var report = showtime.Report.init(G.allocator);
+    errdefer report.deinit();
+
+    const source = readFileAllocLimited(G.allocator, G.io, deck_path, G.editor_memory.len - 1) catch |read_error| {
+        try report.add(
+            .error_,
+            .deck,
+            .deck_load_failed,
+            null,
+            null,
+            null,
+            null,
+            "Deck could not be read",
+            @errorName(read_error),
+        );
+        return report;
+    };
+    defer G.allocator.free(source);
+
+    var arena = std.heap.ArenaAllocator.init(G.allocator);
+    defer arena.deinit();
+    const deck = try SlideShow.new(arena.allocator());
+    const context = parser.constructSlidesFromBuf(source, deck, arena.allocator()) catch |parse_error| {
+        try report.add(
+            .error_,
+            .deck,
+            .deck_load_failed,
+            null,
+            null,
+            null,
+            null,
+            "Deck could not be parsed",
+            @errorName(parse_error),
+        );
+        return report;
+    };
+    defer context.deinit();
+    report.summary.slides = deck.slides.items.len;
+
+    for (context.parser_errors.items) |parse_error| {
+        const title = try std.fmt.allocPrint(
+            G.allocator,
+            "Parser error on line {d}",
+            .{parse_error.line_number},
+        );
+        defer G.allocator.free(title);
+        const detail = if (parse_error.message) |message| message else @errorName(parse_error.parser_error);
+        try report.add(
+            .error_,
+            .deck,
+            .parser_error,
+            null,
+            null,
+            null,
+            if (parse_error.line_number > 0) parse_error.line_number else null,
+            title,
+            detail,
+        );
+    }
+    if (context.parser_errors.items.len == 0) {
+        try report.add(
+            .error_,
+            .deck,
+            .deck_load_failed,
+            null,
+            null,
+            null,
+            null,
+            "Deck could not be loaded",
+            @errorName(load_error),
+        );
+    }
+    return report;
+}
+
+/// Re-open the just-created ordinary deck through an independent parser,
+/// font set, renderer, and Showtime report. None of the live document,
+/// history, selection, poll, or playback objects are borrowed or replaced.
+fn verifyPortableShowtime(deck_path: []const u8, runtime: showtime.RuntimeSnapshot) !showtime.Report {
+    const source = try readFileAllocLimited(G.allocator, G.io, deck_path, G.editor_memory.len - 1);
+    defer G.allocator.free(source);
+    var graph = try ParsedSlideshowGraph.init(G.allocator, source);
+    defer graph.deinit();
+    var isolated_fonts = try fonts.AvailableFonts.init(.{});
+    defer isolated_fonts.deinit();
+    if (graph.parser_context.?.custom_fonts_present)
+        try isolated_fonts.loadCustomFonts(graph.parser_context.?.fontConfig, deck_path);
+    const isolated_renderer = try renderer.SlideshowRenderer.new(G.allocator, &isolated_fonts);
+    defer isolated_renderer.deinit();
+    isolated_renderer.video_cache.io = G.io;
+    isolated_renderer.texture_cache.io = G.io;
+    try isolated_renderer.preRender(graph.slideshow, deck_path);
+    var report = try showtime.analyze(G.allocator, graph.slideshow, isolated_renderer, source, runtime);
+    errdefer report.deinit();
+    try appendReusableDefinitionShowtime(&report, source, deck_path);
+    return report;
+}
+
+fn sourceLineAtOffset(source: []const u8, offset: usize) usize {
+    var line: usize = 1;
+    for (source[0..@min(offset, source.len)]) |byte| if (byte == '\n') {
+        line += 1;
+    };
+    return line;
+}
+
+/// Showtime definition findings carry an authored source line. Resolve that
+/// line to the nearest physical definition that starts at or before it; group
+/// and slide-template members naturally fall under their owning directive.
+fn showtimeDefinitionCatalogIndexAtLine(
+    source: []const u8,
+    catalog: studio_catalog.Catalog,
+    source_line: usize,
+) ?usize {
+    if (source_line == 0) return null;
+    var candidate: ?usize = null;
+    for (catalog.entries, 0..) |entry, index| {
+        if (sourceLineAtOffset(source, entry.directive_offset) > source_line) break;
+        candidate = index;
+    }
+    return candidate;
+}
+
+test "Showtime source links resolve reusable directives and body members" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@push card x=10 y=10 text=Card\n" ++
+        "@pushgroup cluster\n" ++
+        "@box id=one x=20 y=20 text=One\n" ++
+        "@endgroup\n" ++
+        "@slide\n";
+    var catalog = try studio_catalog.discover(allocator, source);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(?usize, 0), showtimeDefinitionCatalogIndexAtLine(source, catalog, 1));
+    try std.testing.expectEqual(@as(?usize, 1), showtimeDefinitionCatalogIndexAtLine(source, catalog, 3));
+}
+
+fn definitionUseOffset(catalog: studio_catalog.Catalog, entry_index: usize) usize {
+    const entry = catalog.entries[entry_index];
+    for (catalog.entries[entry_index + 1 ..]) |later| {
+        if (later.kind == entry.kind and std.mem.eql(u8, later.name, entry.name)) return later.directive_offset;
+    }
+    return catalog.source_len;
+}
+
+/// Materialize every physical reusable definition at the exact source-order
+/// point where that definition is active. Each one gets an independent
+/// parser projection and renderer, so unused Library content receives the
+/// same media/glyph/layout scrutiny without disturbing Studio's preview cache.
+fn appendReusableDefinitionShowtime(report: *showtime.Report, source: []const u8, deck_path: []const u8) !void {
+    var catalog = try studio_catalog.discover(G.allocator, source);
+    defer catalog.deinit();
+    for (catalog.entries, 0..) |entry, entry_index| {
+        if (!entry.placeable) {
+            try report.add(.error_, .deck, .render_scene_missing, null, null, null, sourceLineAtOffset(source, entry.directive_offset), "Reusable definition has an unstable name", "Use a literal letters/numbers/_/- name so Showtime and Studio can materialize it.");
+            continue;
+        }
+        var id_buffer: [64]u8 = undefined;
+        const instance_id = std.fmt.bufPrint(&id_buffer, "__showtime_{x}", .{
+            @as(u32, @truncate(std.hash.Wyhash.hash(entry.directive_offset, entry.name))),
+        }) catch "__showtime_definition";
+        const temporary_source = studio_library_preview.buildSource(G.allocator, source, .{
+            .kind = entry.kind,
+            .name = entry.name,
+            .insertion_offset = definitionUseOffset(catalog, entry_index),
+            .instance_id = instance_id,
+        }) catch |err| {
+            var title_buffer: [256]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buffer, "{s} definition “{s}” cannot be projected", .{ @tagName(entry.kind), entry.name }) catch "Reusable definition cannot be projected";
+            var detail_buffer: [192]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buffer, "Fix this definition and retry: {s}", .{@errorName(err)}) catch "Fix this definition and retry.";
+            try report.add(.error_, .render, .render_scene_missing, null, null, null, sourceLineAtOffset(source, entry.directive_offset), title, detail);
+            continue;
+        };
+        defer G.allocator.free(temporary_source);
+        var graph = ParsedSlideshowGraph.init(G.allocator, temporary_source) catch |err| {
+            var title_buffer: [256]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buffer, "{s} definition “{s}” cannot be parsed", .{ @tagName(entry.kind), entry.name }) catch "Reusable definition cannot be parsed";
+            var detail_buffer: [192]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buffer, "Fix this definition and retry: {s}", .{@errorName(err)}) catch "Fix this definition and retry.";
+            try report.add(.error_, .deck, .render_scene_missing, null, null, null, sourceLineAtOffset(source, entry.directive_offset), title, detail);
+            continue;
+        };
+        defer graph.deinit();
+        if (graph.slideshow.slides.items.len == 0) continue;
+        const parsed = graph.slideshow.slides.items[graph.slideshow.slides.items.len - 1];
+        const projected = studio_library_preview.projectSlide(
+            graph.slideshow_allocator,
+            parsed,
+            entry.kind,
+            instance_id,
+        ) catch |err| {
+            var title_buffer: [256]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buffer, "{s} definition “{s}” produces no preview", .{ @tagName(entry.kind), entry.name }) catch "Reusable definition produces no preview";
+            var detail_buffer: [192]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buffer, "Fix this definition and retry: {s}", .{@errorName(err)}) catch "Fix this definition and retry.";
+            try report.add(.error_, .render, .render_scene_missing, null, null, null, sourceLineAtOffset(source, entry.directive_offset), title, detail);
+            continue;
+        };
+        const projected_deck = try SlideShow.new(graph.slideshow_allocator);
+        try projected_deck.slides.append(graph.slideshow_allocator, projected);
+        const isolated_renderer = try renderer.SlideshowRenderer.new(G.allocator, &G.fonts);
+        defer isolated_renderer.deinit();
+        isolated_renderer.video_cache.io = G.io;
+        isolated_renderer.texture_cache.io = G.io;
+        isolated_renderer.preRender(projected_deck, deck_path) catch |err| {
+            var title_buffer: [256]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buffer, "{s} definition “{s}” cannot render", .{ @tagName(entry.kind), entry.name }) catch "Reusable definition cannot render";
+            var detail_buffer: [192]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buffer, "Fix this definition and retry: {s}", .{@errorName(err)}) catch "Fix this definition and retry.";
+            try report.add(.error_, .render, .render_scene_missing, null, null, null, sourceLineAtOffset(source, entry.directive_offset), title, detail);
+            continue;
+        };
+        var definition_report = try showtime.analyze(G.allocator, projected_deck, isolated_renderer, temporary_source, .{
+            .monitor_count = 1,
+            .display_width = 1920,
+            .display_height = 1080,
+            .refresh_rate = 60,
+            .vsync_enabled = true,
+            .presenter_running = true,
+            .presenter_reachable = true,
+        });
+        defer definition_report.deinit();
+        for (definition_report.findings.items) |finding| {
+            if (finding.slide_index == null) continue;
+            var title_buffer: [512]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buffer, "{s} “{s}”: {s}", .{ @tagName(entry.kind), entry.name, finding.title }) catch finding.title;
+            try report.add(
+                finding.severity,
+                finding.category,
+                finding.code,
+                null,
+                finding.morph_state,
+                finding.owner_identity,
+                finding.source_line orelse sourceLineAtOffset(source, entry.directive_offset),
+                title,
+                finding.detail,
+            );
+        }
+    }
+}
+
 fn crowdSpecForSlide(slideshow: *const SlideShow, slide_number: i32) ?slides.CrowdSpec {
     if (slide_number < 0 or slide_number >= slideshow.slides.items.len) return null;
     const slide = slideshow.slides.items[@intCast(slide_number)];
@@ -647,20 +1524,37 @@ fn crowdSpecForSlide(slideshow: *const SlideShow, slide_number: i32) ?slides.Cro
     return null;
 }
 
-fn ensurePresenterCompanionRunning(runtime: *presenter.Runtime, options: PresenterOptions) bool {
+fn ensurePresenterCompanionRunning(
+    runtime: *presenter.Runtime,
+    options: PresenterOptions,
+    network: *PresenterNetworkState,
+) bool {
     if (runtime.isRunning()) return true;
-    if (comptime builtin.os.tag == .windows) {
-        if (!options.host_explicit) {
-            log.err("Presenter Companion on Windows requires --presenter-host=<LAN-IP>", .{});
-            return false;
-        }
-    }
-    const port = runtime.start(options.port, options.host) catch |err| {
+    _ = network.refresh();
+    const port = runtime.start(options.port, network.host()) catch |err| {
         log.err("Presenter Companion could not start: {any}", .{err});
         return false;
     };
     // Never log pairing_url: its fragment is the private presenter capability.
     log.info("Presenter Companion listening on port {d}; setup address: {s}", .{ port, runtime.base_url.slice() });
+    return true;
+}
+
+fn rePairPresenterCompanion(
+    runtime: *presenter.Runtime,
+    network: *const PresenterNetworkState,
+) bool {
+    if (!runtime.isRunning()) return true;
+    runtime.rePair(network.host()) catch |err| {
+        // Do not leave an obsolete capability alive after the interface that
+        // advertised it disappeared. Local presentation controls are
+        // independent and continue normally.
+        runtime.stop();
+        log.err("Presenter Companion could not refresh after network change: {any}", .{err});
+        return false;
+    };
+    // Never log pairing_url: its fragment is the newly rotated capability.
+    log.info("Presenter Companion re-paired for {s}", .{runtime.base_url.slice()});
     return true;
 }
 
@@ -734,7 +1628,9 @@ fn drawCenteredPresenterText(
 fn drawPresenterPairingOverlay(
     code: *qrcode.Code,
     runtime: *presenter.Runtime,
+    network: *const PresenterNetworkState,
     connected: bool,
+    laptop_link_copied: bool,
     screen_width: i32,
     screen_height: i32,
 ) void {
@@ -746,14 +1642,14 @@ fn drawPresenterPairingOverlay(
         .width = @floatFromInt(screen_width),
         .height = @floatFromInt(screen_height),
     }, .{ .r = 7, .g = 11, .b = 24, .a = 255 });
-    drawCenteredPresenterText(font, "PAIR PRESENTER PHONE", presenterOverlayPx(18, scale), 36 * scale, .{ .r = 97, .g = 218, .b = 251, .a = 255 }, screen_width);
-    drawCenteredPresenterText(font, "Scan this private code before enabling screen mirroring", presenterOverlayPx(58, scale), 24 * scale, .{ .r = 185, .g = 202, .b = 220, .a = 255 }, screen_width);
+    drawCenteredPresenterText(font, "PAIR PRESENTER COMPANION", presenterOverlayPx(18, scale), 36 * scale, .{ .r = 97, .g = 218, .b = 251, .a = 255 }, screen_width);
+    drawCenteredPresenterText(font, "Scan on a phone, or press L for a private laptop link", presenterOverlayPx(58, scale), 24 * scale, .{ .r = 185, .g = 202, .b = 220, .a = 255 }, screen_width);
 
     const qr_target = @max(
         presenterOverlayPx(120, scale),
         @min(
             presenterOverlayPx(380, scale),
-            @min(screen_width - presenterOverlayPx(80, scale), screen_height - presenterOverlayPx(210, scale)),
+            @min(screen_width - presenterOverlayPx(80, scale), screen_height - presenterOverlayPx(300, scale)),
         ),
     );
     if (code.ensure(runtime.pairing_url.slice())) {
@@ -785,21 +1681,524 @@ fn drawPresenterPairingOverlay(
 
         var address_buffer: [320:0]u8 = @splat(0);
         const address = std.fmt.bufPrintZ(&address_buffer, "Local address: {s}", .{runtime.base_url.slice()}) catch "Local address is too long";
-        const address_y = @min(screen_height - presenterOverlayPx(82, scale), top + rendered_side + presenterOverlayPx(14, scale));
+        const address_y = @min(screen_height - presenterOverlayPx(150, scale), top + rendered_side + presenterOverlayPx(14, scale));
         drawCenteredPresenterText(font, address, address_y, 22 * scale, .{ .r = 223, .g = 233, .b = 244, .a = 255 }, screen_width);
+
+        var network_buffer: [192:0]u8 = @splat(0);
+        const network_label = std.fmt.bufPrintZ(
+            &network_buffer,
+            "{s} · {s} · address {d}/{d}",
+            .{
+                network.selected.interface_name.slice(),
+                network.selected.kind.label(),
+                network.selected_index + 1,
+                @max(@as(usize, 1), network.discovery.len),
+            },
+        ) catch "Network details unavailable";
+        drawCenteredPresenterText(
+            font,
+            network_label,
+            address_y + presenterOverlayPx(27, scale),
+            18 * scale,
+            .{ .r = 97, .g = 218, .b = 251, .a = 255 },
+            screen_width,
+        );
+        var guidance_buffer: [192:0]u8 = @splat(0);
+        const guidance = std.fmt.bufPrintZ(
+            &guidance_buffer,
+            "{s}",
+            .{network.selected.kind.guidance()},
+        ) catch "Verify that the phone can reach this address";
+        drawCenteredPresenterText(
+            font,
+            guidance,
+            address_y + presenterOverlayPx(51, scale),
+            17 * scale,
+            .{ .r = 185, .g = 202, .b = 220, .a = 255 },
+            screen_width,
+        );
     } else {
         drawCenteredPresenterText(font, "The pairing address is too long to encode as a QR code.", presenterOverlayPx(160, scale), 24 * scale, .{ .r = 255, .g = 155, .b = 174, .a = 255 }, screen_width);
     }
 
     drawCenteredPresenterText(
         font,
-        if (connected) "PHONE CONNECTED" else "WAITING FOR PHONE",
+        if (laptop_link_copied)
+            "PRIVATE LAPTOP LINK COPIED"
+        else if (connected)
+            "COMPANION CONNECTED"
+        else
+            "WAITING FOR COMPANION",
         screen_height - presenterOverlayPx(82, scale),
         24 * scale,
-        if (connected) .{ .r = 130, .g = 230, .b = 174, .a = 255 } else .{ .r = 255, .g = 181, .b = 71, .a = 255 },
+        if (laptop_link_copied or connected) .{ .r = 130, .g = 230, .b = 174, .a = 255 } else .{ .r = 255, .g = 181, .b = 71, .a = 255 },
         screen_width,
     );
-    drawCenteredPresenterText(font, "P: hide setup   •   Shift-P: unpair and stop", screen_height - presenterOverlayPx(30, scale), 18 * scale, .{ .r = 139, .g = 158, .b = 179, .a = 255 }, screen_width);
+    drawCenteredPresenterText(
+        font,
+        if (network.discovery.len > 1)
+            "L: copy laptop link   •   N: next address   •   P: hide   •   Shift-P: stop"
+        else
+            "L: copy laptop link   •   P: hide   •   Shift-P: unpair and stop",
+        screen_height - presenterOverlayPx(30, scale),
+        18 * scale,
+        .{ .r = 139, .g = 158, .b = 179, .a = 255 },
+        screen_width,
+    );
+}
+
+fn openDisplayPicker(
+    picker: *DisplayPicker,
+    fullscreen_mode: *FullscreenMode,
+    windowed_width: i32,
+    windowed_height: i32,
+    screen_width: *i32,
+    screen_height: *i32,
+) void {
+    picker.restore_fullscreen = fullscreen_mode.*;
+    picker.confirmed_monitor = DisplayPicker.clampMonitor(picker.confirmed_monitor);
+    if (fullscreen_mode.* != .windowed) leavePresentationFullscreen(
+        fullscreen_mode,
+        picker.confirmed_monitor,
+        windowed_width,
+        windowed_height,
+        screen_width,
+        screen_height,
+    );
+    picker.candidate_monitor = picker.confirmed_monitor;
+    picker.identified_monitor = null;
+    picker.visible = true;
+}
+
+fn placeDisplayPickerWindow(
+    picker: *DisplayPicker,
+    monitor_unchecked: i32,
+    windowed_width: *i32,
+    windowed_height: *i32,
+    screen_width: *i32,
+    screen_height: *i32,
+) void {
+    const monitor = DisplayPicker.clampMonitor(monitor_unchecked);
+    const dimensions = moveWindowToMonitor(monitor, windowed_width.*, windowed_height.*);
+    windowed_width.* = dimensions.width;
+    windowed_height.* = dimensions.height;
+    screen_width.* = dimensions.width;
+    screen_height.* = dimensions.height;
+    picker.identified_monitor = monitor;
+}
+
+fn closeDisplayPicker(
+    picker: *DisplayPicker,
+    accept: bool,
+    fullscreen_mode: *FullscreenMode,
+    windowed_width: *i32,
+    windowed_height: *i32,
+    screen_width: *i32,
+    screen_height: *i32,
+) void {
+    const monitor = DisplayPicker.clampMonitor(if (accept)
+        picker.candidate_monitor
+    else
+        picker.confirmed_monitor);
+    placeDisplayPickerWindow(
+        picker,
+        monitor,
+        windowed_width,
+        windowed_height,
+        screen_width,
+        screen_height,
+    );
+    if (accept) picker.confirmed_monitor = monitor;
+    const restore = picker.restore_fullscreen;
+    picker.visible = false;
+    picker.identified_monitor = null;
+    picker.restore_fullscreen = .windowed;
+    if (restore != .windowed) enterPresentationFullscreen(
+        fullscreen_mode,
+        restore,
+        monitor,
+        windowed_width,
+        windowed_height,
+        screen_width,
+        screen_height,
+    );
+}
+
+const DisplayPickerLayout = struct {
+    top: i32,
+    row_height: i32,
+    row_gap: i32,
+    left: i32,
+    panel_width: i32,
+    start_monitor: i32,
+    visible_count: i32,
+
+    fn monitorAt(self: DisplayPickerLayout, point: rl.Vector2) ?i32 {
+        var row: i32 = 0;
+        while (row < self.visible_count) : (row += 1) {
+            const y = self.top + row * (self.row_height + self.row_gap);
+            if (point.x >= @as(f32, @floatFromInt(self.left)) and
+                point.x <= @as(f32, @floatFromInt(self.left + self.panel_width)) and
+                point.y >= @as(f32, @floatFromInt(y)) and
+                point.y <= @as(f32, @floatFromInt(y + self.row_height)))
+            {
+                return self.start_monitor + row;
+            }
+        }
+        return null;
+    }
+};
+
+fn displayPickerLayout(screen_width: i32, screen_height: i32, count: i32, candidate_monitor: i32) DisplayPickerLayout {
+    const scale = presenterOverlayScale(screen_width, screen_height);
+    const row_height = presenterOverlayPx(66, scale);
+    const row_gap = presenterOverlayPx(8, scale);
+    const top = presenterOverlayPx(103, scale);
+    const footer_space = presenterOverlayPx(112, scale);
+    const available = @max(row_height, screen_height - top - footer_space);
+    const visible_count: i32 = @min(count, @max(@as(i32, 1), @divFloor(available + row_gap, row_height + row_gap)));
+    const max_start = @max(@as(i32, 0), count - visible_count);
+    const start = std.math.clamp(candidate_monitor - @divFloor(visible_count, 2), 0, max_start);
+    const panel_width = @min(screen_width - presenterOverlayPx(64, scale), presenterOverlayPx(930, scale));
+    return .{
+        .top = top,
+        .row_height = row_height,
+        .row_gap = row_gap,
+        .left = @divFloor(screen_width - panel_width, 2),
+        .panel_width = panel_width,
+        .start_monitor = start,
+        .visible_count = visible_count,
+    };
+}
+
+fn drawDisplayPickerOverlay(
+    picker: *const DisplayPicker,
+    screen_width: i32,
+    screen_height: i32,
+) void {
+    const scale = presenterOverlayScale(screen_width, screen_height);
+    const font = G.presenter_ui_font;
+    rl.drawRectangle(0, 0, screen_width, screen_height, .{ .r = 7, .g = 11, .b = 24, .a = 255 });
+
+    var title_buffer: [96:0]u8 = @splat(0);
+    const title: [:0]const u8 = if (picker.identified_monitor) |monitor|
+        std.fmt.bufPrintZ(&title_buffer, "DISPLAY {d} IDENTIFIED HERE", .{monitor + 1}) catch "IDENTIFY PRESENTATION DISPLAY"
+    else
+        "CHOOSE PRESENTATION DISPLAY";
+    drawCenteredPresenterText(font, title, presenterOverlayPx(20, scale), 34 * scale, .{ .r = 97, .g = 218, .b = 251, .a = 255 }, screen_width);
+    drawCenteredPresenterText(
+        font,
+        "Rayslides never guesses which active screen is the projector",
+        presenterOverlayPx(61, scale),
+        19 * scale,
+        .{ .r = 185, .g = 202, .b = 220, .a = 255 },
+        screen_width,
+    );
+
+    const count = DisplayPicker.monitorCount();
+    const layout = displayPickerLayout(screen_width, screen_height, count, picker.candidate_monitor);
+    const current_monitor = DisplayPicker.clampMonitor(rl.getCurrentMonitor());
+
+    var visible_index: i32 = 0;
+    while (visible_index < layout.visible_count) : (visible_index += 1) {
+        const monitor = layout.start_monitor + visible_index;
+        const y = layout.top + visible_index * (layout.row_height + layout.row_gap);
+        const candidate = monitor == picker.candidate_monitor;
+        const confirmed = monitor == picker.confirmed_monitor;
+        const window_here = monitor == current_monitor;
+        rl.drawRectangleRounded(
+            .{
+                .x = @floatFromInt(layout.left),
+                .y = @floatFromInt(y),
+                .width = @floatFromInt(layout.panel_width),
+                .height = @floatFromInt(layout.row_height),
+            },
+            0.18,
+            8,
+            if (candidate) .{ .r = 27, .g = 52, .b = 78, .a = 255 } else .{ .r = 12, .g = 24, .b = 40, .a = 255 },
+        );
+        rl.drawRectangleRoundedLinesEx(
+            .{
+                .x = @floatFromInt(layout.left),
+                .y = @floatFromInt(y),
+                .width = @floatFromInt(layout.panel_width),
+                .height = @floatFromInt(layout.row_height),
+            },
+            0.18,
+            8,
+            if (candidate) 2 * scale else 1 * scale,
+            if (candidate) .{ .r = 97, .g = 218, .b = 251, .a = 255 } else .{ .r = 33, .g = 58, .b = 86, .a = 255 },
+        );
+
+        var name_buffer: [256:0]u8 = @splat(0);
+        const name = std.fmt.bufPrintZ(
+            &name_buffer,
+            "{s}  DISPLAY {d} · {s}",
+            .{ if (candidate) ">" else " ", monitor + 1, rl.getMonitorName(monitor) },
+        ) catch "Display name unavailable";
+        rl.drawTextEx(
+            font,
+            name,
+            .{ .x = @floatFromInt(layout.left + presenterOverlayPx(18, scale)), .y = @floatFromInt(y + presenterOverlayPx(8, scale)) },
+            20 * scale,
+            0,
+            .{ .r = 238, .g = 246, .b = 255, .a = 255 },
+        );
+
+        const position = rl.getMonitorPosition(monitor);
+        var detail_buffer: [256:0]u8 = @splat(0);
+        const detail = std.fmt.bufPrintZ(
+            &detail_buffer,
+            "{d} × {d} · {d} Hz · position {d}, {d}{s}{s}",
+            .{
+                rl.getMonitorWidth(monitor),
+                rl.getMonitorHeight(monitor),
+                rl.getMonitorRefreshRate(monitor),
+                @as(i32, @intFromFloat(position.x)),
+                @as(i32, @intFromFloat(position.y)),
+                if (confirmed) " · SELECTED" else "",
+                if (window_here) " · WINDOW HERE" else "",
+            },
+        ) catch "Display details unavailable";
+        rl.drawTextEx(
+            font,
+            detail,
+            .{ .x = @floatFromInt(layout.left + presenterOverlayPx(18, scale)), .y = @floatFromInt(y + presenterOverlayPx(36, scale)) },
+            15 * scale,
+            0,
+            if (confirmed) .{ .r = 130, .g = 230, .b = 174, .a = 255 } else .{ .r = 139, .g = 158, .b = 179, .a = 255 },
+        );
+    }
+
+    var page_buffer: [96:0]u8 = @splat(0);
+    const page: [:0]const u8 = if (count == 1)
+        "One active display detected"
+    else
+        std.fmt.bufPrintZ(
+            &page_buffer,
+            "Display {d} of {d} selected",
+            .{ picker.candidate_monitor + 1, count },
+        ) catch "Display selection";
+    drawCenteredPresenterText(
+        font,
+        page,
+        screen_height - presenterOverlayPx(78, scale),
+        18 * scale,
+        .{ .r = 255, .g = 181, .b = 71, .a = 255 },
+        screen_width,
+    );
+    drawCenteredPresenterText(
+        font,
+        "Click row: identify/use   ·   ↑/↓: select   ·   Space: identify   ·   Enter: use   ·   Esc: cancel",
+        screen_height - presenterOverlayPx(36, scale),
+        17 * scale,
+        .{ .r = 139, .g = 158, .b = 179, .a = 255 },
+        screen_width,
+    );
+}
+
+const ShowtimeOverlay = struct {
+    visible: bool = false,
+    selected: usize = 0,
+    first_visible: usize = 0,
+
+    fn normalize(self: *ShowtimeOverlay, finding_count: usize, capacity: usize) void {
+        if (finding_count == 0) {
+            self.selected = 0;
+            self.first_visible = 0;
+            return;
+        }
+        self.selected = @min(self.selected, finding_count - 1);
+        if (capacity == 0) return;
+        if (self.selected < self.first_visible) self.first_visible = self.selected;
+        if (self.selected >= self.first_visible + capacity) self.first_visible = self.selected + 1 - capacity;
+        self.first_visible = @min(self.first_visible, finding_count - @min(finding_count, capacity));
+    }
+
+    fn move(self: *ShowtimeOverlay, delta: i8, finding_count: usize, capacity: usize) void {
+        if (finding_count == 0) return;
+        if (delta < 0) self.selected -|= 1 else self.selected = @min(finding_count - 1, self.selected + 1);
+        self.normalize(finding_count, capacity);
+    }
+};
+
+const ShowtimeOverlayLayout = struct {
+    panel: rl.Rectangle,
+    summary: rl.Rectangle,
+    rows: rl.Rectangle,
+    footer: rl.Rectangle,
+    row_height: f32,
+    row_gap: f32,
+    capacity: usize,
+
+    fn row(self: ShowtimeOverlayLayout, slot: usize) rl.Rectangle {
+        return .{
+            .x = self.rows.x,
+            .y = self.rows.y + @as(f32, @floatFromInt(slot)) * (self.row_height + self.row_gap),
+            .width = self.rows.width,
+            .height = self.row_height,
+        };
+    }
+
+    fn rowAt(self: ShowtimeOverlayLayout, point: rl.Vector2) ?usize {
+        for (0..self.capacity) |slot| if (showtimePointInRectangle(point, self.row(slot))) return slot;
+        return null;
+    }
+};
+
+fn showtimePointInRectangle(point: rl.Vector2, rect: rl.Rectangle) bool {
+    return point.x >= rect.x and point.y >= rect.y and point.x <= rect.x + rect.width and point.y <= rect.y + rect.height;
+}
+
+fn showtimeOverlayLayout(screen_width: i32, screen_height: i32) ShowtimeOverlayLayout {
+    const scale = presenterOverlayScale(screen_width, screen_height);
+    const margin = 20 * scale;
+    const panel: rl.Rectangle = .{
+        .x = margin,
+        .y = margin,
+        .width = @as(f32, @floatFromInt(screen_width)) - margin * 2,
+        .height = @as(f32, @floatFromInt(screen_height)) - margin * 2,
+    };
+    const header_height = 78 * scale;
+    const summary_height = 68 * scale;
+    const footer_height = 42 * scale;
+    const row_gap = 7 * scale;
+    const rows: rl.Rectangle = .{
+        .x = panel.x + 20 * scale,
+        .y = panel.y + header_height + summary_height + 15 * scale,
+        .width = panel.width - 40 * scale,
+        .height = @max(0, panel.height - header_height - summary_height - footer_height - 31 * scale),
+    };
+    const row_height = 67 * scale;
+    return .{
+        .panel = panel,
+        .summary = .{ .x = rows.x, .y = panel.y + header_height, .width = rows.width, .height = summary_height },
+        .rows = rows,
+        .footer = .{ .x = rows.x, .y = panel.y + panel.height - footer_height, .width = rows.width, .height = footer_height },
+        .row_height = row_height,
+        .row_gap = row_gap,
+        .capacity = @max(@as(usize, 1), @as(usize, @intFromFloat(@floor((rows.height + row_gap) / (row_height + row_gap))))),
+    };
+}
+
+const ShowtimeOverlayAction = union(enum) {
+    none,
+    close,
+    rerun,
+    portable,
+    open_finding: usize,
+};
+
+fn updateShowtimeOverlay(
+    overlay: *ShowtimeOverlay,
+    report: *const showtime.Report,
+    screen_width: i32,
+    screen_height: i32,
+) ShowtimeOverlayAction {
+    if (!overlay.visible) return .none;
+    const layout = showtimeOverlayLayout(screen_width, screen_height);
+    overlay.normalize(report.findings.items.len, layout.capacity);
+    if (rl.isKeyPressed(.escape)) return .close;
+    if (rl.isKeyPressed(.r)) return .rerun;
+    if (rl.isKeyPressed(.p)) return .portable;
+    if (rl.isKeyPressed(.up)) overlay.move(-1, report.findings.items.len, layout.capacity);
+    if (rl.isKeyPressed(.down)) overlay.move(1, report.findings.items.len, layout.capacity);
+    const wheel = rl.getMouseWheelMove();
+    if (wheel > 0) overlay.move(-1, report.findings.items.len, layout.capacity);
+    if (wheel < 0) overlay.move(1, report.findings.items.len, layout.capacity);
+    if (rl.isKeyPressed(.enter) and report.findings.items.len > 0) return .{ .open_finding = overlay.selected };
+    if (rl.isMouseButtonPressed(.left)) {
+        const pointer = rl.getMousePosition();
+        if (!showtimePointInRectangle(pointer, layout.panel)) return .close;
+        if (layout.rowAt(pointer)) |slot| {
+            const index = overlay.first_visible + slot;
+            if (index < report.findings.items.len) {
+                if (overlay.selected == index) return .{ .open_finding = index };
+                overlay.selected = index;
+            }
+        }
+    }
+    return .none;
+}
+
+fn showtimeSeverityColor(severity: showtime.Severity) rl.Color {
+    return switch (severity) {
+        .error_ => .{ .r = 255, .g = 107, .b = 132, .a = 255 },
+        .warning => .{ .r = 255, .g = 181, .b = 71, .a = 255 },
+        .info => .{ .r = 97, .g = 218, .b = 251, .a = 255 },
+    };
+}
+
+fn drawShowtimeOverlay(
+    overlay: *const ShowtimeOverlay,
+    report: *const showtime.Report,
+    screen_width: i32,
+    screen_height: i32,
+) void {
+    const layout = showtimeOverlayLayout(screen_width, screen_height);
+    const scale = presenterOverlayScale(screen_width, screen_height);
+    const font = G.presenter_ui_font;
+    rl.drawRectangle(0, 0, screen_width, screen_height, .{ .r = 5, .g = 9, .b = 20, .a = 255 });
+    rl.drawRectangleRounded(layout.panel, 0.025, 8, .{ .r = 10, .g = 19, .b = 33, .a = 255 });
+
+    var title_buffer: [160:0]u8 = @splat(0);
+    const title: [:0]const u8 = if (report.ready())
+        std.fmt.bufPrintZ(&title_buffer, "READY FOR SHOW  ·  {d} SLIDES  ·  {d} SCENES", .{ report.summary.slides, report.summary.scenes }) catch "SHOWTIME PREFLIGHT"
+    else
+        std.fmt.bufPrintZ(&title_buffer, "SHOWTIME  ·  {d} BLOCKERS  ·  {d} WARNINGS", .{ report.summary.errors, report.summary.warnings }) catch "SHOWTIME PREFLIGHT";
+    rl.drawTextEx(font, title, .{ .x = layout.panel.x + 20 * scale, .y = layout.panel.y + 15 * scale }, 28 * scale, 0, if (report.ready()) .{ .r = 130, .g = 230, .b = 174, .a = 255 } else .{ .r = 255, .g = 181, .b = 71, .a = 255 });
+    rl.drawTextEx(font, "Exact parser + renderer + venue state · no playback, history, selection, or source mutation", .{ .x = layout.panel.x + 20 * scale, .y = layout.panel.y + 48 * scale }, 15 * scale, 0, .{ .r = 151, .g = 170, .b = 193, .a = 255 });
+
+    rl.drawRectangleRounded(layout.summary, 0.10, 8, .{ .r = 14, .g = 28, .b = 47, .a = 255 });
+    var summary_buffer: [384:0]u8 = @splat(0);
+    const summary_text = std.fmt.bufPrintZ(
+        &summary_buffer,
+        "DECK {d} slides / {d} endpoints     RENDER {d} fragments     ASSETS {d}     DEFINITIONS {d}",
+        .{ report.summary.slides, report.summary.reveal_endpoints, report.summary.render_fragments, report.summary.assets, report.summary.reusable_definitions },
+    ) catch "Showtime summary";
+    rl.drawTextEx(font, summary_text, .{ .x = layout.summary.x + 16 * scale, .y = layout.summary.y + 12 * scale }, 18 * scale, 0, .{ .r = 232, .g = 241, .b = 250, .a = 255 });
+    var counts_buffer: [256:0]u8 = @splat(0);
+    const counts = std.fmt.bufPrintZ(&counts_buffer, "{d} errors   ·   {d} warnings   ·   {d} notes{s}", .{ report.summary.errors, report.summary.warnings, report.summary.info, if (report.truncated) "   ·   result limit reached" else "" }) catch "Readiness counts";
+    rl.drawTextEx(font, counts, .{ .x = layout.summary.x + 16 * scale, .y = layout.summary.y + 39 * scale }, 15 * scale, 0, if (report.summary.errors > 0) showtimeSeverityColor(.error_) else if (report.summary.warnings > 0) showtimeSeverityColor(.warning) else .{ .r = 130, .g = 230, .b = 174, .a = 255 });
+
+    if (report.findings.items.len == 0) {
+        rl.drawTextEx(font, "All deterministic checks passed. Review the actual projector and phone before walking on stage.", .{ .x = layout.rows.x + 12 * scale, .y = layout.rows.y + 22 * scale }, 19 * scale, 0, .{ .r = 185, .g = 202, .b = 220, .a = 255 });
+    } else {
+        for (0..layout.capacity) |slot| {
+            const index = overlay.first_visible + slot;
+            if (index >= report.findings.items.len) break;
+            const finding = report.findings.items[index];
+            const row = layout.row(slot);
+            const selected = index == overlay.selected;
+            rl.drawRectangleRounded(row, 0.10, 8, if (selected) .{ .r = 24, .g = 48, .b = 72, .a = 255 } else .{ .r = 12, .g = 25, .b = 42, .a = 255 });
+            rl.drawRectangle(@intFromFloat(row.x), @intFromFloat(row.y), @max(@as(i32, 3), @as(i32, @intFromFloat(5 * scale))), @intFromFloat(row.height), showtimeSeverityColor(finding.severity));
+            var location_buffer: [64:0]u8 = @splat(0);
+            const location: [:0]const u8 = if (finding.slide_index) |slide_index|
+                std.fmt.bufPrintZ(&location_buffer, "  ·  slide {d}", .{slide_index + 1}) catch ""
+            else if (finding.source_line) |line|
+                std.fmt.bufPrintZ(&location_buffer, "  ·  line {d}", .{line}) catch ""
+            else
+                "";
+            var row_title_buffer: [512:0]u8 = @splat(0);
+            const row_title = std.fmt.bufPrintZ(&row_title_buffer, "{s}  {s}{s}{s}", .{
+                @tagName(finding.category),
+                finding.title,
+                location,
+                if (finding.morph_state != null) "  ·  morph" else "",
+            }) catch "Showtime finding";
+            rl.drawTextEx(font, row_title, .{ .x = row.x + 17 * scale, .y = row.y + 9 * scale }, 18 * scale, 0, .{ .r = 238, .g = 246, .b = 255, .a = 255 });
+            var detail_buffer: [640:0]u8 = @splat(0);
+            const detail = std.fmt.bufPrintZ(&detail_buffer, "{s}", .{finding.detail}) catch "See source for details";
+            rl.drawTextEx(font, detail, .{ .x = row.x + 17 * scale, .y = row.y + 37 * scale }, 14 * scale, 0, .{ .r = 151, .g = 170, .b = 193, .a = 255 });
+        }
+    }
+
+    var page_buffer: [128:0]u8 = @splat(0);
+    const page = if (report.findings.items.len == 0)
+        "R rerun  ·  P portable folder  ·  Esc close"
+    else
+        std.fmt.bufPrintZ(&page_buffer, "↑/↓ review  ·  Enter open slide/source  ·  R rerun  ·  P portable folder  ·  Esc close   ({d}/{d})", .{ overlay.selected + 1, report.findings.items.len }) catch "Showtime controls";
+    rl.drawTextEx(font, page, .{ .x = layout.footer.x, .y = layout.footer.y + 10 * scale }, 15 * scale, 0, .{ .r = 139, .g = 158, .b = 179, .a = 255 });
 }
 
 test "presenter pairing overlay scales for projector resolutions" {
@@ -807,6 +2206,25 @@ test "presenter pairing overlay scales for projector resolutions" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), presenterOverlayScale(1920, 1080), 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 3), presenterOverlayScale(3840, 2160), 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 1), presenterOverlayScale(900, 506), 0.001);
+}
+
+test "display picker rows stay clickable at compact and projector sizes" {
+    const compact = displayPickerLayout(900, 506, 2, 0);
+    try std.testing.expectEqual(@as(i32, 2), compact.visible_count);
+    try std.testing.expectEqual(@as(i32, 0), compact.monitorAt(.{
+        .x = @floatFromInt(compact.left + 10),
+        .y = @floatFromInt(compact.top + 10),
+    }).?);
+    try std.testing.expectEqual(@as(i32, 1), compact.monitorAt(.{
+        .x = @floatFromInt(compact.left + 10),
+        .y = @floatFromInt(compact.top + compact.row_height + compact.row_gap + 10),
+    }).?);
+    try std.testing.expect(compact.monitorAt(.{ .x = 0, .y = 0 }) == null);
+
+    const projector = displayPickerLayout(1920, 1080, 12, 9);
+    try std.testing.expect(projector.visible_count < 12);
+    try std.testing.expect(projector.start_monitor <= 9);
+    try std.testing.expect(projector.start_monitor + projector.visible_count > 9);
 }
 
 const ExportController = struct {
@@ -1216,7 +2634,7 @@ const PresenterPreviewController = struct {
             self.target.begin();
             defer self.target.end();
             rl.clearBackground(.black);
-            try slide_renderer.render(
+            try slide_renderer.renderWithVideoPosters(
                 slide_number,
                 reveal_state,
                 transition_state,
@@ -1928,6 +3346,10 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_precision_view = false;
     var diagnostics_grid_settings = false;
     var diagnostics_presenter_pairing = false;
+    var diagnostics_presenter_session = false;
+    var diagnostics_display_picker = false;
+    var diagnostics_confirm_display: ?i32 = null;
+    var diagnostics_showtime = false;
     var diagnostics_large_deck_count: ?usize = null;
     var diagnostics_incremental_edit_slide: ?usize = null;
     var diagnostics_window_size: ?WindowDimensions = null;
@@ -1944,12 +3366,17 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_hide_hud = false;
     var diagnostics_select_buffer: [128]u8 = undefined;
     var diagnostics_select_id: ?[]const u8 = null;
+    var diagnostics_video_playback = false;
     var diagnostics_library_preview_buffer: [128]u8 = undefined;
     var diagnostics_library_preview_name: ?[]const u8 = null;
     var diagnostics_library_definition_buffer: [128]u8 = undefined;
     var diagnostics_library_definition_name: ?[]const u8 = null;
     var diagnostics_find_slide_buffer: [studio.max_panel_search_bytes]u8 = undefined;
     var diagnostics_find_slide_query: ?[]const u8 = null;
+    var showtime_report_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var showtime_report_path: ?[]const u8 = null;
+    var portable_show_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var portable_show_path: ?[]const u8 = null;
 
     // get args
     const slideshow_to_load: ?[]const u8 = blk: {
@@ -2008,6 +3435,30 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-presenter-pairing")) {
                 diagnostics_presenter_pairing = true;
                 launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-presenter-session")) {
+                diagnostics_presenter_session = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-display-picker")) {
+                diagnostics_display_picker = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-confirm-display=")) {
+                diagnostics_confirm_display = parseDiagnosticDisplayNumber(arg["--diagnostics-confirm-display=".len..]) orelse
+                    return error.InvalidDiagnosticMonitorIndex;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-showtime")) {
+                diagnostics_showtime = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--showtime-report=")) {
+                showtime_report_path = std.fmt.bufPrint(
+                    &showtime_report_path_buffer,
+                    "{s}",
+                    .{arg["--showtime-report=".len..]},
+                ) catch std.process.fatal("Showtime report path is too long", .{});
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--portable-show=")) {
+                portable_show_path = std.fmt.bufPrint(
+                    &portable_show_path_buffer,
+                    "{s}",
+                    .{arg["--portable-show=".len..]},
+                ) catch std.process.fatal("Portable show path is too long", .{});
             } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-large-deck=")) {
                 const value = arg["--diagnostics-large-deck=".len..];
                 const count = std.fmt.parseInt(usize, value, 10) catch return error.InvalidDiagnosticSlideCount;
@@ -2074,6 +3525,10 @@ pub fn main(init: std.process.Init) anyerror!void {
                     "{s}",
                     .{arg["--diagnostics-select=".len..]},
                 ) catch std.process.fatal("Diagnostics selection ID is too long", .{});
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-video-playback")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_video_playback = true;
             } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-library-preview=")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
@@ -2113,6 +3568,10 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     if ((diagnostics_report_path != null or diagnostics_exit_after_capture) and diagnostics_capture_path == null)
         return error.DiagnosticCapturePathRequired;
+    if (showtime_report_path != null and portable_show_path != null)
+        return error.ShowtimeOutputModesConflict;
+    if (portable_show_path != null and slideshow_to_load == null)
+        return error.PortableShowRequiresDeck;
 
     const starts_in_studio = launch_studio or slideshow_to_load == null;
     const windowWidth: i32 = 1280;
@@ -2126,7 +3585,11 @@ pub fn main(init: std.process.Init) anyerror!void {
     // Register before GLFW finishes launching NSApplication: LaunchServices
     // may deliver the initial Finder/Open With document during initWindow.
     MacOpenDocuments.install();
-    rl.setConfigFlags(.{ .window_resizable = true, .vsync_hint = true });
+    rl.setConfigFlags(.{
+        .window_resizable = true,
+        .vsync_hint = true,
+        .window_hidden = showtime_report_path != null or portable_show_path != null,
+    });
     rl.initWindow(screenWidth, screenHeight, "rayslides");
     rl.setWindowMinSize(900, 506);
     if (starts_in_studio) {
@@ -2173,12 +3636,15 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer crowd_runtime.stop();
     var presenter_runtime = try presenter.Runtime.init(gpa, io);
     defer presenter_runtime.deinit();
+    var presenter_network = PresenterNetworkState.init(presenter_options);
+    var presenter_network_refresh_at: f64 = 0;
     var presenter_preview = try PresenterPreviewController.init();
     defer presenter_preview.deinit();
     var presenter_qr: qrcode.Code = .{};
     var presenter_pairing_visible = false;
-    if (diagnostics_presenter_pairing) {
-        if (!ensurePresenterCompanionRunning(&presenter_runtime, presenter_options))
+    var presenter_laptop_link_copied_until: f64 = 0;
+    if (diagnostics_presenter_pairing or diagnostics_presenter_session) {
+        if (!ensurePresenterCompanionRunning(&presenter_runtime, presenter_options, &presenter_network))
             return error.DiagnosticPresenterPairingFailed;
         presenter_pairing_visible = true;
     }
@@ -2201,6 +3667,11 @@ pub fn main(init: std.process.Init) anyerror!void {
     var is_pre_rendered: bool = false;
     var export_controller: ExportController = try .init(gpa, io, null);
     defer export_controller.deinit();
+    // A presentation screenshot is rendered once with immutable authored
+    // video posters, then read back at the start of the following frame. Live
+    // playback keeps advancing and is never stopped or rewound for the copy.
+    var screenshot_poster_render_pending = false;
+    var screenshot_capture_pending = false;
     var laser_pointer: LaserPointer = try .init(gpa);
     defer laser_pointer.deinit();
     var remote_drawing: RemoteDrawing = try .init(gpa);
@@ -2217,6 +3688,14 @@ pub fn main(init: std.process.Init) anyerror!void {
     var property_prompt: studio_prompt.Prompt = .{};
     var pending_semantic_command: ?studio.SemanticCommand = null;
     var pending_save_as = false;
+    var pending_portable_show = false;
+    var showtime_overlay = ShowtimeOverlay{ .visible = diagnostics_showtime };
+    var showtime_report: ?showtime.Report = null;
+    defer if (showtime_report) |*report| report.deinit();
+    var showtime_cli_completed = false;
+    var showtime_cli_failed = false;
+    var showtime_source_line_pending: ?usize = null;
+    var showtime_definition_identity_pending: ?usize = null;
     var studio_history = StudioHistory.init(gpa);
     defer studio_history.deinit();
     var studio_clipboard = StudioClipboard.init(gpa);
@@ -2233,9 +3712,52 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer studio_library_preview_cache.deinit(G.slide_renderer);
     var studio_composition_cache: StudioCompositionCache = .{};
 
-    var manual_fullscreen: bool = false;
+    var fullscreen_mode: FullscreenMode = .windowed;
     var windowed_width = screenWidth;
     var windowed_height = screenHeight;
+    var display_picker = DisplayPicker.init();
+    if (diagnostics_confirm_display) |requested_monitor| {
+        const monitor_count = DisplayPicker.monitorCount();
+        if (requested_monitor >= monitor_count) return error.InvalidDiagnosticMonitorIndex;
+        // Drive the same identify + confirm functions as the interactive
+        // picker. This gives venue QA a deterministic path even when a window
+        // manager isolation Space cannot deliver synthetic GLFW input.
+        openDisplayPicker(
+            &display_picker,
+            &fullscreen_mode,
+            windowed_width,
+            windowed_height,
+            &screenWidth,
+            &screenHeight,
+        );
+        display_picker.candidate_monitor = requested_monitor;
+        placeDisplayPickerWindow(
+            &display_picker,
+            requested_monitor,
+            &windowed_width,
+            &windowed_height,
+            &screenWidth,
+            &screenHeight,
+        );
+        closeDisplayPicker(
+            &display_picker,
+            true,
+            &fullscreen_mode,
+            &windowed_width,
+            &windowed_height,
+            &screenWidth,
+            &screenHeight,
+        );
+        log.info("diagnostics confirmed presentation display {d}/{d}: {s} ({d}x{d} @ {d} Hz)", .{
+            requested_monitor + 1,
+            monitor_count,
+            rl.getMonitorName(requested_monitor),
+            rl.getMonitorWidth(requested_monitor),
+            rl.getMonitorHeight(requested_monitor),
+            rl.getMonitorRefreshRate(requested_monitor),
+        });
+    }
+    if (diagnostics_display_picker) display_picker.visible = true;
     var window_close_seen = false;
     var studio_was_capturing_input = false;
 
@@ -2279,27 +3801,202 @@ pub fn main(init: std.process.Init) anyerror!void {
         const command_palette_active_at_frame_start = studio_mode.commandPaletteActive();
         const library_picker_active_at_frame_start = studio_mode.libraryPickerActive();
         const text_input_active_at_frame_start = property_prompt.active or studio_mode.textEntryActive();
-        const presenter_pairing_visible_at_frame_start = presenter_pairing_visible;
-        var presenter_overlay_consumed_input = false;
-        if (!text_input_active_at_frame_start and rl.isKeyPressed(.p)) {
-            presenter_overlay_consumed_input = true;
-            if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
-                presenter_runtime.stop();
+        const presenter_network_now = rl.getTime();
+        if (presenter_runtime.isRunning() and !presenter_network.explicit and
+            presenter_network_now >= presenter_network_refresh_at)
+        {
+            presenter_network_refresh_at = presenter_network_now + 1.5;
+            if (presenter_network.refresh() and
+                !rePairPresenterCompanion(&presenter_runtime, &presenter_network))
+            {
                 presenter_pairing_visible = false;
-                log.info("Presenter Companion stopped and pairing invalidated", .{});
-            } else if (presenter_pairing_visible) {
-                presenter_pairing_visible = false;
-            } else if (ensurePresenterCompanionRunning(&presenter_runtime, presenter_options)) {
-                presenter_pairing_visible = true;
             }
         }
-        if (presenter_pairing_visible_at_frame_start and rl.isKeyPressed(.escape)) {
+        if (diagnostics_presenter_session and presenter_pairing_visible and presenter_runtime.phoneConnected()) {
             presenter_pairing_visible = false;
+        }
+        const presenter_pairing_visible_at_frame_start = presenter_pairing_visible;
+        const display_picker_visible_at_frame_start = display_picker.visible;
+        const showtime_visible_at_frame_start = showtime_overlay.visible;
+        var presenter_overlay_consumed_input = false;
+        if (showtime_visible_at_frame_start) {
             presenter_overlay_consumed_input = true;
-            window_close_seen = false;
+            if (showtime_report) |*active_report| switch (updateShowtimeOverlay(&showtime_overlay, active_report, screenWidth, screenHeight)) {
+                .none => {},
+                .close => {
+                    showtime_overlay.visible = false;
+                    window_close_seen = false;
+                },
+                .rerun => {
+                    const runtime = showtimeRuntimeSnapshot(
+                        &display_picker,
+                        fullscreen_mode,
+                        &presenter_runtime,
+                        &presenter_network,
+                        &crowd_runtime,
+                    );
+                    if (buildLiveShowtimeReport(runtime)) |report| {
+                        replaceShowtimeReport(&showtime_report, report);
+                        showtime_overlay.normalize(showtime_report.?.findings.items.len, showtimeOverlayLayout(screenWidth, screenHeight).capacity);
+                    } else |err| log.err("Showtime rerun failed: {any}", .{err});
+                },
+                .portable => {
+                    pending_portable_show = true;
+                    var folder_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                    const deck_name = if (G.slideshow_filp) |path| std.fs.path.basename(path) else "show.sld";
+                    const extension = std.fs.path.extension(deck_name);
+                    const stem = deck_name[0 .. deck_name.len - extension.len];
+                    const initial = std.fmt.bufPrint(&folder_buffer, "{s}-portable", .{stem}) catch "show-portable";
+                    property_prompt.begin(.portable_folder, initial);
+                    showtime_overlay.visible = false;
+                },
+                .open_finding => |finding_index| {
+                    const finding = showtime_report.?.findings.items[finding_index];
+                    if (finding.slide_index) |slide_index| {
+                        if (slide_index < G.slideshow.slides.items.len) {
+                            G.current_slide = @intCast(slide_index);
+                            studio_mode.active_morph_state = finding.morph_state;
+                            G.playback.enterSlide(null, 0, 0, .{}, 1, rl.getTime());
+                            const slide = G.slideshow.slides.items[slide_index];
+                            const items = if (finding.morph_state) |state|
+                                if (state < slide.morph_states.items.len) slide.morph_states.items[state].items.items else &.{}
+                            else
+                                slide.items.?.items;
+                            if (finding.owner_identity) |identity| {
+                                for (items) |item| {
+                                    if (item.identity != identity) continue;
+                                    _ = studio_mode.selectItemByIdOrSource(items, item.id, item.effectiveSource());
+                                    break;
+                                }
+                            }
+                            showtime_overlay.visible = false;
+                        }
+                    } else if (finding.source_line) |source_line| {
+                        showtime_source_line_pending = source_line;
+                        showtime_definition_identity_pending = finding.owner_identity;
+                        showtime_overlay.visible = false;
+                    }
+                },
+            };
+        } else if (display_picker_visible_at_frame_start) {
+            presenter_overlay_consumed_input = true;
+            display_picker.confirmed_monitor = DisplayPicker.clampMonitor(display_picker.confirmed_monitor);
+            display_picker.candidate_monitor = DisplayPicker.clampMonitor(display_picker.candidate_monitor);
+            if (rl.isMouseButtonPressed(.left)) {
+                const layout = displayPickerLayout(
+                    screenWidth,
+                    screenHeight,
+                    DisplayPicker.monitorCount(),
+                    display_picker.candidate_monitor,
+                );
+                if (layout.monitorAt(rl.getMousePosition())) |monitor| {
+                    if (display_picker.identified_monitor == monitor and
+                        display_picker.candidate_monitor == monitor)
+                    {
+                        closeDisplayPicker(
+                            &display_picker,
+                            true,
+                            &fullscreen_mode,
+                            &windowed_width,
+                            &windowed_height,
+                            &screenWidth,
+                            &screenHeight,
+                        );
+                    } else {
+                        display_picker.candidate_monitor = monitor;
+                        placeDisplayPickerWindow(
+                            &display_picker,
+                            monitor,
+                            &windowed_width,
+                            &windowed_height,
+                            &screenWidth,
+                            &screenHeight,
+                        );
+                    }
+                }
+            }
+            if (rl.isKeyPressed(.up) or rl.isKeyPressed(.left)) display_picker.cycle(-1);
+            if (rl.isKeyPressed(.down) or rl.isKeyPressed(.right) or rl.isKeyPressed(.n)) display_picker.cycle(1);
+            if (rl.isKeyPressed(.space)) placeDisplayPickerWindow(
+                &display_picker,
+                display_picker.candidate_monitor,
+                &windowed_width,
+                &windowed_height,
+                &screenWidth,
+                &screenHeight,
+            );
+            if (rl.isKeyPressed(.enter)) closeDisplayPicker(
+                &display_picker,
+                true,
+                &fullscreen_mode,
+                &windowed_width,
+                &windowed_height,
+                &screenWidth,
+                &screenHeight,
+            );
+            if (rl.isKeyPressed(.escape) or rl.isKeyPressed(.d)) {
+                closeDisplayPicker(
+                    &display_picker,
+                    false,
+                    &fullscreen_mode,
+                    &windowed_width,
+                    &windowed_height,
+                    &screenWidth,
+                    &screenHeight,
+                );
+                window_close_seen = false;
+            }
+        } else if (!text_input_active_at_frame_start and rl.isKeyPressed(.d)) {
+            presenter_overlay_consumed_input = true;
+            presenter_pairing_visible = false;
+            openDisplayPicker(
+                &display_picker,
+                &fullscreen_mode,
+                windowed_width,
+                windowed_height,
+                &screenWidth,
+                &screenHeight,
+            );
+        } else {
+            if (!text_input_active_at_frame_start and rl.isKeyPressed(.p)) {
+                presenter_overlay_consumed_input = true;
+                if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
+                    presenter_runtime.stop();
+                    presenter_pairing_visible = false;
+                    log.info("Presenter Companion stopped and pairing invalidated", .{});
+                } else if (presenter_pairing_visible) {
+                    presenter_pairing_visible = false;
+                } else if (ensurePresenterCompanionRunning(&presenter_runtime, presenter_options, &presenter_network)) {
+                    presenter_pairing_visible = true;
+                }
+            }
+            if (presenter_pairing_visible_at_frame_start and rl.isKeyPressed(.escape)) {
+                presenter_pairing_visible = false;
+                presenter_overlay_consumed_input = true;
+                window_close_seen = false;
+            }
+            if (presenter_pairing_visible_at_frame_start and rl.isKeyPressed(.n)) {
+                presenter_overlay_consumed_input = true;
+                if (presenter_network.cycle()) {
+                    if (!rePairPresenterCompanion(&presenter_runtime, &presenter_network))
+                        presenter_pairing_visible = false;
+                }
+            }
+            if (presenter_pairing_visible_at_frame_start and rl.isKeyPressed(.l)) {
+                presenter_overlay_consumed_input = true;
+                const private_link = presenter_runtime.pairing_url.slice();
+                var clipboard_buffer: [385:0]u8 = @splat(0);
+                if (private_link.len < clipboard_buffer.len) {
+                    @memcpy(clipboard_buffer[0..private_link.len], private_link);
+                    rl.setClipboardText(clipboard_buffer[0..private_link.len :0]);
+                    presenter_laptop_link_copied_until = rl.getTime() + 1.8;
+                }
+            }
         }
         const presenter_overlay_captures_input = presenter_pairing_visible_at_frame_start or
-            presenter_pairing_visible or presenter_overlay_consumed_input;
+            presenter_pairing_visible or display_picker_visible_at_frame_start or
+            display_picker.visible or showtime_visible_at_frame_start or
+            showtime_overlay.visible or presenter_overlay_consumed_input;
         // A modal or inline property draft is not part of the persisted source
         // yet. Do not let the OS close button silently throw it away; after
         // submitting or cancelling, Q/Escape (or a fresh close request)
@@ -2331,6 +4028,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                     log.err("could not export pill screenshot to {s}", .{pill_shot_path});
                 }
             }
+        }
+
+        if (screenshot_capture_pending) {
+            screenshot_capture_pending = false;
+            try export_controller.screenshot(G.slideshow_filp);
         }
 
         if (export_controller.running) {
@@ -2393,7 +4095,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 }
             } else {
                 if (export_controller.running == false) {
-                    try export_controller.screenshot(G.slideshow_filp);
+                    screenshot_poster_render_pending = true;
                 }
             }
         }
@@ -2403,10 +4105,13 @@ pub fn main(init: std.process.Init) anyerror!void {
             log.info("frame diagnostics {s}", .{if (frame_diagnostics.enabled) "enabled" else "disabled"});
         }
 
-        // Finder/Open With arrives as a macOS open-documents Apple event,
-        // while dropping onto the live window is exposed by Raylib on every
-        // desktop platform. Both paths copy the transient OS string before
-        // queuing the same ordinary slideshow reload.
+        // Finder/Open With arrives as a macOS open-documents Apple event.
+        // Raylib file drops can additionally create image/video items while
+        // Studio owns input. Copy every accepted transient OS path before
+        // releasing Raylib's FilePathList below.
+        var dropped_media_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var dropped_media_path_len: usize = 0;
+        var dropped_media_kind: ?StudioMediaKind = null;
         var external_open_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const external_open_len = MacOpenDocuments.take(&external_open_buffer);
         if (external_open_len > 0) {
@@ -2424,7 +4129,25 @@ pub fn main(init: std.process.Init) anyerror!void {
                 const raw_path = dropped.paths[index];
                 if (raw_path == null) continue;
                 const path = std.mem.span(raw_path);
-                if (queueExternalDeckOpen(path, text_input_active_at_frame_start, &studio_mode)) break;
+                if (isSlideshowDocumentPath(path)) {
+                    if (queueExternalDeckOpen(path, text_input_active_at_frame_start, &studio_mode)) break;
+                    continue;
+                }
+                if (studio_mode.capturesInput() and !text_input_active_at_frame_start) {
+                    if (studioMediaKindForPath(path)) |kind| {
+                        if (dropped_media_kind == null and path.len <= dropped_media_path_buffer.len) {
+                            @memcpy(dropped_media_path_buffer[0..path.len], path);
+                            dropped_media_path_len = path.len;
+                            dropped_media_kind = kind;
+                        }
+                        // One drop maps to one ordinary source/history edit;
+                        // additional recognized media files can be dropped in
+                        // following gestures without making a hidden batch.
+                        continue;
+                    }
+                }
+                studio_mode.setNotice(if (studio_mode.capturesInput()) .media_drop_unsupported else .open_requires_sld);
+                log.warn("Ignored unsupported dropped file: {s}", .{path});
             }
         }
 
@@ -2448,10 +4171,26 @@ pub fn main(init: std.process.Init) anyerror!void {
                     .enabled = launch_studio or studio_was_enabled,
                     .ui_font = G.studio_ui_font,
                 };
+                invalidateShowtimeForDocumentReplacement(&showtime_overlay, &showtime_report);
                 is_pre_rendered = false;
             } else |err| {
                 studio_mode.setNotice(.reload_failed);
                 log.err("Slideshow reload rejected; current document preserved: {any}", .{err});
+                if (!showtime_cli_completed and (showtime_report_path != null or portable_show_path != null)) {
+                    var report = try buildLoadFailureShowtimeReport(filp, err);
+                    defer report.deinit();
+                    if (showtime_report_path) |report_path| {
+                        const encoded = try showtime.jsonAlloc(gpa, &report);
+                        defer gpa.free(encoded);
+                        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = report_path, .data = encoded });
+                        log.err("Showtime report written to {s}: not ready", .{report_path});
+                    } else if (portable_show_path) |destination| {
+                        log.err("Portable show was not created at {s}: the source deck did not pass parsing", .{destination});
+                    }
+                    showtime_cli_failed = true;
+                    showtime_cli_completed = true;
+                    break;
+                }
             }
         }
 
@@ -2515,6 +4254,53 @@ pub fn main(init: std.process.Init) anyerror!void {
                         result.total_slide_count,
                     });
                     is_pre_rendered = true;
+
+                    const showtime_runtime = showtimeRuntimeSnapshot(
+                        &display_picker,
+                        fullscreen_mode,
+                        &presenter_runtime,
+                        &presenter_network,
+                        &crowd_runtime,
+                    );
+                    if (showtime_overlay.visible and showtime_report == null) {
+                        replaceShowtimeReport(&showtime_report, try buildLiveShowtimeReport(showtime_runtime));
+                        showtime_overlay.visible = true;
+                    }
+                    if (!showtime_cli_completed) {
+                        if (showtime_report_path) |report_path| {
+                            var report = try buildLiveShowtimeReport(showtime_runtime);
+                            defer report.deinit();
+                            const encoded = try showtime.jsonAlloc(gpa, &report);
+                            defer gpa.free(encoded);
+                            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = report_path, .data = encoded });
+                            showtime_cli_failed = !report.ready();
+                            showtime_cli_completed = true;
+                            log.info("Showtime report written to {s}: {s}", .{ report_path, if (report.ready()) "ready" else "not ready" });
+                            break;
+                        }
+                        if (portable_show_path) |destination| {
+                            var portable = try showtime.createPortableFolder(
+                                gpa,
+                                io,
+                                G.editor_memory[0..G.source_len],
+                                G.slideshow_filp.?,
+                                destination,
+                            );
+                            defer portable.deinit();
+                            var report = try verifyPortableShowtime(portable.deck_path, showtime_runtime);
+                            defer report.deinit();
+                            try report.add(.info, .portable, .portable_verified, null, null, null, null, "Portable copy re-opened successfully", "The copied .sld and copied assets passed an independent parser/renderer preflight.");
+                            const encoded = try showtime.jsonAlloc(gpa, &report);
+                            defer gpa.free(encoded);
+                            const portable_report_path = try std.fs.path.join(gpa, &.{ destination, "showtime-report.json" });
+                            defer gpa.free(portable_report_path);
+                            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = portable_report_path, .data = encoded, .flags = .{ .exclusive = true } });
+                            showtime_cli_failed = !report.ready();
+                            showtime_cli_completed = true;
+                            log.info("Portable show created at {s}: {s}", .{ destination, if (report.ready()) "ready" else "not ready" });
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -2581,7 +4367,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         // G.slide_render_width = G.internal_render_size.x - ed_anim.current_size.x;
         // try G.slide_renderer.render(G.current_slide, slideAreaTL(), slideSizeInWindow(), G.internal_render_size);
         const internal_render_size: rl.Vector2 = .{ .x = 1920, .y = 1080 };
-        if (!manual_fullscreen) {
+        if (fullscreen_mode == .windowed) {
             screenWidth = rl.getScreenWidth();
             screenHeight = rl.getScreenHeight();
         }
@@ -2675,6 +4461,37 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .clipboard_item_count = studio_clipboard.items.items.len,
             };
         }
+        if (showtime_source_line_pending) |source_line| {
+            var opened = false;
+            if (frame_studio_catalog) |catalog| {
+                if (showtimeDefinitionCatalogIndexAtLine(
+                    G.editor_memory[0..G.source_len],
+                    catalog,
+                    source_line,
+                )) |catalog_index| {
+                    if (std.mem.indexOfScalar(
+                        usize,
+                        studio_workspace_cache.library_catalog_indices.items,
+                        catalog_index,
+                    )) |workspace_index| {
+                        if (workspace_index < studio_workspace.library.len) {
+                            opened = studio_mode.enterDefinitionMode(
+                                studio_items,
+                                catalog_index,
+                                workspace_index,
+                                studio_workspace.library[workspace_index],
+                            );
+                        }
+                    }
+                }
+            }
+            if (!opened) {
+                showtime_definition_identity_pending = null;
+                studio_mode.setNotice(.edit_failed);
+                log.warn("Showtime could not open reusable definition at source line {d}", .{source_line});
+            }
+            showtime_source_line_pending = null;
+        }
         if (diagnostics_library_definition_pending) |name| {
             const workspace_index = studioLibraryWorkspaceIndex(studio_workspace, name);
             if (workspace_index) |index| {
@@ -2750,6 +4567,14 @@ pub fn main(init: std.process.Init) anyerror!void {
             };
             studio_items = studio_library_preview_cache.items();
             studio_mode.applyPendingDefinitionSelection(studio_items);
+            if (showtime_definition_identity_pending) |identity| {
+                for (studio_items) |item| {
+                    if (item.identity != identity) continue;
+                    _ = studio_mode.selectItemByIdOrSource(studio_items, item.id, item.effectiveSource());
+                    break;
+                }
+                showtime_definition_identity_pending = null;
+            }
             definition_preview_entry = workspace_entry;
             definition_edit_context = switch (entry.kind) {
                 .element => null,
@@ -2764,7 +4589,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             };
         }
         const studio_render_fragment_count = if (definition_preview_entry != null)
-            try collectStudioDefinitionBounds(&studio_bounds, &studio_render_bounds, gpa)
+            try collectStudioDefinitionBounds(&studio_bounds, &studio_render_bounds, gpa, studio_items)
         else
             try collectStudioBounds(
                 &studio_bounds,
@@ -2772,32 +4597,40 @@ pub fn main(init: std.process.Init) anyerror!void {
                 gpa,
                 G.current_slide,
                 studio_mode.active_morph_state,
+                studio_items,
             );
         if (diagnostics_selection_pending) |item_id| {
             if (studio_mode.selectItemByIdOrSource(studio_items, item_id, .{})) {
                 studio_mode.active_dock = .properties;
                 studio_mode.inspector_panel = .properties;
+                studio_mode.video_properties_playback = diagnostics_video_playback;
             } else {
                 log.warn("diagnostics could not select unique item id={s}", .{item_id});
             }
             diagnostics_selection_pending = null;
         }
-        if (diagnostics_command_palette_pending) {
-            studio_mode.openCommandPaletteForDiagnostics(studio_items);
-            diagnostics_command_palette_pending = false;
-        }
-        if (diagnostics_precision_view_pending) {
-            studio_mode.showPrecisionViewForDiagnostics();
-            diagnostics_precision_view_pending = false;
-        }
-        if (diagnostics_grid_settings_pending) {
-            studio_mode.showGridSettingsForDiagnostics();
-            diagnostics_grid_settings_pending = false;
-        }
-        if (diagnostics_find_slide_pending) |query| {
-            if (!studio_mode.openSlideSearchForDiagnostics(query))
-                log.warn("diagnostics could not open slide search for invalid query", .{});
-            diagnostics_find_slide_pending = null;
+        // The release-QA harness moves the native window to its isolated
+        // workspace before opening focus-sensitive diagnostic UI. Otherwise
+        // the workspace transition can dismiss a freshly opened overlay.
+        const diagnostic_ui_gate_open = diagnosticCaptureGateIsOpen(io, diagnostics_capture_gate_path);
+        if (diagnostic_ui_gate_open) {
+            if (diagnostics_command_palette_pending) {
+                studio_mode.openCommandPaletteForDiagnostics(studio_items);
+                diagnostics_command_palette_pending = false;
+            }
+            if (diagnostics_precision_view_pending) {
+                studio_mode.showPrecisionViewForDiagnostics();
+                diagnostics_precision_view_pending = false;
+            }
+            if (diagnostics_grid_settings_pending) {
+                studio_mode.showGridSettingsForDiagnostics();
+                diagnostics_grid_settings_pending = false;
+            }
+            if (diagnostics_find_slide_pending) |query| {
+                if (!studio_mode.openSlideSearchForDiagnostics(query))
+                    log.warn("diagnostics could not open slide search for invalid query", .{});
+                diagnostics_find_slide_pending = null;
+            }
         }
         if (rl.isWindowResized()) studio_mode.cancelActiveInteraction(studio_items);
         const composition_cache_builds_before = studio_composition_cache.rebuild_count;
@@ -2831,6 +4664,7 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         var semantic_to_apply: ?studio.SemanticCommand = null;
         var semantic_text: ?[]const u8 = null;
+        var dropped_media_source_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var inline_field_to_finish: ?studio.InlineField = null;
         var inline_commit_completed = false;
         // false requests Undo, true requests Redo. Palette history commands
@@ -2845,8 +4679,14 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .none => {},
                 .browse_requested => {
                     var chosen_path: [std.fs.max_path_bytes]u8 = undefined;
-                    const chosen_len = browseStudioImagePath(&chosen_path);
-                    if (chosen_len > 0) property_prompt.begin(.image_path, chosen_path[0..chosen_len]);
+                    const prompt_kind = property_prompt.kind;
+                    const media_kind: StudioMediaKind = switch (prompt_kind) {
+                        .image_path => .image,
+                        .video_path => .video,
+                        else => unreachable,
+                    };
+                    const chosen_len = browseStudioMediaPath(media_kind, &chosen_path);
+                    if (chosen_len > 0) property_prompt.begin(prompt_kind, chosen_path[0..chosen_len]);
                     window_close_seen = false;
                 },
                 .submitted => {
@@ -2865,6 +4705,44 @@ pub fn main(init: std.process.Init) anyerror!void {
                             studio_mode.setNotice(.none);
                             log.err("Studio Save As failed: {any}", .{err});
                         }
+                    } else if (pending_portable_show) {
+                        const runtime = showtimeRuntimeSnapshot(
+                            &display_picker,
+                            fullscreen_mode,
+                            &presenter_runtime,
+                            &presenter_network,
+                            &crowd_runtime,
+                        );
+                        if (showtime.createPortableFolder(
+                            gpa,
+                            io,
+                            G.editor_memory[0..G.source_len],
+                            G.slideshow_filp orelse "untitled.sld",
+                            property_prompt.text(),
+                        )) |portable_value| {
+                            var portable = portable_value;
+                            defer portable.deinit();
+                            if (verifyPortableShowtime(portable.deck_path, runtime)) |verified_value| {
+                                var verified = verified_value;
+                                verified.add(.info, .portable, .portable_verified, null, null, null, null, "Portable copy re-opened successfully", "The copied .sld and copied assets passed an independent parser/renderer preflight.") catch {};
+                                replaceShowtimeReport(&showtime_report, verified);
+                                showtime_overlay = .{ .visible = true };
+                                pending_portable_show = false;
+                                studio_mode.setNotice(.none);
+                                log.info("Portable show created and independently preflighted at {s}", .{property_prompt.text()});
+                            } else |err| {
+                                property_prompt.rejectSaveFailure();
+                                log.err("Portable show verification failed: {any}", .{err});
+                            }
+                        } else |err| {
+                            switch (err) {
+                                error.InvalidPortableDestination => property_prompt.rejectInvalidPath(),
+                                error.PathAlreadyExists => property_prompt.rejectExistingPath(),
+                                else => property_prompt.rejectSaveFailure(),
+                            }
+                            studio_mode.setNotice(.none);
+                            log.err("Portable show creation failed: {any}", .{err});
+                        }
                     } else {
                         semantic_to_apply = pending_semantic_command;
                         semantic_text = property_prompt.text();
@@ -2875,6 +4753,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .cancelled => {
                     pending_semantic_command = null;
                     pending_save_as = false;
+                    pending_portable_show = false;
                     window_close_seen = false;
                 },
             }
@@ -2896,6 +4775,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 gpa,
                 G.current_slide,
                 studio_mode.active_morph_state,
+                studio_items,
             );
             definition_preview_entry = null;
         }
@@ -2945,12 +4825,51 @@ pub fn main(init: std.process.Init) anyerror!void {
                         );
                     },
                     .pair_presenter_phone => {
-                        if (ensurePresenterCompanionRunning(&presenter_runtime, presenter_options)) {
+                        if (ensurePresenterCompanionRunning(&presenter_runtime, presenter_options, &presenter_network)) {
                             presenter_pairing_visible = true;
                             studio_mode.setNotice(.none);
                         } else {
                             studio_mode.setNotice(.edit_failed);
                         }
+                    },
+                    .choose_presentation_display => {
+                        presenter_pairing_visible = false;
+                        openDisplayPicker(
+                            &display_picker,
+                            &fullscreen_mode,
+                            windowed_width,
+                            windowed_height,
+                            &screenWidth,
+                            &screenHeight,
+                        );
+                        studio_mode.setNotice(.none);
+                    },
+                    .showtime_preflight => {
+                        const runtime = showtimeRuntimeSnapshot(
+                            &display_picker,
+                            fullscreen_mode,
+                            &presenter_runtime,
+                            &presenter_network,
+                            &crowd_runtime,
+                        );
+                        if (buildLiveShowtimeReport(runtime)) |report| {
+                            replaceShowtimeReport(&showtime_report, report);
+                            showtime_overlay = .{ .visible = true };
+                            presenter_pairing_visible = false;
+                            studio_mode.setNotice(.none);
+                        } else |err| {
+                            studio_mode.setNotice(.edit_failed);
+                            log.err("Showtime preflight failed: {any}", .{err});
+                        }
+                    },
+                    .create_portable_show => {
+                        pending_portable_show = true;
+                        var folder_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                        const deck_name = if (G.slideshow_filp) |path| std.fs.path.basename(path) else "show.sld";
+                        const extension = std.fs.path.extension(deck_name);
+                        const stem = deck_name[0 .. deck_name.len - extension.len];
+                        const initial = std.fmt.bufPrint(&folder_buffer, "{s}-portable", .{stem}) catch "show-portable";
+                        property_prompt.begin(.portable_folder, initial);
                     },
                     .add_item => |add| switch (add.kind) {
                         .text => {
@@ -2965,7 +4884,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                             pending_semantic_command = command;
                             property_prompt.begin(.image_path, "");
                         },
-                        .shape => semantic_to_apply = command,
+                        .video => {
+                            pending_semantic_command = command;
+                            property_prompt.begin(.video_path, "");
+                        },
+                        .shape, .line, .arrow => semantic_to_apply = command,
                     },
                     .edit_text => |target| {
                         const initial = studioItemByIdentity(studio_items, target.item_identity) orelse null;
@@ -2984,6 +4907,23 @@ pub fn main(init: std.process.Init) anyerror!void {
                         // Prompt.begin copied any live inline draft, so the
                         // narrow editor can now be dismissed without losing it.
                         studio_mode.dismissInlineTextForModal();
+                    },
+                    .replace_media => |target| prompt: {
+                        const item = studioItemByIdentity(studio_items, target.item_identity) orelse {
+                            studio_mode.setNotice(.edit_failed);
+                            break :prompt;
+                        };
+                        const kind: studio_prompt.Kind = switch (item.kind) {
+                            .img => .image_path,
+                            .vid => .video_path,
+                            else => {
+                                studio_mode.setNotice(.property_unavailable);
+                                break :prompt;
+                            },
+                        };
+                        const initial = if (item.kind == .img) item.img_path orelse "" else item.vid_path orelse "";
+                        pending_semantic_command = command;
+                        property_prompt.begin(kind, initial);
                     },
                     .edit_numeric_geometry => |request| prompt: {
                         const item = studioItemByIdentity(studio_items, request.target.item_identity) orelse {
@@ -3069,6 +5009,23 @@ pub fn main(init: std.process.Init) anyerror!void {
                         var initial_buffer: [64]u8 = undefined;
                         pending_semantic_command = command;
                         property_prompt.begin(.opacity, formatStudioFloat(&initial_buffer, opacity) catch "1");
+                    },
+                    .set_rotation => |change| prompt: {
+                        if (change.value != null) {
+                            semantic_to_apply = command;
+                            break :prompt;
+                        }
+                        const item = studioItemByIdentity(studio_items, change.target.item_identity) orelse {
+                            studio_mode.setNotice(.edit_failed);
+                            break :prompt;
+                        };
+                        const rotation = if (change.target.edit_scope == .shared_template)
+                            if (item.sharedTemplateValues()) |shared| shared.rotation else item.rotation
+                        else
+                            item.rotation;
+                        var initial_buffer: [64]u8 = undefined;
+                        pending_semantic_command = command;
+                        property_prompt.begin(.coordinate, formatStudioFloat(&initial_buffer, rotation) catch "0");
                     },
                     .promote_to_reusable => |target| {
                         var suggested_name: [96]u8 = undefined;
@@ -3236,6 +5193,41 @@ pub fn main(init: std.process.Init) anyerror!void {
                 }
             }
         }
+        if (semantic_to_apply == null) {
+            if (dropped_media_kind) |kind| {
+                const source_path_len = studioMediaSourcePath(
+                    dropped_media_path_buffer[0..dropped_media_path_len],
+                    &dropped_media_source_buffer,
+                );
+                if (source_path_len == 0) {
+                    studio_mode.setNotice(.edit_failed);
+                } else if (std.mem.indexOfAny(
+                    u8,
+                    dropped_media_source_buffer[0..source_path_len],
+                    " \t\r\n",
+                ) != null) {
+                    // The current attribute grammar has no quoted path form.
+                    // Refuse rather than emitting a directive that would bind
+                    // only the prefix before the first whitespace byte.
+                    studio_mode.setNotice(.media_drop_unsupported);
+                    log.warn("Dropped media path cannot be represented in .sld yet: {s}", .{
+                        dropped_media_source_buffer[0..source_path_len],
+                    });
+                } else {
+                    const pointer = rl.getMousePosition();
+                    const position = if (studio_viewport.containsScreenPoint(pointer))
+                        studio.screenToLogical(studio_viewport, pointer) orelse studio_viewport.logical_size.scale(0.5)
+                    else
+                        studio_viewport.logical_size.scale(0.5);
+                    semantic_to_apply = studio_mode.droppedMediaCommand(
+                        if (kind == .image) .image else .video,
+                        position,
+                    );
+                    if (semantic_to_apply != null)
+                        semantic_text = dropped_media_source_buffer[0..source_path_len];
+                }
+            }
+        }
         if (studio_mode.capturesInput() and laser_pointer.show) {
             laser_pointer.show = false;
             laser_pointer.clearDrawing();
@@ -3384,17 +5376,31 @@ pub fn main(init: std.process.Init) anyerror!void {
                     @intFromFloat(@ceil(canvas.height)),
                 );
             }
-            try G.slide_renderer.render(
-                G.current_slide,
-                reveal_state,
-                transition_state,
-                slide_tl,
-                slide_size_in_window,
-                internal_render_size,
-                crowd_snapshot,
-                previous_crowd_snapshot,
-                crowd_runtime.public_url.slice(),
-            );
+            if (export_controller.running or screenshot_poster_render_pending) {
+                try G.slide_renderer.renderWithVideoPosters(
+                    G.current_slide,
+                    reveal_state,
+                    transition_state,
+                    slide_tl,
+                    slide_size_in_window,
+                    internal_render_size,
+                    crowd_snapshot,
+                    previous_crowd_snapshot,
+                    crowd_runtime.public_url.slice(),
+                );
+            } else {
+                try G.slide_renderer.render(
+                    G.current_slide,
+                    reveal_state,
+                    transition_state,
+                    slide_tl,
+                    slide_size_in_window,
+                    internal_render_size,
+                    crowd_snapshot,
+                    previous_crowd_snapshot,
+                    crowd_runtime.public_url.slice(),
+                );
+            }
             if (clip_studio_canvas) rl.endScissorMode();
             video_overlay_consumed_click = G.slide_renderer.processVideoOverlay(
                 G.current_slide,
@@ -3498,11 +5504,21 @@ pub fn main(init: std.process.Init) anyerror!void {
                 drawPresenterPairingOverlay(
                     &presenter_qr,
                     &presenter_runtime,
+                    &presenter_network,
                     presenter_runtime.phoneConnected(),
+                    rl.getTime() < presenter_laptop_link_copied_until,
                     screenWidth,
                     screenHeight,
                 );
             }
+            if (display_picker.visible) drawDisplayPickerOverlay(&display_picker, screenWidth, screenHeight);
+            if (showtime_overlay.visible) {
+                if (showtime_report) |*report| drawShowtimeOverlay(&showtime_overlay, report, screenWidth, screenHeight);
+            }
+        }
+        if (screenshot_poster_render_pending) {
+            screenshot_poster_render_pending = false;
+            screenshot_capture_pending = true;
         }
 
         if (studio_geometry_batch) |batch| {
@@ -3600,6 +5616,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                     error.InvalidStudioColor,
                     error.InvalidStudioFontSize,
                     error.InvalidStudioOpacity,
+                    error.InvalidStudioUnitInterval,
+                    error.InvalidStudioVideoPoster,
+                    error.InvalidStudioMediaPath,
                     => true,
                     else => false,
                 };
@@ -3816,33 +5835,25 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
 
         if (!presenter_overlay_captures_input and !property_prompt.active and !studio_mode.textEntryActive() and rl.isKeyPressed(.f)) {
-            if (!manual_fullscreen) {
-                windowed_width = screenWidth;
-                windowed_height = screenHeight;
-                const monitor = rl.getCurrentMonitor();
-                rl.setWindowSize(rl.getMonitorWidth(monitor), rl.getMonitorHeight(monitor));
-                if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
-                    screenWidth = rl.getMonitorWidth(monitor);
-                    screenHeight = rl.getMonitorHeight(monitor);
-                    rl.toggleFullscreen();
-                } else {
-                    screenWidth = rl.getRenderWidth();
-                    screenHeight = rl.getRenderHeight();
-                    rl.toggleBorderlessWindowed();
-                }
-                manual_fullscreen = true;
+            if (fullscreen_mode == .windowed) {
+                enterPresentationFullscreen(
+                    &fullscreen_mode,
+                    if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) .exclusive else .borderless,
+                    display_picker.confirmed_monitor,
+                    &windowed_width,
+                    &windowed_height,
+                    &screenWidth,
+                    &screenHeight,
+                );
             } else {
-                // rl.toggleFullscreen();
-                screenWidth = windowed_width;
-                screenHeight = windowed_height;
-                if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
-                    rl.toggleFullscreen();
-                } else {
-                    rl.toggleBorderlessWindowed();
-                }
-                // rl.toggleFullscreen();
-                rl.setWindowSize(windowed_width, windowed_height);
-                manual_fullscreen = false;
+                leavePresentationFullscreen(
+                    &fullscreen_mode,
+                    display_picker.confirmed_monitor,
+                    windowed_width,
+                    windowed_height,
+                    &screenWidth,
+                    &screenHeight,
+                );
             }
         }
 
@@ -3919,6 +5930,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             G.slideshow_filp_to_load = G.slideshow_filp; // signal that we need to load
         }
     }
+    if (showtime_cli_failed) return error.ShowtimePreflightFailed;
 }
 
 fn updateAutomaticReveal(now: f64) void {
@@ -4554,6 +6566,7 @@ const AppData = struct {
         // reparses and be replaced selectively.
         self.slide_renderer = try renderer.SlideshowRenderer.new(self.allocator, &self.fonts);
         self.slide_renderer.video_cache.io = io;
+        self.slide_renderer.texture_cache.io = io;
         self.playback.reset(rl.getTime());
 
         self.editor_memory = try self.allocator.alloc(u8, 128 * 1024);
@@ -4606,7 +6619,23 @@ const AppData = struct {
 
 var G = AppData{};
 
-fn browseStudioImagePath(output: []u8) usize {
+fn studioMediaSourcePath(selected_path: []const u8, output: []u8) usize {
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = std.Io.Dir.cwd().realPath(G.io, &cwd_buffer) catch return 0;
+    const cwd = cwd_buffer[0..cwd_len];
+    const source_path = studioMediaPathFromSelection(
+        G.allocator,
+        cwd,
+        G.slideshow_filp,
+        selected_path,
+    ) catch return 0;
+    defer G.allocator.free(source_path);
+    if (source_path.len > output.len) return 0;
+    @memcpy(output[0..source_path.len], source_path);
+    return source_path.len;
+}
+
+fn browseStudioMediaPath(kind: StudioMediaKind, output: []u8) usize {
     if (comptime builtin.os.tag != .macos) return 0;
 
     var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -4619,19 +6648,9 @@ fn browseStudioImagePath(output: []u8) usize {
     var directory_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
     const directory = std.fmt.bufPrintZ(&directory_buffer, "{s}", .{absolute_deck_dir}) catch return 0;
     var selected_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const selected_len = MacOpenDocuments.chooseImage(directory, &selected_buffer);
+    const selected_len = MacOpenDocuments.chooseMedia(kind, directory, &selected_buffer);
     if (selected_len == 0) return 0;
-
-    const source_path = studioImagePathFromSelection(
-        G.allocator,
-        cwd,
-        G.slideshow_filp,
-        selected_buffer[0..selected_len],
-    ) catch return 0;
-    defer G.allocator.free(source_path);
-    if (source_path.len > output.len) return 0;
-    @memcpy(output[0..source_path.len], source_path);
-    return source_path.len;
+    return studioMediaSourcePath(selected_buffer[0..selected_len], output);
 }
 
 var slicetocbuf: [1024]u8 = undefined;
@@ -4677,6 +6696,7 @@ fn loadSlideshow(filp: []const u8) !void {
     }
     const staged_renderer = try renderer.SlideshowRenderer.new(G.allocator, &staged_fonts);
     staged_renderer.video_cache.io = G.io;
+    staged_renderer.texture_cache.io = G.io;
     var staged_renderer_owned = true;
     defer if (staged_renderer_owned) staged_renderer.deinit();
 
@@ -5214,8 +7234,13 @@ fn studioItemByIdentity(items: []const slides.SlideItem, identity: usize) ?*cons
     return null;
 }
 
-fn inheritedPropertyForInlineField(field: studio.InlineField) source_editor.InheritedProperty {
-    return switch (field) {
+fn studioResolvedBoundsByIdentity(bounds: []const studio.ResolvedBounds, identity: usize) ?studio.ResolvedBounds {
+    for (bounds) |entry| if (entry.identity == identity) return entry;
+    return null;
+}
+
+fn inheritedPropertyForStudioProperty(property: studio.AuthoredProperty) source_editor.InheritedProperty {
+    return switch (property) {
         .text => .text,
         .x => .x,
         .y => .y,
@@ -5224,7 +7249,24 @@ fn inheritedPropertyForInlineField(field: studio.InlineField) source_editor.Inhe
         .foreground => .color,
         .background => .bg,
         .font_size => .fontsize,
+        .corner_radius => .radius,
+        .line_width => .stroke_width,
+        .line_direction => .direction,
+        .line_arrows => .arrow,
+        .rotation => .rotation,
+        .text_alignment => .text_align,
+        .text_vertical_alignment => .valign,
         .opacity => .opacity,
+        .image_source => .img,
+        .video_source => .vid,
+        .media_fit => .fit,
+        .media_focus_x => .focus_x,
+        .media_focus_y => .focus_y,
+        .video_poster => .poster,
+        .video_volume => .volume,
+        .video_autoplay => .autoplay,
+        .video_loop => .loop,
+        .video_muted => .muted,
     };
 }
 
@@ -5232,7 +7274,7 @@ fn studioPropertyOverrides(
     source_overrides: source_editor.InheritedPropertyOverrides,
 ) studio.PropertyOverrideSet {
     var result: studio.PropertyOverrideSet = .{};
-    const fields = [_]studio.InlineField{
+    const properties = [_]studio.AuthoredProperty{
         .text,
         .x,
         .y,
@@ -5241,10 +7283,27 @@ fn studioPropertyOverrides(
         .foreground,
         .background,
         .font_size,
+        .corner_radius,
+        .line_width,
+        .line_direction,
+        .line_arrows,
+        .rotation,
+        .text_alignment,
+        .text_vertical_alignment,
         .opacity,
+        .image_source,
+        .video_source,
+        .media_fit,
+        .media_focus_x,
+        .media_focus_y,
+        .video_poster,
+        .video_volume,
+        .video_autoplay,
+        .video_loop,
+        .video_muted,
     };
-    for (fields) |field| {
-        if (source_overrides.contains(inheritedPropertyForInlineField(field))) result.set(field);
+    for (properties) |property| {
+        if (source_overrides.contains(inheritedPropertyForStudioProperty(property))) result.set(property);
     }
     return result;
 }
@@ -5433,6 +7492,46 @@ test "Studio composition capabilities expose exact component overrides and safe 
     try std.testing.expectEqual(@as(usize, 2), capability_cache.rebuild_count);
 }
 
+test "Studio composition capabilities expose button-based media overrides" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@push clip vid=assets/demo.mp4 w=640 fit=contain volume=0.8\n" ++
+        "@slide\n" ++
+        "@pop clip id=hero vid=assets/local.mp4 fit=cover autoplay loop muted volume=0.5\n";
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const parser_context = try parser.constructSlidesFromBuf(source, deck, arena.allocator());
+    defer parser_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parser_context.parser_errors.items.len);
+
+    const slide = deck.slides.items[0];
+    const items = slide.items.?.items;
+    const studio_state: studio.Studio = .{
+        .enabled = true,
+        .selected_identity = items[0].identity,
+        .selected_source = items[0].source,
+    };
+    const context = studioCompositionContext(allocator, source, slide, null, items, studio_state).?;
+    try std.testing.expectEqual(studio.ReusableInstanceKind.component, context.kind);
+    const owner = try studioResetOwner(source, slide, null, &items[0]);
+    const source_overrides = try source_editor.inheritedPropertyOverrides(source, owner, items[0].id.?);
+    try std.testing.expect(source_overrides.fit);
+    try std.testing.expect(source_overrides.vid);
+    try std.testing.expect(context.local_overrides.contains(.video_source));
+    try std.testing.expect(context.local_overrides.contains(.media_fit));
+    try std.testing.expect(context.local_overrides.contains(.video_autoplay));
+    try std.testing.expect(context.local_overrides.contains(.video_loop));
+    try std.testing.expect(context.local_overrides.contains(.video_muted));
+    try std.testing.expect(context.local_overrides.contains(.video_volume));
+    try std.testing.expect(context.resettable_overrides.contains(.media_fit));
+    try std.testing.expectEqual(source_editor.InheritedProperty.fit, inheritedPropertyForStudioProperty(.media_fit));
+    try std.testing.expectEqual(source_editor.InheritedProperty.vid, inheritedPropertyForStudioProperty(.video_source));
+    try std.testing.expectEqual(source_editor.InheritedProperty.autoplay, inheritedPropertyForStudioProperty(.video_autoplay));
+    try std.testing.expectEqual(source_editor.InheritedProperty.loop, inheritedPropertyForStudioProperty(.video_loop));
+    try std.testing.expectEqual(source_editor.InheritedProperty.muted, inheritedPropertyForStudioProperty(.video_muted));
+}
+
 test "Studio composition capabilities authorize an exact reusable group detach" {
     const allocator = std.testing.allocator;
     const source =
@@ -5462,13 +7561,13 @@ test "Studio composition capabilities authorize an exact reusable group detach" 
     try std.testing.expectEqual(studio.CompositionBlockReason.none, context.detach_block);
     try std.testing.expect(context.detach_target != null);
     try std.testing.expectEqual(items[1].source.line_offset, context.detach_target.?.source.line_offset);
-    try std.testing.expectEqual(@as(u16, 0), context.local_overrides.bits);
+    try std.testing.expectEqual(@as(u32, 0), context.local_overrides.bits);
 }
 
 test "Studio component materialization preserves effective box semantics" {
     const allocator = std.testing.allocator;
     const source =
-        "@push card x=10 y=20 w=300 h=80 fontsize=40 color=#112233ff bg=#01020304 " ++
+        "@push card x=10 y=20 w=300 h=80 fontsize=40 align=center valign=middle color=#112233ff bg=#01020304 " ++
         "line_height=1.2 underline_width=2 bullet_color=#aabbccff bullet_symbol=• " ++
         "shadow=#101112ff shadow_x=3 shadow_y=4 opacity=0.75 visible=false locked=true text=Shared\n" ++
         "@slide\n" ++
@@ -5501,6 +7600,8 @@ test "Studio component materialization preserves effective box semantics" {
     try std.testing.expectEqual(before.position, after.position);
     try std.testing.expectEqual(before.size, after.size);
     try std.testing.expectEqual(before.fontSize, after.fontSize);
+    try std.testing.expectEqual(before.text_alignment, after.text_alignment);
+    try std.testing.expectEqual(before.text_vertical_alignment, after.text_vertical_alignment);
     try std.testing.expectEqual(before.color, after.color);
     try std.testing.expectEqual(before.background_color, after.background_color);
     try std.testing.expectEqual(before.line_height_factor, after.line_height_factor);
@@ -5512,6 +7613,279 @@ test "Studio component materialization preserves effective box semantics" {
     try std.testing.expectEqual(before.visible, after.visible);
     try std.testing.expectEqual(before.locked, after.locked);
     try std.testing.expectEqual(before.animation, after.animation);
+}
+
+test "Studio media materialization preserves image and video authoring semantics" {
+    const allocator = std.testing.allocator;
+    const cases = [_]slides.SlideItem{
+        .{
+            .identity = 1,
+            .id = "image",
+            .kind = .img,
+            .img_path = "assets/hero.png",
+            .position = .{ .x = 10, .y = 20 },
+            .size = .{ .x = 300, .y = 180 },
+            .media_fit = .contain,
+            .media_focus = .{ .x = 0.25, .y = 0.75 },
+        },
+        .{
+            .identity = 2,
+            .id = "video",
+            .kind = .vid,
+            .vid_path = "assets/demo.mp4",
+            .position = .{ .x = 40, .y = 50 },
+            .size = .{ .x = 640, .y = 360 },
+            .media_fit = .cover,
+            .media_focus = .{ .x = 0.8, .y = 0.2 },
+            .vid_poster = 1.25,
+            .vid_autoplay = true,
+            .vid_loop = true,
+            .vid_volume = 0.65,
+            .vid_muted = true,
+        },
+    };
+    for (cases) |before| {
+        const snippet = try materializeStudioItem(allocator, &before);
+        defer allocator.free(snippet);
+        const direct_source = try std.fmt.allocPrint(allocator, "@slide\n{s}\n", .{snippet});
+        defer allocator.free(direct_source);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const deck = try slides.SlideShow.new(arena.allocator());
+        const context = try parser.constructSlidesFromBuf(direct_source, deck, arena.allocator());
+        defer context.deinit();
+        try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+        const after = deck.slides.items[0].items.?.items[0];
+        try std.testing.expectEqual(before.kind, after.kind);
+        try std.testing.expectEqual(before.media_fit, after.media_fit);
+        try std.testing.expectEqual(before.media_focus, after.media_focus);
+        try std.testing.expectEqual(before.vid_poster, after.vid_poster);
+        try std.testing.expectEqual(before.vid_autoplay, after.vid_autoplay);
+        try std.testing.expectEqual(before.vid_loop, after.vid_loop);
+        try std.testing.expectApproxEqAbs(before.vid_volume, after.vid_volume, 0.0001);
+        try std.testing.expectEqual(before.vid_muted, after.vid_muted);
+        if (before.img_path) |path| try std.testing.expectEqualStrings(path, after.img_path.?);
+        if (before.vid_path) |path| try std.testing.expectEqualStrings(path, after.vid_path.?);
+    }
+}
+
+test "Studio line materialization preserves complete authoring semantics" {
+    const allocator = std.testing.allocator;
+    const before: slides.SlideItem = .{
+        .identity = 3,
+        .id = "connector",
+        .kind = .line,
+        .position = .{ .x = 100, .y = 120 },
+        .size = .{ .x = 640, .y = 240 },
+        .line_width = 8,
+        .line_direction = .up,
+        .line_arrow_start = true,
+        .line_arrow_end = true,
+        .color = .{ .r = 51, .g = 204, .b = 255, .a = 255 },
+        .opacity = 0.65,
+        .locked = true,
+    };
+    const snippet = try materializeStudioItem(allocator, &before);
+    defer allocator.free(snippet);
+    try std.testing.expect(std.mem.startsWith(u8, snippet, "@line "));
+
+    const direct_source = try std.fmt.allocPrint(allocator, "@slide\n{s}\n", .{snippet});
+    defer allocator.free(direct_source);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(direct_source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const after = deck.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SlideItemKind.line, after.kind);
+    try std.testing.expectEqual(before.position, after.position);
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expectApproxEqAbs(before.line_width, after.line_width, 0.0001);
+    try std.testing.expectEqual(before.line_direction, after.line_direction);
+    try std.testing.expectEqual(before.line_arrow_start, after.line_arrow_start);
+    try std.testing.expectEqual(before.line_arrow_end, after.line_arrow_end);
+    try std.testing.expectEqual(before.color, after.color);
+    try std.testing.expectApproxEqAbs(before.opacity, after.opacity, 0.0001);
+    try std.testing.expectEqual(before.locked, after.locked);
+}
+
+test "Studio detaches parsed reusable media without semantic loss" {
+    const allocator = std.testing.allocator;
+    const Harness = struct {
+        fn expectMediaEqual(before: slides.SlideItem, after: slides.SlideItem) !void {
+            try std.testing.expectEqual(before.kind, after.kind);
+            try std.testing.expectEqualStrings(before.id.?, after.id.?);
+            try std.testing.expectEqual(before.position, after.position);
+            try std.testing.expectEqual(before.size, after.size);
+            try std.testing.expectEqual(before.media_fit, after.media_fit);
+            try std.testing.expectEqual(before.media_focus, after.media_focus);
+            try std.testing.expectEqual(before.scale, after.scale);
+            try std.testing.expectEqual(before.ratio, after.ratio);
+            try std.testing.expectApproxEqAbs(before.opacity, after.opacity, 0.0001);
+            try std.testing.expectEqual(before.visible, after.visible);
+            try std.testing.expectEqual(before.locked, after.locked);
+            if (before.img_path) |path| try std.testing.expectEqualStrings(path, after.img_path.?);
+            if (before.vid_path) |path| try std.testing.expectEqualStrings(path, after.vid_path.?);
+            try std.testing.expectEqual(before.vid_poster, after.vid_poster);
+            try std.testing.expectEqual(before.vid_autoplay, after.vid_autoplay);
+            try std.testing.expectEqual(before.vid_loop, after.vid_loop);
+            try std.testing.expectApproxEqAbs(before.vid_volume, after.vid_volume, 0.0001);
+            try std.testing.expectEqual(before.vid_muted, after.vid_muted);
+            try std.testing.expectEqual(slides.SourceScope.direct, after.source.scope);
+        }
+    };
+
+    const component_source =
+        "@push clip vid=assets/shared.mp4 x=10 y=20 w=640 h=360 fit=contain focus_x=0.2 focus_y=0.8 poster=0.5 volume=0.9 opacity=0.7\n" ++
+        "@slide\n" ++
+        "@pop clip id=hero vid=assets/local.mp4 x=80 fit=cover focus_x=0.75 focus_y=0.25 poster=1.25 autoplay loop volume=0.6 muted opacity=0.8\n";
+    var component_before_arena = std.heap.ArenaAllocator.init(allocator);
+    defer component_before_arena.deinit();
+    const component_before_deck = try slides.SlideShow.new(component_before_arena.allocator());
+    const component_before_context = try parser.constructSlidesFromBuf(
+        component_source,
+        component_before_deck,
+        component_before_arena.allocator(),
+    );
+    defer component_before_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), component_before_context.parser_errors.items.len);
+    const component_before = component_before_deck.slides.items[0].items.?.items[0];
+    const component_snippet = try materializeStudioItem(allocator, &component_before);
+    defer allocator.free(component_snippet);
+    const component_offset = std.mem.indexOf(u8, component_source, "@pop clip").?;
+    const component_info = try source_editor.inspectComponentInstanceForDetach(component_source, component_offset);
+    const detached_component = try source_editor.detachComponentInstance(
+        allocator,
+        component_source,
+        component_offset,
+        component_info.definition_offset,
+        component_snippet,
+    );
+    defer detached_component.deinit(allocator);
+    var component_after_arena = std.heap.ArenaAllocator.init(allocator);
+    defer component_after_arena.deinit();
+    const component_after_deck = try slides.SlideShow.new(component_after_arena.allocator());
+    const component_after_context = try parser.constructSlidesFromBuf(
+        detached_component.source,
+        component_after_deck,
+        component_after_arena.allocator(),
+    );
+    defer component_after_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), component_after_context.parser_errors.items.len);
+    try Harness.expectMediaEqual(
+        component_before,
+        component_after_deck.slides.items[0].items.?.items[0],
+    );
+
+    const group_source =
+        "@pushgroup media_group\n" ++
+        "@box id=photo img=assets/hero.png x=10 y=20 w=0 h=0 scale=0.5 ratio=1.4 fit=contain focus_x=0.2 focus_y=0.8 opacity=0.7\n" ++
+        "@box id=clip vid=assets/demo.mp4 x=600 y=20 w=640 h=360 fit=cover focus_x=0.9 focus_y=0.1 poster=1.25 autoplay loop volume=0.65 muted opacity=0.8\n" ++
+        "@endgroup\n" ++
+        "@slide\n" ++
+        "@popgroup media_group id=hero\n";
+    var group_before_arena = std.heap.ArenaAllocator.init(allocator);
+    defer group_before_arena.deinit();
+    const group_before_deck = try slides.SlideShow.new(group_before_arena.allocator());
+    const group_before_context = try parser.constructSlidesFromBuf(
+        group_source,
+        group_before_deck,
+        group_before_arena.allocator(),
+    );
+    defer group_before_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), group_before_context.parser_errors.items.len);
+    const group_before = group_before_deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 2), group_before.len);
+    var group_snippets: [2][]u8 = undefined;
+    var group_snippet_count: usize = 0;
+    defer for (group_snippets[0..group_snippet_count]) |snippet| allocator.free(snippet);
+    for (group_before, 0..) |*item, index| {
+        group_snippets[index] = try materializeStudioItem(allocator, item);
+        group_snippet_count += 1;
+    }
+    const group_offset = std.mem.indexOf(u8, group_source, "@popgroup media_group").?;
+    const group_info = try source_editor.inspectReusableGroupInstance(allocator, group_source, group_offset);
+    const detached_group = try source_editor.detachReusableGroupInstance(
+        allocator,
+        group_source,
+        group_offset,
+        group_info.definition_offset,
+        &group_snippets,
+    );
+    defer detached_group.deinit(allocator);
+    var group_after_arena = std.heap.ArenaAllocator.init(allocator);
+    defer group_after_arena.deinit();
+    const group_after_deck = try slides.SlideShow.new(group_after_arena.allocator());
+    const group_after_context = try parser.constructSlidesFromBuf(
+        detached_group.source,
+        group_after_deck,
+        group_after_arena.allocator(),
+    );
+    defer group_after_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), group_after_context.parser_errors.items.len);
+    const group_after = group_after_deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(group_before.len, group_after.len);
+    for (group_before, group_after) |before, after| try Harness.expectMediaEqual(before, after);
+}
+
+test "Studio media definitions survive rename cleanup and history" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@push clip vid=assets/demo.mp4 x=20 y=30 w=640 h=360 fit=cover focus_x=0.8 focus_y=0.2 poster=1.25 autoplay loop volume=0.65 muted\n" ++
+        "@slide\n" ++
+        "@pop clip id=hero\n" ++
+        "@pushgroup unused_media\n" ++
+        "@box id=photo img=assets/unused.png fit=contain\n" ++
+        "@endgroup\n";
+    var catalog = try studio_catalog.discover(allocator, source);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 2), catalog.entries.len);
+    const renamed = try studio_catalog.renameDefinition(allocator, source, catalog.entries[0], "movie");
+    defer renamed.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, renamed.source, "@push movie vid=assets/demo.mp4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renamed.source, "@pop movie id=hero") != null);
+    const cleaned = try studio_catalog.cleanupUnusedDefinitions(allocator, renamed.source);
+    defer cleaned.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned.source, "unused_image") == null);
+
+    const Harness = struct {
+        fn expectMedia(source_: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const deck = try slides.SlideShow.new(arena.allocator());
+            const context = try parser.constructSlidesFromBuf(source_, deck, arena.allocator());
+            defer context.deinit();
+            try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+            const item = deck.slides.items[0].items.?.items[0];
+            try std.testing.expectEqualStrings("hero", item.id.?);
+            try std.testing.expectEqualStrings("assets/demo.mp4", item.vid_path.?);
+            try std.testing.expectEqual(slides.MediaFit.cover, item.media_fit);
+            try std.testing.expectEqual(rl.Vector2{ .x = 0.8, .y = 0.2 }, item.media_focus);
+            try std.testing.expectEqual(@as(?f32, 1.25), item.vid_poster);
+            try std.testing.expect(item.vid_autoplay);
+            try std.testing.expect(item.vid_loop);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.65), item.vid_volume, 0.0001);
+            try std.testing.expect(item.vid_muted);
+        }
+    };
+    try Harness.expectMedia(source);
+    try Harness.expectMedia(cleaned.source);
+
+    var history = StudioHistory.init(allocator);
+    defer history.deinit();
+    try history.record(
+        try allocator.dupe(u8, source),
+        try allocator.dupe(u8, cleaned.source),
+        0,
+        0,
+    );
+    const undo_restore = (try history.prepareRestore(.undo)).?;
+    try Harness.expectMedia(undo_restore.source);
+    history.commitRestore(.undo);
+    const redo_restore = (try history.prepareRestore(.redo)).?;
+    try Harness.expectMedia(redo_restore.source);
+    history.commitRestore(.redo);
 }
 
 fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticCommand, items: []const slides.SlideItem) bool {
@@ -5531,13 +7905,32 @@ fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticComman
         }
         return false;
     }
+    if (command == .set_common_property) {
+        for (command.set_common_property.targets.slice()) |target| {
+            if (target.edit_scope != .shared_template) continue;
+            const item = studioItemByIdentity(items, target.item_identity) orelse continue;
+            if (item.instance_source != null) return true;
+        }
+        return false;
+    }
     const target: studio.CommandTarget = switch (command) {
         .edit_text => |value| value,
+        .replace_media => |value| value,
+        .set_media_fit => |value| value.target,
+        .set_text_alignment => |value| value.target,
+        .set_line_style => |value| value.target,
+        .set_rotation => |value| value.target,
+        .set_media_focus => |value| value.target,
+        .set_video_poster => |value| value.target,
+        .set_video_volume => |value| value.target,
+        .set_video_toggle => |value| value.target,
         .edit_numeric_geometry => |value| value.target,
         .set_foreground, .set_background => |value| value.target,
         .set_custom_foreground,
         .set_custom_background,
         .set_font_size,
+        .set_corner_radius,
+        .set_line_width,
         .set_opacity,
         .clear_background,
         => |value| value,
@@ -5698,6 +8091,7 @@ fn rendererPreviewFromLive(preview: studio.LivePreview) renderer.ItemGeometryPre
         .after_position = preview.after.position,
         .after_size = preview.after.size,
         .resized = preview.resized,
+        .rotation = preview.rotation,
     };
 }
 
@@ -5709,6 +8103,7 @@ fn rendererPreviewFromCommand(command: studio.GeometryCommand) renderer.ItemGeom
         .after_position = command.after_position,
         .after_size = command.after_size,
         .resized = command.resized,
+        .rotation = null,
     };
 }
 
@@ -6199,6 +8594,10 @@ fn formatStudioFloat(buffer: []u8, value: f32) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{d}", .{if (value == 0) @as(f32, 0) else value});
 }
 
+fn studioRotationEligible(item: slides.SlideItem) bool {
+    return item.kind == .textbox or item.kind == .line or item.kind == .img or item.kind == .vid;
+}
+
 fn canonicalStudioColor(input: []const u8, buffer: *[9]u8) ![]const u8 {
     const value = std.mem.trim(u8, input, " \t\r\n");
     if ((value.len != 7 and value.len != 9) or value[0] != '#') return error.InvalidStudioColor;
@@ -6218,6 +8617,18 @@ fn canonicalStudioOpacity(input: []const u8, buffer: []u8) ![]const u8 {
     return formatStudioFloat(buffer, try canonicalOpacityValue(input));
 }
 
+fn canonicalStudioUnitInterval(input: []const u8, buffer: []u8) ![]const u8 {
+    const value = try parseStudioFiniteFloat(input);
+    if (value < 0 or value > 1) return error.InvalidStudioUnitInterval;
+    return formatStudioFloat(buffer, value);
+}
+
+fn canonicalStudioVideoPoster(input: []const u8, buffer: []u8) ![]const u8 {
+    const value = try parseStudioFiniteFloat(input);
+    if (value < 0) return error.InvalidStudioVideoPoster;
+    return formatStudioFloat(buffer, value);
+}
+
 fn canonicalStudioFontSize(input: []const u8, buffer: []u8) ![]const u8 {
     const value = std.mem.trim(u8, input, " \t\r\n");
     const size = std.fmt.parseInt(i32, value, 10) catch return error.InvalidStudioFontSize;
@@ -6235,6 +8646,34 @@ const InlineSemanticEdit = struct {
 /// inline fields share exactly the same ownership, canonicalization, history,
 /// and reparse implementation.
 fn inlineSemanticEdit(commit: studio.InlineCommit) InlineSemanticEdit {
+    if (commit.targets.count > 1) {
+        const property: studio.CommonProperty = switch (commit.field) {
+            .text => unreachable,
+            .x => .x,
+            .y => .y,
+            .width => .width,
+            .height => .height,
+            .foreground => .foreground,
+            .background => .background,
+            .font_size => .font_size,
+            .corner_radius => .corner_radius,
+            .line_width => .line_width,
+            .rotation => .rotation,
+            .opacity => .opacity,
+            .media_focus_x => .media_focus_x,
+            .media_focus_y => .media_focus_y,
+            .video_poster => .video_poster,
+            .video_volume => .video_volume,
+        };
+        return .{
+            .command = .{ .set_common_property = .{
+                .targets = commit.targets,
+                .property = property,
+                .value = commit.value,
+            } },
+            .value = commit.value,
+        };
+    }
     const command: studio.SemanticCommand = switch (commit.field) {
         .text => .{ .edit_text = commit.target },
         .x => .{ .edit_numeric_geometry = .{ .target = commit.target, .field = .x } },
@@ -6247,7 +8686,14 @@ fn inlineSemanticEdit(commit: studio.InlineCommit) InlineSemanticEdit {
         else
             .{ .set_custom_background = commit.target },
         .font_size => .{ .set_font_size = commit.target },
+        .corner_radius => .{ .set_corner_radius = commit.target },
+        .line_width => .{ .set_line_width = commit.target },
+        .rotation => .{ .set_rotation = .{ .target = commit.target } },
         .opacity => .{ .set_opacity = commit.target },
+        .media_focus_x => .{ .set_media_focus = .{ .target = commit.target, .axis = .x } },
+        .media_focus_y => .{ .set_media_focus = .{ .target = commit.target, .axis = .y } },
+        .video_poster => .{ .set_video_poster = .{ .target = commit.target } },
+        .video_volume => .{ .set_video_volume = .{ .target = commit.target } },
     };
     return .{ .command = command, .value = commit.value };
 }
@@ -6280,9 +8726,30 @@ fn validateInlineCommit(commit: studio.InlineCommit) ?studio.InlineError {
             var buffer: [32]u8 = undefined;
             _ = canonicalStudioFontSize(commit.value, &buffer) catch return .invalid_font_size;
         },
+        .corner_radius => {
+            const value = parseStudioFiniteFloat(commit.value) catch return .invalid_corner_radius;
+            if (value < 0) return .invalid_corner_radius;
+        },
+        .line_width => {
+            const value = parseStudioFiniteFloat(commit.value) catch return .invalid_line_width;
+            if (value <= 0) return .invalid_line_width;
+        },
+        .rotation => _ = parseStudioFiniteFloat(commit.value) catch return .invalid_rotation,
         .opacity => {
             var buffer: [64]u8 = undefined;
             _ = canonicalStudioOpacity(commit.value, &buffer) catch return .invalid_opacity;
+        },
+        .media_focus_x, .media_focus_y => {
+            var buffer: [64]u8 = undefined;
+            _ = canonicalStudioUnitInterval(commit.value, &buffer) catch return .invalid_unit_interval;
+        },
+        .video_poster => {
+            var buffer: [64]u8 = undefined;
+            _ = canonicalStudioVideoPoster(commit.value, &buffer) catch return .invalid_video_poster;
+        },
+        .video_volume => {
+            var buffer: [64]u8 = undefined;
+            _ = canonicalStudioUnitInterval(commit.value, &buffer) catch return .invalid_unit_interval;
         },
     }
     return null;
@@ -6296,6 +8763,15 @@ fn inlineCommitChangesValue(
     items: []const slides.SlideItem,
     resolved_bounds: []const studio.ResolvedBounds,
 ) bool {
+    if (commit.targets.count > 1) {
+        for (commit.targets.slice()) |target| {
+            var single = commit;
+            single.target = target;
+            single.targets = .{};
+            if (inlineCommitChangesValue(single, items, resolved_bounds)) return true;
+        }
+        return false;
+    }
     const item = studioItemByIdentity(items, commit.target.item_identity) orelse return true;
     const shared = if (commit.target.edit_scope == .shared_template) item.sharedTemplateValues() else null;
     const geometry = if (shared) |values|
@@ -6336,9 +8812,44 @@ fn inlineCommitChangesValue(
             const submitted = std.fmt.parseInt(i32, std.mem.trim(u8, commit.value, " \t\r\n"), 10) catch return true;
             break :changed current == null or current.? != submitted;
         },
+        .corner_radius => changed: {
+            const current = if (shared) |values| values.corner_radius else item.corner_radius;
+            const submitted = parseStudioFiniteFloat(commit.value) catch return true;
+            break :changed @abs(current - submitted) > 0.000001;
+        },
+        .line_width => changed: {
+            const current = if (shared) |values| values.line_width else item.line_width;
+            const submitted = parseStudioFiniteFloat(commit.value) catch return true;
+            break :changed @abs(current - submitted) > 0.000001;
+        },
+        .rotation => changed: {
+            const current = if (shared) |values| values.rotation else item.rotation;
+            const submitted = parseStudioFiniteFloat(commit.value) catch return true;
+            break :changed @abs(current - submitted) > 0.000001;
+        },
         .opacity => changed: {
             const current = if (shared) |values| values.opacity else item.opacity;
             const submitted = canonicalOpacityValue(commit.value) catch return true;
+            break :changed @abs(current - submitted) > 0.000001;
+        },
+        .media_focus_x => changed: {
+            const current = if (shared) |values| values.media_focus.x else item.media_focus.x;
+            const submitted = parseStudioFiniteFloat(commit.value) catch return true;
+            break :changed @abs(current - submitted) > 0.000001;
+        },
+        .media_focus_y => changed: {
+            const current = if (shared) |values| values.media_focus.y else item.media_focus.y;
+            const submitted = parseStudioFiniteFloat(commit.value) catch return true;
+            break :changed @abs(current - submitted) > 0.000001;
+        },
+        .video_poster => changed: {
+            const current = if (shared) |values| values.vid_poster orelse 0 else item.vid_poster orelse 0;
+            const submitted = parseStudioFiniteFloat(commit.value) catch return true;
+            break :changed @abs(current - submitted) > 0.000001;
+        },
+        .video_volume => changed: {
+            const current = if (shared) |values| values.vid_volume else item.vid_volume;
+            const submitted = parseStudioFiniteFloat(commit.value) catch return true;
             break :changed @abs(current - submitted) > 0.000001;
         },
     };
@@ -6361,7 +8872,12 @@ fn inlineErrorForSemanticFailure(field: studio.InlineField, err: anyerror) studi
         error.InvalidStudioDimension => .non_positive_dimension,
         error.InvalidStudioColor => .invalid_color,
         error.InvalidStudioFontSize => .invalid_font_size,
+        error.InvalidStudioCornerRadius => .invalid_corner_radius,
+        error.InvalidStudioLineWidth => .invalid_line_width,
+        error.InvalidStudioRotation => .invalid_rotation,
         error.InvalidStudioOpacity => .invalid_opacity,
+        error.InvalidStudioUnitInterval => .invalid_unit_interval,
+        error.InvalidStudioVideoPoster => .invalid_video_poster,
         error.InvalidStudioText => .invalid_text,
         error.InvalidLiteralValue => if (field == .text) .invalid_text else .source_edit_failed,
         else => .source_edit_failed,
@@ -6382,6 +8898,10 @@ test "Studio custom property values canonicalize safely" {
     try std.testing.expectEqualStrings("0.005", try canonicalStudioOpacity("0.5%", &number_buffer));
     try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("-0.1", &number_buffer));
     try std.testing.expectError(error.InvalidStudioOpacity, canonicalStudioOpacity("101%", &number_buffer));
+    try std.testing.expectEqualStrings("0.75", try canonicalStudioUnitInterval("0.75", &number_buffer));
+    try std.testing.expectError(error.InvalidStudioUnitInterval, canonicalStudioUnitInterval("1.01", &number_buffer));
+    try std.testing.expectEqualStrings("6.25", try canonicalStudioVideoPoster("6.25", &number_buffer));
+    try std.testing.expectError(error.InvalidStudioVideoPoster, canonicalStudioVideoPoster("-0.1", &number_buffer));
     try std.testing.expectEqualStrings("48", try canonicalStudioFontSize("48", &number_buffer));
     try std.testing.expectError(error.InvalidStudioFontSize, canonicalStudioFontSize("0", &number_buffer));
 }
@@ -6405,7 +8925,13 @@ test "Studio inline commits map to legacy atomic semantic edits" {
         .{ .field = .background, .value = "#01020304", .tag = .set_custom_background },
         .{ .field = .background, .value = " NoNe ", .tag = .clear_background },
         .{ .field = .font_size, .value = "48", .tag = .set_font_size },
+        .{ .field = .corner_radius, .value = "24", .tag = .set_corner_radius },
+        .{ .field = .line_width, .value = "6", .tag = .set_line_width },
         .{ .field = .opacity, .value = "75%", .tag = .set_opacity },
+        .{ .field = .media_focus_x, .value = "0.25", .tag = .set_media_focus },
+        .{ .field = .media_focus_y, .value = "0.75", .tag = .set_media_focus },
+        .{ .field = .video_poster, .value = "2.5", .tag = .set_video_poster },
+        .{ .field = .video_volume, .value = "0.65", .tag = .set_video_volume },
     };
     for (cases) |case| {
         const mapped = inlineSemanticEdit(.{ .target = target, .field = case.field, .value = case.value });
@@ -6442,10 +8968,30 @@ test "Studio inline validation reports the exact field without touching source" 
         .field = .font_size,
         .value = "12.5",
     }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_corner_radius, validateInlineCommit(.{
+        .target = target,
+        .field = .corner_radius,
+        .value = "-1",
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_line_width, validateInlineCommit(.{
+        .target = target,
+        .field = .line_width,
+        .value = "0",
+    }).?);
     try std.testing.expectEqual(studio.InlineError.invalid_opacity, validateInlineCommit(.{
         .target = target,
         .field = .opacity,
         .value = "101%",
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_unit_interval, validateInlineCommit(.{
+        .target = target,
+        .field = .media_focus_x,
+        .value = "-0.01",
+    }).?);
+    try std.testing.expectEqual(studio.InlineError.invalid_video_poster, validateInlineCommit(.{
+        .target = target,
+        .field = .video_poster,
+        .value = "-1",
     }).?);
     try std.testing.expectEqual(studio.InlineError.invalid_text, validateInlineCommit(.{
         .target = target,
@@ -6461,6 +9007,16 @@ test "Studio inline validation reports the exact field without touching source" 
         .target = target,
         .field = .opacity,
         .value = "0%",
+    }) == null);
+    try std.testing.expect(validateInlineCommit(.{
+        .target = target,
+        .field = .media_focus_y,
+        .value = "1",
+    }) == null);
+    try std.testing.expect(validateInlineCommit(.{
+        .target = target,
+        .field = .video_volume,
+        .value = "0.65",
     }) == null);
 }
 
@@ -6987,16 +9543,17 @@ fn studioLiteralToken(value: []const u8) ![]const u8 {
 }
 
 /// Materialize the complete effective renderer-facing item into a direct
-/// literal @box. Detach is an explicit customization boundary, so values that
+/// literal directive. Detach is an explicit customization boundary, so values that
 /// were previously inherited are intentionally made concrete. Auto-sized
-/// images retain zero W/H plus their scale/ratio controls.
+/// media retain zero W/H plus their scale/ratio controls.
 fn materializeStudioItem(allocator: std.mem.Allocator, item: *const slides.SlideItem) ![]u8 {
-    if (item.kind != .textbox and item.kind != .img) return error.UnsupportedComponentDetach;
+    if (item.kind != .textbox and item.kind != .img and item.kind != .vid and item.kind != .line)
+        return error.UnsupportedComponentDetach;
     const id = try studioLiteralToken(item.id orelse return error.DetachedItemIdMismatch);
 
     var directive = std.ArrayList(u8).empty;
     defer directive.deinit(allocator);
-    try directive.appendSlice(allocator, "@box id=");
+    try directive.appendSlice(allocator, if (item.kind == .line) "@line id=" else "@box id=");
     try directive.appendSlice(allocator, id);
     try appendStudioToken(&directive, allocator, " x={d} y={d} w={d} h={d}", .{
         item.position.x,
@@ -7005,12 +9562,94 @@ fn materializeStudioItem(allocator: std.mem.Allocator, item: *const slides.Slide
         item.size.y,
     });
 
+    if (item.kind == .line) {
+        try appendStudioToken(&directive, allocator, " stroke_width={d}", .{item.line_width});
+        try directive.appendSlice(allocator, " direction=");
+        try directive.appendSlice(allocator, if (item.line_direction == .down) "down" else "up");
+        try directive.appendSlice(allocator, " arrow=");
+        try directive.appendSlice(allocator, if (item.line_arrow_start and item.line_arrow_end)
+            "both"
+        else if (item.line_arrow_start)
+            "start"
+        else if (item.line_arrow_end)
+            "end"
+        else
+            "none");
+        if (item.color) |color| {
+            var color_buffer: [9]u8 = undefined;
+            try directive.appendSlice(allocator, " color=");
+            try directive.appendSlice(allocator, colorLiteral(&color_buffer, color));
+        }
+        if (@abs(item.rotation) > 0.000001)
+            try appendStudioToken(&directive, allocator, " rotation={d}", .{item.rotation});
+        try appendStudioToken(&directive, allocator, " opacity={d} visible={s} locked={s}", .{
+            item.opacity,
+            if (item.visible) "true" else "false",
+            if (item.locked) "true" else "false",
+        });
+        if (item.animation) |spec| {
+            try directive.appendSlice(allocator, " anim=");
+            try directive.appendSlice(allocator, animationEffectLiteral(spec.effect));
+            try directive.appendSlice(allocator, " by=");
+            try directive.appendSlice(allocator, animationGroupingLiteral(spec.by));
+            if (spec.after) |after| try appendStudioToken(&directive, allocator, " after={d}", .{after});
+            try appendStudioToken(&directive, allocator, " duration={d}", .{spec.duration});
+        }
+        return directive.toOwnedSlice(allocator);
+    }
+
     if (item.img_path) |path| {
         try directive.appendSlice(allocator, " img=");
         try directive.appendSlice(allocator, try studioLiteralToken(path));
     }
+    if (item.vid_path) |path| {
+        try directive.appendSlice(allocator, " vid=");
+        try directive.appendSlice(allocator, try studioLiteralToken(path));
+    }
+    if (item.kind == .img or item.kind == .vid) {
+        if (item.media_fit != .stretch) {
+            try directive.appendSlice(allocator, " fit=");
+            try directive.appendSlice(allocator, switch (item.media_fit) {
+                .stretch => unreachable,
+                .contain => "contain",
+                .cover => "cover",
+            });
+        }
+        if (@abs(item.media_focus.x - 0.5) > 0.000001)
+            try appendStudioToken(&directive, allocator, " focus_x={d}", .{item.media_focus.x});
+        if (@abs(item.media_focus.y - 0.5) > 0.000001)
+            try appendStudioToken(&directive, allocator, " focus_y={d}", .{item.media_focus.y});
+    }
+    if (item.kind == .vid) {
+        if (item.vid_poster) |poster| try appendStudioToken(&directive, allocator, " poster={d}", .{poster});
+        if (item.vid_autoplay) try directive.appendSlice(allocator, " autoplay");
+        if (item.vid_loop) try directive.appendSlice(allocator, " loop");
+        if (@abs(item.vid_volume - 1) > 0.000001)
+            try appendStudioToken(&directive, allocator, " volume={d}", .{item.vid_volume});
+        if (item.vid_muted) try directive.appendSlice(allocator, " muted");
+    }
     if (item.fontSize) |font_size|
         try appendStudioToken(&directive, allocator, " fontsize={d}", .{font_size});
+    if (item.corner_radius > 0)
+        try appendStudioToken(&directive, allocator, " radius={d}", .{item.corner_radius});
+    if (@abs(item.rotation) > 0.000001)
+        try appendStudioToken(&directive, allocator, " rotation={d}", .{item.rotation});
+    if (item.text_alignment != .left) {
+        try directive.appendSlice(allocator, " align=");
+        try directive.appendSlice(allocator, switch (item.text_alignment) {
+            .left => unreachable,
+            .center => "center",
+            .right => "right",
+        });
+    }
+    if (item.text_vertical_alignment != .top) {
+        try directive.appendSlice(allocator, " valign=");
+        try directive.appendSlice(allocator, switch (item.text_vertical_alignment) {
+            .top => unreachable,
+            .middle => "middle",
+            .bottom => "bottom",
+        });
+    }
     if (item.color) |color| {
         var color_buffer: [9]u8 = undefined;
         try directive.appendSlice(allocator, " color=");
@@ -7313,24 +9952,25 @@ fn applyStudioText(
     ));
 }
 
-fn applyStudioLockEdit(
+fn applyStudioLiteralAttributeBatch(
     history: *StudioHistory,
-    command: studio.SetLockedCommand,
+    targets: []const studio.CommandTarget,
     slide: *const slides.Slide,
     morph_state: ?usize,
     items: []const slides.SlideItem,
+    key: []const u8,
+    value: []const u8,
 ) !void {
-    if (command.count == 0 or command.count > studio.max_selection_items) return error.InvalidStudioLockBatch;
+    if (targets.len == 0 or targets.len > studio.max_selection_items) return error.InvalidStudioPropertyBatch;
     const source = G.editor_memory[0..G.source_len];
-    const value = if (command.locked) "true" else "false";
     var edits: [studio.max_selection_items]source_editor.LiteralSourceEdit = undefined;
     var patches: [studio.max_selection_items][1]source_editor.LiteralAttributePatch = undefined;
     var snippets: [studio.max_selection_items]?[]u8 = @splat(null);
-    defer for (snippets[0..command.count]) |snippet| if (snippet) |owned| G.allocator.free(owned);
+    defer for (snippets[0..targets.len]) |snippet| if (snippet) |owned| G.allocator.free(owned);
 
-    for (command.slice(), 0..) |target, index| {
+    for (targets, 0..) |target, index| {
         const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
-        patches[index][0] = .{ .key = "locked", .value = value };
+        patches[index][0] = .{ .key = key, .value = value };
         var source_ref = item.source;
 
         if (morph_state) |state_index| {
@@ -7349,7 +9989,7 @@ fn applyStudioLockEdit(
                 },
                 .insert_local => {
                     const id = item.id orelse return error.MorphItemNeedsId;
-                    snippets[index] = try std.fmt.allocPrint(G.allocator, "@set {s} locked={s}", .{ id, value });
+                    snippets[index] = try std.fmt.allocPrint(G.allocator, "@set {s} {s}={s}", .{ id, key, value });
                     edits[index] = .{ .insert = .{
                         .insertion_offset = try source_editor.morphStateEndOffset(
                             source,
@@ -7379,7 +10019,7 @@ fn applyStudioLockEdit(
                         continue;
                     }
                 }
-                snippets[index] = try std.fmt.allocPrint(G.allocator, "@set {s} locked={s}", .{ id, value });
+                snippets[index] = try std.fmt.allocPrint(G.allocator, "@set {s} {s}={s}", .{ id, key, value });
                 edits[index] = .{ .insert = .{
                     .insertion_offset = try source_editor.slideTemplateOverrideInsertionOffset(
                         source,
@@ -7401,7 +10041,25 @@ fn applyStudioLockEdit(
         } };
     }
 
-    return recordStudioPatch(history, try source_editor.applyLiteralEdits(G.allocator, source, edits[0..command.count]));
+    return recordStudioPatch(history, try source_editor.applyLiteralEdits(G.allocator, source, edits[0..targets.len]));
+}
+
+fn applyStudioLockEdit(
+    history: *StudioHistory,
+    command: studio.SetLockedCommand,
+    slide: *const slides.Slide,
+    morph_state: ?usize,
+    items: []const slides.SlideItem,
+) !void {
+    return applyStudioLiteralAttributeBatch(
+        history,
+        command.slice(),
+        slide,
+        morph_state,
+        items,
+        "locked",
+        if (command.locked) "true" else "false",
+    );
 }
 
 fn planStudioVisibilityEdits(
@@ -7786,6 +10444,9 @@ fn applyStudioSemanticEdit(
         .undo,
         .redo,
         .pair_presenter_phone,
+        .choose_presentation_display,
+        .showtime_preflight,
+        .create_portable_show,
         .edit_library_entry,
         => return error.NonSourceStudioCommand,
         .edit_speaker_notes => {
@@ -7818,13 +10479,15 @@ fn applyStudioSemanticEdit(
                     "@box id={s} x={d} y={d} w={d} h={d}",
                     .{ id, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y },
                 ),
-                .image => blk: {
+                .image, .video => blk: {
                     const path = prompted_text orelse return error.StudioPromptMissing;
-                    if (path.len == 0 or std.mem.indexOfAny(u8, path, " \t\r\n") != null) return error.InvalidStudioImagePath;
-                    break :blk try std.fmt.bufPrint(
+                    break :blk try studioMediaDirective(
                         &directive_buffer,
-                        "@box id={s} img={s} x={d} y={d} w={d} h={d}",
-                        .{ id, path, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y },
+                        id,
+                        if (add.kind == .image) .image else .video,
+                        path,
+                        add.position,
+                        add.suggested_size,
                     );
                 },
                 .shape => blk: {
@@ -7836,7 +10499,29 @@ fn applyStudioSemanticEdit(
                         .{ id, add.position.x, add.position.y, add.suggested_size.x, add.suggested_size.y, color },
                     );
                 },
+                .line, .arrow => blk: {
+                    var color_buffer: [9]u8 = undefined;
+                    const color = colorLiteral(&color_buffer, studio.paletteColor(add.suggested_color orelse .blue));
+                    break :blk try std.fmt.bufPrint(
+                        &directive_buffer,
+                        "@line id={s} x={d} y={d} w={d} h={d} stroke_width=6 color={s} arrow={s}",
+                        .{
+                            id,
+                            add.position.x,
+                            add.position.y,
+                            add.suggested_size.x,
+                            add.suggested_size.y,
+                            color,
+                            if (add.kind == .arrow) "end" else "none",
+                        },
+                    );
+                },
             };
+            // Structural reparse replaces every runtime identity. Retain the
+            // authored ID so ordinary slides select the new item immediately
+            // and Definition mode can bind a local GROUP member ID to its
+            // qualified preview counterpart on the following frame.
+            try selection_ids.appendCopy(id);
             if (add.kind == .text or add.kind == .bullets) {
                 const raw_text = prompted_text orelse return error.StudioPromptMissing;
                 const owned_text = if (add.kind == .bullets)
@@ -8069,6 +10754,22 @@ fn applyStudioSemanticEdit(
             );
             return .{ .preserve_selection = true };
         },
+        .replace_media => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .img and item.kind != .vid) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            const path = try studioMediaSourceValue(prompted_text orelse return error.StudioPromptMissing);
+            try applyStudioLiteralAttribute(
+                history,
+                slide,
+                morph_state,
+                item,
+                target.edit_scope,
+                if (item.kind == .img) "img" else "vid",
+                path,
+            );
+            return .{ .preserve_selection = true };
+        },
         .edit_numeric_geometry => |request| {
             const item = studioItemByIdentity(items, request.target.item_identity) orelse return error.StudioItemMissing;
             if (item.kind == .background) return error.ItemHasNoEditableGeometry;
@@ -8098,7 +10799,7 @@ fn applyStudioSemanticEdit(
         },
         .set_foreground => |change| {
             const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
-            if (item.kind != .textbox) return error.ItemHasNoForegroundColor;
+            if (item.kind != .textbox and item.kind != .line) return error.ItemHasNoForegroundColor;
             if (item.locked) return error.StudioItemLocked;
             var color_buffer: [9]u8 = undefined;
             const color = colorLiteral(&color_buffer, studio.paletteColor(change.color));
@@ -8107,7 +10808,7 @@ fn applyStudioSemanticEdit(
         },
         .set_custom_foreground => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
-            if (item.kind != .textbox) return error.ItemHasNoForegroundColor;
+            if (item.kind != .textbox and item.kind != .line) return error.ItemHasNoForegroundColor;
             if (item.locked) return error.StudioItemLocked;
             var color_buffer: [9]u8 = undefined;
             const color = try canonicalStudioColor(prompted_text orelse return error.StudioPromptMissing, &color_buffer);
@@ -8116,7 +10817,7 @@ fn applyStudioSemanticEdit(
         },
         .set_background => |change| {
             const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
-            if (item.kind == .background) return error.ItemHasNoBackgroundColor;
+            if (item.kind == .background or item.kind == .line) return error.ItemHasNoBackgroundColor;
             if (item.locked) return error.StudioItemLocked;
             var color_buffer: [9]u8 = undefined;
             const color = colorLiteral(&color_buffer, studio.paletteColor(change.color));
@@ -8133,7 +10834,7 @@ fn applyStudioSemanticEdit(
         },
         .set_custom_background => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
-            if (item.kind == .background) return error.ItemHasNoBackgroundColor;
+            if (item.kind == .background or item.kind == .line) return error.ItemHasNoBackgroundColor;
             if (item.locked) return error.StudioItemLocked;
             var color_buffer: [9]u8 = undefined;
             const color = try canonicalStudioColor(prompted_text orelse return error.StudioPromptMissing, &color_buffer);
@@ -8149,6 +10850,217 @@ fn applyStudioSemanticEdit(
             try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "fontsize", value);
             return .{ .preserve_selection = true };
         },
+        .set_corner_radius => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .textbox or item.text != null) return error.ItemHasNoCornerRadius;
+            if (item.locked) return error.StudioItemLocked;
+            const radius = try parseStudioFiniteFloat(prompted_text orelse return error.StudioPromptMissing);
+            if (radius < 0) return error.InvalidStudioCornerRadius;
+            var value_buffer: [64]u8 = undefined;
+            const value = try formatStudioFloat(&value_buffer, radius);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "radius", value);
+            return .{ .preserve_selection = true };
+        },
+        .set_line_width => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .line) return error.ItemHasNoLineWidth;
+            if (item.locked) return error.StudioItemLocked;
+            const width = try parseStudioFiniteFloat(prompted_text orelse return error.StudioPromptMissing);
+            if (width <= 0) return error.InvalidStudioLineWidth;
+            var value_buffer: [64]u8 = undefined;
+            const value = try formatStudioFloat(&value_buffer, width);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "stroke_width", value);
+            return .{ .preserve_selection = true };
+        },
+        .set_line_style => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .line) return error.ItemHasNoLineStyle;
+            if (item.locked) return error.StudioItemLocked;
+            const shared = if (change.target.edit_scope == .shared_template) item.sharedTemplateValues() else null;
+            switch (change.change) {
+                .direction => |direction| {
+                    const current = if (shared) |values| values.line_direction else item.line_direction;
+                    if (current == direction) return .{ .source_changed = false, .preserve_selection = true };
+                    try applyStudioLiteralAttribute(
+                        history,
+                        slide,
+                        morph_state,
+                        item,
+                        change.target.edit_scope,
+                        "direction",
+                        if (direction == .down) "down" else "up",
+                    );
+                },
+                .arrow_start, .arrow_end => {
+                    var start = if (shared) |values| values.line_arrow_start else item.line_arrow_start;
+                    var end = if (shared) |values| values.line_arrow_end else item.line_arrow_end;
+                    switch (change.change) {
+                        .arrow_start => |enabled| start = enabled,
+                        .arrow_end => |enabled| end = enabled,
+                        .direction => unreachable,
+                    }
+                    const current_start = if (shared) |values| values.line_arrow_start else item.line_arrow_start;
+                    const current_end = if (shared) |values| values.line_arrow_end else item.line_arrow_end;
+                    if (current_start == start and current_end == end)
+                        return .{ .source_changed = false, .preserve_selection = true };
+                    const value: []const u8 = if (start and end)
+                        "both"
+                    else if (start)
+                        "start"
+                    else if (end)
+                        "end"
+                    else
+                        "none";
+                    try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "arrow", value);
+                },
+            }
+            return .{ .preserve_selection = true };
+        },
+        .set_rotation => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (!studioRotationEligible(item.*)) return error.ItemHasNoRotation;
+            if (item.locked) return error.StudioItemLocked;
+            const rotation = if (change.value) |value|
+                value
+            else
+                try parseStudioFiniteFloat(prompted_text orelse return error.StudioPromptMissing);
+            if (!std.math.isFinite(rotation)) return error.InvalidStudioRotation;
+            const current = if (change.target.edit_scope == .shared_template)
+                if (item.sharedTemplateValues()) |shared| shared.rotation else item.rotation
+            else
+                item.rotation;
+            if (@abs(current - rotation) <= 0.000001)
+                return .{ .source_changed = false, .preserve_selection = true };
+            var value_buffer: [64]u8 = undefined;
+            const value = try formatStudioFloat(&value_buffer, rotation);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "rotation", value);
+            return .{ .preserve_selection = true };
+        },
+        .set_text_alignment => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .textbox) return error.ItemHasNoFontSize;
+            if (item.locked) return error.StudioItemLocked;
+            const key: []const u8 = switch (change.change) {
+                .horizontal => "align",
+                .vertical => "valign",
+            };
+            const value: []const u8 = switch (change.change) {
+                .horizontal => |alignment| switch (alignment) {
+                    .left => "left",
+                    .center => "center",
+                    .right => "right",
+                },
+                .vertical => |alignment| switch (alignment) {
+                    .top => "top",
+                    .middle => "middle",
+                    .bottom => "bottom",
+                },
+            };
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, key, value);
+            return .{ .preserve_selection = true };
+        },
+        .set_common_property => |change| {
+            if (change.targets.count < 2 or change.targets.count > studio.max_selection_items)
+                return error.InvalidStudioPropertyBatch;
+
+            for (change.targets.slice()) |target| {
+                const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+                if (item.locked) return error.StudioItemLocked;
+                const compatible = switch (change.property) {
+                    .x, .y, .width, .height, .opacity => item.kind != .background,
+                    .rotation => studioRotationEligible(item.*),
+                    .background => item.kind != .background and item.kind != .line,
+                    .foreground => item.kind == .textbox or item.kind == .line,
+                    .font_size, .text_alignment, .text_vertical_alignment => item.kind == .textbox,
+                    .corner_radius => item.kind == .textbox and item.text == null,
+                    .line_width => item.kind == .line,
+                    .media_fit, .media_focus_x, .media_focus_y => item.kind == .img or item.kind == .vid,
+                    .video_poster, .video_volume, .video_autoplay, .video_loop, .video_muted => item.kind == .vid,
+                };
+                if (!compatible) return error.IncompatibleStudioPropertyBatch;
+            }
+
+            const key: []const u8 = switch (change.property) {
+                .x => "x",
+                .y => "y",
+                .width => "w",
+                .height => "h",
+                .foreground => "color",
+                .background => "bg",
+                .font_size => "fontsize",
+                .corner_radius => "radius",
+                .line_width => "stroke_width",
+                .rotation => "rotation",
+                .opacity => "opacity",
+                .text_alignment => "align",
+                .text_vertical_alignment => "valign",
+                .media_fit => "fit",
+                .media_focus_x => "focus_x",
+                .media_focus_y => "focus_y",
+                .video_poster => "poster",
+                .video_volume => "volume",
+                .video_autoplay => "autoplay",
+                .video_loop => "loop",
+                .video_muted => "muted",
+            };
+            var value_buffer: [64]u8 = undefined;
+            var color_buffer: [9]u8 = undefined;
+            const raw = change.value;
+            const value: []const u8 = switch (change.property) {
+                .x, .y => try formatStudioFloat(&value_buffer, try parseStudioFiniteFloat(raw)),
+                .width, .height => value: {
+                    const parsed = try parseStudioFiniteFloat(raw);
+                    if (parsed < studio.default_min_item_size) return error.InvalidStudioDimension;
+                    break :value try formatStudioFloat(&value_buffer, parsed);
+                },
+                .foreground => try canonicalStudioColor(raw, &color_buffer),
+                .background => if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " \t\r\n"), "none"))
+                    "none"
+                else
+                    try canonicalStudioColor(raw, &color_buffer),
+                .font_size => try canonicalStudioFontSize(raw, &value_buffer),
+                .corner_radius => radius: {
+                    const parsed = try parseStudioFiniteFloat(raw);
+                    if (parsed < 0) return error.InvalidStudioCornerRadius;
+                    break :radius try formatStudioFloat(&value_buffer, parsed);
+                },
+                .line_width => width: {
+                    const parsed = try parseStudioFiniteFloat(raw);
+                    if (parsed <= 0) return error.InvalidStudioLineWidth;
+                    break :width try formatStudioFloat(&value_buffer, parsed);
+                },
+                .rotation => try formatStudioFloat(&value_buffer, try parseStudioFiniteFloat(raw)),
+                .opacity => try canonicalStudioOpacity(raw, &value_buffer),
+                .media_focus_x, .media_focus_y, .video_volume => try canonicalStudioUnitInterval(raw, &value_buffer),
+                .video_poster => try canonicalStudioVideoPoster(raw, &value_buffer),
+                .text_alignment => if (std.mem.eql(u8, raw, "left") or std.mem.eql(u8, raw, "center") or std.mem.eql(u8, raw, "right"))
+                    raw
+                else
+                    return error.InvalidStudioCommonProperty,
+                .text_vertical_alignment => if (std.mem.eql(u8, raw, "top") or std.mem.eql(u8, raw, "middle") or std.mem.eql(u8, raw, "bottom"))
+                    raw
+                else
+                    return error.InvalidStudioCommonProperty,
+                .media_fit => if (std.mem.eql(u8, raw, "stretch") or std.mem.eql(u8, raw, "contain") or std.mem.eql(u8, raw, "cover"))
+                    raw
+                else
+                    return error.InvalidStudioCommonProperty,
+                .video_autoplay, .video_loop, .video_muted => if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "false"))
+                    raw
+                else
+                    return error.InvalidStudioCommonProperty,
+            };
+            try applyStudioLiteralAttributeBatch(
+                history,
+                change.targets.slice(),
+                slide,
+                morph_state,
+                items,
+                key,
+                value,
+            );
+            return .{ .preserve_selection = true };
+        },
         .set_opacity => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
             if (item.kind == .background) return error.ItemHasNoOpacity;
@@ -8158,9 +11070,106 @@ fn applyStudioSemanticEdit(
             try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "opacity", value);
             return .{ .preserve_selection = true };
         },
+        .set_media_fit => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .img and item.kind != .vid) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            const current = if (change.target.edit_scope == .shared_template)
+                if (item.sharedTemplateValues()) |shared| shared.media_fit else item.media_fit
+            else
+                item.media_fit;
+            if (current == change.fit) return .{ .source_changed = false, .preserve_selection = true };
+            const value: []const u8 = switch (change.fit) {
+                .stretch => "stretch",
+                .contain => "contain",
+                .cover => "cover",
+            };
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "fit", value);
+            return .{ .preserve_selection = true };
+        },
+        .set_media_focus => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .img and item.kind != .vid) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            var value_buffer: [64]u8 = undefined;
+            const value = try canonicalStudioUnitInterval(prompted_text orelse return error.StudioPromptMissing, &value_buffer);
+            try applyStudioLiteralAttribute(
+                history,
+                slide,
+                morph_state,
+                item,
+                change.target.edit_scope,
+                if (change.axis == .x) "focus_x" else "focus_y",
+                value,
+            );
+            return .{ .preserve_selection = true };
+        },
+        .set_video_poster => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .vid) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            const poster = if (change.value) |value| value else try parseStudioFiniteFloat(prompted_text orelse return error.StudioPromptMissing);
+            if (!std.math.isFinite(poster) or poster < 0) return error.InvalidStudioVideoPoster;
+            if (studioResolvedBoundsByIdentity(resolved_bounds, item.identity)) |bounds| {
+                if (bounds.media_duration > 0 and poster > bounds.media_duration + 0.001)
+                    return error.InvalidStudioVideoPoster;
+            }
+            const current = if (change.target.edit_scope == .shared_template)
+                if (item.sharedTemplateValues()) |shared| shared.vid_poster orelse 0 else item.vid_poster orelse 0
+            else
+                item.vid_poster orelse 0;
+            if (@abs(current - poster) <= 0.000001) return .{ .source_changed = false, .preserve_selection = true };
+            var value_buffer: [64]u8 = undefined;
+            const value = try formatStudioFloat(&value_buffer, poster);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "poster", value);
+            return .{ .preserve_selection = true };
+        },
+        .set_video_volume => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .vid) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            const volume = if (change.value) |value| value else try parseStudioFiniteFloat(prompted_text orelse return error.StudioPromptMissing);
+            if (!std.math.isFinite(volume) or volume < 0 or volume > 1) return error.InvalidStudioUnitInterval;
+            const current = if (change.target.edit_scope == .shared_template)
+                if (item.sharedTemplateValues()) |shared| shared.vid_volume else item.vid_volume
+            else
+                item.vid_volume;
+            if (@abs(current - volume) <= 0.000001) return .{ .source_changed = false, .preserve_selection = true };
+            var value_buffer: [64]u8 = undefined;
+            const value = try formatStudioFloat(&value_buffer, volume);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "volume", value);
+            return .{ .preserve_selection = true };
+        },
+        .set_video_toggle => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .vid) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            const shared = if (change.target.edit_scope == .shared_template) item.sharedTemplateValues() else null;
+            const current = switch (change.property) {
+                .autoplay => if (shared) |values| values.vid_autoplay else item.vid_autoplay,
+                .loop => if (shared) |values| values.vid_loop else item.vid_loop,
+                .muted => if (shared) |values| values.vid_muted else item.vid_muted,
+            };
+            if (current == change.enabled) return .{ .source_changed = false, .preserve_selection = true };
+            const key: []const u8 = switch (change.property) {
+                .autoplay => "autoplay",
+                .loop => "loop",
+                .muted => "muted",
+            };
+            try applyStudioLiteralAttribute(
+                history,
+                slide,
+                morph_state,
+                item,
+                change.target.edit_scope,
+                key,
+                if (change.enabled) "true" else "false",
+            );
+            return .{ .preserve_selection = true };
+        },
         .clear_background => |target| {
             const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
-            if (item.kind == .background) return error.ItemHasNoBackgroundColor;
+            if (item.kind == .background or item.kind == .line) return error.ItemHasNoBackgroundColor;
             if (item.locked) return error.StudioItemLocked;
             try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "bg", "none");
             return .{ .preserve_selection = true };
@@ -8255,7 +11264,7 @@ fn applyStudioSemanticEdit(
                 morph_state,
                 item,
             );
-            const property = inheritedPropertyForInlineField(reset.field);
+            const property = inheritedPropertyForStudioProperty(reset.property);
             if (!try source_editor.inheritedPropertyOverrideExists(
                 G.editor_memory[0..G.source_len],
                 owner,
@@ -8742,6 +11751,7 @@ fn collectStudioBounds(
     allocator: std.mem.Allocator,
     slide_number: i32,
     morph_state: ?usize,
+    items: []const slides.SlideItem,
 ) !usize {
     output.clearRetainingCapacity();
     const fragment_count = try G.slide_renderer.collectItemRenderBoundsForMorphState(
@@ -8757,8 +11767,13 @@ fn collectStudioBounds(
             .identity = entry.owner_identity,
             .position = .{ .x = bounds.x, .y = bounds.y },
             .size = .{ .x = bounds.width, .y = bounds.height },
+            .natural_size = entry.natural_size,
+            .media_duration = entry.media_duration,
+            .media_availability = entry.media_availability,
+            .media_audio = entry.media_audio,
         });
     }
+    try appendStudioUnavailableMediaBounds(output, allocator, items);
     return fragment_count;
 }
 
@@ -8766,6 +11781,7 @@ fn collectStudioDefinitionBounds(
     output: *std.ArrayList(studio.ResolvedBounds),
     render_bounds: *std.ArrayList(renderer.SlideshowRenderer.ItemRenderBounds),
     allocator: std.mem.Allocator,
+    items: []const slides.SlideItem,
 ) !usize {
     output.clearRetainingCapacity();
     const fragment_count = try G.slide_renderer.collectStudioPreviewBounds(allocator, render_bounds);
@@ -8776,9 +11792,45 @@ fn collectStudioDefinitionBounds(
             .identity = entry.owner_identity,
             .position = .{ .x = bounds.x, .y = bounds.y },
             .size = .{ .x = bounds.width, .y = bounds.height },
+            .natural_size = entry.natural_size,
+            .media_duration = entry.media_duration,
+            .media_availability = entry.media_availability,
+            .media_audio = entry.media_audio,
         });
     }
+    try appendStudioUnavailableMediaBounds(output, allocator, items);
     return fragment_count;
+}
+
+fn unavailableMediaGeometry(item: slides.SlideItem) studio.Geometry {
+    const fallback: rl.Vector2 = .{ .x = 640, .y = 360 };
+    var size = item.size;
+    if (size.x <= 0 and size.y <= 0) {
+        size = fallback;
+    } else if (size.x <= 0) {
+        size.x = size.y * fallback.x / fallback.y;
+    } else if (size.y <= 0) {
+        size.y = size.x * fallback.y / fallback.x;
+    }
+    return .{ .position = item.position, .size = size };
+}
+
+fn appendStudioUnavailableMediaBounds(
+    output: *std.ArrayList(studio.ResolvedBounds),
+    allocator: std.mem.Allocator,
+    items: []const slides.SlideItem,
+) !void {
+    for (items) |item| {
+        if (item.kind != .img and item.kind != .vid) continue;
+        if (studioResolvedBoundsByIdentity(output.items, item.identity) != null) continue;
+        const geometry = unavailableMediaGeometry(item);
+        try output.append(allocator, .{
+            .identity = item.identity,
+            .position = geometry.position,
+            .size = geometry.size,
+            .media_availability = if (item.kind == .img) .image_unavailable else .video_unavailable,
+        });
+    }
 }
 
 fn slideSizeInWindow(internal_render_size: rl.Vector2, window_size: rl.Vector2) rl.Vector2 {

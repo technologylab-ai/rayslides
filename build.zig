@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) void {
     exe_mod.addIncludePath(b.path("src/pdf"));
     exe_mod.addCSourceFile(.{ .file = b.path("src/qr/qrcodegen.c") });
     exe_mod.addIncludePath(b.path("src/qr"));
+    exe_mod.addCSourceFile(.{ .file = b.path("src/svg_rasterizer.c") });
+    exe_mod.addIncludePath(b.path("src"));
     if (target.result.os.tag == .macos) {
         // An explicit deployment target makes Zig treat the otherwise-native
         // macOS build as a cross target, so provide the host SDK search roots
@@ -55,6 +57,8 @@ pub fn build(b: *std.Build) void {
         exe_mod.addCSourceFile(.{ .file = b.path("src/macos_open_documents.m") });
         exe_mod.linkFramework("AppKit", .{});
         exe_mod.linkFramework("Foundation", .{});
+    } else if (target.result.os.tag == .windows) {
+        exe_mod.linkSystemLibrary("iphlpapi", .{});
     }
 
     const exe = b.addExecutable(.{

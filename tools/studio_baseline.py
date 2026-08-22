@@ -197,12 +197,9 @@ def aerospace_windows_for_pid(pid: int) -> list[AerospaceWindow]:
         [
             aerospace,
             "list-windows",
-            "--monitor",
-            "all",
-            "--pid",
-            str(pid),
+            "--all",
             "--format",
-            "%{window-id}|%{workspace}|%{app-name}|%{window-layout}",
+            "%{window-id}|%{workspace}|%{app-name}|%{window-layout}|%{app-pid}",
         ],
         cwd=ROOT,
         text=True,
@@ -214,9 +211,9 @@ def aerospace_windows_for_pid(pid: int) -> list[AerospaceWindow]:
         return []
     windows: list[AerospaceWindow] = []
     for line in completed.stdout.splitlines():
-        parts = line.split("|", 3)
-        if len(parts) == 4:
-            windows.append(AerospaceWindow(*parts))
+        parts = line.split("|", 4)
+        if len(parts) == 5 and parts[4] == str(pid):
+            windows.append(AerospaceWindow(*parts[:4]))
     return windows
 
 
@@ -233,24 +230,26 @@ def place_and_verify_window(pid: int, workspace: str, deadline: float) -> Aerosp
             matching = [window for window in windows if window.window_id == target_window_id]
             if matching and matching[0].workspace == workspace and matching[0].layout == "floating":
                 return matching[0]
-            moved = subprocess.run(
+            subprocess.run(
                 [aerospace, "move-node-to-workspace", "--window-id", target_window_id, workspace],
                 cwd=ROOT,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-            if moved.returncode != 0:
-                return None
-            floated = subprocess.run(
+            subprocess.run(
                 [aerospace, "layout", "--window-id", target_window_id, "floating"],
                 cwd=ROOT,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-            if floated.returncode != 0:
-                return None
+            # Aerospace may return nonzero for an idempotent layout request
+            # (for example, asking an already-floating window to float). The
+            # queried window state above is the authority, so keep polling and
+            # retrying until it proves both placement invariants or the
+            # deadline expires. A transient move/layout failure must not abort
+            # a capture that has already reached the requested state.
         time.sleep(0.05)
     return None
 
@@ -309,12 +308,17 @@ def capture_scenario(
         )
         deadline = time.monotonic() + timeout
         if workspace and platform.system() == "Darwin":
-            placed = place_and_verify_window(process.pid, workspace, min(deadline, time.monotonic() + 8.0))
+            placed = place_and_verify_window(process.pid, workspace, min(deadline, time.monotonic() + 12.0))
             if placed is None:
+                observed = ", ".join(
+                    f"{window.window_id}@{window.workspace}/{window.layout}"
+                    for window in aerospace_windows_for_pid(process.pid)
+                ) or "none"
                 terminate_process(process)
                 raise RuntimeError(
                     f"{scenario.name}: could not verify the launched Rayslides window on "
-                    f"Aerospace workspace {workspace} with floating layout; capture aborted"
+                    f"Aerospace workspace {workspace} with floating layout; "
+                    f"observed windows: {observed}; capture aborted"
                 )
             print(
                 f"[{scenario.name}] verified window {placed.window_id} on workspace "

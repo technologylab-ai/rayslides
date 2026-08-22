@@ -1,5 +1,67 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const slides = @import("slides.zig");
+
+const network_c = if (builtin.os.tag == .windows) struct {} else @cImport({
+    @cInclude("ifaddrs.h");
+    @cInclude("net/if.h");
+    @cInclude("netinet/in.h");
+});
+
+const WindowsNetwork = struct {
+    const windows = std.os.windows;
+    const ws2 = windows.ws2_32;
+
+    const SocketAddress = extern struct {
+        address: ?*ws2.sockaddr,
+        length: i32,
+    };
+
+    const UnicastAddress = extern struct {
+        alignment: u64,
+        next: ?*UnicastAddress,
+        address: SocketAddress,
+    };
+
+    const AdapterAddress = extern struct {
+        alignment: u64,
+        next: ?*AdapterAddress,
+        adapter_name: ?[*:0]u8,
+        first_unicast: ?*UnicastAddress,
+        first_anycast: ?*anyopaque,
+        first_multicast: ?*anyopaque,
+        first_dns_server: ?*anyopaque,
+        dns_suffix: ?[*:0]u16,
+        description: ?[*:0]u16,
+        friendly_name: ?[*:0]u16,
+        physical_address: [8]u8,
+        physical_address_len: u32,
+        flags: u32,
+        mtu: u32,
+        interface_type: u32,
+        operating_status: u32,
+    };
+
+    const address_family_ipv4: u32 = 2;
+    const no_error: u32 = 0;
+    const skip_anycast: u32 = 0x0002;
+    const skip_multicast: u32 = 0x0004;
+    const skip_dns_server: u32 = 0x0008;
+    const interface_up: u32 = 1;
+    const interface_ethernet: u32 = 6;
+    const interface_ppp: u32 = 23;
+    const interface_loopback: u32 = 24;
+    const interface_wifi: u32 = 71;
+    const interface_tunnel: u32 = 131;
+
+    extern "iphlpapi" fn GetAdaptersAddresses(
+        family: u32,
+        flags: u32,
+        reserved: ?*anyopaque,
+        addresses: *AdapterAddress,
+        buffer_len: *u32,
+    ) callconv(.winapi) u32;
+};
 
 pub const default_port: u16 = 7332;
 pub const max_connections: u16 = 16;
@@ -34,6 +96,207 @@ pub fn FixedText(comptime capacity: usize) type {
             return std.mem.eql(u8, self.slice(), value);
         }
     };
+}
+
+pub const max_local_addresses: usize = 16;
+
+pub const LocalAddressKind = enum {
+    explicit,
+    private_lan,
+    public_lan,
+    vpn,
+    link_local,
+    loopback,
+
+    pub fn label(self: LocalAddressKind) []const u8 {
+        return switch (self) {
+            .explicit => "EXPLICIT ADDRESS",
+            .private_lan => "PRIVATE LAN",
+            .public_lan => "PUBLIC NETWORK",
+            .vpn => "VPN / VIRTUAL",
+            .link_local => "LINK-LOCAL ONLY",
+            .loopback => "THIS COMPUTER ONLY",
+        };
+    }
+
+    pub fn guidance(self: LocalAddressKind) []const u8 {
+        return switch (self) {
+            .explicit => "Verify the phone can reach this configured host",
+            .private_lan => "Phone must be on the same Wi-Fi or hotspot",
+            .public_lan => "Phone must be on this network; prefer a private hotspot",
+            .vpn => "Phone must share this VPN; a Wi-Fi/hotspot address is safer",
+            .link_local => "May not route between devices; use Wi-Fi or a phone hotspot",
+            .loopback => "Only a browser on this computer can connect",
+        };
+    }
+};
+
+pub const LocalAddress = struct {
+    host: FixedText(64) = .{},
+    interface_name: FixedText(48) = .{},
+    kind: LocalAddressKind = .loopback,
+
+    pub fn init(host: []const u8, interface_name: []const u8, kind: LocalAddressKind) ?LocalAddress {
+        var result: LocalAddress = .{ .kind = kind };
+        result.host.set(host) catch return null;
+        result.interface_name.set(interface_name) catch return null;
+        return result;
+    }
+
+    fn rank(self: LocalAddress) u16 {
+        return switch (self.kind) {
+            .explicit => 600,
+            .private_lan => 500,
+            .public_lan => 400,
+            .vpn => 300,
+            .link_local => 100,
+            .loopback => 0,
+        };
+    }
+};
+
+pub const LocalAddressDiscovery = struct {
+    addresses: [max_local_addresses]LocalAddress = @splat(.{}),
+    len: usize = 0,
+
+    pub fn add(self: *LocalAddressDiscovery, candidate: LocalAddress) void {
+        for (self.addresses[0..self.len]) |existing| {
+            if (existing.host.eql(candidate.host.slice())) return;
+        }
+        if (self.len == self.addresses.len) return;
+        self.addresses[self.len] = candidate;
+        self.len += 1;
+    }
+
+    pub fn preferred(self: *const LocalAddressDiscovery) ?LocalAddress {
+        var best: ?LocalAddress = null;
+        for (self.addresses[0..self.len]) |candidate| {
+            if (best == null or candidate.rank() > best.?.rank()) best = candidate;
+        }
+        return best;
+    }
+};
+
+fn interfaceIsVirtual(name: []const u8) bool {
+    const virtual_prefixes = [_][]const u8{
+        "utun",   "tun",  "tap",    "ppp",   "ipsec", "wg",   "tailscale", "zt", "vpn",
+        "docker", "veth", "bridge", "vmnet", "vbox",  "awdl", "llw",
+    };
+    for (virtual_prefixes) |prefix| {
+        if (name.len >= prefix.len and std.ascii.eqlIgnoreCase(name[0..prefix.len], prefix)) return true;
+    }
+    return false;
+}
+
+fn classifyIpv4(bytes: [4]u8, interface_name: []const u8) LocalAddressKind {
+    if (bytes[0] == 127) return .loopback;
+    if (bytes[0] == 169 and bytes[1] == 254) return .link_local;
+    if (interfaceIsVirtual(interface_name)) return .vpn;
+    if (bytes[0] == 10 or
+        (bytes[0] == 172 and bytes[1] >= 16 and bytes[1] <= 31) or
+        (bytes[0] == 192 and bytes[1] == 168))
+    {
+        return .private_lan;
+    }
+    return .public_lan;
+}
+
+fn addIpv4Candidate(
+    discovery: *LocalAddressDiscovery,
+    bytes: [4]u8,
+    interface_name: []const u8,
+) void {
+    if (bytes[0] == 0 and bytes[1] == 0 and bytes[2] == 0 and bytes[3] == 0) return;
+    var host_buffer: [15]u8 = undefined;
+    const host = std.fmt.bufPrint(
+        &host_buffer,
+        "{d}.{d}.{d}.{d}",
+        .{ bytes[0], bytes[1], bytes[2], bytes[3] },
+    ) catch return;
+    if (LocalAddress.init(host, interface_name, classifyIpv4(bytes, interface_name))) |candidate|
+        discovery.add(candidate);
+}
+
+/// Enumerate active IPv4 interfaces without opening a route or contacting the
+/// Internet. IPv4 keeps QR addresses short and covers ordinary venue Wi-Fi and
+/// phone hotspots; an explicit --presenter-host remains available for unusual
+/// IPv6-only or policy-managed networks.
+pub fn discoverLocalAddresses() LocalAddressDiscovery {
+    var result: LocalAddressDiscovery = .{};
+    if (comptime builtin.os.tag == .windows) {
+        var adapter_buffer: [32 * 1024]u8 align(@alignOf(WindowsNetwork.AdapterAddress)) = undefined;
+        var adapter_buffer_len: u32 = adapter_buffer.len;
+        const adapters: *WindowsNetwork.AdapterAddress = @ptrCast(&adapter_buffer);
+        const flags = WindowsNetwork.skip_anycast |
+            WindowsNetwork.skip_multicast |
+            WindowsNetwork.skip_dns_server;
+        if (WindowsNetwork.GetAdaptersAddresses(
+            WindowsNetwork.address_family_ipv4,
+            flags,
+            null,
+            adapters,
+            &adapter_buffer_len,
+        ) == WindowsNetwork.no_error) {
+            var adapter: ?*WindowsNetwork.AdapterAddress = adapters;
+            while (adapter) |entry| : (adapter = entry.next) {
+                if (entry.operating_status != WindowsNetwork.interface_up) continue;
+                const interface_name: []const u8 = switch (entry.interface_type) {
+                    WindowsNetwork.interface_wifi => "Wi-Fi",
+                    WindowsNetwork.interface_ethernet => "Ethernet",
+                    WindowsNetwork.interface_ppp, WindowsNetwork.interface_tunnel => "VPN",
+                    WindowsNetwork.interface_loopback => "loopback",
+                    else => "Network adapter",
+                };
+                var unicast = entry.first_unicast;
+                while (unicast) |unicast_entry| : (unicast = unicast_entry.next) {
+                    const address = unicast_entry.address.address orelse continue;
+                    if (address.family != WindowsNetwork.ws2.AF.INET) continue;
+                    const ipv4: *const WindowsNetwork.ws2.sockaddr.in = @ptrCast(@alignCast(address));
+                    const bytes_ptr: *const [4]u8 = @ptrCast(&ipv4.addr);
+                    addIpv4Candidate(&result, bytes_ptr.*, interface_name);
+                }
+            }
+        }
+        if (result.len == 0) result.add(LocalAddress.init("127.0.0.1", "loopback", .loopback).?);
+        return result;
+    }
+
+    var head: ?*network_c.struct_ifaddrs = null;
+    if (network_c.getifaddrs(&head) != 0) {
+        result.add(LocalAddress.init("127.0.0.1", "loopback", .loopback).?);
+        return result;
+    }
+    defer network_c.freeifaddrs(head);
+
+    var cursor = head;
+    while (cursor) |entry| : (cursor = entry.ifa_next) {
+        if ((entry.ifa_flags & network_c.IFF_UP) == 0) continue;
+        const address = entry.ifa_addr orelse continue;
+        if (address.*.sa_family != network_c.AF_INET) continue;
+        const ipv4: *const network_c.struct_sockaddr_in = @ptrCast(@alignCast(address));
+        const bytes_ptr: *const [4]u8 = @ptrCast(&ipv4.sin_addr);
+        addIpv4Candidate(&result, bytes_ptr.*, std.mem.span(entry.ifa_name));
+    }
+    if (result.len == 0) result.add(LocalAddress.init("127.0.0.1", "loopback", .loopback).?);
+    return result;
+}
+
+test "presenter address discovery classifies and ranks venue interfaces" {
+    try std.testing.expectEqual(LocalAddressKind.loopback, classifyIpv4(.{ 127, 0, 0, 1 }, "lo0"));
+    try std.testing.expectEqual(LocalAddressKind.link_local, classifyIpv4(.{ 169, 254, 4, 2 }, "en0"));
+    try std.testing.expectEqual(LocalAddressKind.private_lan, classifyIpv4(.{ 192, 168, 1, 8 }, "en0"));
+    try std.testing.expectEqual(LocalAddressKind.private_lan, classifyIpv4(.{ 172, 20, 10, 2 }, "en1"));
+    try std.testing.expectEqual(LocalAddressKind.vpn, classifyIpv4(.{ 10, 8, 0, 4 }, "utun4"));
+    try std.testing.expectEqual(LocalAddressKind.public_lan, classifyIpv4(.{ 100, 64, 1, 2 }, "en0"));
+
+    var discovery: LocalAddressDiscovery = .{};
+    discovery.add(LocalAddress.init("127.0.0.1", "lo0", .loopback).?);
+    discovery.add(LocalAddress.init("10.8.0.4", "utun4", .vpn).?);
+    discovery.add(LocalAddress.init("172.20.10.2", "en1", .private_lan).?);
+    discovery.add(LocalAddress.init("172.20.10.2", "duplicate", .public_lan).?);
+    try std.testing.expectEqual(@as(usize, 3), discovery.len);
+    try std.testing.expectEqualStrings("172.20.10.2", discovery.preferred().?.host.slice());
+    try std.testing.expectEqualStrings("Phone must be on the same Wi-Fi or hotspot", discovery.preferred().?.kind.guidance());
 }
 
 pub const Command = enum {
@@ -80,6 +343,23 @@ pub const DrawingEvent = struct {
     sequence: u64 = 0,
 };
 
+pub const LatencyMetric = struct {
+    samples: u16 = 0,
+    failures: u16 = 0,
+    median_ms: ?u32 = null,
+    p95_ms: ?u32 = null,
+};
+
+/// Browser-measured, secret-free delivery evidence retained only for the
+/// current pairing session. Notes, URLs, capability, and client identity are
+/// intentionally absent so Showtime may report it safely.
+pub const ClientHealth = struct {
+    state: LatencyMetric = .{},
+    command: LatencyMetric = .{},
+    pointer: LatencyMetric = .{},
+    drawing: LatencyMetric = .{},
+};
+
 pub const Snapshot = struct {
     session_id: FixedText(24) = .{},
     revision: u64 = 1,
@@ -118,6 +398,8 @@ const Store = struct {
     drawing_last_seen_ms: i64 = 0,
     drawing_position: struct { x: f32 = 0, y: f32 = 0 } = .{},
     last_drawing_sequence: u64 = 0,
+    client_health: ClientHealth = .{},
+    client_health_seen_ms: i64 = 0,
 
     fn resetSession(self: *Store, random: [40]u8, now_ms: i64) void {
         const preview_storage = self.preview_storage;
@@ -126,6 +408,11 @@ const Store = struct {
         self.* = .{ .preview_storage = preview_storage, .started_at_ms = now_ms };
         self.snapshot.session_id.set(&session_hex) catch unreachable;
         self.capability.set(&capability_hex) catch unreachable;
+    }
+
+    fn invalidateSession(self: *Store) void {
+        const preview_storage = self.preview_storage;
+        self.* = .{ .preview_storage = preview_storage };
     }
 
     fn authorized(self: *const Store, candidate: []const u8) bool {
@@ -312,25 +599,37 @@ pub const Runtime = struct {
             self.pairing_url.set("") catch unreachable;
         }
 
-        var random: [40]u8 = undefined;
-        try self.io.randomSecure(&random);
-        self.mutex.lockUncancelable(self.io);
-        self.store.resetSession(random, self.nowMs());
-        self.mutex.unlock(self.io);
-
         self.port = self.listener.?.socket.address.getPort();
+        try self.installSession(public_host);
+        self.serve_future = try self.io.concurrent(serve, .{self});
+        return self.port;
+    }
+
+    /// Rotate both the session identity and private capability while keeping
+    /// the listener/port alive. Network changes therefore produce a fresh QR;
+    /// returning to the previous venue network can never revive its old URL.
+    pub fn rePair(self: *Runtime, public_host: []const u8) !void {
+        if (self.listener == null) return error.NotRunning;
+        try self.installSession(public_host);
+    }
+
+    fn installSession(self: *Runtime, public_host: []const u8) !void {
         var base_buffer: [256]u8 = undefined;
         const base = try std.fmt.bufPrint(&base_buffer, "http://{s}:{d}", .{ public_host, self.port });
-        try self.base_url.set(base);
+        var random: [40]u8 = undefined;
+        try self.io.randomSecure(&random);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.store.resetSession(random, self.nowMs());
         var pairing_buffer: [384]u8 = undefined;
         const pairing = try std.fmt.bufPrint(
             &pairing_buffer,
             "{s}/presenter/#{s}",
             .{ base, self.store.capability.slice() },
         );
+        try self.base_url.set(base);
         try self.pairing_url.set(pairing);
-        self.serve_future = try self.io.concurrent(serve, .{self});
-        return self.port;
     }
 
     pub fn stop(self: *Runtime) void {
@@ -347,6 +646,9 @@ pub const Runtime = struct {
         self.port = 0;
         self.base_url.set("") catch unreachable;
         self.pairing_url.set("") catch unreachable;
+        self.mutex.lockUncancelable(self.io);
+        self.store.invalidateSession();
+        self.mutex.unlock(self.io);
     }
 
     pub fn isRunning(self: *const Runtime) bool {
@@ -375,6 +677,17 @@ pub const Runtime = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.store.last_seen_ms != 0 and self.nowMs() - self.store.last_seen_ms <= connected_window_ms;
+    }
+
+    pub fn clientHealth(self: *Runtime) ?ClientHealth {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.store.client_health_seen_ms == 0 or
+            self.nowMs() - self.store.client_health_seen_ms > connected_window_ms)
+        {
+            return null;
+        }
+        return self.store.client_health;
     }
 
     pub fn activePointer(self: *Runtime) ?PointerSample {
@@ -432,7 +745,13 @@ pub const Runtime = struct {
 
     fn handleConnectionTask(self: *Runtime, stream: std.Io.net.Stream) std.Io.Cancelable!void {
         defer _ = self.active_connections.fetchSub(1, .acq_rel);
-        self.handleConnection(stream) catch |err| std.log.warn("Presenter Companion request failed: {t}", .{err});
+        self.handleConnection(stream) catch |err| switch (err) {
+            // Browsers routinely open and abandon speculative HTTP
+            // connections. They never reached a request and are not a venue
+            // failure worth alarming the presenter about.
+            error.HttpRequestTruncated => {},
+            else => std.log.warn("Presenter Companion request failed: {t}", .{err}),
+        };
     }
 
     fn handleConnection(self: *Runtime, stream: std.Io.net.Stream) !void {
@@ -514,13 +833,18 @@ pub const Runtime = struct {
             const command = std.meta.stringToEnum(Command, parsed.value.command) orelse
                 return respondError(&request, .bad_request, "unknown presenter command");
             self.mutex.lockUncancelable(self.io);
-            self.store.last_seen_ms = self.nowMs();
+            if (!self.store.authorized(token)) {
+                self.mutex.unlock(self.io);
+                return respondError(&request, .unauthorized, "presenter pairing required");
+            }
+            const accepted_at_ms = self.nowMs();
+            self.store.last_seen_ms = accepted_at_ms;
             const queued = self.store.enqueue(command, parsed.value.seq) catch {
                 self.mutex.unlock(self.io);
                 return respondError(&request, .too_many_requests, "presenter command queue is full");
             };
             self.mutex.unlock(self.io);
-            return respondCommand(&request, parsed.value.seq, queued);
+            return respondCommand(&request, parsed.value.seq, queued, accepted_at_ms);
         }
 
         if (request.head.method == .POST and std.mem.eql(u8, path, "/api/v1/presenter/pointer")) {
@@ -546,13 +870,18 @@ pub const Runtime = struct {
                 .sequence = parsed.value.seq,
             };
             self.mutex.lockUncancelable(self.io);
-            self.store.last_seen_ms = self.nowMs();
-            const accepted = self.store.updatePointer(sample, self.store.last_seen_ms) catch {
+            if (!self.store.authorized(token)) {
+                self.mutex.unlock(self.io);
+                return respondError(&request, .unauthorized, "presenter pairing required");
+            }
+            const accepted_at_ms = self.nowMs();
+            self.store.last_seen_ms = accepted_at_ms;
+            const accepted = self.store.updatePointer(sample, accepted_at_ms) catch {
                 self.mutex.unlock(self.io);
                 return respondError(&request, .bad_request, "pointer coordinates must be normalized");
             };
             self.mutex.unlock(self.io);
-            return respondPointer(&request, parsed.value.seq, accepted);
+            return respondPointer(&request, parsed.value.seq, accepted, accepted_at_ms);
         }
 
         if (request.head.method == .POST and std.mem.eql(u8, path, "/api/v1/presenter/drawing")) {
@@ -580,8 +909,13 @@ pub const Runtime = struct {
                 .sequence = parsed.value.seq,
             };
             self.mutex.lockUncancelable(self.io);
-            self.store.last_seen_ms = self.nowMs();
-            const queued = self.store.enqueueDrawing(event, self.store.last_seen_ms) catch |err| switch (err) {
+            if (!self.store.authorized(token)) {
+                self.mutex.unlock(self.io);
+                return respondError(&request, .unauthorized, "presenter pairing required");
+            }
+            const accepted_at_ms = self.nowMs();
+            self.store.last_seen_ms = accepted_at_ms;
+            const queued = self.store.enqueueDrawing(event, accepted_at_ms) catch |err| switch (err) {
                 error.InvalidDrawing => {
                     self.mutex.unlock(self.io);
                     return respondError(&request, .bad_request, "drawing coordinates must be normalized");
@@ -592,7 +926,38 @@ pub const Runtime = struct {
                 },
             };
             self.mutex.unlock(self.io);
-            return respondDrawing(&request, parsed.value.seq, queued);
+            return respondDrawing(&request, parsed.value.seq, queued, accepted_at_ms);
+        }
+
+        if (request.head.method == .POST and std.mem.eql(u8, path, "/api/v1/presenter/health")) {
+            const token = queryValue(target, "token") orelse "";
+            self.mutex.lockUncancelable(self.io);
+            const authorized = self.store.authorized(token);
+            self.mutex.unlock(self.io);
+            if (!authorized) return respondError(&request, .unauthorized, "presenter pairing required");
+            if (!hasJsonContentType(&request)) return respondError(&request, .unsupported_media_type, "Content-Type must be application/json");
+            const body = self.readBody(&request) catch |err| switch (err) {
+                error.BodyTooLarge, error.StreamTooLong => return respondError(&request, .payload_too_large, "request body too large"),
+                else => return err,
+            };
+            defer self.allocator.free(body);
+            const parsed = std.json.parseFromSlice(ClientHealth, self.allocator, body, .{}) catch {
+                return respondError(&request, .bad_request, "invalid connection health report");
+            };
+            defer parsed.deinit();
+            if (!validClientHealth(parsed.value))
+                return respondError(&request, .bad_request, "connection health values are out of range");
+            self.mutex.lockUncancelable(self.io);
+            if (!self.store.authorized(token)) {
+                self.mutex.unlock(self.io);
+                return respondError(&request, .unauthorized, "presenter pairing required");
+            }
+            const accepted_at_ms = self.nowMs();
+            self.store.last_seen_ms = accepted_at_ms;
+            self.store.client_health = parsed.value;
+            self.store.client_health_seen_ms = accepted_at_ms;
+            self.mutex.unlock(self.io);
+            return respondHealth(&request, accepted_at_ms);
         }
 
         if (request.head.method == .GET and std.mem.eql(u8, path, "/health/presenter")) {
@@ -630,7 +995,45 @@ const DrawingRequest = struct {
     seq: u64,
 };
 
+fn validLatencyMetric(metric: LatencyMetric) bool {
+    if (metric.samples > 80 or metric.failures > 10_000) return false;
+    if (metric.median_ms) |value| if (value > 60_000) return false;
+    if (metric.p95_ms) |value| if (value > 60_000) return false;
+    if (metric.samples == 0 and (metric.median_ms != null or metric.p95_ms != null)) return false;
+    return true;
+}
+
+fn validClientHealth(health: ClientHealth) bool {
+    return validLatencyMetric(health.state) and
+        validLatencyMetric(health.command) and
+        validLatencyMetric(health.pointer) and
+        validLatencyMetric(health.drawing);
+}
+
 const presenter_html = @embedFile("assets/presenter.html");
+
+test "embedded Presenter Companion keeps phone and intentional laptop workflows" {
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "@media (min-width: 900px) and (min-height: 600px)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "@media (orientation: landscape) and (max-height: 599px)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "document.body.dataset.presenterMode = mode;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "--landscape-surface-width: clamp(240px, calc(177.7778dvh - 258px), 440px)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "body[data-presenter-mode=\"draw\"] .drawing-actions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "Laptop companion · ←/→ navigate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "grid-template-columns: minmax(0, 1.75fr)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "document.addEventListener(\"keydown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "rayslidesPresenterDiagnostics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "controls p95") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "/api/v1/presenter/health") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "visibilitychange") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "window.addEventListener(\"hashchange\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "nextFragment !== token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "function suspendDisconnectedControls()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "if (failures > 2) suspendDisconnectedControls();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "navigator.sendBeacon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "navigator.wakeLock.request") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, presenter_html, "const pointer = mode === \"pointer\";"));
+    try std.testing.expect(std.mem.indexOf(u8, presenter_html, "https://") == null);
+}
 
 const page_headers: []const std.http.Header = &.{
     .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
@@ -682,24 +1085,31 @@ fn respondError(request: *std.http.Server.Request, status: std.http.Status, mess
     try request.respond(writer.buffered(), .{ .status = status, .keep_alive = false, .extra_headers = api_headers });
 }
 
-fn respondCommand(request: *std.http.Server.Request, sequence: u64, queued: bool) !void {
+fn respondCommand(request: *std.http.Server.Request, sequence: u64, queued: bool, accepted_at_ms: i64) !void {
     var buffer: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try std.json.Stringify.value(.{ .sequence = sequence, .queued = queued }, .{}, &writer);
+    try std.json.Stringify.value(.{ .sequence = sequence, .queued = queued, .accepted_at_ms = accepted_at_ms }, .{}, &writer);
     try request.respond(writer.buffered(), .{ .keep_alive = false, .extra_headers = api_headers });
 }
 
-fn respondPointer(request: *std.http.Server.Request, sequence: u64, accepted: bool) !void {
+fn respondPointer(request: *std.http.Server.Request, sequence: u64, accepted: bool, accepted_at_ms: i64) !void {
     var buffer: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try std.json.Stringify.value(.{ .sequence = sequence, .accepted = accepted }, .{}, &writer);
+    try std.json.Stringify.value(.{ .sequence = sequence, .accepted = accepted, .accepted_at_ms = accepted_at_ms }, .{}, &writer);
     try request.respond(writer.buffered(), .{ .keep_alive = false, .extra_headers = api_headers });
 }
 
-fn respondDrawing(request: *std.http.Server.Request, sequence: u64, queued: bool) !void {
+fn respondDrawing(request: *std.http.Server.Request, sequence: u64, queued: bool, accepted_at_ms: i64) !void {
     var buffer: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try std.json.Stringify.value(.{ .sequence = sequence, .queued = queued }, .{}, &writer);
+    try std.json.Stringify.value(.{ .sequence = sequence, .queued = queued, .accepted_at_ms = accepted_at_ms }, .{}, &writer);
+    try request.respond(writer.buffered(), .{ .keep_alive = false, .extra_headers = api_headers });
+}
+
+fn respondHealth(request: *std.http.Server.Request, accepted_at_ms: i64) !void {
+    var buffer: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try std.json.Stringify.value(.{ .accepted = true, .accepted_at_ms = accepted_at_ms }, .{}, &writer);
     try request.respond(writer.buffered(), .{ .keep_alive = false, .extra_headers = api_headers });
 }
 
@@ -809,6 +1219,87 @@ fn rawHttp(allocator: std.mem.Allocator, io: std.Io, port: u16, request: []const
     return reader.interface.allocRemaining(allocator, .limited(192 * 1024));
 }
 
+test "re-pairing after a network change invalidates the old capability" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var runtime = try Runtime.init(allocator, io);
+    defer runtime.deinit();
+    const port = try runtime.start(0, "192.168.1.20");
+    var old_capability: [64]u8 = undefined;
+    @memcpy(&old_capability, runtime.store.capability.slice());
+    var old_session: [16]u8 = undefined;
+    @memcpy(&old_session, runtime.store.snapshot.session_id.slice());
+
+    try runtime.rePair("172.20.10.2");
+    try std.testing.expectEqual(port, runtime.port);
+    try std.testing.expectEqualStrings("http://172.20.10.2", runtime.base_url.slice()[0.."http://172.20.10.2".len]);
+    try std.testing.expect(!std.mem.eql(u8, &old_capability, runtime.store.capability.slice()));
+    try std.testing.expect(!std.mem.eql(u8, &old_session, runtime.store.snapshot.session_id.slice()));
+    try std.testing.expect(!runtime.phoneConnected());
+
+    const old_request = try std.fmt.allocPrint(
+        allocator,
+        "GET /api/v1/presenter/state?token={s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        .{old_capability},
+    );
+    defer allocator.free(old_request);
+    const old_response = try rawHttp(allocator, io, port, old_request);
+    defer allocator.free(old_response);
+    try std.testing.expect(std.mem.indexOf(u8, old_response, "401 Unauthorized") != null);
+
+    const new_request = try std.fmt.allocPrint(
+        allocator,
+        "GET /api/v1/presenter/state?token={s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        .{runtime.store.capability.slice()},
+    );
+    defer allocator.free(new_request);
+    const new_response = try rawHttp(allocator, io, port, new_request);
+    defer allocator.free(new_response);
+    try std.testing.expect(std.mem.indexOf(u8, new_response, "200 OK") != null);
+
+    runtime.stop();
+    try std.testing.expectEqual(@as(u16, 0), runtime.store.capability.len);
+}
+
+test "stop and restart clears stale input and never revives a capability" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var runtime = try Runtime.init(allocator, io);
+    defer runtime.deinit();
+    const port = try runtime.start(0, "127.0.0.1");
+    var old_capability: [64]u8 = undefined;
+    @memcpy(&old_capability, runtime.store.capability.slice());
+
+    runtime.mutex.lockUncancelable(io);
+    try std.testing.expect(try runtime.store.enqueue(.next, 9));
+    try std.testing.expect(try runtime.store.updatePointer(.{ .active = true, .x = 0.4, .y = 0.6, .sequence = 8 }, runtime.nowMs()));
+    try std.testing.expect(try runtime.store.enqueueDrawing(.{ .phase = .begin, .x = 0.2, .y = 0.3, .sequence = 7 }, runtime.nowMs()));
+    runtime.mutex.unlock(io);
+
+    runtime.stop();
+    try std.testing.expect(!runtime.isRunning());
+    try std.testing.expect(runtime.takeCommand() == null);
+    try std.testing.expect(runtime.activePointer() == null);
+    try std.testing.expect(runtime.takeDrawing() == null);
+
+    try std.testing.expectEqual(port, try runtime.start(port, "127.0.0.1"));
+    try std.testing.expect(!std.mem.eql(u8, &old_capability, runtime.store.capability.slice()));
+    runtime.mutex.lockUncancelable(io);
+    try std.testing.expect(try runtime.store.enqueue(.previous, 1));
+    runtime.mutex.unlock(io);
+    try std.testing.expectEqual(Command.previous, runtime.takeCommand().?.command);
+
+    const stale_request = try std.fmt.allocPrint(
+        allocator,
+        "GET /api/v1/presenter/state?token={s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        .{old_capability},
+    );
+    defer allocator.free(stale_request);
+    const stale_response = try rawHttp(allocator, io, port, stale_request);
+    defer allocator.free(stale_response);
+    try std.testing.expect(std.mem.indexOf(u8, stale_response, "401 Unauthorized") != null);
+}
+
 test "presenter HTTP is private and queues authenticated commands" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -878,6 +1369,7 @@ test "presenter HTTP is private and queues authenticated commands" {
     const command_response = try rawHttp(allocator, io, port, command_request);
     defer allocator.free(command_response);
     try std.testing.expect(std.mem.indexOf(u8, command_response, "\"queued\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command_response, "\"accepted_at_ms\":") != null);
     try std.testing.expectEqual(Command.next, runtime.takeCommand().?.command);
 
     const pointer_body = "{\"active\":true,\"x\":0.2,\"y\":0.8,\"seq\":1}";
@@ -890,6 +1382,7 @@ test "presenter HTTP is private and queues authenticated commands" {
     const pointer_response = try rawHttp(allocator, io, port, pointer_request);
     defer allocator.free(pointer_response);
     try std.testing.expect(std.mem.indexOf(u8, pointer_response, "\"accepted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pointer_response, "\"accepted_at_ms\":") != null);
     const pointer = runtime.activePointer().?;
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), pointer.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), pointer.y, 0.0001);
@@ -906,6 +1399,7 @@ test "presenter HTTP is private and queues authenticated commands" {
     const drawing_response = try rawHttp(allocator, io, port, drawing_request);
     defer allocator.free(drawing_response);
     try std.testing.expect(std.mem.indexOf(u8, drawing_response, "\"queued\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawing_response, "\"accepted_at_ms\":") != null);
     const drawing = runtime.takeDrawing().?;
     try std.testing.expectEqual(DrawingPhase.begin, drawing.phase);
     try std.testing.expectApproxEqAbs(@as(f32, 0.15), drawing.x, 0.0001);
@@ -922,6 +1416,21 @@ test "presenter HTTP is private and queues authenticated commands" {
     defer allocator.free(clear_response);
     try std.testing.expect(std.mem.indexOf(u8, clear_response, "\"queued\":true") != null);
     try std.testing.expectEqual(Command.clear_drawing, runtime.takeCommand().?.command);
+
+    const health_body = "{\"state\":{\"samples\":40,\"failures\":0,\"median_ms\":18,\"p95_ms\":42},\"command\":{\"samples\":4,\"failures\":0,\"median_ms\":25,\"p95_ms\":63},\"pointer\":{\"samples\":12,\"failures\":1,\"median_ms\":31,\"p95_ms\":91},\"drawing\":{\"samples\":8,\"failures\":0,\"median_ms\":35,\"p95_ms\":97}}";
+    const health_request = try std.fmt.allocPrint(
+        allocator,
+        "POST /api/v1/presenter/health?token={s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ runtime.store.capability.slice(), health_body.len, health_body },
+    );
+    defer allocator.free(health_request);
+    const health_response = try rawHttp(allocator, io, port, health_request);
+    defer allocator.free(health_response);
+    try std.testing.expect(std.mem.indexOf(u8, health_response, "\"accepted\":true") != null);
+    const health = runtime.clientHealth().?;
+    try std.testing.expectEqual(@as(u16, 40), health.state.samples);
+    try std.testing.expectEqual(@as(?u32, 97), health.drawing.p95_ms);
+    try std.testing.expectEqual(@as(u16, 1), health.pointer.failures);
 }
 
 test "Presenter Companion and Crowdplay remain independent servers" {
