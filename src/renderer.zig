@@ -746,6 +746,10 @@ pub const SlideshowRenderer = struct {
     /// playback while still using the exact generated scene graph.
     pub const ShowtimeRenderItem = struct {
         owner_identity: usize,
+        /// Painted bounds before owner rotation. Showtime compares text to
+        /// its authored box in this coordinate space, while `bounds` remains
+        /// rotation-aware for canvas-escape and display checks.
+        unrotated_bounds: rl.Rectangle,
         bounds: rl.Rectangle,
         has_bounds: bool = false,
         has_pixels: bool = false,
@@ -798,6 +802,7 @@ pub const SlideshowRenderer = struct {
                     .height = @max(element.line_start.y, element.line_end.y) + half_stroke - top,
                 };
             }
+            const unrotated_bounds = element_bounds;
             if (element.kind != .background and @abs(element.rotation) > 0.0001)
                 element_bounds = rotatedRectangleBounds(element_bounds, element.rotation_center, element.rotation);
             const has_bounds = element.kind == .background or (element_bounds.width > 0 and element_bounds.height > 0);
@@ -838,6 +843,14 @@ pub const SlideshowRenderer = struct {
                 const previous = &output.items[output.items.len - 1];
                 if (has_bounds) {
                     if (previous.has_bounds) {
+                        const unrotated_left = @min(previous.unrotated_bounds.x, unrotated_bounds.x);
+                        const unrotated_top = @min(previous.unrotated_bounds.y, unrotated_bounds.y);
+                        previous.unrotated_bounds = .{
+                            .x = unrotated_left,
+                            .y = unrotated_top,
+                            .width = @max(previous.unrotated_bounds.x + previous.unrotated_bounds.width, unrotated_bounds.x + unrotated_bounds.width) - unrotated_left,
+                            .height = @max(previous.unrotated_bounds.y + previous.unrotated_bounds.height, unrotated_bounds.y + unrotated_bounds.height) - unrotated_top,
+                        };
                         const left = @min(previous.bounds.x, element_bounds.x);
                         const top = @min(previous.bounds.y, element_bounds.y);
                         previous.bounds = .{
@@ -847,6 +860,7 @@ pub const SlideshowRenderer = struct {
                             .height = @max(previous.bounds.y + previous.bounds.height, element_bounds.y + element_bounds.height) - top,
                         };
                     } else {
+                        previous.unrotated_bounds = unrotated_bounds;
                         previous.bounds = element_bounds;
                         previous.has_bounds = true;
                     }
@@ -859,6 +873,7 @@ pub const SlideshowRenderer = struct {
             } else {
                 try output.append(allocator, .{
                     .owner_identity = element.owner_identity,
+                    .unrotated_bounds = unrotated_bounds,
                     .bounds = element_bounds,
                     .has_bounds = has_bounds,
                     .has_pixels = has_pixels,

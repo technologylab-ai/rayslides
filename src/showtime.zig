@@ -261,8 +261,11 @@ fn outsideCanvas(bounds: rl.Rectangle) bool {
 fn textOverflows(item: slides.SlideItem, bounds: rl.Rectangle) bool {
     if (item.kind != .textbox) return false;
     const epsilon: f32 = 1.0;
-    if (item.size.x > 0 and bounds.x + bounds.width > item.position.x + item.size.x + epsilon) return true;
-    if (item.size.y > 0 and bounds.y + bounds.height > item.position.y + item.size.y + epsilon) return true;
+    const authored = rl.Rectangle{ .x = item.position.x, .y = item.position.y, .width = item.size.x, .height = item.size.y };
+    if (item.size.x > 0 and
+        (bounds.x < authored.x - epsilon or bounds.x + bounds.width > authored.x + authored.width + epsilon)) return true;
+    if (item.size.y > 0 and
+        (bounds.y < authored.y - epsilon or bounds.y + bounds.height > authored.y + authored.height + epsilon)) return true;
     return false;
 }
 
@@ -395,7 +398,7 @@ pub fn analyze(
                     }
                 }
                 if (observation.has_bounds) {
-                    if (textOverflows(item, observation.bounds) and !report.alreadyHas(.text_overflow, slide_index, item.identity)) {
+                    if (textOverflows(item, observation.unrotated_bounds) and !report.alreadyHas(.text_overflow, slide_index, item.identity)) {
                         try report.addFmt(.warning, .typography, .text_overflow, slide_index, morph_state, item.identity, sourceLine(item), "Text exceeds object {d}'s authored box", .{item.identity}, "Enlarge the box, shorten the text, or reduce its font size.", .{});
                     }
                     if (outsideCanvas(observation.bounds) and !report.alreadyHas(.canvas_escape, slide_index, item.identity)) {
@@ -703,6 +706,26 @@ test "asset discovery covers image video fonts overrides and ignores text" {
     try std.testing.expectEqualStrings("art/hero.png", refs.items[1].path);
     try std.testing.expectEqualStrings("clips/demo.mp4", refs.items[2].path);
     try std.testing.expectEqualStrings("../alternate.png", refs.items[3].path);
+}
+
+test "text overflow uses unrotated painted coordinates for rotated owners" {
+    const item = slides.SlideItem{
+        .kind = .textbox,
+        .position = .{ .x = 200, .y = 300 },
+        .size = .{ .x = 320, .y = 120 },
+        .rotation = -12,
+    };
+    const painted = rl.Rectangle{
+        .x = item.position.x,
+        .y = item.position.y,
+        .width = item.size.x,
+        .height = item.size.y,
+    };
+    try std.testing.expect(!textOverflows(item, painted));
+
+    var escaped = painted;
+    escaped.width += 3;
+    try std.testing.expect(textOverflows(item, escaped));
 }
 
 test "portable planning rewrites collisions deterministically and leaves source ordinary" {
