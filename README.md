@@ -61,13 +61,19 @@ During development, use `zig build run -- talk.sld`. On macOS,
 
 ## Documentation
 
-- [Follow the active product roadmap](ROADMAP.md)
-- [Read the unreleased four-topic release notes](RELEASE_NOTES.md)
-- [Explore the visual guide](https://technologylab-ai.github.io/rayslides/)
+- [Read the online documentation](https://technologylab-ai.github.io/rayslides/)
 - [Create your first deck](https://technologylab-ai.github.io/rayslides/getting-started.html)
 - [Learn the Studio interface](https://technologylab-ai.github.io/rayslides/studio.html)
 - [Add reveals, transitions, and morph states](https://technologylab-ai.github.io/rayslides/motion.html)
+- [Use Presenter Companion](https://technologylab-ai.github.io/rayslides/presenter.html)
+- [Run a Crowdplay poll](https://technologylab-ai.github.io/rayslides/crowdplay.html)
 - [Write `.sld` source](https://technologylab-ai.github.io/rayslides/format.html)
+- [Browse controls and limits](https://technologylab-ai.github.io/rayslides/reference.html)
+
+## Project status
+
+- [Read the unreleased four-topic release notes](RELEASE_NOTES.md)
+- [Follow the active product roadmap](ROADMAP.md)
 
 Rayslides began as a raylib-based port of
 [renerocksai/slides](https://github.com/renerocksai/slides). It now combines
