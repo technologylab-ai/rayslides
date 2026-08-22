@@ -75,8 +75,8 @@ Every visual line honors the edge.
 @box x=1458 y=764 w=324 h=120 rotation=-7 fontsize=30 align=center valign=middle color=#e1fff8ff text=Morph-safe
 @line x=474 y=362 w=272 h=116 stroke_width=9 direction=down arrow=end color=#61dafbff
 @line x=1174 y=362 w=272 h=116 stroke_width=9 direction=up arrow=start color=#ff70caff
-@line x=474 y=790 w=272 h=-184 stroke_width=9 direction=up arrow=end color=#ffb547ff
-@line x=1174 y=790 w=272 h=-184 stroke_width=9 direction=down arrow=start color=#65e6c4ff
+@line x=474 y=606 w=272 h=184 stroke_width=9 direction=up arrow=end color=#ffb547ff
+@line x=1174 y=606 w=272 h=184 stroke_width=9 direction=down arrow=start color=#65e6c4ff
 
 @slide transition=fade duration=0.4
 @bg color=#07111fff
