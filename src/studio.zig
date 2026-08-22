@@ -2072,7 +2072,15 @@ fn emptyWorkspaceLayout() WorkspaceLayout {
 }
 
 fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) WorkspaceLayout {
-    const organizer_height = @min(@max(190 * scale, @floor(sidebar.height * 0.61)), @max(130 * scale, sidebar.height - 126 * scale));
+    // Both deck panels use three distinct vertical bands: heading, actions,
+    // then content. Reserve enough room for one slide card and one Library
+    // card at the minimum supported Studio height.
+    const organizer_min_height: f32 = 192 * scale;
+    const library_min_height: f32 = 150 * scale;
+    const organizer_height = @min(
+        @max(organizer_min_height, @floor(sidebar.height * 0.61)),
+        @max(130 * scale, sidebar.height - gap - library_min_height),
+    );
     const organizer: rl.Rectangle = .{ .x = sidebar.x, .y = sidebar.y, .width = sidebar.width, .height = organizer_height };
 
     const action_gap: f32 = 4 * scale;
@@ -2126,7 +2134,7 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
     );
     const library_cleanup: rl.Rectangle = .{
         .x = library.x + library.width - 12 * scale - library_action_width,
-        .y = library.y + 5 * scale,
+        .y = library.y + 34 * scale,
         .width = library_action_width,
         .height = 26 * scale,
     };
@@ -2175,9 +2183,9 @@ fn workspaceLayoutInSidebar(sidebar: rl.Rectangle, gap: f32, scale: f32) Workspa
     };
     const library_rows_clip: rl.Rectangle = .{
         .x = library.x + 8 * scale,
-        .y = library.y + 40 * scale,
+        .y = library.y + 70 * scale,
         .width = library.width - 16 * scale,
-        .height = @max(0, library_pager_y - 5 * scale - (library.y + 40 * scale)),
+        .height = @max(0, library_pager_y - 5 * scale - (library.y + 70 * scale)),
     };
     return .{
         .scale = scale,
@@ -17177,6 +17185,10 @@ test "workspace layout exposes bounded slide thumbnail slots" {
     try std.testing.expect(layout.slide_page_status.width >= 72 * layout.scale);
     try std.testing.expect(layout.library_page_status.x + layout.library_page_status.width < layout.library_page_previous.x);
     try std.testing.expect(layout.library_page_status.width >= 72 * layout.scale);
+    const library_heading_bottom = layout.library.y + 9 * layout.scale +
+        @as(f32, @floatFromInt(scaledUiFont(layout.scale, UiTypography.heading)));
+    try std.testing.expect(library_heading_bottom <= layout.library_use.y);
+    try std.testing.expect(layout.library_use.y + layout.library_use.height < layout.library_rows_clip.y);
     const inspector = objectsLayout(frameLayout(
         .{ .x = 0, .y = 0, .width = 1600, .height = 900 },
         true,
