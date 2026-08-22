@@ -40,7 +40,7 @@
           <p>The workspace keeps the slide visible. The main controls remain outside the 16:9 canvas.</p>
           <figure class="shot">
             <div class="annotated-shot">
-              <img src="images/rayslides-studio-properties.jpg" alt="Annotated Rayslides Studio workspace" width="1319" height="768">
+              <img src="images/rayslides-studio-overview.png" alt="Annotated Rayslides Studio workspace editing the current capabilities showcase" width="2560" height="1440">
               <span class="marker marker-one">1</span><span class="marker marker-two">2</span><span class="marker marker-three">3</span><span class="marker marker-four">4</span><span class="marker marker-five">5</span>
             </div>
             <figcaption><strong>The five main areas stay visible in a wide window.</strong> A narrow window shows one side panel at a time.</figcaption>
@@ -56,7 +56,7 @@
           <h2>Create an object</h2>
           <p>Choose a creation tool, then click the canvas. Studio returns to Select after one placement.</p>
           <figure class="shot shot-toolbar">
-            <img src="images/studio-creation-toolbar.png" alt="Studio toolbar with Select, Text, Bullets, Image, Video, Rectangle, Line, and Library tools" width="690" height="72" loading="lazy">
+            <img src="images/studio-creation-toolbar.png" alt="Studio toolbar with Select, Text, Bullets, Image, Video, Rectangle, Line, and Library tools" width="720" height="105" loading="lazy">
             <figcaption><strong>The creation buttons are source-native canvas tools.</strong> Each new object becomes source-backed content.</figcaption>
           </figure>
           <div class="table-wrap">
@@ -86,6 +86,10 @@
           </ol>
           <p>Use the arrow keys for a one-pixel nudge. Hold <kbd>Shift</kbd> for ten pixels.</p>
           <div class="callout"><p><strong>Hold <kbd>Cmd/Ctrl</kbd> during a drag to bypass snapping.</strong> Press <kbd>G</kbd> to show the 20-pixel grid.</p></div>
+          <figure class="shot">
+            <img src="images/studio-rotated-image.png" alt="Studio with a rotated image selected, its painted outline and rotation handle visible, and rotation shown in Properties" width="2560" height="1440" loading="lazy">
+            <figcaption><strong>Rotation is authored, not baked into the bitmap.</strong> The canvas handle and exact <code>ROT</code> value update the same source property.</figcaption>
+          </figure>
 
           <h3>Select more than one object</h3>
           <figure class="diagram">
@@ -118,6 +122,10 @@
           <p>For an image or video, the first field shows <strong>IMAGE</strong> or <strong>VIDEO</strong>, the effective filename/path, and a separate <strong>Replace</strong> button. Click Replace, or press <kbd>Enter</kbd> while Properties is visible, to choose a new file through the same picker and deck-relative path policy used for insertion. The object's geometry, ID, ordering, and other properties stay unchanged. An amber <strong>R</strong> beside a local source override restores the inherited asset.</p>
           <p>Use <strong>Stretch</strong> to fill the box without preserving aspect ratio, <strong>Fit</strong> to show the complete picture inside the box, or <strong>Fill</strong> to cover the box with an aspect-preserving crop. <code>FX</code> and <code>FY</code> move that crop or fitted picture from <code>0</code> (left/top) to <code>1</code> (right/bottom); <code>0.5</code> is centered. Natural pixel dimensions remain visible beside the box size for images and videos alike.</p>
           <p>For videos, choose <strong>Playback</strong> to edit <strong>Auto</strong>, <strong>Loop</strong>, <strong>Mute</strong>, poster time, volume, and opacity. The duration-aware scrubber previews the authored poster without changing the playback start. Slide cards, Library and Definition previews, Presenter preview, PNG screenshots, and PDF export use that immutable poster without interrupting live playback. Authored volume and mute return each time the slide is entered; presenter adjustments remain temporary for the current visit. Choose <strong>Layout</strong> to return to fitting and geometry. Amber <strong>R</strong> markers reset local source, Fit, focus, poster, volume, and playback-toggle overrides one at a time.</p>
+          <figure class="shot">
+            <img src="images/studio-media-playback.png" alt="Studio with a rotated Big Buck Bunny video selected and Replace, loop, mute, duration, poster, volume, rotation, and opacity controls visible" width="1920" height="1080" loading="lazy">
+            <figcaption><strong>Video is a first-class Studio object.</strong> This selected bunny clip keeps a 6.2-second poster and a 3-degree rotation while its playback and replacement controls remain editable.</figcaption>
+          </figure>
           <p>When media cannot load, Studio retains a selectable repair box while Properties keeps the filename and <strong>Replace</strong> action live. Diagnostics distinguish missing or unreadable files, unsupported image data, missing ffmpeg/ffprobe, probe or codec failures, and poster decode failures. Out-of-range or recoverable poster choices receive amber warnings while retaining their pixels, and silent videos are identified without being treated as broken. These overlays are editor-only and never appear on the projected or exported slide.</p>
           <p>Text boxes provide left/center/right and top/middle/bottom alignment. Rectangle <strong>Radius</strong> is measured in logical pixels. Lines expose stroke width, up/down direction, and no/start/end/both arrow heads; their endpoint handles follow the painted stroke. <strong>ROT</strong> accepts any finite clockwise degree value around the object's effective center. These values remain source-native through reusable definitions, local overrides, morph states, Showtime, and export.</p>
           <p>Press <kbd>Esc</kbd> to cancel the current value. Invalid values stay in the field and show an explanation.</p>
@@ -141,7 +149,7 @@
           <h3>Use the Properties actions</h3>
           <div class="panel-guide">
             <figure class="shot panel-capture">
-              <img src="images/studio-properties-panel.png" alt="Properties panel with Duplicate, Delete, Reuse, Lock, geometry, and color controls" width="316" height="520" loading="lazy">
+              <img src="images/studio-properties-panel.png" alt="Properties panel with Duplicate, Delete, Reuse, Lock, geometry, color, rotation, opacity, alignment, and layer controls" width="380" height="835" loading="lazy">
               <figcaption><strong>The scope appears below the fields.</strong> This example edits a shared group definition.</figcaption>
             </figure>
             <div class="panel-copy">
@@ -188,7 +196,7 @@
           <p>The Objects tab lists the paint order from front to back.</p>
           <p>The list also includes hidden, transparent, and locked objects. Use it when the canvas cannot select an object.</p>
           <figure class="shot">
-            <img src="images/rayslides-studio-objects.jpg" alt="Objects list beside the Studio canvas" width="1319" height="768" loading="lazy">
+            <img src="images/rayslides-studio-objects.png" alt="Objects list beside the Studio canvas while editing the current capabilities showcase" width="2560" height="1440" loading="lazy">
             <figcaption><strong>Each row shows the source name and object type.</strong> Use Vis and U to change visibility or locking.</figcaption>
           </figure>
           <p>The Back, Down, Up, and Front buttons change the paint order. Studio makes each layer change one undo step.</p>
@@ -300,7 +308,7 @@
           <h2>Organize slides</h2>
           <div class="panel-guide">
             <figure class="shot panel-capture">
-              <img src="images/studio-slides-panel.png" alt="Slides panel with Add, Duplicate, Delete, Up, Down, Template, Find, Previous, and Next controls" width="270" height="428" loading="lazy">
+              <img src="images/studio-slides-panel.png" alt="Slides panel with Add, Duplicate, Delete, Up, Down, Template, Find, Previous, and Next controls plus showcase thumbnails" width="430" height="690" loading="lazy">
               <figcaption><strong>A slide card shows its title, item count, and state count.</strong> Click the card to load it.</figcaption>
             </figure>
             <div class="panel-copy">
@@ -322,8 +330,12 @@
           <p>Type an action, tool, category, or shortcut. Disabled commands stay visible and explain why they cannot run.</p>
           <p>The <strong>Present</strong> commands include speaker notes, private Presenter Companion pairing, <strong>Choose presentation display</strong>, <strong>Showtime preflight</strong>, and <strong>Create portable show</strong>. The display picker names and identifies active screens before you explicitly choose one; it never assumes an external monitor is the projector. Showtime checks the exact parser, renderer, assets, reusable definitions, display, and local services without changing the deck or playback. Portable show writes an ordinary copied <code>.sld</code> and assets, then independently re-opens and preflights the copy.</p>
           <figure class="shot">
-            <img src="images/command-palette.png" alt="Studio command list showing save, history, and tool commands" width="1600" height="900" loading="lazy">
+            <img src="images/command-palette.png" alt="Studio command list showing save, history, authoring, presentation, and tool commands" width="1920" height="1080" loading="lazy">
             <figcaption><strong>The list uses the current context.</strong> It can explain an unavailable action without changing the source.</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="images/studio-showtime.png" alt="Showtime preflight overlay reporting eight slides, twelve scenes, four assets, three reusable definitions, and venue notes" width="1920" height="1080" loading="lazy">
+            <figcaption><strong>Showtime checks the exact deck before the room does.</strong> It separates deck blockers from actionable venue warnings and Presenter status.</figcaption>
           </figure>
 
           <h2>Reuse a composition</h2>
@@ -331,7 +343,7 @@
           <p>Select an entry to preview it. The preview does not change the deck.</p>
           <div class="panel-guide">
             <figure class="shot panel-capture panel-capture-short">
-              <img src="images/studio-library-panel.png" alt="Library panel with Item, Group, and Slide entries plus management controls" width="270" height="277" loading="lazy">
+              <img src="images/studio-library-panel.png" alt="Library panel with current Item, Group, and Slide entries plus management controls" width="430" height="425" loading="lazy">
               <figcaption><strong>Each row shows its type and use count.</strong> An unused entry can still be a deliberate asset.</figcaption>
             </figure>
             <div class="panel-copy">
@@ -346,11 +358,11 @@
           </div>
           <div class="shot-grid">
             <figure class="shot">
-              <img src="images/library-preview.png" alt="Read-only preview of a reusable group" width="1600" height="900" loading="lazy">
+              <img src="images/library-preview.png" alt="Read-only preview of a reusable group with its resolved member objects listed" width="1920" height="1080" loading="lazy">
               <figcaption><strong>Preview mode is read-only.</strong> Inspect the resolved group before you use it.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="images/library-definition.png" alt="Definition mode with the title selected and its shared Properties open" width="1280" height="720" loading="lazy">
+              <img src="images/library-definition.png" alt="Definition mode with a reusable group title selected and its shared Properties open" width="1920" height="1080" loading="lazy">
               <figcaption><strong>Definition mode edits shared members.</strong> Select an object, then change its Properties.</figcaption>
             </figure>
           </div>

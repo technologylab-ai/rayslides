@@ -137,8 +137,14 @@ def render(base_url: str, output: Path) -> None:
                         "returnByValue": True,
                     },
                 )
-                metrics = client.command("Page.getLayoutMetrics")
-                size = metrics["cssContentSize"]
+                dimensions = client.command(
+                    "Runtime.evaluate",
+                    {
+                        "expression": "({ width: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) })",
+                        "returnByValue": True,
+                    },
+                )
+                size = dimensions["result"]["value"]
                 capture = client.command(
                     "Page.captureScreenshot",
                     {

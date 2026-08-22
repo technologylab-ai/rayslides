@@ -65,6 +65,25 @@ This file tracks the documentation work that remains after the first site draft.
   - Show the voting screen.
   - Show the result view.
 
+## Current-capabilities illustration refresh
+
+- [x] Replace the one-slide Studio fixture with a complete source-native showcase.
+  - Cover crisp type, rounded geometry, lines, arrowheads, rotation, images, SVG, video, reusable content, morph states, Showtime, and Presenter Companion resilience.
+  - Keep images and videos on the same picker, replacement, fitting, focus, rotation, reusable-ownership, diagnostics, and export floor.
+- [x] Lead the README and documentation overview with direct presentation renders.
+  - Show typography and geometry at presentation resolution.
+  - Show a rotated raster image and a separately rotated Big Buck Bunny video poster.
+  - Show a semantic motion state rather than a simulated animation diagram.
+- [x] Refresh the main Studio evidence from the same showcase source.
+  - Show the current creation toolbar, slide thumbnails, Library types, Properties, Objects, and morph timeline.
+  - Show selected rotated image and video objects with their exact source-backed controls.
+  - Show current command discovery, Showtime preflight, reusable preview, and shared Definition editing.
+- [x] Keep deterministic documentation capture separate from checked-in images.
+  - Run `python3 tools/docs_studio_capture.py --output /tmp/rayslides-doc-captures --workspace 12`.
+  - Inspect temporary captures before promoting selected files into `docs/images`.
+  - Keep every capture window floating on Aerospace workspace 12 and close it after capture.
+- [x] Re-run the complete desktop/mobile documentation review and release-confidence gate after promotion.
+
 ## Final review gate
 
 - [x] Run automated checks after all content changes.

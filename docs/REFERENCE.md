@@ -6,9 +6,9 @@ Rayslides is a visual, source-native presentation studio built with Zig and
 authoring, presentation, audience participation, and export around readable
 `.sld` files. Builds target macOS, Linux, and Windows.
 
-![Rayslides Studio editing a polished slide with inline typography, color, geometry, and layout controls](images/rayslides-studio-properties.jpg)
+![Rayslides Studio editing the current capabilities showcase with crisp type, media, reusable content, and morph states](images/rayslides-studio-overview.png)
 
-![Rayslides Studio showing the source-aware Objects and layers inspector](images/rayslides-studio-objects.jpg)
+![Rayslides Studio showing the source-aware Objects and layers inspector](images/rayslides-studio-objects.png)
 
 ## Build and run
 

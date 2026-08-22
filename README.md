@@ -2,11 +2,18 @@
 
 Design visually. Keep readable source. Present without the cloud.
 
-[![Rayslides Studio editing a polished slide](docs/images/rayslides-studio-properties.jpg)](https://technologylab-ai.github.io/rayslides/)
+[![A polished Rayslides slide with crisp type, rotated media, and a source-to-showtime flow](docs/images/showcase-authoring.png)](https://technologylab-ai.github.io/rayslides/)
 
 Rayslides is a visual slide editor and presenter built with Zig and
 [raylib](https://github.com/raysan5/raylib). Edit a deck on the canvas or in its
 plain-text `.sld` source. Both views stay in sync.
+
+[![Rayslides Studio editing that same source-backed showcase](docs/images/rayslides-studio-overview.png)](https://technologylab-ai.github.io/rayslides/studio.html)
+
+<p align="center">
+  <img src="docs/images/showcase-geometry.png" width="49%" alt="A Rayslides slide with rotated rounded cards, lines, and arrowheads">
+  <img src="docs/images/showcase-media.png" width="49%" alt="A Rayslides slide with a rotated raster image, SVG, and rotated video poster">
+</p>
 
 With Rayslides, you can:
 
