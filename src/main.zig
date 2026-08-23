@@ -8082,9 +8082,9 @@ fn starterDeckPatch(
 }
 
 test "starter deck replacement is one owned source patch" {
-    const patch = try starterDeckPatch(std.testing.allocator, pristine_untitled_source, .aurora);
+    const patch = try starterDeckPatch(std.testing.allocator, pristine_untitled_source, .signal);
     defer patch.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(studio_new_deck.source(.aurora), patch.source);
+    try std.testing.expectEqualStrings(studio_new_deck.source(.signal), patch.source);
     try std.testing.expectEqual(
         @as(isize, @intCast(patch.source.len)) - @as(isize, @intCast(pristine_untitled_source.len)),
         patch.byte_delta,

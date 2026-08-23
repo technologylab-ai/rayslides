@@ -123,10 +123,10 @@ The current direction and upcoming implementation tranches are tracked in the
 [Studio roadmap](../STUDIO_ROADMAP.md).
 
 Run rayslides without a slide file to open the **Create your first deck**
-chooser in Studio. Choose Blank, Midnight, Editorial, or Aurora with a click
-or keys <kbd>1</kbd>–<kbd>4</kbd>. Blank starts with one clean slide; the three
-designed starters create two immediately useful slides plus source-native
-`@pushslide` layouts, a reusable `@pushgroup` footer, stable item IDs, and live
+chooser in Studio. Choose Studio, Folio, Ember, or Signal with a click
+or keys <kbd>1</kbd>–<kbd>4</kbd>. Each starter creates two immediately useful
+slides, source-native `@pushslide` layouts, a reusable `@pushgroup` footer,
+stable item IDs, and live
 `$slide_number` fields. Nothing is hidden in a project format: the result is
 ordinary readable `.sld` source and one Undo returns to the pristine chooser.
 
@@ -507,10 +507,10 @@ scoped, so a library item can only be placed after its definition.
 | --------------- | ----------- |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> | Open the searchable contextual command palette |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>F</kbd> | Find and jump within Slides, Library, or Objects |
-| <kbd>1</kbd>–<kbd>4</kbd> on the new-deck chooser | Create Blank, Midnight, Editorial, or Aurora |
+| <kbd>1</kbd>–<kbd>4</kbd> on the new-deck chooser | Create Studio, Folio, Ember, or Signal |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, then atomically save changes to its `.sld` file |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, or save an `*.edited.sld` copy of a named deck |
-| <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Undo the last visual edit |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Undo the last visual edit; after choosing a starter, return to the chooser |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
 | <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |
 | <kbd>G</kbd> | Toggle grid display and grid snapping |

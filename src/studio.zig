@@ -2344,25 +2344,27 @@ pub fn newDeckLayout(viewport: Viewport) NewDeckLayout {
         .width = @max(0, viewport.slide_size.x),
         .height = @max(0, viewport.slide_size.y),
     };
-    const margin: f32 = @min(24, @max(8, bounds.width * 0.025));
-    const panel_width = @min(@as(f32, 940), @max(0, bounds.width - margin * 2));
-    const panel_height = @min(@as(f32, 570), @max(0, bounds.height - margin * 2));
+    const margin: f32 = @min(18, @max(8, bounds.width * 0.02));
+    const panel_width = @min(@as(f32, 1120), @max(0, bounds.width - margin * 2));
+    const panel_height = @min(@as(f32, 760), @max(0, bounds.height - margin * 2));
     const panel: rl.Rectangle = .{
         .x = bounds.x + (bounds.width - panel_width) / 2,
         .y = bounds.y + (bounds.height - panel_height) / 2,
         .width = panel_width,
         .height = panel_height,
     };
-    const compact = panel.height < 410 or panel.width < 700;
-    const padding: f32 = if (compact) 14 else 22;
-    const header_height: f32 = if (compact) 62 else 102;
-    const gap: f32 = if (compact) 8 else 14;
-    const card_width = @max(0, (panel.width - padding * 2 - gap) / 2);
-    const card_height = @max(0, (panel.height - padding * 2 - header_height - gap) / 2);
+    const compact = panel.height < 560 or panel.width < 700;
+    const padding: f32 = if (compact) 14 else 18;
+    const header_height: f32 = if (compact) 62 else 88;
+    const gap: f32 = if (compact) 8 else 12;
+    const columns: usize = 2;
+    const rows: usize = 2;
+    const card_width = @max(0, (panel.width - padding * 2 - gap * @as(f32, @floatFromInt(columns - 1))) / @as(f32, @floatFromInt(columns)));
+    const card_height = @max(0, (panel.height - padding * 2 - header_height - gap * @as(f32, @floatFromInt(rows - 1))) / @as(f32, @floatFromInt(rows)));
     var cards: [studio_new_deck.all.len]rl.Rectangle = undefined;
     for (&cards, 0..) |*card, index| {
-        const column: f32 = @floatFromInt(index % 2);
-        const row: f32 = @floatFromInt(index / 2);
+        const column: f32 = @floatFromInt(index % columns);
+        const row: f32 = @floatFromInt(index / columns);
         card.* = .{
             .x = panel.x + padding + column * (card_width + gap),
             .y = panel.y + padding + header_height + row * (card_height + gap),
@@ -2375,71 +2377,112 @@ pub fn newDeckLayout(viewport: Viewport) NewDeckLayout {
 
 const StarterPalette = struct {
     background: rl.Color,
-    panel: rl.Color,
+    surface: rl.Color,
     accent: rl.Color,
+    accent_two: rl.Color,
     text: rl.Color,
+    muted: rl.Color,
 };
 
 fn starterPalette(preset: NewDeckPreset) StarterPalette {
     return switch (preset) {
-        .blank => .{
-            .background = .{ .r = 11, .g = 18, .b = 32, .a = 255 },
-            .panel = .{ .r = 26, .g = 38, .b = 56, .a = 255 },
-            .accent = .{ .r = 112, .g = 218, .b = 255, .a = 255 },
-            .text = .{ .r = 232, .g = 238, .b = 247, .a = 255 },
-        },
-        .midnight => .{
+        .studio => .{
             .background = .{ .r = 7, .g = 17, .b = 31, .a = 255 },
-            .panel = .{ .r = 18, .g = 37, .b = 59, .a = 255 },
-            .accent = .{ .r = 255, .g = 181, .b = 71, .a = 255 },
-            .text = .{ .r = 97, .g = 218, .b = 251, .a = 255 },
+            .surface = .{ .r = 16, .g = 40, .b = 60, .a = 255 },
+            .accent = .{ .r = 97, .g = 218, .b = 251, .a = 255 },
+            .accent_two = .{ .r = 255, .g = 181, .b = 71, .a = 255 },
+            .text = .{ .r = 248, .g = 251, .b = 255, .a = 255 },
+            .muted = .{ .r = 169, .g = 189, .b = 208, .a = 255 },
         },
-        .paper => .{
-            .background = .{ .r = 243, .g = 238, .b = 229, .a = 255 },
-            .panel = .{ .r = 38, .g = 52, .b = 61, .a = 255 },
-            .accent = .{ .r = 178, .g = 83, .b = 62, .a = 255 },
-            .text = .{ .r = 32, .g = 40, .b = 47, .a = 255 },
+        .folio => .{
+            .background = .{ .r = 247, .g = 243, .b = 234, .a = 255 },
+            .surface = .{ .r = 35, .g = 82, .b = 214, .a = 255 },
+            .accent = .{ .r = 239, .g = 101, .b = 75, .a = 255 },
+            .accent_two = .{ .r = 147, .g = 180, .b = 255, .a = 255 },
+            .text = .{ .r = 23, .g = 33, .b = 58, .a = 255 },
+            .muted = .{ .r = 89, .g = 97, .b = 106, .a = 255 },
         },
-        .aurora => .{
-            .background = .{ .r = 7, .g = 20, .b = 38, .a = 255 },
-            .panel = .{ .r = 20, .g = 43, .b = 72, .a = 255 },
-            .accent = .{ .r = 113, .g = 229, .b = 255, .a = 255 },
-            .text = .{ .r = 232, .g = 79, .b = 217, .a = 255 },
+        .ember => .{
+            .background = .{ .r = 36, .g = 18, .b = 28, .a = 255 },
+            .surface = .{ .r = 255, .g = 240, .b = 223, .a = 255 },
+            .accent = .{ .r = 244, .g = 95, .b = 87, .a = 255 },
+            .accent_two = .{ .r = 255, .g = 202, .b = 103, .a = 255 },
+            .text = .{ .r = 255, .g = 244, .b = 232, .a = 255 },
+            .muted = .{ .r = 217, .g = 174, .b = 164, .a = 255 },
+        },
+        .signal => .{
+            .background = .{ .r = 231, .g = 244, .b = 92, .a = 255 },
+            .surface = .{ .r = 255, .g = 253, .b = 242, .a = 255 },
+            .accent = .{ .r = 63, .g = 70, .b = 232, .a = 255 },
+            .accent_two = .{ .r = 255, .g = 79, .b = 154, .a = 255 },
+            .text = .{ .r = 16, .g = 21, .b = 21, .a = 255 },
+            .muted = .{ .r = 65, .g = 73, .b = 67, .a = 255 },
         },
     };
 }
 
-fn drawStarterPreview(rect: rl.Rectangle, preset: NewDeckPreset, colors: StarterPalette) void {
+fn starterPreviewRect(slide: rl.Rectangle, x: f32, y: f32, width: f32, height: f32) rl.Rectangle {
+    return .{
+        .x = slide.x + x / default_logical_size.x * slide.width,
+        .y = slide.y + y / default_logical_size.y * slide.height,
+        .width = width / default_logical_size.x * slide.width,
+        .height = height / default_logical_size.y * slide.height,
+    };
+}
+
+fn starterPreviewFont(slide: rl.Rectangle, logical_size: f32) i32 {
+    return @max(7, @as(i32, @intFromFloat(@round(logical_size / default_logical_size.y * slide.height))));
+}
+
+fn drawStarterPreview(studio: Studio, rect: rl.Rectangle, preset: NewDeckPreset, colors: StarterPalette) void {
     if (rect.width <= 0 or rect.height <= 0) return;
+    rl.beginScissorMode(
+        @intFromFloat(@floor(rect.x)),
+        @intFromFloat(@floor(rect.y)),
+        @intFromFloat(@ceil(rect.width)),
+        @intFromFloat(@ceil(rect.height)),
+    );
+    defer rl.endScissorMode();
     rl.drawRectangleRounded(rect, 0.035, 8, colors.background);
-    const unit = @min(rect.width / 16, rect.height / 9);
-    const left = rect.x + unit * 0.75;
-    const top = rect.y + unit * 0.65;
     switch (preset) {
-        .blank => {
-            const center: rl.Vector2 = .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 };
-            rl.drawCircleV(center, @max(5, unit * 0.42), .{ .r = colors.panel.r, .g = colors.panel.g, .b = colors.panel.b, .a = 220 });
-            rl.drawRectangleRec(.{ .x = center.x - unit * 0.32, .y = center.y - 1, .width = unit * 0.64, .height = 2 }, colors.accent);
-            rl.drawRectangleRec(.{ .x = center.x - 1, .y = center.y - unit * 0.32, .width = 2, .height = unit * 0.64 }, colors.accent);
+        .studio => {
+            rl.drawRectangleRounded(starterPreviewRect(rect, 1240, 112, 536, 704), 0.12, 8, colors.surface);
+            rl.drawCircleV(.{ .x = rect.x + rect.width * 0.79, .y = rect.y + rect.height * 0.38 }, rect.height * 0.15, .{ .r = 24, .g = 75, .b = 103, .a = 255 });
+            rl.drawCircleV(.{ .x = rect.x + rect.width * 0.82, .y = rect.y + rect.height * 0.43 }, rect.height * 0.08, .{ .r = 167, .g = 108, .b = 38, .a = 255 });
+            studio.drawUiText("THE SOURCE IS THE PROJECT", .{ .x = rect.x + rect.width * 0.058, .y = rect.y + rect.height * 0.075 }, starterPreviewFont(rect, 25), colors.accent);
+            studio.drawUiText("Design the talk.", .{ .x = rect.x + rect.width * 0.054, .y = rect.y + rect.height * 0.22 }, starterPreviewFont(rect, 90), colors.text);
+            studio.drawUiText("Own every detail.", .{ .x = rect.x + rect.width * 0.054, .y = rect.y + rect.height * 0.36 }, starterPreviewFont(rect, 90), colors.accent_two);
+            studio.drawUiText("Readable source. Presentation-ready pixels.", .{ .x = rect.x + rect.width * 0.058, .y = rect.y + rect.height * 0.61 }, starterPreviewFont(rect, 28), colors.muted);
         },
-        .midnight => {
-            rl.drawRectangleRec(.{ .x = left, .y = top, .width = unit * 4.2, .height = @max(2, unit * 0.22) }, colors.text);
-            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 1.0, .width = unit * 9.8, .height = unit * 1.35 }, .white);
-            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 2.75, .width = unit * 7.1, .height = unit * 0.44 }, .{ .r = 159, .g = 181, .b = 201, .a = 255 });
-            rl.drawRectangleRec(.{ .x = left, .y = rect.y + rect.height - unit * 1.2, .width = unit * 3.4, .height = @max(2, unit * 0.18) }, colors.accent);
+        .folio => {
+            rl.drawRectangleRec(starterPreviewRect(rect, 0, 0, 34, 1080), colors.surface);
+            rl.drawRectangleRounded(starterPreviewRect(rect, 1370, 112, 378, 690), 0.08, 8, colors.surface);
+            rl.drawRectangleRounded(starterPreviewRect(rect, 1266, 734, 246, 92), 0.18, 8, colors.accent);
+            studio.drawUiText("ISSUE 01 · A POINT OF VIEW", .{ .x = rect.x + rect.width * 0.058, .y = rect.y + rect.height * 0.075 }, starterPreviewFont(rect, 23), .{ .r = 182, .g = 58, .b = 45, .a = 255 });
+            studio.drawUiText("A clear point", .{ .x = rect.x + rect.width * 0.054, .y = rect.y + rect.height * 0.22 }, starterPreviewFont(rect, 102), colors.text);
+            studio.drawUiText("of view.", .{ .x = rect.x + rect.width * 0.054, .y = rect.y + rect.height * 0.35 }, starterPreviewFont(rect, 102), colors.text);
+            studio.drawUiText("01", .{ .x = rect.x + rect.width * 0.75, .y = rect.y + rect.height * 0.18 }, starterPreviewFont(rect, 150), colors.background);
+            studio.drawUiText("Research and stories, arranged with intent.", .{ .x = rect.x + rect.width * 0.058, .y = rect.y + rect.height * 0.62 }, starterPreviewFont(rect, 28), colors.muted);
         },
-        .paper => {
-            rl.drawRectangleRec(.{ .x = left, .y = top, .width = unit * 2.1, .height = @max(2, unit * 0.18) }, colors.accent);
-            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 1.1, .width = unit * 10.5, .height = unit * 1.25 }, colors.text);
-            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 2.8, .width = unit * 7.6, .height = unit * 0.28 }, .{ .r = 108, .g = 102, .b = 95, .a = 255 });
-            rl.drawRectangleRec(.{ .x = left, .y = rect.y + rect.height - unit * 1.25, .width = rect.width - unit * 1.5, .height = @max(2, unit * 0.12) }, colors.accent);
+        .ember => {
+            rl.drawCircleV(.{ .x = rect.x + rect.width * 0.84, .y = rect.y + rect.height * 0.06 }, rect.height * 0.36, colors.accent);
+            rl.drawCircleV(.{ .x = rect.x + rect.width * 0.86, .y = rect.y + rect.height * 0.04 }, rect.height * 0.23, .{ .r = 255, .g = 140, .b = 114, .a = 255 });
+            rl.drawRectangleRounded(starterPreviewRect(rect, 1260, 422, 500, 390), 0.1, 8, colors.surface);
+            studio.drawUiText("STORIES WITH A PULSE", .{ .x = rect.x + rect.width * 0.058, .y = rect.y + rect.height * 0.085 }, starterPreviewFont(rect, 24), colors.accent_two);
+            studio.drawUiText("Ideas with", .{ .x = rect.x + rect.width * 0.054, .y = rect.y + rect.height * 0.23 }, starterPreviewFont(rect, 102), colors.text);
+            studio.drawUiText("a pulse.", .{ .x = rect.x + rect.width * 0.054, .y = rect.y + rect.height * 0.37 }, starterPreviewFont(rect, 102), colors.text);
+            studio.drawUiText("Bold idea · human delivery", .{ .x = rect.x + rect.width * 0.058, .y = rect.y + rect.height * 0.67 }, starterPreviewFont(rect, 28), colors.muted);
+            studio.drawUiText("01", .{ .x = rect.x + rect.width * 0.70, .y = rect.y + rect.height * 0.50 }, starterPreviewFont(rect, 82), .{ .r = 143, .g = 48, .b = 64, .a = 255 });
         },
-        .aurora => {
-            rl.drawCircleV(.{ .x = rect.x + rect.width * 0.76, .y = rect.y + rect.height * 0.37 }, unit * 2.3, .{ .r = 42, .g = 104, .b = 255, .a = 100 });
-            rl.drawCircleV(.{ .x = rect.x + rect.width * 0.83, .y = rect.y + rect.height * 0.57 }, unit * 1.55, .{ .r = colors.text.r, .g = colors.text.g, .b = colors.text.b, .a = 120 });
-            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 0.4, .width = unit * 4.1, .height = @max(2, unit * 0.19) }, colors.accent);
-            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 1.5, .width = unit * 7.7, .height = unit * 1.45 }, .white);
-            rl.drawRectangleRec(.{ .x = left, .y = top + unit * 3.35, .width = unit * 5.9, .height = unit * 0.28 }, .{ .r = 169, .g = 196, .b = 220, .a = 255 });
+        .signal => {
+            rl.drawRectangleRounded(starterPreviewRect(rect, 64, 64, 1792, 928), 0.035, 8, colors.surface);
+            rl.drawRectangleRounded(starterPreviewRect(rect, 1398, 64, 458, 928), 0.08, 8, colors.accent);
+            rl.drawRectangleRounded(starterPreviewRect(rect, 1230, 164, 330, 96), 0.14, 8, colors.accent_two);
+            studio.drawUiText("LOUD, CLEAR, UNMISSABLE", .{ .x = rect.x + rect.width * 0.064, .y = rect.y + rect.height * 0.105 }, starterPreviewFont(rect, 23), colors.accent);
+            studio.drawUiText("MAKE IT", .{ .x = rect.x + rect.width * 0.06, .y = rect.y + rect.height * 0.26 }, starterPreviewFont(rect, 112), colors.text);
+            studio.drawUiText("LAND.", .{ .x = rect.x + rect.width * 0.06, .y = rect.y + rect.height * 0.40 }, starterPreviewFont(rect, 112), colors.text);
+            studio.drawUiText("01", .{ .x = rect.x + rect.width * 0.77, .y = rect.y + rect.height * 0.30 }, starterPreviewFont(rect, 138), colors.surface);
+            studio.drawUiText("Ideas that cannot fade into the background.", .{ .x = rect.x + rect.width * 0.064, .y = rect.y + rect.height * 0.69 }, starterPreviewFont(rect, 26), colors.muted);
         },
     }
 }
@@ -3569,13 +3612,13 @@ pub const FrameInput = struct {
             .rename_library_pressed = rl.isKeyPressed(.f2),
             .delete_library_pressed = shift and rl.isKeyPressed(.delete),
             .new_deck_choice = if (rl.isKeyPressed(.one))
-                .blank
+                .studio
             else if (rl.isKeyPressed(.two))
-                .midnight
+                .folio
             else if (rl.isKeyPressed(.three))
-                .paper
+                .ember
             else if (rl.isKeyPressed(.four))
-                .aurora
+                .signal
             else
                 null,
             .workspace_scroll = wheel.y,
@@ -12628,14 +12671,19 @@ pub const Studio = struct {
             rl.drawRectangleRounded(card, 0.055, 8, .{ .r = 23, .g = 31, .b = 47, .a = 255 });
             rl.drawRectangleRoundedLinesEx(card, 0.055, 8, 1, .{ .r = 91, .g = 110, .b = 139, .a = 230 });
             const inset: f32 = if (layout.compact) 7 else 10;
-            const preview_height = @max(30, card.height * @as(f32, if (layout.compact) 0.43 else 0.52));
+            const copy_height = @as(f32, @floatFromInt(card_title_font + UiTypography.compact)) +
+                @as(f32, if (layout.compact) 13 else 22);
+            const max_preview_height = @max(30, card.height - inset * 2 - copy_height);
+            const available_preview_width = @max(0, card.width - inset * 2);
+            const preview_height = @min(available_preview_width * 9 / 16, max_preview_height);
+            const preview_width = @min(available_preview_width, preview_height * 16 / 9);
             const preview: rl.Rectangle = .{
-                .x = card.x + inset,
+                .x = card.x + (card.width - preview_width) / 2,
                 .y = card.y + inset,
-                .width = card.width - inset * 2,
-                .height = @min(preview_height, card.height - inset * 2),
+                .width = preview_width,
+                .height = preview_height,
             };
-            drawStarterPreview(preview, preset, colors);
+            drawStarterPreview(self, preview, preset, colors);
 
             var shortcut_buffer: [4]u8 = undefined;
             const shortcut = std.fmt.bufPrintZ(&shortcut_buffer, "{d}", .{index + 1}) catch "";

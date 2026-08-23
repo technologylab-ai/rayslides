@@ -181,7 +181,7 @@ disk persistence.
 
 - [x] Open no-file launches directly into a visual starter chooser inside
   Studio, with click and 1–4 keyboard selection.
-- [x] Provide Blank, Midnight, Editorial, and Aurora starters as ordinary,
+- [x] Provide Studio, Folio, Ember, and Signal starters as ordinary,
   parser-tested `.sld` source rather than an opaque template format.
 - [x] Seed designed decks with reusable `@pushslide` layouts, a shared
   `@pushgroup` footer, stable object IDs, and `$slide_number` fields that remain

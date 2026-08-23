@@ -326,6 +326,15 @@
           </div>
           <p>Each slide action changes the <code>.sld</code> source in one undo step.</p>
 
+          <h2>Undo and redo</h2>
+          <p>Studio records each successful visual or structural source change as one history step. Undo restores both the source and the slide you were working on.</p>
+          <ul>
+            <li>Press <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> to undo one source edit.</li>
+            <li>Press <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> to redo it.</li>
+            <li>Use <strong>Undo</strong> or <strong>Redo</strong> in the Commands menu when you prefer the mouse.</li>
+          </ul>
+          <div class="callout"><p><strong>The starter chooser is part of normal history.</strong> After choosing Studio, Folio, Ember, or Signal, one Undo returns to the pristine picker. Redo restores the chosen deck unless you make a different edit first.</p></div>
+
           <h2>Find a command</h2>
           <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> to open the command list.</p>
           <p>Type an action, tool, category, or shortcut. Disabled commands stay visible and explain why they cannot run.</p>
@@ -416,8 +425,6 @@
           <ul>
             <li>Press <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> to save the current file.</li>
             <li>Press <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> to save a copy.</li>
-            <li>Press <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> to undo one source edit.</li>
-            <li>Press <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> to redo it.</li>
           </ul>
           <p>Rayslides writes a recovery copy when you quit with unsaved work.</p>
 
