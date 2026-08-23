@@ -206,7 +206,7 @@ owner is unsafe or the field does not apply to every item.
 
 For an image or video selection, the first Properties field identifies the
 effective media kind and shows its source path. Click the separate
-**Replace** button (or press <kbd>Enter</kbd> while Properties is visible) to
+**...** replacement button (or press <kbd>Enter</kbd> while Properties is visible) to
 choose a replacement through the same native picker/manual-entry and
 deck-relative path policy used for insertion. Replacement changes only
 `img=` or `vid=`: geometry, opacity, ordering, IDs, and other authored
@@ -244,7 +244,7 @@ morphing, Showtime, screenshots, and PDF export all use the painted rotation.
 
 If Studio cannot load an image or probe/decode a video, the missing media does
 not become unselectable. Studio keeps a source-sized fallback box on the
-canvas and leaves the filename and **Replace** action live in Properties.
+canvas and leaves the filename and **...** replacement action live in Properties.
 Diagnostics distinguish a missing or unreadable file, unsupported image data,
 missing ffmpeg/ffprobe, video probe or codec failure, and poster decode failure,
 and prescribe the relevant repair. An out-of-range poster is clamped to the

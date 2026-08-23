@@ -55,6 +55,8 @@ pub const UiTypography = struct {
     pub const status_heading: i32 = 20;
 };
 
+const media_picker_button_label: [:0]const u8 = "...";
+
 pub fn uiScale(viewport: Viewport) f32 {
     if (!viewport.valid()) return 1;
     // Docked Studio uses one scale for both the shell and every child metric.
@@ -1911,7 +1913,11 @@ pub const UiLayout = struct {
     rotation: rl.Rectangle = empty_ui_rectangle,
     opacity: rl.Rectangle = empty_ui_rectangle,
     media_fit_buttons: [3]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 3,
-    media_focus_fields: [2]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 2,
+    /// Layout-mode media scalars share one row in source order: focus X,
+    /// focus Y, rotation, opacity. Keeping all four cells equal prevents the
+    /// focal values from being squeezed inside the ordinary three-column
+    /// font/rotation/opacity layout.
+    media_scalar_fields: [4]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 4,
     inline_error: rl.Rectangle = empty_ui_rectangle,
     align_buttons: [6]rl.Rectangle,
     distribute_buttons: [2]rl.Rectangle,
@@ -2648,7 +2654,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     const new_slide_width: f32 = @as(f32, if (compact_toolbar) 58 else 82) * scale;
     const grid_width: f32 = @as(f32, if (compact_toolbar) 46 else 66) * scale;
     const grid_settings_width: f32 = @as(f32, if (compact_toolbar) 20 else 28) * scale;
-    const scene_width: f32 = @as(f32, if (compact_toolbar) 92 else 150) * scale;
+    const scene_width: f32 = @as(f32, if (compact_toolbar) 104 else 150) * scale;
     const toolbar_width = margin * 2 + tool_size * 8 + gap * 7 + gap + new_slide_width + gap + grid_width + grid_settings_width + gap + scene_width;
     const toolbar: rl.Rectangle = if (docked)
         viewport.chrome.?.toolbar
@@ -2843,11 +2849,14 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .width = media_fit_width,
             .height = field_height,
         };
-        const media_focus_gap: f32 = 4 * scale;
-        const media_focus_width = (font_size.width - media_focus_gap) / 2;
-        const media_focus_fields = [2]rl.Rectangle{
-            .{ .x = font_size.x, .y = font_size.y, .width = media_focus_width, .height = font_size.height },
-            .{ .x = font_size.x + media_focus_width + media_focus_gap, .y = font_size.y, .width = media_focus_width, .height = font_size.height },
+        const media_scalar_gap: f32 = 4 * scale;
+        const media_scalar_width = (inner_width - media_scalar_gap * 3) / 4;
+        var media_scalar_fields: [4]rl.Rectangle = undefined;
+        for (&media_scalar_fields, 0..) |*field, index| field.* = .{
+            .x = properties.x + inset + @as(f32, @floatFromInt(index)) * (media_scalar_width + media_scalar_gap),
+            .y = scalar_y,
+            .width = media_scalar_width,
+            .height = field_height,
         };
         const inline_error: rl.Rectangle = .{
             .x = properties.x + inset,
@@ -2915,7 +2924,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .rotation = rotation,
             .opacity = opacity,
             .media_fit_buttons = media_fit_buttons,
-            .media_focus_fields = media_focus_fields,
+            .media_scalar_fields = media_scalar_fields,
             .inline_error = inline_error,
             .align_buttons = align_buttons,
             .distribute_buttons = distribute_buttons,
@@ -3011,6 +3020,15 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = scalar_width,
         .height = font_size.height,
     };
+    const media_scalar_gap: f32 = 4 * scale;
+    const media_scalar_width = (inner_width - media_scalar_gap * 3) / 4;
+    var media_scalar_fields: [4]rl.Rectangle = undefined;
+    for (&media_scalar_fields, 0..) |*field, index| field.* = .{
+        .x = properties.x + inset + @as(f32, @floatFromInt(index)) * (media_scalar_width + media_scalar_gap),
+        .y = font_size.y,
+        .width = media_scalar_width,
+        .height = font_size.height,
+    };
 
     var align_buttons: [6]rl.Rectangle = undefined;
     const align_gap: f32 = 5 * scale;
@@ -3075,6 +3093,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .font_size = font_size,
         .rotation = rotation,
         .opacity = opacity,
+        .media_scalar_fields = media_scalar_fields,
         .align_buttons = align_buttons,
         .distribute_buttons = distribute_buttons,
         .layer_buttons = layer_buttons,
@@ -5830,17 +5849,34 @@ pub const Studio = struct {
             .corner_radius, .line_width => layout.font_size,
             .rotation => layout.rotation,
             .opacity => layout.opacity,
-            .media_focus_x => layout.media_focus_fields[0],
-            .media_focus_y => layout.media_focus_fields[1],
+            .media_focus_x => layout.media_scalar_fields[0],
+            .media_focus_y => layout.media_scalar_fields[1],
             .video_poster => videoPosterFieldRect(layout),
             .video_volume => layout.font_size,
         };
     }
 
+    fn inlineFieldRectForItem(
+        layout: UiLayout,
+        field: InlineField,
+        item: slides.SlideItem,
+        video_playback: bool,
+    ) rl.Rectangle {
+        if ((item.kind == .img or item.kind == .vid) and !video_playback) {
+            return switch (field) {
+                .rotation => layout.media_scalar_fields[2],
+                .opacity => layout.media_scalar_fields[3],
+                else => inlineFieldRect(layout, field),
+            };
+        }
+        return inlineFieldRect(layout, field);
+    }
+
     fn inlineFieldAtPoint(layout: UiLayout, item: slides.SlideItem, pointer: rl.Vector2, video_playback: bool) ?InlineField {
         const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .video_volume };
         for (fields) |field| {
-            if (inlineFieldVisible(field, item, video_playback) and pointInRectangle(pointer, inlineFieldRect(layout, field))) return field;
+            if (inlineFieldVisible(field, item, video_playback) and
+                pointInRectangle(pointer, inlineFieldRectForItem(layout, field, item, video_playback))) return field;
         }
         return null;
     }
@@ -5858,7 +5894,12 @@ pub const Studio = struct {
         for (fields) |field| {
             if (!context.local_overrides.contains(authoredPropertyForInlineField(field))) continue;
             if (!inlineFieldVisible(field, item, self.video_properties_playback)) continue;
-            if (pointInRectangle(pointer, inlineResetRect(inlineFieldRect(layout, field)))) return field;
+            if (pointInRectangle(pointer, inlineResetRect(inlineFieldRectForItem(
+                layout,
+                field,
+                item,
+                self.video_properties_playback,
+            )))) return field;
         }
         return null;
     }
@@ -9276,7 +9317,7 @@ pub const Studio = struct {
                     if (pointInRectangle(pointer, button)) return self.emitMediaFit(items, allow_shared_edit, fit);
                 }
                 const focus_fields = [_]InlineField{ .media_focus_x, .media_focus_y };
-                for (layout.media_focus_fields, focus_fields) |field_rect, field| {
+                for (layout.media_scalar_fields[0..2], focus_fields) |field_rect, field| {
                     if (pointInRectangle(pointer, field_rect))
                         return self.beginInlineEdit(items, resolved_bounds, field, allow_shared_edit);
                 }
@@ -9352,12 +9393,20 @@ pub const Studio = struct {
                 )
             else
                 self.emitPropertyRequest(items, allow_shared_edit, .font_size);
-        if (pointInRectangle(pointer, layout.rotation))
+        const rotation_rect = if (selected_item) |item|
+            inlineFieldRectForItem(layout, .rotation, item, selected_video_playback)
+        else
+            layout.rotation;
+        if (pointInRectangle(pointer, rotation_rect))
             return if (inline_properties)
                 self.beginInlineEdit(items, resolved_bounds, .rotation, allow_shared_edit)
             else
                 self.emitPropertyRequest(items, allow_shared_edit, .rotation);
-        if (pointInRectangle(pointer, layout.opacity))
+        const opacity_rect = if (selected_item) |item|
+            inlineFieldRectForItem(layout, .opacity, item, selected_video_playback)
+        else
+            layout.opacity;
+        if (pointInRectangle(pointer, opacity_rect))
             return if (inline_properties)
                 self.beginInlineEdit(items, resolved_bounds, .opacity, allow_shared_edit)
             else
@@ -9488,7 +9537,10 @@ pub const Studio = struct {
                 false;
             if (pointInRectangle(pointer, inlineTextExpandRect(layout.edit_text, text_local_override)))
                 return .pointing_hand;
-            const field = inlineFieldRect(layout, self.inline_editor.field);
+            const field = if (self.selectedIndex(items)) |index|
+                inlineFieldRectForItem(layout, self.inline_editor.field, items[index], self.video_properties_playback)
+            else
+                inlineFieldRect(layout, self.inline_editor.field);
             if (pointInRectangle(pointer, field)) return .ibeam;
         }
         if (self.tooltipTargetAtPoint(viewport, workspace, pointer) != null) return .pointing_hand;
@@ -12881,6 +12933,7 @@ pub const Studio = struct {
 
     fn drawToolbar(self: Studio, viewport: Viewport) void {
         const layout = uiLayout(viewport);
+        const compact_toolbar = if (viewport.chrome) |chrome| chrome.content.width < 1100 else false;
         const body_font = scaledUiFont(layout.scale, UiTypography.body);
         const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
         drawStudioPanel(layout.toolbar);
@@ -12895,15 +12948,9 @@ pub const Studio = struct {
                 .{ .r = 80, .g = 215, .b = 255, .a = 255 }
             else
                 .{ .r = 115, .g = 128, .b = 150, .a = 200 });
-            const label = toolLabel(tool);
-            const font_size = body_font;
-            const width = self.measureUiText(label, font_size);
-            self.drawUiText(
-                label,
-                .{ .x = button.x + (button.width - width) / 2, .y = button.y + (button.height - @as(f32, @floatFromInt(font_size))) / 2 },
-                font_size,
-                .white,
-            );
+            const label = if (compact_toolbar) compactToolLabel(tool) else toolLabel(tool);
+            const font_size = if (compact_toolbar) compact_font else body_font;
+            drawButtonLabel(self, button, label, font_size, .white);
         }
         drawActionButton(self, layout.new_slide, "+ Slide");
         rl.drawRectangleRec(layout.grid_toggle, if (self.grid_snapping)
@@ -12915,13 +12962,7 @@ pub const Studio = struct {
         else
             .{ .r = 115, .g = 128, .b = 150, .a = 200 });
         const grid_label: [:0]const u8 = if (self.grid_snapping) "GRID ON" else "GRID";
-        const grid_label_width = self.measureUiText(grid_label, compact_font);
-        self.drawUiText(
-            grid_label,
-            .{ .x = layout.grid_toggle.x + (layout.grid_toggle.width - grid_label_width) / 2, .y = layout.grid_toggle.y + (layout.grid_toggle.height - @as(f32, @floatFromInt(compact_font))) / 2 },
-            compact_font,
-            .white,
-        );
+        drawButtonLabel(self, layout.grid_toggle, grid_label, compact_font, .white);
         drawToggleButton(self, layout.grid_settings_toggle, "v", self.grid_settings_active);
         drawActionButton(self, layout.scene_previous, "<");
         var scene_buffer: [32]u8 = undefined;
@@ -13305,7 +13346,7 @@ pub const Studio = struct {
         const placeholder = mediaSourcePlaceholder(kind_label, path);
         // Once a source is known, its tail (normally the filename) owns the
         // whole field. IMAGE/VIDEO is only an empty-source placeholder; the
-        // adjacent Replace button already communicates the available action.
+        // adjacent picker button already communicates the available action.
         const multiline = inlineTextIsMultiline(layout) and path.len == 0;
         const path_width = @max(0, source_rect.width - 7 -
             (if (multiline or placeholder.len == 0) 0 else self.measureUiText(placeholder, label_font) + 7) - reserved_right - 6);
@@ -13323,7 +13364,7 @@ pub const Studio = struct {
             resettable_override,
             viewport,
         );
-        drawCompactButton(self, replace, "Replace");
+        drawCompactButton(self, replace, media_picker_button_label);
     }
 
     fn drawVideoPosterTimeline(_: Studio, rect: rl.Rectangle, poster: f32, duration: f32) void {
@@ -13508,7 +13549,10 @@ pub const Studio = struct {
             else
                 false;
             self.drawInlineField(
-                inlineFieldRect(layout, field),
+                if (selected_item) |item|
+                    inlineFieldRectForItem(layout, field, item, selected_video_playback)
+                else
+                    inlineFieldRect(layout, field),
                 label,
                 value,
                 active,
@@ -14167,6 +14211,19 @@ fn toolLabel(tool: Tool) [:0]const u8 {
     };
 }
 
+fn compactToolLabel(tool: Tool) [:0]const u8 {
+    return switch (tool) {
+        .select => "V",
+        .add_text => "T",
+        .add_bullets => "B",
+        .add_image => "IM",
+        .add_video => "VD",
+        .add_shape => "BX",
+        .add_line, .add_arrow => "LN",
+        .add_reusable => "LB",
+    };
+}
+
 fn inlineErrorMessage(reason: InlineError) [:0]const u8 {
     return switch (reason) {
         .invalid_utf8 => "Invalid UTF-8; Esc cancels without changing source",
@@ -14191,18 +14248,35 @@ fn drawStudioPanel(rect: rl.Rectangle) void {
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 80, .g = 215, .b = 255, .a = 180 });
 }
 
+fn fitButtonLabel(
+    studio: Studio,
+    buffer: []u8,
+    rect: rl.Rectangle,
+    label: []const u8,
+    font_size: i32,
+) [:0]const u8 {
+    const horizontal_padding = @min(@as(f32, 4), rect.width * 0.1);
+    return studio.fitUiText(buffer, label, font_size, @max(0, rect.width - horizontal_padding * 2));
+}
+
+fn drawButtonLabel(studio: Studio, rect: rl.Rectangle, label: []const u8, font_size: i32, color: rl.Color) void {
+    var fitted_buffer: [128]u8 = undefined;
+    const fitted = fitButtonLabel(studio, &fitted_buffer, rect, label, font_size);
+    const width = studio.measureUiText(fitted, font_size);
+    studio.drawUiText(
+        fitted,
+        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
+        font_size,
+        color,
+    );
+}
+
 fn drawActionButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
     if (rect.width <= 0 or rect.height <= 0) return;
     rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 115, .g = 128, .b = 150, .a = 200 });
     const font_size: i32 = @max(UiTypography.body, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    const width = studio.measureUiText(label, font_size);
-    studio.drawUiText(
-        label,
-        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
-        font_size,
-        .white,
-    );
+    drawButtonLabel(studio, rect, label, font_size, .white);
 }
 
 fn drawCompactButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
@@ -14210,13 +14284,7 @@ fn drawCompactButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) vo
     rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 105, .g = 120, .b = 143, .a = 210 });
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    const width = studio.measureUiText(label, font_size);
-    studio.drawUiText(
-        label,
-        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
-        font_size,
-        .white,
-    );
+    drawButtonLabel(studio, rect, label, font_size, .white);
 }
 
 fn drawDisabledBadge(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
@@ -14224,13 +14292,7 @@ fn drawDisabledBadge(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) vo
     rl.drawRectangleRec(rect, .{ .r = 24, .g = 25, .b = 33, .a = 225 });
     rl.drawRectangleLinesEx(rect, 1, .{ .r = 74, .g = 78, .b = 92, .a = 190 });
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    const width = studio.measureUiText(label, font_size);
-    studio.drawUiText(
-        label,
-        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
-        font_size,
-        .{ .r = 130, .g = 137, .b = 153, .a = 255 },
-    );
+    drawButtonLabel(studio, rect, label, font_size, .{ .r = 130, .g = 137, .b = 153, .a = 255 });
 }
 
 fn drawToggleButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8, active: bool) void {
@@ -14244,13 +14306,7 @@ fn drawToggleButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8, act
     else
         .{ .r = 115, .g = 128, .b = 150, .a = 200 });
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    const width = studio.measureUiText(label, font_size);
-    studio.drawUiText(
-        label,
-        .{ .x = rect.x + (rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
-        font_size,
-        .white,
-    );
+    drawButtonLabel(studio, rect, label, font_size, .white);
 }
 
 fn drawPropertyToggleButton(
@@ -14283,13 +14339,7 @@ fn drawPropertyToggleButton(
         .height = rect.height,
     };
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    const width = studio.measureUiText(label, font_size);
-    studio.drawUiText(
-        label,
-        .{ .x = label_rect.x + (label_rect.width - width) / 2, .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2 },
-        font_size,
-        .white,
-    );
+    drawButtonLabel(studio, label_rect, label, font_size, .white);
 
     rl.drawRectangleRec(reset_rect, if (resettable_override)
         .{ .r = 99, .g = 67, .b = 25, .a = 255 }
@@ -18481,7 +18531,7 @@ test "property layout stays contained and typography remains legible" {
         for (fixed) |rect| try expectRectangleContained(layout.properties, rect);
         for (layout.geometry_fields) |rect| try expectRectangleContained(layout.properties, rect);
         for (layout.media_fit_buttons) |rect| try expectRectangleContained(layout.properties, rect);
-        for (layout.media_focus_fields) |rect| try expectRectangleContained(layout.properties, rect);
+        for (layout.media_scalar_fields) |rect| try expectRectangleContained(layout.properties, rect);
         try expectRectangleContained(layout.properties, Studio.mediaPageToggleRect(layout));
         try expectRectangleContained(layout.properties, Studio.videoPosterFieldRect(layout));
         try expectRectangleContained(layout.properties, Studio.videoTimelineRect(layout));
@@ -18795,12 +18845,37 @@ test "inline property layout stays legible and contained at compact minimum" {
         layout.edit_text.y + layout.edit_text.height);
     try expectRectangleContained(layout.properties, layout.inline_error);
     try std.testing.expect(layout.inline_error.height >= 14);
+    for (layout.media_scalar_fields, 0..) |field, index| {
+        try expectRectangleContained(layout.properties, field);
+        try std.testing.expect(field.width >= 60);
+        try std.testing.expectEqual(layout.media_scalar_fields[0].width, field.width);
+        try std.testing.expectEqual(layout.media_scalar_fields[0].height, field.height);
+        try std.testing.expectEqual(layout.media_scalar_fields[0].y, field.y);
+        if (index > 0)
+            try std.testing.expect(layout.media_scalar_fields[index - 1].x +
+                layout.media_scalar_fields[index - 1].width < field.x);
+    }
     for (layout.foreground_swatches) |swatch| try expectRectangleContained(layout.properties, swatch);
     for (layout.background_swatches) |swatch| try expectRectangleContained(layout.properties, swatch);
     for (Studio.lineStyleButtonRects(layout)) |button| {
         try expectRectangleContained(layout.properties, button);
         try std.testing.expect(button.width >= 70);
         try std.testing.expect(button.height >= 24);
+    }
+}
+
+test "small button labels fit inside their controls" {
+    try std.testing.expectEqualStrings("...", media_picker_button_label);
+    const studio: Studio = .{};
+    const rect: rl.Rectangle = .{ .x = 0, .y = 0, .width = 54, .height = 28 };
+    const font_size: i32 = 14;
+    const labels = [_][]const u8{ "...", "Replace", "Inherited", "Playback", "Start arrow", "Unlock", "GRID ON" };
+    const padding = @min(@as(f32, 4), rect.width * 0.1);
+    for (labels) |label| {
+        var buffer: [128]u8 = undefined;
+        const fitted = fitButtonLabel(studio, &buffer, rect, label, font_size);
+        try std.testing.expect(fitted.len > 0);
+        try std.testing.expect(studio.measureUiText(fitted, font_size) <= rect.width - padding * 2);
     }
 }
 
@@ -19102,6 +19177,14 @@ test "image and video Properties share fit and focal controls" {
         };
         const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
         const layout = uiLayout(frame.viewport);
+        try std.testing.expectEqual(
+            layout.media_scalar_fields[2],
+            Studio.inlineFieldRectForItem(layout, .rotation, items[0], false),
+        );
+        try std.testing.expectEqual(
+            layout.media_scalar_fields[3],
+            Studio.inlineFieldRectForItem(layout, .opacity, items[0], false),
+        );
 
         _ = studio.update(&items, &.{}, frame.viewport, .{
             .pointer_screen = rectangleCenter(layout.media_fit_buttons[2]),
@@ -19116,7 +19199,7 @@ test "image and video Properties share fit and focal controls" {
         }
 
         _ = studio.update(&items, &.{}, frame.viewport, .{
-            .pointer_screen = rectangleCenter(layout.media_focus_fields[0]),
+            .pointer_screen = rectangleCenter(layout.media_scalar_fields[0]),
             .pointer_pressed = true,
         });
         try std.testing.expectEqual(@as(?InlineField, .media_focus_x), studio.inlineEditField());
@@ -19134,6 +19217,13 @@ test "image and video Properties share fit and focal controls" {
             else => return error.UnexpectedSemanticCommand,
         }
         studio.acceptInlineCommit(.media_focus_x);
+
+        _ = studio.update(&items, &.{}, frame.viewport, .{
+            .pointer_screen = rectangleCenter(layout.media_scalar_fields[2]),
+            .pointer_pressed = true,
+        });
+        try std.testing.expectEqual(@as(?InlineField, .rotation), studio.inlineEditField());
+        _ = studio.update(&items, &.{}, frame.viewport, .{ .cancel_pressed = true });
     }
 }
 
