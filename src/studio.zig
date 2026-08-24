@@ -431,7 +431,7 @@ pub fn frameLayout(
     const gap: f32 = @as(f32, if (compact_shell) 6 else 8) * scale;
     const edge: f32 = 8 * scale;
     const toolbar_height: f32 = @as(f32, if (compact_shell) 44 else 48) * scale;
-    const status_height: f32 = @as(f32, if (compact_shell) 68 else 100) * scale;
+    const status_height: f32 = @as(f32, if (compact_shell) 62 else 92) * scale;
     const toolbar: rl.Rectangle = .{
         .x = safe_content.x,
         .y = safe_content.y,
@@ -3406,7 +3406,7 @@ pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
         .compact = true,
     };
     const scale = if (viewport.chrome != null) uiScale(viewport) else 1;
-    const compact = panel.height < 100 * scale;
+    const compact = panel.height < 80 * scale;
     const padding: f32 = @as(f32, if (compact) 6 else 8) * scale;
     const gap: f32 = 5 * scale;
     const action_width: f32 = @as(f32, if (compact) 43 else 52) * scale;
@@ -3434,6 +3434,69 @@ pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
         .card_width = @as(f32, if (compact) 112 else 154) * scale,
         .card_gap = 6 * scale,
         .compact = compact,
+    };
+}
+
+pub const StatusRevealLayout = struct {
+    scale: f32 = 1,
+    /// Always-visible grab target at the bottom edge, horizontally centred.
+    handle: rl.Rectangle = empty_frame_rectangle,
+    /// The drawer in its fully-open position.
+    panel: rl.Rectangle = empty_frame_rectangle,
+    /// Region the drawer is clipped to, so it emerges from behind the handle
+    /// instead of sliding in over the window edge.
+    clip: rl.Rectangle = empty_frame_rectangle,
+    line_height: f32 = 0,
+};
+
+pub fn statusRevealLayout(viewport: Viewport) StatusRevealLayout {
+    const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
+        .x = viewport.slide_top_left.x,
+        .y = viewport.slide_top_left.y,
+        .width = viewport.slide_size.x,
+        .height = viewport.slide_size.y,
+    };
+    if (bounds.width <= 0 or bounds.height <= 0) return .{};
+    const scale = uiScale(viewport);
+    const handle_width = @min(150 * scale, bounds.width * 0.35);
+    const handle_height = 15 * scale;
+    const handle: rl.Rectangle = .{
+        .x = bounds.x + (bounds.width - handle_width) / 2,
+        .y = bounds.y + bounds.height - handle_height,
+        .width = handle_width,
+        .height = handle_height,
+    };
+    const line_height = 22 * scale;
+    const panel_height = line_height * 3 + 26 * scale;
+    const panel_width = @min(1040 * scale, @max(0, bounds.width - 24 * scale));
+    const panel: rl.Rectangle = .{
+        .x = bounds.x + (bounds.width - panel_width) / 2,
+        .y = handle.y - panel_height,
+        .width = panel_width,
+        .height = panel_height,
+    };
+    return .{
+        .scale = scale,
+        .handle = handle,
+        .panel = panel,
+        .clip = .{
+            .x = bounds.x,
+            .y = bounds.y,
+            .width = bounds.width,
+            .height = @max(0, handle.y - bounds.y),
+        },
+        .line_height = line_height,
+    };
+}
+
+/// Where the drawer actually sits this frame, given how far it has glided.
+pub fn statusRevealPanelAt(layout: StatusRevealLayout, reveal: f32) rl.Rectangle {
+    const hidden = 1 - std.math.clamp(reveal, 0, 1);
+    return .{
+        .x = layout.panel.x,
+        .y = layout.panel.y + layout.panel.height * hidden,
+        .width = layout.panel.width,
+        .height = layout.panel.height,
     };
 }
 
@@ -3475,6 +3538,8 @@ pub const FrameInput = struct {
     toggle_pressed: bool = false,
     toggle_focus_canvas_pressed: bool = false,
     command_palette_pressed: bool = false,
+    /// Toggles the pinned state of the bottom status drawer.
+    status_reveal_toggle_pressed: bool = false,
     find_pressed: bool = false,
     palette_previous_pressed: bool = false,
     palette_next_pressed: bool = false,
@@ -3587,6 +3652,7 @@ pub const FrameInput = struct {
             .toggle_pressed = rl.isKeyPressed(.e),
             .toggle_focus_canvas_pressed = rl.isKeyPressed(.tab),
             .command_palette_pressed = shortcut_modifier and rl.isKeyPressed(.k),
+            .status_reveal_toggle_pressed = rl.isKeyPressed(.f1),
             .find_pressed = shortcut_modifier and rl.isKeyPressed(.f),
             .palette_previous_pressed = keyPressedOrRepeated(.up),
             .palette_next_pressed = keyPressedOrRepeated(.down),
@@ -3828,6 +3894,34 @@ pub const max_panel_search_bytes: usize = 128;
 pub const tooltip_delay_seconds: f32 = 0.55;
 pub const tooltip_pointer_tolerance: f32 = 5;
 
+/// Hover intent before the status drawer peeks open, and the glide it uses.
+/// Shorter than the tooltip delay because the handle is a deliberate target
+/// rather than something the pointer crosses on its way somewhere else.
+pub const status_reveal_delay_seconds: f32 = 0.3;
+pub const status_reveal_glide_seconds: f32 = 0.14;
+
+/// The bottom band belongs to the morph timeline; the status detail lives in a
+/// drawer that slides up from a handle at the bottom edge. Ambient state the
+/// user must not miss (notices, and the live geometry drawn beside the
+/// selection) never lives in here — only material you go looking for.
+const StatusRevealState = struct {
+    hover_elapsed: f32 = 0,
+    /// Click the handle, or press the shortcut, to keep the drawer open while
+    /// working. Pinning survives the pointer leaving the drawer.
+    pinned: bool = false,
+    /// 0 fully stowed, 1 fully open. Animated so the drawer reads as one
+    /// surface moving rather than a panel blinking into existence.
+    reveal: f32 = 0,
+
+    fn open(self: StatusRevealState) bool {
+        return self.pinned or self.hover_elapsed >= status_reveal_delay_seconds;
+    }
+
+    fn visible(self: StatusRevealState) bool {
+        return self.reveal > 0.001;
+    }
+};
+
 const CommandPaletteState = struct {
     active: bool = false,
     query: [max_command_query_bytes + 1]u8 = [_]u8{0} ** (max_command_query_bytes + 1),
@@ -3993,6 +4087,7 @@ pub const Studio = struct {
     pending_geometry_batch: ?GeometryBatchCommand = null,
     inline_editor: InlineEditor = .{},
     command_palette: CommandPaletteState = .{},
+    status_reveal: StatusRevealState = .{},
     library_picker_active: bool = false,
     active_search: ?SearchPanel = null,
     slide_search: PanelSearchState = .{},
@@ -4708,6 +4803,51 @@ pub const Studio = struct {
             self.tooltip.elapsed += @max(@as(f32, 0), input.frame_time);
         }
         self.tooltip.target = target;
+    }
+
+    /// Hover intent opens the drawer; once open the whole drawer keeps it open,
+    /// so crossing the gap between handle and content does not make it flap.
+    fn updateStatusReveal(self: *Studio, viewport: Viewport, input: FrameInput) void {
+        const layout = statusRevealLayout(viewport);
+        if (layout.handle.width <= 0) {
+            self.status_reveal = .{};
+            return;
+        }
+        if (input.status_reveal_toggle_pressed) self.status_reveal.pinned = !self.status_reveal.pinned;
+        const on_handle = pointInRectangle(input.pointer_screen, layout.handle);
+        if (input.pointer_pressed and on_handle) self.status_reveal.pinned = !self.status_reveal.pinned;
+
+        const hot = on_handle or (self.status_reveal.visible() and
+            pointInRectangle(input.pointer_screen, statusRevealPanelAt(layout, self.status_reveal.reveal)));
+        if (hot) {
+            self.status_reveal.hover_elapsed = @min(
+                status_reveal_delay_seconds,
+                self.status_reveal.hover_elapsed + @max(@as(f32, 0), input.frame_time),
+            );
+        } else {
+            self.status_reveal.hover_elapsed = 0;
+        }
+
+        const target: f32 = if (self.status_reveal.open()) 1 else 0;
+        const step = @max(@as(f32, 0), input.frame_time) / status_reveal_glide_seconds;
+        self.status_reveal.reveal = if (self.status_reveal.reveal < target)
+            @min(target, self.status_reveal.reveal + step)
+        else
+            @max(target, self.status_reveal.reveal - step);
+    }
+
+    /// Pins the status drawer open for deterministic documentation capture.
+    pub fn showStatusRevealForDiagnostics(self: *Studio) void {
+        self.status_reveal.pinned = true;
+        self.status_reveal.reveal = 1;
+    }
+
+    pub fn statusRevealOpen(self: Studio) bool {
+        return self.status_reveal.open();
+    }
+
+    pub fn statusRevealPinned(self: Studio) bool {
+        return self.status_reveal.pinned;
     }
 
     fn commandResultCount(self: Studio) usize {
@@ -6981,6 +7121,7 @@ pub const Studio = struct {
             return null;
         }
         self.updateTooltip(viewport, workspace, input);
+        self.updateStatusReveal(viewport, input);
         if (input.toggle_pressed) {
             self.toggle(items);
             return null;
@@ -11097,7 +11238,7 @@ pub const Studio = struct {
                 const selected_locked = if (self.selectedIndex(items)) |index| items[index].locked else false;
                 self.drawProperties(items, resolved_bounds, viewport, selected_locked);
             }
-            self.drawStatus(items, resolved_bounds, viewport);
+            self.drawStatus(viewport);
         }
     }
 
@@ -11428,7 +11569,7 @@ pub const Studio = struct {
         self.draw(items, resolved_bounds, viewport);
         self.drawWorkspaceBackground(viewport, workspace);
         self.drawWorkspaceOverlay(viewport, workspace);
-        self.drawDiscoveryOverlay(items, viewport, workspace);
+        self.drawDiscoveryOverlay(items, resolved_bounds, viewport, workspace);
     }
 
     pub fn drawWorkspaceBackground(self: Studio, viewport: Viewport, workspace: Workspace) void {
@@ -12023,10 +12164,13 @@ pub const Studio = struct {
     pub fn drawDiscoveryOverlay(
         self: Studio,
         items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
         viewport: Viewport,
         workspace: Workspace,
     ) void {
         if (!self.enabled) return;
+        self.drawNoticeToast(viewport);
+        self.drawStatusReveal(items, resolved_bounds, viewport);
         if (self.grid_settings_active) {
             self.drawGridSettings(viewport);
         } else if (self.command_palette.active) {
@@ -12036,6 +12180,172 @@ pub const Studio = struct {
         } else if (self.tooltip.visible()) {
             self.drawTooltip(viewport);
         }
+    }
+
+    /// The handle is always drawn; the drawer only when it has glided out.
+    /// Both sit above the timeline band so nothing can paint over them.
+    fn drawStatusReveal(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+    ) void {
+        const layout = statusRevealLayout(viewport);
+        if (layout.handle.width <= 0 or layout.handle.height <= 0) return;
+        const scale = layout.scale;
+        const active = self.status_reveal.visible();
+
+        if (active) {
+            const panel = statusRevealPanelAt(layout, self.status_reveal.reveal);
+            rl.beginScissorMode(
+                @intFromFloat(@floor(layout.clip.x)),
+                @intFromFloat(@floor(layout.clip.y)),
+                @intFromFloat(@ceil(layout.clip.width)),
+                @intFromFloat(@ceil(layout.clip.height)),
+            );
+            // Semi-transparent so the deck stays legible underneath: this is a
+            // reference surface, not a modal.
+            rl.drawRectangleRec(.{
+                .x = panel.x,
+                .y = panel.y - 6 * scale,
+                .width = panel.width,
+                .height = 6 * scale,
+            }, theme.alpha(theme.shadow, 70));
+            rl.drawRectangleRec(panel, theme.alpha(theme.raised, 224));
+            rl.drawRectangleRec(.{
+                .x = panel.x,
+                .y = panel.y,
+                .width = panel.width,
+                .height = @max(1, scale),
+            }, theme.border_strong);
+
+            const body_font = scaledUiFont(scale, UiTypography.body);
+            const compact_font = scaledUiFont(scale, UiTypography.compact);
+            const text_x = panel.x + 14 * scale;
+            const text_width = @max(0, panel.width - 28 * scale);
+            var line_y = panel.y + 13 * scale;
+
+            var status_buffer: [512]u8 = undefined;
+            var fitted_buffer: [512]u8 = undefined;
+            const status_text = self.statusSummary(items, resolved_bounds, &status_buffer);
+            self.drawUiText(
+                self.fitUiText(&fitted_buffer, status_text, body_font, text_width),
+                .{ .x = text_x, .y = line_y },
+                body_font,
+                theme.text,
+            );
+            line_y += layout.line_height;
+
+            var view_buffer: [192]u8 = undefined;
+            const view_help = std.fmt.bufPrintZ(
+                &view_buffer,
+                "VIEW {d:.0}% · Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit",
+                .{self.canvasZoomPercent()},
+            ) catch "Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit";
+            var view_fitted: [192]u8 = undefined;
+            self.drawUiText(
+                self.fitUiText(&view_fitted, view_help, compact_font, text_width),
+                .{ .x = text_x, .y = line_y },
+                compact_font,
+                theme.text_muted,
+            );
+            line_y += layout.line_height;
+
+            var keys_fitted: [224]u8 = undefined;
+            self.drawUiText(
+                self.fitUiText(&keys_fitted, if (self.grid_snapping)
+                    "GRID ON · G toggle · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo"
+                else
+                    "G grid · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo", compact_font, text_width),
+                .{ .x = text_x, .y = line_y },
+                compact_font,
+                theme.text_muted,
+            );
+
+            const hint: [:0]const u8 = if (self.status_reveal.pinned) "F1 unpin" else "F1 pin";
+            const hint_width = self.measureUiText(hint, compact_font);
+            self.drawUiText(hint, .{
+                .x = panel.x + panel.width - hint_width - 14 * scale,
+                .y = panel.y + 13 * scale,
+            }, compact_font, theme.text_disabled);
+            rl.endScissorMode();
+        }
+
+        // Handle: a quiet pill with a chevron that flips once the drawer is out.
+        const handle = layout.handle;
+        rl.drawRectangleRounded(handle, 0.6, 6, if (active) theme.accent_fill else theme.control);
+        rl.drawRectangleRoundedLinesEx(handle, 0.6, 6, @max(1, scale), if (active) theme.accent else theme.border_strong);
+        const centre: rl.Vector2 = .{ .x = handle.x + handle.width / 2, .y = handle.y + handle.height / 2 };
+        const arm = 4 * scale;
+        const rise: f32 = if (active) 2 * scale else -2 * scale;
+        const chevron = if (active) theme.text else theme.text_muted;
+        rl.drawLineEx(
+            .{ .x = centre.x - arm, .y = centre.y - rise },
+            .{ .x = centre.x, .y = centre.y + rise },
+            @max(1, 1.5 * scale),
+            chevron,
+        );
+        rl.drawLineEx(
+            .{ .x = centre.x, .y = centre.y + rise },
+            .{ .x = centre.x + arm, .y = centre.y - rise },
+            @max(1, 1.5 * scale),
+            chevron,
+        );
+    }
+
+    /// Notices are cleared by the next interaction, so they can never live
+    /// behind a hover: a failure the user never saw is a failure they never
+    /// fixed. The toast floats above the band and needs no seeking.
+    fn drawNoticeToast(self: Studio, viewport: Viewport) void {
+        var message_buffer: [256]u8 = undefined;
+        const message = self.noticeMessage(&message_buffer) orelse return;
+        const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
+            .x = viewport.slide_top_left.x,
+            .y = viewport.slide_top_left.y,
+            .width = viewport.slide_size.x,
+            .height = viewport.slide_size.y,
+        };
+        if (bounds.width <= 0 or bounds.height <= 0) return;
+        const scale = uiScale(viewport);
+        const font = scaledUiFont(scale, UiTypography.body);
+        const accent: rl.Color = switch (self.notice) {
+            .saved, .copy_saved, .library_cleanup_empty => theme.success,
+            .library_cleanup_ready => theme.warning,
+            else => theme.danger,
+        };
+        const padding_x = 14 * scale;
+        var fitted_buffer: [256]u8 = undefined;
+        const max_width = @max(0, bounds.width - 48 * scale);
+        const fitted = self.fitUiText(&fitted_buffer, message, font, @max(0, max_width - padding_x * 2 - 6 * scale));
+        const toast_width = self.measureUiText(fitted, font) + padding_x * 2 + 6 * scale;
+        const toast_height = 32 * scale;
+        const band = statusPanel(viewport);
+        const band_top = if (band.height > 0) band.y else bounds.y + bounds.height;
+        const toast: rl.Rectangle = .{
+            .x = bounds.x + (bounds.width - toast_width) / 2,
+            .y = band_top - toast_height - 10 * scale,
+            .width = toast_width,
+            .height = toast_height,
+        };
+        if (toast.y < bounds.y) return;
+        rl.drawRectangleRounded(.{
+            .x = toast.x + 1 * scale,
+            .y = toast.y + 3 * scale,
+            .width = toast.width,
+            .height = toast.height,
+        }, 0.3, 8, theme.alpha(theme.shadow, 90));
+        rl.drawRectangleRounded(toast, 0.3, 8, theme.overlay);
+        rl.drawRectangleRoundedLinesEx(toast, 0.3, 8, @max(1, scale), theme.border_strong);
+        rl.drawRectangleRec(.{
+            .x = toast.x + 1 * scale,
+            .y = toast.y + 7 * scale,
+            .width = @max(2, 3 * scale),
+            .height = @max(0, toast.height - 14 * scale),
+        }, accent);
+        self.drawUiText(fitted, .{
+            .x = toast.x + padding_x,
+            .y = toast.y + (toast.height - @as(f32, @floatFromInt(font))) / 2,
+        }, font, theme.text);
     }
 
     fn drawGridSettings(self: Studio, viewport: Viewport) void {
@@ -12514,19 +12824,6 @@ pub const Studio = struct {
         const active_scene = if (self.active_morph_state) |state| state + 1 else 0;
         const body_font = scaledUiFont(layout.scale, if (layout.compact) UiTypography.compact else UiTypography.body);
         const meta_font = scaledUiFont(layout.scale, UiTypography.compact);
-
-        // Repaint the complete card band plus the text baseline immediately
-        // below it. drawStatus() runs first; without the extra baseline clear,
-        // the lower halves of its shortcut text peek out beneath the cards.
-        // The notice row starts lower (or directly after compact cards) and
-        // remains available for source/edit feedback.
-        const repaint_height = layout.cards_clip.height + @as(f32, if (layout.compact) 8 else 18) * layout.scale;
-        rl.drawRectangleRec(.{
-            .x = layout.panel.x + 1,
-            .y = layout.panel.y + 1,
-            .width = layout.panel.width - 2,
-            .height = @min(layout.panel.height - 2, repaint_height),
-        }, theme.surface);
 
         rl.beginScissorMode(
             @intFromFloat(@floor(layout.cards_clip.x)),
@@ -13876,74 +14173,38 @@ pub const Studio = struct {
         drawCompactButton(self, layout.lock_item, if (selected_locked) "Unlock" else "Lock");
     }
 
-    fn drawStatus(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
-        const panel = statusPanel(viewport);
-        if (panel.width <= 0 or panel.height <= 0) return;
-        const scale = uiScale(viewport);
-        const heading_font = scaledUiFont(scale, UiTypography.status_heading);
-        const body_font = scaledUiFont(scale, UiTypography.body);
-        rl.drawRectangleRec(panel, theme.surface);
-        rl.drawRectangleLinesEx(panel, 1, theme.border);
-
-        var status_buffer: [512]u8 = undefined;
-        const status_text = if (self.selected_identity) |identity| selected: {
+    /// One line describing the current selection and its source ownership.
+    /// Shared by the status drawer and available to tests.
+    pub fn statusSummary(
+        self: Studio,
+        items: []const slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        buffer: *[512]u8,
+    ) [:0]const u8 {
+        if (self.selected_identity) |identity| {
             const geometry = if (self.selectionCount() > 1)
-                self.selectedBounds(items, resolved_bounds) orelse break :selected "STUDIO · selection unavailable"
+                self.selectedBounds(items, resolved_bounds) orelse return "STUDIO · selection unavailable"
             else
-                self.selectedGeometry(items, resolved_bounds) orelse break :selected "STUDIO · selection unavailable";
-            const index = self.selectedIndex(items) orelse break :selected "STUDIO · selection unavailable";
+                self.selectedGeometry(items, resolved_bounds) orelse return "STUDIO · selection unavailable";
+            const index = self.selectedIndex(items) orelse return "STUDIO · selection unavailable";
             const item = items[index];
             const source = if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource();
             const destination_label = if (self.selectionCount() > 1)
                 self.groupDestinationLabel()
             else
                 self.editDestinationLabel(item);
-            break :selected std.fmt.bufPrintZ(
-                &status_buffer,
+            return std.fmt.bufPrintZ(
+                buffer,
                 "STUDIO{s} · {d} selected · primary #{d} · {s}, line {d} · x {d:.0} y {d:.0} w {d:.0} h {d:.0}",
                 .{ if (self.dirty) " *" else "", self.selectionCount(), identity, destination_label, source.line_number, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
             ) catch "STUDIO · selected item";
-        } else if (self.dirty) "STUDIO * · click an item to select it" else "STUDIO · click an item to select it";
-
-        self.drawUiText(status_text, .{ .x = panel.x + 12 * scale, .y = panel.y + 9 * scale }, heading_font, theme.text);
-        const compact_status = panel.height < 100 * scale;
-        var view_help_buffer: [192]u8 = undefined;
-        if (compact_status and self.notice == .none) {
-            const view_help = std.fmt.bufPrintZ(
-                &view_help_buffer,
-                "VIEW {d:.0}% · Cmd/Ctrl +/- zoom · Space pan · Cmd/Ctrl-K Commands",
-                .{self.canvasZoomPercent()},
-            ) catch "Cmd/Ctrl +/- zoom · Space pan · Cmd/Ctrl-K Commands";
-            self.drawUiText(
-                view_help,
-                .{ .x = panel.x + 12 * scale, .y = panel.y + 43 * scale },
-                body_font,
-                theme.text_muted,
-            );
-        } else {
-            const view_help = std.fmt.bufPrintZ(
-                &view_help_buffer,
-                "VIEW {d:.0}% · Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit",
-                .{self.canvasZoomPercent()},
-            ) catch "Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit";
-            self.drawUiText(
-                view_help,
-                .{ .x = panel.x + 12 * scale, .y = panel.y + 39 * scale },
-                body_font,
-                theme.text_muted,
-            );
-            self.drawUiText(
-                if (self.grid_snapping)
-                    "GRID ON · G toggle · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo"
-                else
-                    "G grid · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo",
-                .{ .x = panel.x + 12 * scale, .y = panel.y + 64 * scale },
-                body_font,
-                theme.text_muted,
-            );
         }
-        var notice_buffer: [256]u8 = undefined;
-        const notice_text: ?[:0]const u8 = switch (self.notice) {
+        return if (self.dirty) "STUDIO * · click an item to select it" else "STUDIO · click an item to select it";
+    }
+
+    /// The user-facing text for the current notice, or null when there is none.
+    pub fn noticeMessage(self: Studio, buffer: *[256]u8) ?[:0]const u8 {
+        return switch (self.notice) {
             .none => null,
             .saved => "Saved to the original .sld",
             .copy_saved => "Saved an .edited.sld copy",
@@ -13979,13 +14240,13 @@ pub const Studio = struct {
             .library_entry_in_use => "Cannot delete: later source instances still use this reusable",
             .library_delete_unsupported => "Slide-template deletion is not source-safe yet",
             .library_cleanup_ready => std.fmt.bufPrintZ(
-                &notice_buffer,
+                buffer,
                 "Cleanup preview: {d} safe to remove · {d} blocked · click Apply",
                 .{ self.library_cleanup_preview_count, self.library_cleanup_blocked_count },
             ) catch "Cleanup preview ready - click Apply",
             .library_cleanup_empty => "Library cleanup found no safely unreachable definitions",
             .library_cleanup_blocked => std.fmt.bufPrintZ(
-                &notice_buffer,
+                buffer,
                 "Library cleanup: {d} unreachable definition{s} blocked by source context",
                 .{
                     self.library_cleanup_blocked_count,
@@ -13999,14 +14260,17 @@ pub const Studio = struct {
             .morph_state_required => "Select a state card first; BASE cannot be renamed, deleted, or reordered",
             .morph_structure_locked => "That state move would break cumulative source ownership; no change was made",
         };
-        if (notice_text) |message| {
-            const notice_color: rl.Color = switch (self.notice) {
-                .saved, .copy_saved, .library_cleanup_empty => theme.success,
-                .library_cleanup_ready => theme.warning,
-                else => theme.danger,
-            };
-            self.drawUiText(message, .{ .x = panel.x + 12 * scale, .y = panel.y + @as(f32, if (compact_status) 43 else 89) * scale }, body_font, notice_color);
-        }
+    }
+
+    /// The bottom band is now the morph timeline's alone. Its detail moved to
+    /// the status drawer, and its notices to a toast, so nothing here can be
+    /// painted over by the timeline that shares the band.
+    fn drawStatus(self: Studio, viewport: Viewport) void {
+        _ = self;
+        const panel = statusPanel(viewport);
+        if (panel.width <= 0 or panel.height <= 0) return;
+        rl.drawRectangleRec(panel, theme.surface);
+        rl.drawRectangleLinesEx(panel, 1, theme.border);
     }
 };
 
@@ -20624,6 +20888,105 @@ test "command palette emits application save and history intentions" {
         .undo => {},
         else => return error.UnexpectedSemanticCommand,
     }
+}
+
+test "status drawer opens on hover intent and glides shut when the pointer leaves" {
+    const frame = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .properties);
+    const viewport = frame.viewport;
+    const layout = statusRevealLayout(viewport);
+    try std.testing.expect(layout.handle.width > 0);
+    // The handle sits at the bottom edge, horizontally centred on the window.
+    try std.testing.expectApproxEqAbs(
+        frame.chrome.content.x + frame.chrome.content.width / 2,
+        layout.handle.x + layout.handle.width / 2,
+        0.5,
+    );
+    try std.testing.expectApproxEqAbs(
+        frame.chrome.content.y + frame.chrome.content.height,
+        layout.handle.y + layout.handle.height,
+        0.5,
+    );
+
+    var studio: Studio = .{ .enabled = true };
+    const on_handle = rectangleCenter(layout.handle);
+    const away: rl.Vector2 = .{ .x = frame.chrome.content.x + 4, .y = frame.chrome.content.y + 4 };
+
+    // A brief brush past the handle must not open it.
+    studio.updateStatusReveal(viewport, .{ .pointer_screen = on_handle, .frame_time = 0.05 });
+    try std.testing.expect(!studio.statusRevealOpen());
+
+    // Sustained hover does.
+    studio.updateStatusReveal(viewport, .{ .pointer_screen = on_handle, .frame_time = status_reveal_delay_seconds });
+    try std.testing.expect(studio.statusRevealOpen());
+
+    // Glides open, then stays open while the pointer rests inside the drawer.
+    for (0..20) |_| studio.updateStatusReveal(viewport, .{ .pointer_screen = on_handle, .frame_time = 0.016 });
+    try std.testing.expectApproxEqAbs(@as(f32, 1), studio.status_reveal.reveal, 0.001);
+    const inside = rectangleCenter(statusRevealPanelAt(layout, 1));
+    studio.updateStatusReveal(viewport, .{ .pointer_screen = inside, .frame_time = 0.016 });
+    try std.testing.expect(studio.statusRevealOpen());
+
+    // Leaving closes it, and the glide runs to a full stop.
+    studio.updateStatusReveal(viewport, .{ .pointer_screen = away, .frame_time = 0.016 });
+    try std.testing.expect(!studio.statusRevealOpen());
+    for (0..20) |_| studio.updateStatusReveal(viewport, .{ .pointer_screen = away, .frame_time = 0.016 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0), studio.status_reveal.reveal, 0.001);
+}
+
+test "status drawer pins open from the keyboard and from clicking the handle" {
+    const frame = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .properties);
+    const viewport = frame.viewport;
+    const layout = statusRevealLayout(viewport);
+    const away: rl.Vector2 = .{ .x = frame.chrome.content.x + 4, .y = frame.chrome.content.y + 4 };
+
+    var studio: Studio = .{ .enabled = true };
+    studio.updateStatusReveal(viewport, .{ .pointer_screen = away, .status_reveal_toggle_pressed = true });
+    try std.testing.expect(studio.statusRevealPinned());
+    // Pinned means it stays open with the pointer nowhere near it.
+    for (0..20) |_| studio.updateStatusReveal(viewport, .{ .pointer_screen = away, .frame_time = 0.016 });
+    try std.testing.expect(studio.statusRevealOpen());
+    try std.testing.expectApproxEqAbs(@as(f32, 1), studio.status_reveal.reveal, 0.001);
+
+    studio.updateStatusReveal(viewport, .{ .pointer_screen = away, .status_reveal_toggle_pressed = true });
+    try std.testing.expect(!studio.statusRevealPinned());
+    try std.testing.expect(!studio.statusRevealOpen());
+
+    // Clicking the handle pins it too.
+    studio.updateStatusReveal(viewport, .{
+        .pointer_screen = rectangleCenter(layout.handle),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.statusRevealPinned());
+}
+
+test "the timeline band no longer overlaps the status detail it used to hide" {
+    // The regression this drawer exists to fix: the band is the timeline's, and
+    // the drawer lives above it rather than underneath.
+    const frame = frameLayout(.{ .x = 0, .y = 0, .width = 2560, .height = 1440 }, true, false, .properties);
+    const viewport = frame.viewport;
+    const timeline = morphTimelineLayout(viewport);
+    try std.testing.expect(!timeline.compact);
+    // The band is sized for the timeline it carries, with no dead rows left for
+    // text that would be painted over.
+    const band = statusPanel(viewport);
+    try std.testing.expect(timeline.cards_clip.y + timeline.cards_clip.height <= band.y + band.height);
+
+    const layout = statusRevealLayout(viewport);
+    const open_panel = statusRevealPanelAt(layout, 1);
+    try std.testing.expect(open_panel.y + open_panel.height <= layout.handle.y + 0.5);
+    // Fully open, the drawer clears the band entirely, so nothing occludes it.
+    try std.testing.expect(open_panel.y < band.y);
+}
+
+test "notices stay outside the drawer so they cannot be missed" {
+    var studio: Studio = .{ .enabled = true };
+    var buffer: [256]u8 = undefined;
+    try std.testing.expect(studio.noticeMessage(&buffer) == null);
+    studio.notice = .save_failed;
+    const message = studio.noticeMessage(&buffer) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, message, "Save failed"));
+    // A notice never depends on the drawer being open.
+    try std.testing.expect(!studio.statusRevealOpen());
 }
 
 test "tooltips appear after a stable delay and reset on motion or click" {

@@ -56,6 +56,7 @@ const cli_help =
     \\  --diagnostics-command-tooltip    Show deterministic command hover help
     \\  --diagnostics-precision-view     Show rulers, guides, and precision tools
     \\  --diagnostics-grid-settings      Open the Studio grid appearance popover
+    \\  --diagnostics-status-drawer      Pin the Studio status drawer open
     \\  --diagnostics-presenter-pairing  Show the Presenter pairing overlay
     \\  --diagnostics-presenter-session  Pair, then enter presentation for browser QA
     \\  --diagnostics-presentation-capture
@@ -1276,6 +1277,28 @@ fn readFileAllocLimited(allocator: std.mem.Allocator, io: std.Io, path: []const 
 /// Turn a rejected document load into the same stable report shape used by a
 /// successful renderer-backed preflight. This path deliberately reparses in
 /// isolation: malformed source never replaces the live Studio document.
+/// Titles the window with the open document so several Rayslides windows can
+/// be told apart in a window manager, a Dock, or a screenshot. Only pushed to
+/// the OS when the text actually changes; setWindowTitle is not free.
+fn syncWindowTitle(dirty: bool) void {
+    const cache = struct {
+        var last: [std.fs.max_path_bytes + 32]u8 = undefined;
+        var last_len: usize = 0;
+        var primed: bool = false;
+    };
+    var buffer: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const name: []const u8 = if (G.slideshow_filp) |path| std.fs.path.basename(path) else "";
+    const title: [:0]const u8 = if (name.len == 0)
+        "Rayslides"
+    else
+        std.fmt.bufPrintZ(&buffer, "{s}{s} - Rayslides", .{ name, if (dirty) " *" else "" }) catch "Rayslides";
+    if (cache.primed and std.mem.eql(u8, cache.last[0..cache.last_len], title)) return;
+    @memcpy(cache.last[0..title.len], title);
+    cache.last_len = title.len;
+    cache.primed = true;
+    rl.setWindowTitle(title);
+}
+
 fn buildLoadFailureShowtimeReport(deck_path: []const u8, load_error: anyerror) !showtime.Report {
     var report = showtime.Report.init(G.allocator);
     errdefer report.deinit();
@@ -3347,6 +3370,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_command_tooltip = false;
     var diagnostics_precision_view = false;
     var diagnostics_grid_settings = false;
+    var diagnostics_status_drawer = false;
     var diagnostics_presenter_pairing = false;
     var diagnostics_presenter_session = false;
     var diagnostics_presentation_capture = false;
@@ -3434,6 +3458,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-grid-settings")) {
                 diagnostics_enabled = true;
                 diagnostics_grid_settings = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-status-drawer")) {
+                diagnostics_enabled = true;
+                diagnostics_status_drawer = true;
                 launch_studio = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-presenter-pairing")) {
                 diagnostics_presenter_pairing = true;
@@ -3673,6 +3701,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_command_palette_pending = diagnostics_command_palette;
     var diagnostics_precision_view_pending = diagnostics_precision_view;
     var diagnostics_grid_settings_pending = diagnostics_grid_settings;
+    var diagnostics_status_drawer_pending = diagnostics_status_drawer;
     var diagnostics_find_slide_pending = diagnostics_find_slide_query;
     var diagnostics_incremental_edit_pending = diagnostics_incremental_edit_slide;
     var diagnostics_capture_stable_frames: usize = 0;
@@ -3795,6 +3824,7 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     while (true) {
         frame_diagnostics.observeFrame(rl.getTime());
+        syncWindowTitle(studio_mode.dirty);
         // Window managers may tile a just-launched diagnostic process while
         // moving it to the requested QA workspace. Baseline capture is the
         // one mode where the CLI dimensions are a strict test contract, so
@@ -4640,6 +4670,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             if (diagnostics_grid_settings_pending) {
                 studio_mode.showGridSettingsForDiagnostics();
                 diagnostics_grid_settings_pending = false;
+            }
+            if (diagnostics_status_drawer_pending) {
+                studio_mode.showStatusRevealForDiagnostics();
+                diagnostics_status_drawer_pending = false;
             }
             if (diagnostics_find_slide_pending) |query| {
                 if (!studio_mode.openSlideSearchForDiagnostics(query))
@@ -5513,7 +5547,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 // Discovery chrome is intentionally last: command search and
                 // hover help must remain legible above diagnostics and every
                 // persistent Studio surface.
-                studio_mode.drawDiscoveryOverlay(studio_items, studio_viewport, studio_workspace);
+                studio_mode.drawDiscoveryOverlay(studio_items, studio_bounds.items, studio_viewport, studio_workspace);
             }
             if (presenter_pairing_visible and presenter_runtime.isRunning()) {
                 drawPresenterPairingOverlay(

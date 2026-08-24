@@ -1547,7 +1547,7 @@ td:first-child {
   gap: 4px;
   padding: 5px;
   background: #050a12;
-  border: 1px solid rgba(97, 218, 251, 0.38);
+  border: 1px solid rgba(62, 166, 223, 0.32);
   border-radius: 4px;
 }
 
@@ -1561,10 +1561,10 @@ td:first-child {
   grid-template: "left canvas right" 1fr "timeline timeline timeline" 24px / 20% 1fr 20%;
 }
 
-.wide-map > i { grid-area: left; background: #0d192a; }
+.wide-map > i { grid-area: left; background: #14181f; }
 .wide-map > .workspace-canvas { grid-area: canvas; background: #15334b; }
-.wide-map > em { grid-area: right; background: #0d192a; }
-.wide-map > footer { grid-area: timeline; background: #281f40; }
+.wide-map > em { grid-area: right; background: #14181f; }
+.wide-map > footer { grid-area: timeline; background: #1a1f28; }
 
 .focus-map {
   padding: 12px;
@@ -1589,8 +1589,8 @@ td:first-child {
 }
 
 .narrow-map > .workspace-canvas { grid-area: canvas; background: #15334b; }
-.narrow-map > em { grid-area: panel; background: #0d192a; }
-.narrow-map > footer { grid-area: timeline; background: #281f40; }
+.narrow-map > em { grid-area: panel; background: #14181f; }
+.narrow-map > footer { grid-area: timeline; background: #1a1f28; }
 
 .shot-status img {
   border-radius: 4px;

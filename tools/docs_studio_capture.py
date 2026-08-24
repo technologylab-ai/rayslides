@@ -17,7 +17,18 @@ from pathlib import Path
 
 from PIL import Image
 
-from studio_baseline import ROOT, aerospace_windows_for_pid, place_and_verify_window, terminate_process
+from studio_baseline import (
+    ROOT,
+    aerospace_windows_for_pid,
+    assert_frame_not_blank,
+    place_and_verify_window,
+    terminate_process,
+)
+
+
+CAPTURE_ATTEMPTS = 4
+INTER_CAPTURE_PAUSE = 1.5
+RETRY_PAUSE = 3.0
 
 
 @dataclass(frozen=True)
@@ -92,6 +103,13 @@ CAPTURES: tuple[Capture, ...] = (
         1440,
         "testslides/docs-motion.sld",
         ("--diagnostics-select=title",),
+    ),
+    Capture(
+        "status-drawer",
+        2560,
+        1440,
+        "testslides/studio-showcase.sld",
+        ("--diagnostics-select=headline", "--diagnostics-status-drawer"),
     ),
     Capture("new-deck", 2560, 1440, None),
 )
@@ -182,6 +200,7 @@ def run_capture(
         raise RuntimeError(f"{capture.name}: app exited {return_code}\n{tail}")
     if not image_path.is_file() or not report_path.is_file():
         raise RuntimeError(f"{capture.name}: image/report missing; see {log_path}")
+    assert_frame_not_blank(image_path, capture.name)
     with Image.open(image_path) as image:
         if image.size != (capture.width, capture.height):
             raise RuntimeError(
@@ -207,8 +226,26 @@ def main() -> None:
     binary = args.binary.resolve()
     if not binary.is_file():
         raise SystemExit(f"Rayslides binary not found: {binary}")
-    for capture in selected_captures(args.scenario):
-        run_capture(capture, binary, args.output.resolve(), args.workspace, args.timeout)
+    output = args.output.resolve()
+    for index, capture in enumerate(selected_captures(args.scenario)):
+        # Back-to-back launches race the window manager: the next window can be
+        # captured before the compositor has it, which returns a dead frame.
+        # Give it a beat, and retry the frames that still come back empty.
+        if index:
+            time.sleep(INTER_CAPTURE_PAUSE)
+        for attempt in range(1, CAPTURE_ATTEMPTS + 1):
+            try:
+                run_capture(capture, binary, output, args.workspace, args.timeout)
+                break
+            except RuntimeError as error:
+                if "never rendered" not in str(error) or attempt == CAPTURE_ATTEMPTS:
+                    raise
+                print(
+                    f"[{capture.name}] frame never rendered; retrying "
+                    f"({attempt}/{CAPTURE_ATTEMPTS - 1})",
+                    flush=True,
+                )
+                time.sleep(RETRY_PAUSE)
 
 
 if __name__ == "__main__":

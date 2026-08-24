@@ -265,6 +265,35 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=3)
 
 
+# A Studio frame always carries light chrome text, so a healthy capture lights
+# up a large share of its pixels. A frame that lost the compositor comes back
+# near-black with at most a stray sliver.
+BLANK_LUMINANCE = 40
+BLANK_MINIMUM_LIT_FRACTION = 0.002
+
+
+def assert_frame_not_blank(image_path: Path, label: str) -> None:
+    """Reject a framebuffer that never actually rendered.
+
+    A window that loses the compositor mid-capture still writes a valid PNG of
+    exactly the right size, just (near-)black. Size checks pass, so without this
+    the dead frame is silently promoted over a good baseline or documentation
+    figure. This has already caught real capture races on a contended desktop.
+    """
+    with Image.open(image_path) as image:
+        grey = image.convert("L")
+        histogram = grey.histogram()
+        total = grey.width * grey.height
+    lit = sum(histogram[BLANK_LUMINANCE:])
+    fraction = lit / total if total else 0.0
+    if fraction < BLANK_MINIMUM_LIT_FRACTION:
+        raise RuntimeError(
+            f"{label}: captured frame never rendered "
+            f"({fraction * 100:.3f}% of pixels above luminance {BLANK_LUMINANCE}); "
+            "the window most likely lost the compositor during capture"
+        )
+
+
 def capture_scenario(
     scenario: Scenario,
     binary: Path,
@@ -357,6 +386,10 @@ def run_capture(args: argparse.Namespace, update: bool) -> int:
         )
         actual_report = json.loads(actual_report_path.read_text(encoding="utf-8"))
         capture_errors = validate_report(scenario, actual_report, None)
+        try:
+            assert_frame_not_blank(actual_image, scenario.name)
+        except RuntimeError as error:
+            capture_errors.append(str(error).split(": ", 1)[-1])
         capture_errors.extend(validate_capture_image(scenario, actual_image))
         if capture_errors:
             failures.extend(f"{scenario.name}: {error}" for error in capture_errors)
