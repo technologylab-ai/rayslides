@@ -847,8 +847,8 @@ td:first-child {
   display: grid;
   min-height: 42px;
   color: var(--muted);
-  background: #121d2f;
-  border: 1px solid #52627c;
+  background: #202630;
+  border: 1px solid #3b4452;
   border-radius: 3px;
   place-items: center;
   font-family: var(--mono);
@@ -889,9 +889,9 @@ td:first-child {
 }
 
 .grid-option-row span.active {
-  color: #06121b;
-  background: var(--cyan);
-  border-color: var(--cyan-soft);
+  color: #e7ebf2;
+  background: #1b557a;
+  border-color: #3ea6df;
 }
 
 .grid-contrast-label {
@@ -1724,8 +1724,8 @@ td:first-child {
 
 .morph-edit-properties b {
   padding: 8px;
-  color: #06121b;
-  background: var(--cyan);
+  color: #e7ebf2;
+  background: #1b557a;
   text-align: center;
   font-size: 11px;
 }
@@ -1733,8 +1733,8 @@ td:first-child {
 .morph-edit-properties span {
   padding: 9px;
   color: var(--muted);
-  background: #121d2f;
-  border: 1px solid #52627c;
+  background: #202630;
+  border: 1px solid #3b4452;
   font-family: var(--mono);
   font-size: 10px;
 }

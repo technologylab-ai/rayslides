@@ -7,3 +7,4 @@ zig-pkg/
 **/.DS_Store/
 .DS_Store/
 *.pdf
+__pycache__/

@@ -11437,17 +11437,27 @@ pub const Studio = struct {
         if (!workspaceHasRoom(layout)) return;
         drawStudioPanel(layout.organizer);
         drawStudioPanel(layout.library);
+        // The selection wash belongs in this pass, not the overlay: slide
+        // thumbnails and Library visuals are rendered in between, so filling a
+        // card later would paint straight over the artwork it is meant to mark.
         for (0..slideCardCapacity(layout)) |visible_slot| {
-            if (self.visibleSlidePreview(viewport, workspace, visible_slot) == null) break;
+            const preview = self.visibleSlidePreview(viewport, workspace, visible_slot) orelse break;
             const card = slideCardRect(layout, visible_slot) orelse break;
-            rl.drawRectangleRec(card, theme.row);
+            const active = preview.slide_index == workspace.current_slide;
+            rl.drawRectangleRec(card, if (active) theme.accent_soft else theme.row);
             rl.drawRectangleRec(slidePreviewRect(card), theme.sunken);
         }
         for (0..libraryRowCapacity(layout)) |visible_slot| {
             const entry_index = self.visibleLibraryIndex(viewport, workspace, visible_slot) orelse break;
             const row = libraryRowRect(layout, visible_slot) orelse break;
             const entry = workspace.library[entry_index];
-            rl.drawRectangleRec(row, if (entry.available) theme.row else theme.control_disabled);
+            const selected = self.selected_library_index != null and self.selected_library_index.? == entry_index;
+            rl.drawRectangleRec(row, if (selected)
+                theme.accent_soft
+            else if (entry.available)
+                theme.row
+            else
+                theme.control_disabled);
         }
     }
 
@@ -11685,7 +11695,6 @@ pub const Studio = struct {
             const card = slideCardRect(layout, visible_slot) orelse break;
             const active = summary.index == workspace.current_slide;
             const border: rl.Color = if (active) theme.accent else theme.border;
-            if (active) rl.drawRectangleRec(card, theme.accent_soft);
             rl.drawRectangleLinesEx(card, if (active) 2 else 1, border);
             if (self.active_search == .slides and result_index == self.slide_search.selected_result)
                 rl.drawRectangleLinesEx(.{ .x = card.x + 3, .y = card.y + 3, .width = card.width - 6, .height = card.height - 6 }, 1, theme.accent_bright);
@@ -11774,7 +11783,6 @@ pub const Studio = struct {
                 theme.border_subtle
             else
                 theme.border;
-            if (selected) rl.drawRectangleRec(row, theme.accent_soft);
             rl.drawRectangleLinesEx(row, if (selected) 2 else 1, border);
             if (self.active_search == .library and result_index == self.library_search.selected_result)
                 rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 1, theme.accent_bright);
