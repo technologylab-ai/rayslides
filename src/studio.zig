@@ -16,6 +16,7 @@ const rl = @import("raylib");
 const animation = @import("animation.zig");
 const slides = @import("slides.zig");
 const studio_new_deck = @import("studio_new_deck.zig");
+const theme = @import("studio_theme.zig");
 
 pub const NewDeckPreset = studio_new_deck.Preset;
 
@@ -56,6 +57,18 @@ pub const UiTypography = struct {
 };
 
 const media_picker_button_label: [:0]const u8 = "...";
+
+/// Internal padding of an inline property field. These were spelled out as
+/// bare 7s and 6s at each call site (and mirrored in the tests), which is how
+/// the compact geometry fields ended up clipping "1300" to "130C".
+pub const InlineFieldPadding = struct {
+    /// Left inset of the label.
+    pub const left: f32 = 6;
+    /// Space between the label and its value.
+    pub const label_gap: f32 = 5;
+    /// Space kept clear at the right edge so the caret never touches it.
+    pub const right: f32 = 4;
+};
 
 pub fn uiScale(viewport: Viewport) f32 {
     if (!viewport.valid()) return 1;
@@ -415,10 +428,10 @@ pub fn frameLayout(
     else
         .compact;
     const compact_shell = mode == .compact;
-    const gap: f32 = @as(f32, if (compact_shell) 8 else 10) * scale;
-    const edge: f32 = 12 * scale;
-    const toolbar_height: f32 = @as(f32, if (compact_shell) 64 else 70) * scale;
-    const status_height: f32 = @as(f32, if (compact_shell) 76 else 116) * scale;
+    const gap: f32 = @as(f32, if (compact_shell) 6 else 8) * scale;
+    const edge: f32 = 8 * scale;
+    const toolbar_height: f32 = @as(f32, if (compact_shell) 44 else 48) * scale;
+    const status_height: f32 = @as(f32, if (compact_shell) 68 else 100) * scale;
     const toolbar: rl.Rectangle = .{
         .x = safe_content.x,
         .y = safe_content.y,
@@ -1952,11 +1965,11 @@ fn emptyUiLayout(scale: f32) UiLayout {
 }
 
 pub const organizer_action_count = 6;
-pub const slide_card_height: f32 = 88;
-pub const slide_card_gap: f32 = 7;
-pub const library_row_height: f32 = 46;
-pub const library_row_gap: f32 = 6;
-pub const workspace_min_height: f32 = 260;
+pub const slide_card_height: f32 = 66;
+pub const slide_card_gap: f32 = 4;
+pub const library_row_height: f32 = 44;
+pub const library_row_gap: f32 = 4;
+pub const workspace_min_height: f32 = 220;
 
 pub const LibraryVisualDensity = enum { compact, standard, large };
 
@@ -2493,8 +2506,8 @@ fn drawStarterPreview(studio: Studio, rect: rl.Rectangle, preset: NewDeckPreset,
     }
 }
 
-pub const object_row_height: f32 = 54;
-pub const object_row_gap: f32 = 5;
+pub const object_row_height: f32 = 44;
+pub const object_row_gap: f32 = 3;
 
 /// Stable geometry for the tabbed Objects/Properties inspector. Rows are
 /// intentionally derived separately so large scenes remain allocation-free.
@@ -2649,13 +2662,19 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     const margin: f32 = 12 * scale;
     const docked = if (viewport.chrome) |chrome| chrome.visible else false;
     const compact_toolbar = if (viewport.chrome) |chrome| chrome.content.width < 1100 else false;
-    const gap: f32 = @as(f32, if (compact_toolbar) 3 else 8) * scale;
-    const tool_size: f32 = @as(f32, if (compact_toolbar) 30 else 46) * scale;
-    const new_slide_width: f32 = @as(f32, if (compact_toolbar) 58 else 82) * scale;
-    const grid_width: f32 = @as(f32, if (compact_toolbar) 46 else 66) * scale;
-    const grid_settings_width: f32 = @as(f32, if (compact_toolbar) 20 else 28) * scale;
-    const scene_width: f32 = @as(f32, if (compact_toolbar) 104 else 150) * scale;
-    const toolbar_width = margin * 2 + tool_size * 8 + gap * 7 + gap + new_slide_width + gap + grid_width + grid_settings_width + gap + scene_width;
+    const gap: f32 = @as(f32, if (compact_toolbar) 3 else 5) * scale;
+    // Tool buttons carry 3-4 character text labels, so they are sized as a
+    // segmented control: wide enough for "RECT", only as tall as the band.
+    const tool_size: f32 = @as(f32, if (compact_toolbar) 28 else 32) * scale;
+    const tool_width: f32 = @as(f32, if (compact_toolbar) 30 else 48) * scale;
+    const new_slide_width: f32 = @as(f32, if (compact_toolbar) 56 else 72) * scale;
+    const grid_width: f32 = @as(f32, if (compact_toolbar) 44 else 58) * scale;
+    const grid_settings_width: f32 = @as(f32, if (compact_toolbar) 20 else 24) * scale;
+    const scene_width: f32 = @as(f32, if (compact_toolbar) 100 else 132) * scale;
+    // Toolbar padding is independent of the panel margin so the button row can
+    // hug the 48 px band without dragging every other dock metric with it.
+    const toolbar_padding: f32 = @as(f32, if (compact_toolbar) 6 else 8) * scale;
+    const toolbar_width = toolbar_padding * 2 + tool_width * 8 + gap * 7 + gap + new_slide_width + gap + grid_width + grid_settings_width + gap + scene_width;
     const toolbar: rl.Rectangle = if (docked)
         viewport.chrome.?.toolbar
     else
@@ -2663,18 +2682,20 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .x = viewport.slide_top_left.x + margin,
             .y = viewport.slide_top_left.y + margin,
             .width = toolbar_width,
-            .height = tool_size + margin * 2,
+            .height = tool_size + toolbar_padding * 2,
         };
+    // Every control in the band shares one vertical centre line.
+    const tool_row_y = toolbar.y + (toolbar.height - tool_size) / 2;
     var tool_buttons: [8]rl.Rectangle = undefined;
     for (&tool_buttons, 0..) |*button, index| button.* = .{
-        .x = toolbar.x + margin + @as(f32, @floatFromInt(index)) * (tool_size + gap),
-        .y = toolbar.y + margin,
-        .width = tool_size,
+        .x = toolbar.x + toolbar_padding + @as(f32, @floatFromInt(index)) * (tool_width + gap),
+        .y = tool_row_y,
+        .width = tool_width,
         .height = tool_size,
     };
     const new_slide: rl.Rectangle = .{
         .x = tool_buttons[7].x + tool_buttons[7].width + gap,
-        .y = toolbar.y + margin,
+        .y = tool_row_y,
         .width = new_slide_width,
         .height = tool_size,
     };
@@ -2710,12 +2731,12 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     };
 
     const dock_button_gap: f32 = gap;
-    const focus_width: f32 = @as(f32, if (compact_toolbar) 64 else 76) * scale;
-    const properties_toggle_width: f32 = @as(f32, if (compact_toolbar) 86 else 104) * scale;
-    const slides_toggle_width: f32 = @as(f32, if (compact_toolbar) 68 else 82) * scale;
+    const focus_width: f32 = @as(f32, if (compact_toolbar) 60 else 68) * scale;
+    const properties_toggle_width: f32 = @as(f32, if (compact_toolbar) 80 else 92) * scale;
+    const slides_toggle_width: f32 = @as(f32, if (compact_toolbar) 64 else 72) * scale;
     const focus_canvas: rl.Rectangle = if (docked) .{
-        .x = toolbar.x + toolbar.width - margin - focus_width,
-        .y = toolbar.y + (toolbar.height - tool_size) / 2,
+        .x = toolbar.x + toolbar.width - toolbar_padding - focus_width,
+        .y = tool_row_y,
         .width = focus_width,
         .height = tool_size,
     } else empty_ui_rectangle;
@@ -2732,7 +2753,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = slides_toggle_width,
         .height = tool_size,
     } else empty_ui_rectangle;
-    const command_width: f32 = @as(f32, if (compact_toolbar) 92 else 112) * scale;
+    const command_width: f32 = @as(f32, if (compact_toolbar) 84 else 98) * scale;
     const command_anchor_x = if (slides_dock_toggle.width > 0) slides_dock_toggle.x else focus_canvas.x;
     const command_palette: rl.Rectangle = if (docked) .{
         .x = command_anchor_x - dock_button_gap - command_width,
@@ -3315,17 +3336,17 @@ pub fn commandPaletteLayout(viewport: Viewport) CommandPaletteLayout {
         .height = viewport.slide_size.y,
     };
     const margin = 20 * scale;
-    const panel_width = @min(780 * scale, @max(0, bounds.width - margin * 2));
-    const panel_height = @min(590 * scale, @max(0, bounds.height - margin * 2));
+    const panel_width = @min(660 * scale, @max(0, bounds.width - margin * 2));
+    const panel_height = @min(430 * scale, @max(0, bounds.height - margin * 2));
     const panel: rl.Rectangle = .{
         .x = bounds.x + (bounds.width - panel_width) / 2,
-        .y = bounds.y + @max(margin, (bounds.height - panel_height) * 0.18),
+        .y = bounds.y + @max(margin, (bounds.height - panel_height) * 0.14),
         .width = panel_width,
         .height = panel_height,
     };
-    const inset = 18 * scale;
-    const search_height = 58 * scale;
-    const footer_height = 38 * scale;
+    const inset = 10 * scale;
+    const search_height = 40 * scale;
+    const footer_height = 26 * scale;
     const search: rl.Rectangle = .{
         .x = panel.x + inset,
         .y = panel.y + inset,
@@ -3344,13 +3365,16 @@ pub fn commandPaletteLayout(viewport: Viewport) CommandPaletteLayout {
         .search = search,
         .rows_clip = .{
             .x = search.x,
-            .y = search.y + search.height + 12 * scale,
+            .y = search.y + search.height + 6 * scale,
             .width = search.width,
-            .height = @max(0, footer.y - 10 * scale - (search.y + search.height + 12 * scale)),
+            .height = @max(0, footer.y - 6 * scale - (search.y + search.height + 6 * scale)),
         },
         .footer = footer,
-        .row_height = 62 * scale,
-        .row_gap = 6 * scale,
+        // Single-line rows. The old two-line card was 62 px tall and showed six
+        // commands; at 34 px the same panel lists more than a dozen without
+        // scrolling, which is the whole point of a command palette.
+        .row_height = 34 * scale,
+        .row_gap = 2 * scale,
     };
 }
 
@@ -11416,17 +11440,14 @@ pub const Studio = struct {
         for (0..slideCardCapacity(layout)) |visible_slot| {
             if (self.visibleSlidePreview(viewport, workspace, visible_slot) == null) break;
             const card = slideCardRect(layout, visible_slot) orelse break;
-            rl.drawRectangleRec(card, .{ .r = 25, .g = 31, .b = 45, .a = 250 });
-            rl.drawRectangleRec(slidePreviewRect(card), .{ .r = 4, .g = 7, .b = 13, .a = 255 });
+            rl.drawRectangleRec(card, theme.row);
+            rl.drawRectangleRec(slidePreviewRect(card), theme.sunken);
         }
         for (0..libraryRowCapacity(layout)) |visible_slot| {
             const entry_index = self.visibleLibraryIndex(viewport, workspace, visible_slot) orelse break;
             const row = libraryRowRect(layout, visible_slot) orelse break;
             const entry = workspace.library[entry_index];
-            rl.drawRectangleRec(row, if (entry.available)
-                .{ .r = 25, .g = 31, .b = 45, .a = 250 }
-            else
-                .{ .r = 22, .g = 25, .b = 32, .a = 245 });
+            rl.drawRectangleRec(row, if (entry.available) theme.row else theme.control_disabled);
         }
     }
 
@@ -11442,16 +11463,13 @@ pub const Studio = struct {
     ) void {
         if (rect.width <= 0 or rect.height <= 0) return;
         const engaged = active or search.len > 0;
-        rl.drawRectangleRounded(rect, 0.16, 6, if (engaged)
-            .{ .r = 18, .g = 31, .b = 48, .a = 255 }
-        else
-            .{ .r = 22, .g = 28, .b = 40, .a = 235 });
+        rl.drawRectangleRounded(rect, 0.16, 6, if (engaged) theme.field else theme.control);
         rl.drawRectangleRoundedLinesEx(rect, 0.16, 6, if (active) 2 else 1, if (active)
-            .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            theme.accent
         else if (search.len > 0)
-            .{ .r = 255, .g = 92, .b = 198, .a = 220 }
+            theme.alpha(theme.accent, 150)
         else
-            .{ .r = 87, .g = 101, .b = 125, .a = 190 });
+            theme.border_strong);
 
         var label_buffer: [192]u8 = undefined;
         const raw_label: []const u8 = if (active and search.len > 0)
@@ -11479,17 +11497,17 @@ pub const Studio = struct {
                 .y = rect.y + 3,
                 .width = @min(available_width + 4, self.measureUiText(fitted, font_size) + 4),
                 .height = @max(0, rect.height - 6),
-            }, .{ .r = 43, .g = 123, .b = 151, .a = 190 });
+            }, theme.selection);
         }
         self.drawUiText(fitted, .{
             .x = text_position.x,
             .y = text_position.y,
         }, font_size, if (search.len > 0)
-            .white
+            theme.text
         else if (active)
-            .{ .r = 157, .g = 181, .b = 210, .a = 255 }
+            theme.text_muted
         else
-            .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+            theme.text_secondary);
         if (active and (!search.select_all or search.len == 0)) {
             const caret_x = if (search.len == 0)
                 text_position.x
@@ -11500,14 +11518,14 @@ pub const Studio = struct {
                 .y = rect.y + 4,
                 .width = 1.5,
                 .height = @max(0, rect.height - 8),
-            }, .{ .r = 114, .g = 226, .b = 255, .a = 255 });
+            }, theme.accent_bright);
         }
         if (search.len > 0) {
             const clear_label: [:0]const u8 = "×";
             self.drawUiText(clear_label, .{
                 .x = rect.x + rect.width - 18,
                 .y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2,
-            }, font_size, .{ .r = 255, .g = 143, .b = 211, .a = 255 });
+            }, font_size, theme.text_muted);
         }
     }
 
@@ -11519,8 +11537,8 @@ pub const Studio = struct {
     ) void {
         _ = self;
         if (visual_rect.width <= 0 or visual_rect.height <= 0) return;
-        rl.drawRectangleRec(visual_rect, .{ .r = 10, .g = 17, .b = 29, .a = 255 });
-        rl.drawRectangleLinesEx(visual_rect, 1, .{ .r = 111, .g = 127, .b = 151, .a = 210 });
+        rl.drawRectangleRec(visual_rect, theme.sunken);
+        rl.drawRectangleLinesEx(visual_rect, 1, theme.border);
         const summary = visual orelse {
             const center = rl.Vector2{
                 .x = visual_rect.x + visual_rect.width / 2,
@@ -11578,7 +11596,7 @@ pub const Studio = struct {
                     item.color,
                 ),
                 .img, .vid => {
-                    rl.drawRectangleRounded(rect, 0.05, 4, .{ .r = 44, .g = 57, .b = 77, .a = 255 });
+                    rl.drawRectangleRounded(rect, 0.05, 4, theme.control);
                     rl.drawLineEx(
                         .{ .x = rect.x, .y = rect.y + rect.height },
                         .{ .x = rect.x + rect.width * 0.44, .y = rect.y + rect.height * 0.45 },
@@ -11624,7 +11642,7 @@ pub const Studio = struct {
         const heading_font = scaledUiFont(font_scale, UiTypography.heading);
         const body_font = scaledUiFont(font_scale, UiTypography.body);
         const compact_font = scaledUiFont(font_scale, UiTypography.compact);
-        self.drawUiText("SLIDES", .{ .x = layout.organizer.x + 12 * font_scale, .y = layout.organizer.y + 9 * font_scale }, heading_font, .white);
+        self.drawUiText("SLIDES", .{ .x = layout.organizer.x + 12 * font_scale, .y = layout.organizer.y + 9 * font_scale }, heading_font, theme.text_heading);
         const action_labels = [_][:0]const u8{ "+", "Dup", "Del", "Up", "Down", "Tpl" };
         for (layout.organizer_actions, action_labels) |button, label| drawCompactButton(self, button, label);
         const slide_search_engaged = self.active_search == .slides or self.slide_search.len > 0;
@@ -11666,14 +11684,12 @@ pub const Studio = struct {
             const summary = workspace.slides[summary_index];
             const card = slideCardRect(layout, visible_slot) orelse break;
             const active = summary.index == workspace.current_slide;
-            const border: rl.Color = if (active)
-                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-            else
-                .{ .r = 103, .g = 117, .b = 140, .a = 210 };
-            rl.drawRectangleLinesEx(card, if (active) 3 else 1, border);
+            const border: rl.Color = if (active) theme.accent else theme.border;
+            if (active) rl.drawRectangleRec(card, theme.accent_soft);
+            rl.drawRectangleLinesEx(card, if (active) 2 else 1, border);
             if (self.active_search == .slides and result_index == self.slide_search.selected_result)
-                rl.drawRectangleLinesEx(.{ .x = card.x + 3, .y = card.y + 3, .width = card.width - 6, .height = card.height - 6 }, 2, .{ .r = 255, .g = 92, .b = 198, .a = 235 });
-            rl.drawRectangleLinesEx(slidePreviewRect(card), 1, .{ .r = 145, .g = 158, .b = 180, .a = 220 });
+                rl.drawRectangleLinesEx(.{ .x = card.x + 3, .y = card.y + 3, .width = card.width - 6, .height = card.height - 6 }, 1, theme.accent_bright);
+            rl.drawRectangleLinesEx(slidePreviewRect(card), 1, theme.border);
 
             const preview = slidePreviewRect(card);
             const text_x = preview.x + preview.width + 9 * font_scale;
@@ -11687,10 +11703,10 @@ pub const Studio = struct {
             );
             var line_buffer: [96]u8 = undefined;
             const slide_number = std.fmt.bufPrintZ(&line_buffer, "SLIDE {d}", .{summary.index + 1}) catch "SLIDE";
-            self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 7 * font_scale }, compact_font, if (active) border else .white);
+            self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 6 * font_scale }, compact_font, if (active) theme.accent_bright else theme.text_muted);
             var title_buffer: [96]u8 = undefined;
             const title = self.fitUiText(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title, body_font, text_width);
-            self.drawUiText(title, .{ .x = text_x, .y = card.y + 28 * font_scale }, body_font, .white);
+            self.drawUiText(title, .{ .x = text_x, .y = card.y + 23 * font_scale }, body_font, theme.text);
             var metadata_buffer: [96]u8 = undefined;
             const metadata = std.fmt.bufPrintZ(
                 &metadata_buffer,
@@ -11699,11 +11715,11 @@ pub const Studio = struct {
             ) catch "slide details";
             var fitted_metadata_buffer: [96]u8 = undefined;
             const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
-            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = card.y + 57 * font_scale }, compact_font, .{ .r = 185, .g = 196, .b = 215, .a = 255 });
+            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = card.y + 45 * font_scale }, compact_font, theme.text_muted);
             rl.endScissorMode();
         }
 
-        self.drawUiText("LIBRARY", .{ .x = layout.library.x + 12 * font_scale, .y = layout.library.y + 9 * font_scale }, heading_font, .white);
+        self.drawUiText("LIBRARY", .{ .x = layout.library.x + 12 * font_scale, .y = layout.library.y + 9 * font_scale }, heading_font, theme.text_heading);
         drawCompactButton(self, layout.library_use, "Use");
         drawCompactButton(self, layout.library_edit, "Edit");
         drawCompactButton(self, layout.library_rename, "Ren");
@@ -11753,24 +11769,25 @@ pub const Studio = struct {
             const row = libraryRowRect(layout, visible_slot) orelse break;
             const selected = self.selected_library_index != null and self.selected_library_index.? == entry_index;
             const border: rl.Color = if (selected)
-                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+                theme.accent
             else if (!entry.available)
-                .{ .r = 85, .g = 90, .b = 102, .a = 180 }
+                theme.border_subtle
             else
-                .{ .r = 103, .g = 117, .b = 140, .a = 210 };
+                theme.border;
+            if (selected) rl.drawRectangleRec(row, theme.accent_soft);
             rl.drawRectangleLinesEx(row, if (selected) 2 else 1, border);
             if (self.active_search == .library and result_index == self.library_search.selected_result)
-                rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 2, .{ .r = 255, .g = 92, .b = 198, .a = 235 });
+                rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 1, theme.accent_bright);
             const badge: [:0]const u8 = switch (entry.kind) {
                 .element => "ITEM",
                 .group => "GROUP",
                 .slide_template => "SLIDE",
             };
-            const accent: rl.Color = switch (entry.kind) {
-                .element => .{ .r = 43, .g = 123, .b = 151, .a = if (entry.available) 255 else 100 },
-                .group => .{ .r = 170, .g = 91, .b = 126, .a = if (entry.available) 255 else 100 },
-                .slide_template => .{ .r = 116, .g = 83, .b = 160, .a = if (entry.available) 255 else 100 },
-            };
+            const accent: rl.Color = theme.alpha(switch (entry.kind) {
+                .element => theme.kind_element,
+                .group => theme.kind_group,
+                .slide_template => theme.kind_slide,
+            }, if (entry.available) 255 else 100);
             const visual_rect = libraryVisualRect(layout, row);
             self.drawLibraryVisualCard(
                 visual_rect,
@@ -11788,7 +11805,7 @@ pub const Studio = struct {
             self.drawUiText(badge, .{
                 .x = badge_rect.x + (badge_rect.width - badge_width) / 2,
                 .y = badge_rect.y + (badge_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
-            }, compact_font, .white);
+            }, compact_font, theme.text);
             const text_x = visual_rect.x + visual_rect.width + 8 * font_scale;
             const text_width = @max(0, row.x + row.width - text_x - 7 * font_scale);
             if (text_width <= 0) continue;
@@ -11800,10 +11817,10 @@ pub const Studio = struct {
             );
             var name_buffer: [128]u8 = undefined;
             const name = self.fitUiText(&name_buffer, entry.name, body_font, text_width);
-            self.drawUiText(name, .{ .x = text_x, .y = row.y + 6 * font_scale }, body_font, if (entry.available)
-                .white
+            self.drawUiText(name, .{ .x = text_x, .y = row.y + 5 * font_scale }, body_font, if (entry.available)
+                theme.text
             else
-                .{ .r = 130, .g = 136, .b = 149, .a = 255 });
+                theme.text_disabled);
             var usage_buffer: [48]u8 = undefined;
             const usage: [:0]const u8 = if (entry.use_count == 0)
                 "unused"
@@ -11811,11 +11828,8 @@ pub const Studio = struct {
                 std.fmt.bufPrintZ(&usage_buffer, "{d} use{s}", .{ entry.use_count, if (entry.use_count == 1) "" else "s" }) catch "used";
             self.drawUiText(usage, .{
                 .x = text_x,
-                .y = row.y + row.height - @as(f32, @floatFromInt(compact_font)) - 6 * font_scale,
-            }, compact_font, if (entry.deletable)
-                .{ .r = 126, .g = 231, .b = 177, .a = 255 }
-            else
-                .{ .r = 168, .g = 179, .b = 198, .a = 255 });
+                .y = row.y + row.height - @as(f32, @floatFromInt(compact_font)) - 5 * font_scale,
+            }, compact_font, if (entry.deletable) theme.success else theme.text_muted);
             rl.endScissorMode();
         }
         if (workspace.new_deck) self.drawNewDeckChooser(viewport);
@@ -11834,9 +11848,9 @@ pub const Studio = struct {
         if (canvas.width <= 0 or canvas.height <= 0) return;
         const scale = uiScale(viewport);
         const accent: rl.Color = switch (entry.kind) {
-            .element => .{ .r = 80, .g = 215, .b = 255, .a = 255 },
-            .group => .{ .r = 255, .g = 112, .b = 176, .a = 255 },
-            .slide_template => .{ .r = 183, .g = 139, .b = 255, .a = 255 },
+            .element => theme.kind_element,
+            .group => theme.kind_group,
+            .slide_template => theme.kind_slide,
         };
         rl.drawRectangleLinesEx(.{
             .x = viewport.slide_top_left.x,
@@ -11853,7 +11867,7 @@ pub const Studio = struct {
             .height = (if (compact) @as(f32, 44) else 64) * scale,
         };
         if (card.width <= 0) return;
-        rl.drawRectangleRounded(card, 0.16, 8, .{ .r = 7, .g = 12, .b = 22, .a = 244 });
+        rl.drawRectangleRounded(card, 0.16, 8, theme.raised);
         rl.drawRectangleRoundedLinesEx(card, 0.16, 8, 1.5 * scale, accent);
         rl.drawRectangleRec(.{
             .x = card.x,
@@ -11887,13 +11901,13 @@ pub const Studio = struct {
                 card.y + (card.height - @as(f32, @floatFromInt(heading_font))) / 2
             else
                 card.y + 10 * scale,
-        }, heading_font, .white);
+        }, heading_font, theme.text);
         if (!compact) {
             self.drawUiText(
                 "READ ONLY · Properties or Library Edit edits · Esc returns",
                 .{ .x = card.x + 15 * scale, .y = card.y + 36 * scale },
                 scaledUiFont(scale, UiTypography.compact),
-                .{ .r = 190, .g = 202, .b = 221, .a = 255 },
+                theme.text_muted,
             );
         }
     }
@@ -11936,9 +11950,9 @@ pub const Studio = struct {
         if (canvas.width <= 0 or canvas.height <= 0) return;
         const scale = uiScale(viewport);
         const accent: rl.Color = switch (mode.kind) {
-            .element => .{ .r = 80, .g = 215, .b = 255, .a = 255 },
-            .group => .{ .r = 255, .g = 112, .b = 176, .a = 255 },
-            .slide_template => .{ .r = 183, .g = 139, .b = 255, .a = 255 },
+            .element => theme.kind_element,
+            .group => theme.kind_group,
+            .slide_template => theme.kind_slide,
         };
         rl.drawRectangleLinesEx(.{
             .x = viewport.slide_top_left.x,
@@ -11948,14 +11962,14 @@ pub const Studio = struct {
         }, 3 * scale, accent);
 
         const back = definitionBackRect(viewport);
-        rl.drawRectangleRounded(back, 0.16, 8, .{ .r = 7, .g = 12, .b = 22, .a = 244 });
+        rl.drawRectangleRounded(back, 0.16, 8, theme.raised);
         rl.drawRectangleRoundedLinesEx(back, 0.16, 8, 1.5 * scale, accent);
         const back_label: [:0]const u8 = "< Back";
         const back_font = scaledUiFont(scale, UiTypography.body);
         self.drawUiText(back_label, .{
             .x = back.x + (back.width - self.measureUiText(back_label, back_font)) / 2,
             .y = back.y + (back.height - @as(f32, @floatFromInt(back_font))) / 2,
-        }, back_font, .white);
+        }, back_font, theme.text);
 
         const card: rl.Rectangle = .{
             .x = back.x + back.width + 8 * scale,
@@ -11964,7 +11978,7 @@ pub const Studio = struct {
             .height = back.height,
         };
         if (card.width <= 0) return;
-        rl.drawRectangleRounded(card, 0.16, 8, .{ .r = 7, .g = 12, .b = 22, .a = 244 });
+        rl.drawRectangleRounded(card, 0.16, 8, theme.raised);
         rl.drawRectangleRoundedLinesEx(card, 0.16, 8, 1.5 * scale, accent);
         const kind: []const u8 = switch (mode.kind) {
             .element => "ITEM",
@@ -11976,7 +11990,7 @@ pub const Studio = struct {
         var fitted_buffer: [192]u8 = undefined;
         const heading_font = scaledUiFont(scale, UiTypography.heading);
         const fitted = self.fitUiText(&fitted_buffer, title, heading_font, @max(0, card.width - 28 * scale));
-        self.drawUiText(fitted, .{ .x = card.x + 14 * scale, .y = card.y + 10 * scale }, heading_font, .white);
+        self.drawUiText(fitted, .{ .x = card.x + 14 * scale, .y = card.y + 10 * scale }, heading_font, theme.text);
         var detail_buffer: [160]u8 = undefined;
         const detail = std.fmt.bufPrintZ(
             &detail_buffer,
@@ -11991,7 +12005,7 @@ pub const Studio = struct {
             self.fitUiText(&fitted_buffer, detail, scaledUiFont(scale, UiTypography.compact), @max(0, card.width - 28 * scale)),
             .{ .x = card.x + 14 * scale, .y = card.y + 36 * scale },
             scaledUiFont(scale, UiTypography.compact),
-            .{ .r = 190, .g = 202, .b = 221, .a = 255 },
+            theme.text_muted,
         );
     }
 
@@ -12022,19 +12036,19 @@ pub const Studio = struct {
         const scale = uiScale(viewport);
         const body_font = scaledUiFont(scale, UiTypography.body);
         const compact_font = scaledUiFont(scale, UiTypography.compact);
-        const muted: rl.Color = .{ .r = 168, .g = 179, .b = 198, .a = 255 };
-        const accent: rl.Color = .{ .r = 80, .g = 215, .b = 255, .a = 255 };
+        const muted: rl.Color = theme.text_muted;
+        const accent: rl.Color = theme.accent;
 
         rl.drawRectangleRounded(.{
             .x = layout.panel.x + 5 * scale,
             .y = layout.panel.y + 7 * scale,
             .width = layout.panel.width,
             .height = layout.panel.height,
-        }, 0.045, 10, .{ .r = 0, .g = 0, .b = 0, .a = 110 });
-        rl.drawRectangleRounded(layout.panel, 0.045, 10, .{ .r = 10, .g = 16, .b = 29, .a = 252 });
-        rl.drawRectangleRoundedLinesEx(layout.panel, 0.045, 10, 1.5 * scale, .{ .r = 80, .g = 215, .b = 255, .a = 220 });
+        }, 0.045, 10, theme.alpha(theme.shadow, 110));
+        rl.drawRectangleRounded(layout.panel, 0.045, 10, theme.raised);
+        rl.drawRectangleRoundedLinesEx(layout.panel, 0.045, 10, scale, theme.border_strong);
 
-        self.drawUiText("GRID APPEARANCE", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 12 * scale }, body_font, .white);
+        self.drawUiText("GRID APPEARANCE", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 12 * scale }, body_font, theme.text_heading);
         const appearance_labels = [_][:0]const u8{ "AUTO", "DARK", "LIGHT" };
         for (layout.appearance_buttons, appearance_labels, 0..) |button, label, index|
             drawToggleButton(self, button, label, @intFromEnum(self.grid_appearance) == index);
@@ -12046,8 +12060,8 @@ pub const Studio = struct {
         self.drawUiText(contrast_label, .{
             .x = layout.panel.x + layout.panel.width - 14 * scale - contrast_width,
             .y = layout.panel.y + 79 * scale,
-        }, compact_font, .white);
-        rl.drawRectangleRounded(layout.contrast_track, 0.5, 8, .{ .r = 52, .g = 61, .b = 78, .a = 255 });
+        }, compact_font, theme.text);
+        rl.drawRectangleRounded(layout.contrast_track, 0.5, 8, theme.control);
         const normalized = std.math.clamp(self.grid_contrast / maximum_grid_contrast, 0, 1);
         if (normalized > 0) rl.drawRectangleRounded(.{
             .x = layout.contrast_track.x,
@@ -12059,13 +12073,86 @@ pub const Studio = struct {
             .x = layout.contrast_track.x + layout.contrast_track.width * normalized,
             .y = layout.contrast_track.y + layout.contrast_track.height / 2,
         };
-        rl.drawCircleV(knob_center, 7 * scale, .{ .r = 10, .g = 16, .b = 29, .a = 255 });
+        rl.drawCircleV(knob_center, 7 * scale, theme.sunken);
         rl.drawCircleV(knob_center, 4.5 * scale, accent);
 
         self.drawUiText("STYLE", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 139 * scale }, compact_font, muted);
         const style_labels = [_][:0]const u8{ "LINES", "DOTS" };
         for (layout.style_buttons, style_labels, 0..) |button, label, index|
             drawToggleButton(self, button, label, @intFromEnum(self.grid_style) == index);
+    }
+
+    /// The search line for a floating overlay: magnifier glyph, query text, a
+    /// blinking-free caret, and a hairline rule instead of a boxed field, so
+    /// the query reads as the panel's title rather than a nested widget.
+    fn drawOverlaySearch(
+        self: Studio,
+        layout: CommandPaletteLayout,
+        query: []const u8,
+        placeholder: []const u8,
+    ) void {
+        const scale = layout.scale;
+        const heading_font = scaledUiFont(scale, UiTypography.heading);
+        const glyph_center: rl.Vector2 = .{
+            .x = layout.search.x + 11 * scale,
+            .y = layout.search.y + layout.search.height / 2,
+        };
+        const glyph_radius = 5 * scale;
+        rl.drawCircleLinesV(glyph_center, glyph_radius, theme.text_muted);
+        rl.drawLineEx(
+            .{ .x = glyph_center.x + glyph_radius * 0.72, .y = glyph_center.y + glyph_radius * 0.72 },
+            .{ .x = glyph_center.x + glyph_radius * 1.6, .y = glyph_center.y + glyph_radius * 1.6 },
+            @max(1, 1.5 * scale),
+            theme.text_muted,
+        );
+        rl.drawRectangleRec(.{
+            .x = layout.search.x,
+            .y = layout.search.y + layout.search.height,
+            .width = layout.search.width,
+            .height = @max(1, scale),
+        }, theme.border);
+
+        const query_x = layout.search.x + 26 * scale;
+        const query_source: []const u8 = if (query.len > 0) query else placeholder;
+        var query_buffer: [256]u8 = undefined;
+        const fitted_query = self.fitUiText(
+            &query_buffer,
+            query_source,
+            heading_font,
+            @max(0, layout.search.x + layout.search.width - query_x - 10 * scale),
+        );
+        self.drawUiText(fitted_query, .{
+            .x = query_x,
+            .y = layout.search.y + (layout.search.height - @as(f32, @floatFromInt(heading_font))) / 2,
+        }, heading_font, if (query.len > 0) theme.text else theme.text_muted);
+        const caret_x = if (query.len == 0)
+            query_x
+        else
+            @min(
+                layout.search.x + layout.search.width - 4 * scale,
+                query_x + self.measureUiText(fitted_query, heading_font) + 2 * scale,
+            );
+        rl.drawRectangleRec(.{
+            .x = caret_x,
+            .y = layout.search.y + 9 * scale,
+            .width = @max(1, 1.5 * scale),
+            .height = @max(0, layout.search.height - 18 * scale),
+        }, theme.accent_bright);
+    }
+
+    /// Footer shared by the overlay lists: a result count on the left and the
+    /// key hints on the right, both deliberately quiet.
+    fn drawOverlayFooter(self: Studio, layout: CommandPaletteLayout, count_text: []const u8, help: [:0]const u8) void {
+        const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
+        const baseline = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2;
+        var count_buffer: [64]u8 = undefined;
+        const fitted_count = self.fitUiText(&count_buffer, count_text, compact_font, layout.footer.width * 0.5);
+        self.drawUiText(fitted_count, .{ .x = layout.footer.x, .y = baseline }, compact_font, theme.text_muted);
+        const help_width = self.measureUiText(help, compact_font);
+        self.drawUiText(help, .{
+            .x = layout.footer.x + layout.footer.width - help_width,
+            .y = baseline,
+        }, compact_font, theme.text_muted);
     }
 
     fn drawReusablePicker(self: Studio, viewport: Viewport, workspace: Workspace) void {
@@ -12078,78 +12165,12 @@ pub const Studio = struct {
             .height = viewport.slide_size.y,
         };
         const scale = layout.scale;
-        const heading_font = scaledUiFont(scale, 20);
         const body_font = scaledUiFont(scale, UiTypography.body);
         const compact_font = scaledUiFont(scale, UiTypography.compact);
 
-        rl.drawRectangleRec(bounds, .{ .r = 2, .g = 5, .b = 12, .a = 188 });
-        rl.drawRectangleRounded(.{
-            .x = layout.panel.x + 12 * scale,
-            .y = layout.panel.y + 16 * scale,
-            .width = layout.panel.width,
-            .height = layout.panel.height,
-        }, 0.035, 12, .{ .r = 0, .g = 0, .b = 0, .a = 72 });
-        rl.drawRectangleRounded(.{
-            .x = layout.panel.x + 5 * scale,
-            .y = layout.panel.y + 7 * scale,
-            .width = layout.panel.width,
-            .height = layout.panel.height,
-        }, 0.035, 12, .{ .r = 0, .g = 0, .b = 0, .a = 118 });
-        rl.drawRectangleRounded(layout.panel, 0.035, 12, .{ .r = 10, .g = 16, .b = 29, .a = 252 });
-        rl.drawRectangleRoundedLinesEx(layout.panel, 0.035, 12, 2 * scale, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
-        rl.drawRectangleRec(.{
-            .x = layout.panel.x + 18 * scale,
-            .y = layout.panel.y,
-            .width = @max(0, layout.panel.width * 0.34),
-            .height = 3 * scale,
-        }, .{ .r = 255, .g = 92, .b = 198, .a = 245 });
-
-        rl.drawRectangleRounded(layout.search, 0.12, 8, .{ .r = 21, .g = 31, .b = 49, .a = 255 });
-        rl.drawRectangleRoundedLinesEx(layout.search, 0.12, 8, 1.5 * scale, .{ .r = 91, .g = 116, .b = 153, .a = 235 });
-        const badge: rl.Rectangle = .{
-            .x = layout.search.x + 10 * scale,
-            .y = layout.search.y + 10 * scale,
-            .width = 62 * scale,
-            .height = layout.search.height - 20 * scale,
-        };
-        rl.drawRectangleRounded(badge, 0.24, 6, .{ .r = 29, .g = 124, .b = 153, .a = 255 });
-        self.drawUiText("LIB", .{
-            .x = badge.x + 15 * scale,
-            .y = badge.y + (badge.height - @as(f32, @floatFromInt(compact_font))) / 2,
-        }, compact_font, .white);
+        drawOverlayPanel(bounds, layout.panel, scale);
         const query: [:0]const u8 = self.library_search.query[0..self.library_search.len :0];
-        const query_source: []const u8 = if (query.len > 0)
-            query
-        else
-            "Choose a reusable, group, or slide template…";
-        var query_buffer: [256]u8 = undefined;
-        const fitted_query = self.fitUiText(
-            &query_buffer,
-            query_source,
-            heading_font,
-            @max(0, layout.search.width - 110 * scale),
-        );
-        self.drawUiText(fitted_query, .{
-            .x = badge.x + badge.width + 14 * scale,
-            .y = layout.search.y + (layout.search.height - @as(f32, @floatFromInt(heading_font))) / 2,
-        }, heading_font, if (query.len > 0) .white else .{ .r = 148, .g = 163, .b = 188, .a = 255 });
-        const caret_x = if (query.len == 0)
-            badge.x + badge.width + 14 * scale
-        else
-            @min(
-                layout.search.x + layout.search.width - 25 * scale,
-                badge.x + badge.width + 15 * scale + self.measureUiText(fitted_query, heading_font),
-            );
-        rl.drawRectangleRec(.{
-            .x = caret_x,
-            .y = layout.search.y + 16 * scale,
-            .width = 2 * scale,
-            .height = layout.search.height - 32 * scale,
-        }, .{ .r = 255, .g = 104, .b = 205, .a = 235 });
-        if (query.len > 0) self.drawUiText("×", .{
-            .x = layout.search.x + layout.search.width - 24 * scale,
-            .y = layout.search.y + (layout.search.height - @as(f32, @floatFromInt(heading_font))) / 2,
-        }, heading_font, .{ .r = 255, .g = 143, .b = 211, .a = 255 });
+        self.drawOverlaySearch(layout, query, "Choose a reusable, group, or slide template…");
 
         const count = librarySearchResultCount(workspace.library, self.library_search.text());
         const capacity = commandPaletteRowCapacity(layout);
@@ -12170,58 +12191,46 @@ pub const Studio = struct {
             const entry = workspace.library[entry_index];
             const selected = result_index == self.library_search.selected_result;
             const row = commandPaletteRowRect(layout, slot) orelse break;
-            rl.drawRectangleRounded(row, 0.08, 7, if (selected)
-                .{ .r = 28, .g = 68, .b = 91, .a = 255 }
-            else if (entry.available)
-                .{ .r = 20, .g = 27, .b = 42, .a = 246 }
-            else
-                .{ .r = 17, .g = 22, .b = 34, .a = 235 });
-            rl.drawRectangleRoundedLinesEx(row, 0.08, 7, if (selected) 2 * scale else scale, if (selected)
-                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-            else
-                .{ .r = 63, .g = 76, .b = 98, .a = 205 });
-            if (selected) rl.drawRectangleRec(.{
-                .x = row.x,
-                .y = row.y + 9 * scale,
-                .width = 4 * scale,
-                .height = row.height - 18 * scale,
-            }, .{ .r = 255, .g = 92, .b = 198, .a = 255 });
+            drawOverlayRow(row, selected, scale);
 
             const kind_label: [:0]const u8 = switch (entry.kind) {
                 .element => "ITEM",
                 .group => "GROUP",
                 .slide_template => "TEMPLATE",
             };
-            const kind_width = @max(76 * scale, self.measureUiText(kind_label, compact_font) + 18 * scale);
-            const kind_rect: rl.Rectangle = .{
-                .x = row.x + 12 * scale,
-                .y = row.y + 10 * scale,
-                .width = kind_width,
-                .height = 22 * scale,
-            };
-            rl.drawRectangleRounded(kind_rect, 0.28, 6, if (entry.available)
-                .{ .r = 76, .g = 48, .b = 106, .a = 245 }
-            else
-                .{ .r = 50, .g = 48, .b = 61, .a = 220 });
-            self.drawUiText(kind_label, .{
-                .x = kind_rect.x + 8 * scale,
-                .y = kind_rect.y + (kind_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
-            }, compact_font, if (entry.available) .white else .{ .r = 133, .g = 137, .b = 150, .a = 255 });
+            // Fixed kind column, matching the command palette's category column.
+            const kind_x = row.x + 12 * scale;
+            const kind_column = 76 * scale;
+            var kind_buffer: [32]u8 = undefined;
+            const kind = self.fitUiText(&kind_buffer, kind_label, compact_font, kind_column - 8 * scale);
+            self.drawUiText(kind, .{
+                .x = kind_x,
+                .y = row.y + (row.height - @as(f32, @floatFromInt(compact_font))) / 2,
+            }, compact_font, if (entry.available) theme.text_muted else theme.text_disabled);
 
             const action_label: [:0]const u8 = switch (entry.kind) {
                 .element => "PLACE",
                 .group => "INSERT",
                 .slide_template => "NEW SLIDE",
             };
-            const action_width = self.measureUiText(action_label, compact_font) + 20 * scale;
-            const text_x = kind_rect.x + kind_rect.width + 14 * scale;
-            const text_width = @max(0, row.x + row.width - text_x - action_width - 22 * scale);
+            const action_width = self.measureUiText(action_label, compact_font) + 14 * scale;
+            const text_x = kind_x + kind_column;
+            const text_right = row.x + row.width - action_width - 12 * scale;
+            const text_width = @max(0, text_right - text_x);
+
             var name_buffer: [192]u8 = undefined;
             const name = self.fitUiText(&name_buffer, entry.name, body_font, text_width);
-            self.drawUiText(name, .{ .x = text_x, .y = row.y + 8 * scale }, body_font, if (entry.available)
-                .white
+            const name_width = self.measureUiText(name, body_font);
+            self.drawUiText(name, .{
+                .x = text_x,
+                .y = row.y + (row.height - @as(f32, @floatFromInt(body_font))) / 2,
+            }, body_font, if (!entry.available)
+                theme.text_disabled
+            else if (selected)
+                theme.text
             else
-                .{ .r = 137, .g = 143, .b = 158, .a = 255 });
+                theme.text_secondary);
+
             var detail_buffer: [192]u8 = undefined;
             const detail = if (entry.available)
                 std.fmt.bufPrintZ(
@@ -12239,54 +12248,44 @@ pub const Studio = struct {
                 ) catch "Reusable definition"
             else
                 "Unavailable in this source context";
-            var fitted_detail_buffer: [192]u8 = undefined;
-            const fitted_detail = self.fitUiText(&fitted_detail_buffer, detail, compact_font, text_width);
-            self.drawUiText(fitted_detail, .{ .x = text_x, .y = row.y + 35 * scale }, compact_font, if (entry.available)
-                .{ .r = 173, .g = 188, .b = 211, .a = 255 }
-            else
-                .{ .r = 203, .g = 136, .b = 157, .a = 255 });
+            const detail_x = text_x + name_width + 10 * scale;
+            const detail_width = @max(0, text_right - detail_x);
+            if (detail_width > 24 * scale) {
+                var fitted_detail_buffer: [192]u8 = undefined;
+                const fitted_detail = self.fitUiText(&fitted_detail_buffer, detail, compact_font, detail_width);
+                self.drawUiText(fitted_detail, .{
+                    .x = detail_x,
+                    .y = row.y + (row.height - @as(f32, @floatFromInt(compact_font))) / 2,
+                }, compact_font, if (entry.available) theme.text_muted else theme.danger);
+            }
 
+            const action_height = 20 * scale;
             const action_rect: rl.Rectangle = .{
-                .x = row.x + row.width - action_width - 11 * scale,
-                .y = row.y + (row.height - 28 * scale) / 2,
+                .x = row.x + row.width - action_width - 8 * scale,
+                .y = row.y + (row.height - action_height) / 2,
                 .width = action_width,
-                .height = 28 * scale,
+                .height = action_height,
             };
-            rl.drawRectangleRounded(action_rect, 0.22, 6, if (entry.available)
-                .{ .r = 19, .g = 72, .b = 88, .a = 245 }
-            else
-                .{ .r = 35, .g = 38, .b = 48, .a = 220 });
-            rl.drawRectangleRoundedLinesEx(action_rect, 0.22, 6, scale, if (entry.available)
-                .{ .r = 80, .g = 215, .b = 255, .a = 220 }
-            else
-                .{ .r = 71, .g = 74, .b = 84, .a = 190 });
+            rl.drawRectangleRounded(action_rect, 0.3, 6, if (entry.available) theme.control else theme.control_disabled);
+            rl.drawRectangleRoundedLinesEx(action_rect, 0.3, 6, scale, if (entry.available) theme.border_strong else theme.border);
             self.drawUiText(action_label, .{
-                .x = action_rect.x + 10 * scale,
+                .x = action_rect.x + 7 * scale,
                 .y = action_rect.y + (action_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
-            }, compact_font, if (entry.available) .white else .{ .r = 116, .g = 120, .b = 132, .a = 255 });
+            }, compact_font, if (entry.available) theme.text_secondary else theme.text_disabled);
         }
         rl.endScissorMode();
 
         if (count == 0) self.drawUiText("No matching reusable definitions", .{
-            .x = layout.rows_clip.x + 8 * scale,
-            .y = layout.rows_clip.y + 18 * scale,
-        }, heading_font, .{ .r = 184, .g = 194, .b = 214, .a = 255 });
+            .x = layout.rows_clip.x + 12 * scale,
+            .y = layout.rows_clip.y + 12 * scale,
+        }, body_font, theme.text_muted);
         var result_buffer: [64]u8 = undefined;
-        const result_text = std.fmt.bufPrintZ(
+        const result_text = std.fmt.bufPrint(
             &result_buffer,
             "{d} reusable{s}",
             .{ count, if (count == 1) "" else "s" },
         ) catch "reusables";
-        self.drawUiText(result_text, .{
-            .x = layout.footer.x,
-            .y = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2,
-        }, compact_font, .{ .r = 150, .g = 166, .b = 191, .a = 255 });
-        const help = "Type to filter   Up/Down navigate   Enter choose   Esc close";
-        const help_width = self.measureUiText(help, compact_font);
-        self.drawUiText(help, .{
-            .x = layout.footer.x + layout.footer.width - help_width,
-            .y = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2,
-        }, compact_font, .{ .r = 185, .g = 198, .b = 218, .a = 255 });
+        self.drawOverlayFooter(layout, result_text, "↑↓ navigate   enter choose   esc close");
     }
 
     fn drawCommandPalette(
@@ -12304,70 +12303,12 @@ pub const Studio = struct {
             .height = viewport.slide_size.y,
         };
         const scale = layout.scale;
-        const heading_font = scaledUiFont(scale, 20);
         const body_font = scaledUiFont(scale, UiTypography.body);
         const compact_font = scaledUiFont(scale, UiTypography.compact);
 
-        // A deep translucent scrim and three offset shadow layers make the
-        // palette read as a floating instrument without feeling disconnected
-        // from the live deck beneath it.
-        rl.drawRectangleRec(bounds, .{ .r = 2, .g = 5, .b = 12, .a = 188 });
-        rl.drawRectangleRounded(.{
-            .x = layout.panel.x + 12 * scale,
-            .y = layout.panel.y + 16 * scale,
-            .width = layout.panel.width,
-            .height = layout.panel.height,
-        }, 0.035, 12, .{ .r = 0, .g = 0, .b = 0, .a = 72 });
-        rl.drawRectangleRounded(.{
-            .x = layout.panel.x + 5 * scale,
-            .y = layout.panel.y + 7 * scale,
-            .width = layout.panel.width,
-            .height = layout.panel.height,
-        }, 0.035, 12, .{ .r = 0, .g = 0, .b = 0, .a = 118 });
-        rl.drawRectangleRounded(layout.panel, 0.035, 12, .{ .r = 10, .g = 16, .b = 29, .a = 252 });
-        rl.drawRectangleRoundedLinesEx(layout.panel, 0.035, 12, 2 * scale, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
-        rl.drawRectangleRec(.{
-            .x = layout.panel.x + 18 * scale,
-            .y = layout.panel.y,
-            .width = @max(0, layout.panel.width * 0.34),
-            .height = 3 * scale,
-        }, .{ .r = 255, .g = 92, .b = 198, .a = 245 });
-
-        rl.drawRectangleRounded(layout.search, 0.12, 8, .{ .r = 21, .g = 31, .b = 49, .a = 255 });
-        rl.drawRectangleRoundedLinesEx(layout.search, 0.12, 8, 1.5 * scale, .{ .r = 91, .g = 116, .b = 153, .a = 235 });
-        const badge: rl.Rectangle = .{
-            .x = layout.search.x + 10 * scale,
-            .y = layout.search.y + 10 * scale,
-            .width = 62 * scale,
-            .height = layout.search.height - 20 * scale,
-        };
-        rl.drawRectangleRounded(badge, 0.24, 6, .{ .r = 29, .g = 124, .b = 153, .a = 255 });
-        self.drawUiText("CMD K", .{
-            .x = badge.x + 8 * scale,
-            .y = badge.y + (badge.height - @as(f32, @floatFromInt(compact_font))) / 2,
-        }, compact_font, .white);
+        drawOverlayPanel(bounds, layout.panel, scale);
         const query: [:0]const u8 = self.command_palette.query[0..self.command_palette.len :0];
-        const query_source: []const u8 = if (query.len > 0) query else "Search commands, tools, and actions…";
-        var query_buffer: [256]u8 = undefined;
-        const fitted_query = self.fitUiText(
-            &query_buffer,
-            query_source,
-            heading_font,
-            @max(0, layout.search.width - 98 * scale),
-        );
-        self.drawUiText(fitted_query, .{
-            .x = badge.x + badge.width + 14 * scale,
-            .y = layout.search.y + (layout.search.height - @as(f32, @floatFromInt(heading_font))) / 2,
-        }, heading_font, if (query.len > 0) .white else .{ .r = 148, .g = 163, .b = 188, .a = 255 });
-        if (query.len > 0) {
-            const query_width = self.measureUiText(fitted_query, heading_font);
-            rl.drawRectangleRec(.{
-                .x = @min(layout.search.x + layout.search.width - 18 * scale, badge.x + badge.width + 15 * scale + query_width),
-                .y = layout.search.y + 16 * scale,
-                .width = 2 * scale,
-                .height = layout.search.height - 32 * scale,
-            }, .{ .r = 255, .g = 104, .b = 205, .a = 235 });
-        }
+        self.drawOverlaySearch(layout, query, "Search commands…");
 
         const count = self.commandResultCount();
         const capacity = commandPaletteRowCapacity(layout);
@@ -12384,99 +12325,88 @@ pub const Studio = struct {
             const availability = self.commandAvailability(items, workspace, spec.id);
             const selected = result_index == self.command_palette.selected_result;
             const row = commandPaletteRowRect(layout, slot) orelse break;
-            const fill: rl.Color = if (selected)
-                .{ .r = 28, .g = 68, .b = 91, .a = 255 }
-            else if (availability.enabled)
-                .{ .r = 20, .g = 27, .b = 42, .a = 246 }
-            else
-                .{ .r = 17, .g = 22, .b = 34, .a = 235 };
-            rl.drawRectangleRounded(row, 0.08, 7, fill);
-            rl.drawRectangleRoundedLinesEx(row, 0.08, 7, if (selected) 2 * scale else scale, if (selected)
-                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-            else
-                .{ .r = 63, .g = 76, .b = 98, .a = 205 });
-            if (selected) rl.drawRectangleRec(.{
-                .x = row.x,
-                .y = row.y + 9 * scale,
-                .width = 4 * scale,
-                .height = row.height - 18 * scale,
-            }, .{ .r = 255, .g = 92, .b = 198, .a = 255 });
+            drawOverlayRow(row, selected, scale);
 
-            const category_width = @max(58 * scale, self.measureUiText(spec.category, compact_font) + 16 * scale);
-            const category_rect: rl.Rectangle = .{
-                .x = row.x + 12 * scale,
-                .y = row.y + 10 * scale,
-                .width = category_width,
-                .height = 22 * scale,
-            };
-            rl.drawRectangleRounded(category_rect, 0.28, 6, if (availability.enabled)
-                .{ .r = 76, .g = 48, .b = 106, .a = 245 }
+            const title_color: rl.Color = if (!availability.enabled)
+                theme.text_disabled
+            else if (selected)
+                theme.text
             else
-                .{ .r = 50, .g = 48, .b = 61, .a = 220 });
-            self.drawUiText(spec.category, .{
-                .x = category_rect.x + 8 * scale,
-                .y = category_rect.y + (category_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
-            }, compact_font, if (availability.enabled) .white else .{ .r = 133, .g = 137, .b = 150, .a = 255 });
+                theme.text_secondary;
+            const detail_color: rl.Color = if (availability.enabled) theme.text_muted else theme.danger;
+
+            // Category sits in a fixed column so every title starts on the same
+            // x, however long the category name is.
+            const category_x = row.x + 12 * scale;
+            const category_column = 62 * scale;
+            var category_buffer: [48]u8 = undefined;
+            const category = self.fitUiText(&category_buffer, spec.category, compact_font, category_column - 8 * scale);
+            self.drawUiText(category, .{
+                .x = category_x,
+                .y = row.y + (row.height - @as(f32, @floatFromInt(compact_font))) / 2,
+            }, compact_font, if (availability.enabled) theme.text_muted else theme.text_disabled);
 
             const shortcut_width: f32 = if (spec.shortcut.len > 0)
-                self.measureUiText(spec.shortcut, compact_font) + 18 * scale
+                self.measureUiText(spec.shortcut, compact_font) + 14 * scale
             else
                 0;
-            const text_x = category_rect.x + category_rect.width + 14 * scale;
-            const text_width = @max(0, row.x + row.width - text_x - shortcut_width - 22 * scale);
+            const text_x = category_x + category_column;
+            const text_right = row.x + row.width - shortcut_width - 12 * scale;
+            const text_width = @max(0, text_right - text_x);
+
             var title_buffer: [160]u8 = undefined;
             const title = self.fitUiText(&title_buffer, spec.title, body_font, text_width);
-            self.drawUiText(title, .{ .x = text_x, .y = row.y + 8 * scale }, body_font, if (availability.enabled)
-                .white
-            else
-                .{ .r = 137, .g = 143, .b = 158, .a = 255 });
-            var detail_buffer: [224]u8 = undefined;
-            const detail = self.fitUiText(
-                &detail_buffer,
-                if (availability.enabled) spec.description else availability.reason,
-                compact_font,
-                text_width,
-            );
-            self.drawUiText(detail, .{ .x = text_x, .y = row.y + 35 * scale }, compact_font, if (availability.enabled)
-                .{ .r = 173, .g = 188, .b = 211, .a = 255 }
-            else
-                .{ .r = 203, .g = 136, .b = 157, .a = 255 });
+            const title_width = self.measureUiText(title, body_font);
+            self.drawUiText(title, .{
+                .x = text_x,
+                .y = row.y + (row.height - @as(f32, @floatFromInt(body_font))) / 2,
+            }, body_font, title_color);
+
+            // The description trails the title on the same baseline and simply
+            // gives up its space when the row gets narrow.
+            const detail_x = text_x + title_width + 10 * scale;
+            const detail_width = @max(0, text_right - detail_x);
+            if (detail_width > 24 * scale) {
+                var detail_buffer: [224]u8 = undefined;
+                const detail = self.fitUiText(
+                    &detail_buffer,
+                    if (availability.enabled) spec.description else availability.reason,
+                    compact_font,
+                    detail_width,
+                );
+                self.drawUiText(detail, .{
+                    .x = detail_x,
+                    .y = row.y + (row.height - @as(f32, @floatFromInt(compact_font))) / 2,
+                }, compact_font, detail_color);
+            }
 
             if (spec.shortcut.len > 0) {
+                const shortcut_height = 20 * scale;
                 const shortcut_rect: rl.Rectangle = .{
-                    .x = row.x + row.width - shortcut_width - 11 * scale,
-                    .y = row.y + (row.height - 28 * scale) / 2,
+                    .x = row.x + row.width - shortcut_width - 8 * scale,
+                    .y = row.y + (row.height - shortcut_height) / 2,
                     .width = shortcut_width,
-                    .height = 28 * scale,
+                    .height = shortcut_height,
                 };
-                rl.drawRectangleRounded(shortcut_rect, 0.22, 6, .{ .r = 7, .g = 11, .b = 21, .a = 230 });
-                rl.drawRectangleRoundedLinesEx(shortcut_rect, 0.22, 6, scale, .{ .r = 81, .g = 94, .b = 119, .a = 210 });
+                rl.drawRectangleRounded(shortcut_rect, 0.3, 6, theme.control);
+                rl.drawRectangleRoundedLinesEx(shortcut_rect, 0.3, 6, scale, theme.border_strong);
                 self.drawUiText(spec.shortcut, .{
-                    .x = shortcut_rect.x + 9 * scale,
+                    .x = shortcut_rect.x + 7 * scale,
                     .y = shortcut_rect.y + (shortcut_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
-                }, compact_font, if (availability.enabled) .white else .{ .r = 116, .g = 120, .b = 132, .a = 255 });
+                }, compact_font, if (availability.enabled) theme.text_secondary else theme.text_disabled);
             }
         }
         rl.endScissorMode();
 
         if (count == 0) {
             self.drawUiText("No matching commands", .{
-                .x = layout.rows_clip.x + 8 * scale,
-                .y = layout.rows_clip.y + 18 * scale,
-            }, heading_font, .{ .r = 184, .g = 194, .b = 214, .a = 255 });
+                .x = layout.rows_clip.x + 12 * scale,
+                .y = layout.rows_clip.y + 12 * scale,
+            }, body_font, theme.text_muted);
         }
         var result_buffer: [64]u8 = undefined;
-        const result_text = std.fmt.bufPrintZ(&result_buffer, "{d} command{s}", .{ count, if (count == 1) "" else "s" }) catch "commands";
-        self.drawUiText(result_text, .{
-            .x = layout.footer.x,
-            .y = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2,
-        }, compact_font, .{ .r = 150, .g = 166, .b = 191, .a = 255 });
-        const help = "Up/Down navigate   Enter run   Esc close";
-        const help_width = self.measureUiText(help, compact_font);
-        self.drawUiText(help, .{
-            .x = layout.footer.x + layout.footer.width - help_width,
-            .y = layout.footer.y + (layout.footer.height - @as(f32, @floatFromInt(compact_font))) / 2,
-        }, compact_font, .{ .r = 185, .g = 198, .b = 218, .a = 255 });
+        const result_text = std.fmt.bufPrint(&result_buffer, "{d} command{s}", .{ count, if (count == 1) "" else "s" }) catch "commands";
+        self.drawOverlayFooter(layout, result_text, "↑↓ navigate   enter run   esc close");
     }
 
     fn drawTooltip(self: Studio, viewport: Viewport) void {
@@ -12488,68 +12418,86 @@ pub const Studio = struct {
             .width = viewport.slide_size.x,
             .height = viewport.slide_size.y,
         };
+        const title_font = scaledUiFont(scale, UiTypography.body);
+        const detail_font = scaledUiFont(scale, UiTypography.compact);
+        const padding_x = 10 * scale;
+        const padding_y = 6 * scale;
+        const line_gap = 3 * scale;
+        const has_detail = target.detail.len > 0;
+
+        // Two tight lines — title/shortcut, then the explanation — instead of
+        // the old 88 px card. Width now follows the content rather than being
+        // pinned at 430 px, so short hints stop looking like dialogs.
+        const shortcut_width: f32 = if (target.shortcut.len > 0)
+            self.measureUiText(target.shortcut, detail_font) + 14 * scale
+        else
+            0;
+        const shortcut_gap: f32 = if (target.shortcut.len > 0) 10 * scale else 0;
+        const title_width = self.measureUiText(target.title, title_font);
+        const detail_width = if (has_detail) self.measureUiText(target.detail, detail_font) else 0;
+        const content_width = @max(title_width + shortcut_gap + shortcut_width, detail_width);
+
         const margin = 12 * scale;
-        const panel_width = @min(430 * scale, @max(220 * scale, bounds.width - margin * 2));
-        const panel_height: f32 = 88 * scale;
+        const available = @max(0, bounds.width - margin * 2);
+        const panel_width = @min(@min(360 * scale, available), @max(120 * scale, content_width + padding_x * 2));
+        const title_line = @as(f32, @floatFromInt(title_font));
+        const detail_line: f32 = if (has_detail) @as(f32, @floatFromInt(detail_font)) + line_gap else 0;
+        const panel_height = padding_y * 2 + title_line + detail_line;
+
         var x = target.anchor.x + target.anchor.width / 2 - panel_width / 2;
         x = std.math.clamp(x, bounds.x + margin, @max(bounds.x + margin, bounds.x + bounds.width - panel_width - margin));
-        const below = target.anchor.y + target.anchor.height + 10 * scale;
-        const above = target.anchor.y - panel_height - 10 * scale;
+        const below = target.anchor.y + target.anchor.height + 6 * scale;
+        const above = target.anchor.y - panel_height - 6 * scale;
         const y = if (below + panel_height <= bounds.y + bounds.height - margin)
             below
         else
             @max(bounds.y + margin, above);
         const panel: rl.Rectangle = .{ .x = x, .y = y, .width = panel_width, .height = panel_height };
+
         rl.drawRectangleRounded(.{
-            .x = panel.x + 5 * scale,
-            .y = panel.y + 7 * scale,
+            .x = panel.x + 1 * scale,
+            .y = panel.y + 3 * scale,
             .width = panel.width,
             .height = panel.height,
-        }, 0.08, 8, .{ .r = 0, .g = 0, .b = 0, .a = 105 });
-        rl.drawRectangleRounded(panel, 0.08, 8, .{ .r = 12, .g = 18, .b = 31, .a = 252 });
-        rl.drawRectangleRoundedLinesEx(panel, 0.08, 8, 1.5 * scale, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
-        rl.drawRectangleRec(.{
-            .x = panel.x + 12 * scale,
-            .y = panel.y,
-            .width = @min(118 * scale, panel.width - 24 * scale),
-            .height = 3 * scale,
-        }, .{ .r = 255, .g = 92, .b = 198, .a = 245 });
+        }, 0.14, 8, theme.alpha(theme.shadow, 90));
+        rl.drawRectangleRounded(panel, 0.14, 8, theme.overlay);
+        rl.drawRectangleRoundedLinesEx(panel, 0.14, 8, scale, theme.border_strong);
 
-        const title_font = scaledUiFont(scale, UiTypography.body);
-        const detail_font = scaledUiFont(scale, UiTypography.compact);
-        const shortcut_width: f32 = if (target.shortcut.len > 0)
-            self.measureUiText(target.shortcut, detail_font) + 18 * scale
-        else
-            0;
+        const text_right = panel.x + panel.width - padding_x;
         var title_buffer: [160]u8 = undefined;
         const title = self.fitUiText(
             &title_buffer,
             target.title,
             title_font,
-            @max(0, panel.width - 28 * scale - shortcut_width),
+            @max(0, panel.width - padding_x * 2 - shortcut_gap - shortcut_width),
         );
-        self.drawUiText(title, .{ .x = panel.x + 14 * scale, .y = panel.y + 13 * scale }, title_font, .white);
+        self.drawUiText(title, .{ .x = panel.x + padding_x, .y = panel.y + padding_y }, title_font, theme.text);
         if (target.shortcut.len > 0) {
             const shortcut: rl.Rectangle = .{
-                .x = panel.x + panel.width - shortcut_width - 12 * scale,
-                .y = panel.y + 10 * scale,
+                .x = text_right - shortcut_width,
+                .y = panel.y + padding_y - 2 * scale,
                 .width = shortcut_width,
-                .height = 27 * scale,
+                .height = title_line + 4 * scale,
             };
-            rl.drawRectangleRounded(shortcut, 0.24, 6, .{ .r = 35, .g = 48, .b = 70, .a = 245 });
+            rl.drawRectangleRounded(shortcut, 0.3, 6, theme.control);
             self.drawUiText(target.shortcut, .{
-                .x = shortcut.x + 9 * scale,
+                .x = shortcut.x + 7 * scale,
                 .y = shortcut.y + (shortcut.height - @as(f32, @floatFromInt(detail_font))) / 2,
-            }, detail_font, .{ .r = 218, .g = 228, .b = 243, .a = 255 });
+            }, detail_font, theme.text_secondary);
         }
-        var detail_buffer: [256]u8 = undefined;
-        const detail = self.fitUiText(
-            &detail_buffer,
-            target.detail,
-            detail_font,
-            panel.width - 28 * scale,
-        );
-        self.drawUiText(detail, .{ .x = panel.x + 14 * scale, .y = panel.y + 49 * scale }, detail_font, .{ .r = 178, .g = 193, .b = 217, .a = 255 });
+        if (has_detail) {
+            var detail_buffer: [256]u8 = undefined;
+            const detail = self.fitUiText(
+                &detail_buffer,
+                target.detail,
+                detail_font,
+                @max(0, panel.width - padding_x * 2),
+            );
+            self.drawUiText(detail, .{
+                .x = panel.x + padding_x,
+                .y = panel.y + padding_y + title_line + line_gap,
+            }, detail_font, theme.text_muted);
+        }
     }
 
     fn drawMorphTimeline(self: Studio, viewport: Viewport, workspace: Workspace) void {
@@ -12570,7 +12518,7 @@ pub const Studio = struct {
             .y = layout.panel.y + 1,
             .width = layout.panel.width - 2,
             .height = @min(layout.panel.height - 2, repaint_height),
-        }, .{ .r = 10, .g = 14, .b = 24, .a = 255 });
+        }, theme.surface);
 
         rl.beginScissorMode(
             @intFromFloat(@floor(layout.cards_clip.x)),
@@ -12584,20 +12532,10 @@ pub const Studio = struct {
             const card = morphTimelineCardRect(layout, visible_slot) orelse break;
             const active = scene_index == active_scene;
             const base = scene_index == 0;
-            const fill: rl.Color = if (active)
-                .{ .r = 31, .g = 83, .b = 104, .a = 255 }
-            else if (base)
-                .{ .r = 34, .g = 39, .b = 55, .a = 255 }
-            else
-                .{ .r = 38, .g = 31, .b = 57, .a = 255 };
-            const border: rl.Color = if (active)
-                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-            else if (base)
-                .{ .r = 130, .g = 145, .b = 170, .a = 230 }
-            else
-                .{ .r = 190, .g = 133, .b = 255, .a = 220 };
+            const fill: rl.Color = if (active) theme.accent_soft else theme.control;
+            const border: rl.Color = if (active) theme.accent else theme.border_strong;
             rl.drawRectangleRec(card, fill);
-            rl.drawRectangleLinesEx(card, if (active) 3 else 1, border);
+            rl.drawRectangleLinesEx(card, if (active) 2 else 1, border);
 
             var title_buffer: [96]u8 = undefined;
             const title_source: []const u8 = if (base)
@@ -12616,7 +12554,7 @@ pub const Studio = struct {
             self.drawUiText(fitted_title, .{
                 .x = card.x + 9 * layout.scale,
                 .y = card.y + @as(f32, if (layout.compact) 9 else 8) * layout.scale,
-            }, body_font, .white);
+            }, body_font, if (active) theme.text else theme.text_secondary);
 
             if (!layout.compact) {
                 var metadata_buffer: [96]u8 = undefined;
@@ -12641,12 +12579,7 @@ pub const Studio = struct {
                     meta_font,
                     card.width - 18 * layout.scale,
                 );
-                self.drawUiText(fitted_metadata, .{ .x = card.x + 9 * layout.scale, .y = card.y + 38 * layout.scale }, meta_font, .{
-                    .r = 190,
-                    .g = 202,
-                    .b = 222,
-                    .a = 255,
-                });
+                self.drawUiText(fitted_metadata, .{ .x = card.x + 9 * layout.scale, .y = card.y + 38 * layout.scale }, meta_font, theme.text_muted);
             }
 
             if (scene_index > 0 and visible_slot > 0) {
@@ -12654,8 +12587,8 @@ pub const Studio = struct {
                 rl.drawLineEx(
                     .{ .x = card.x - layout.card_gap + 1 * layout.scale, .y = line_y },
                     .{ .x = card.x - 2 * layout.scale, .y = line_y },
-                    2 * layout.scale,
-                    .{ .r = 190, .g = 133, .b = 255, .a = 210 },
+                    @max(1, layout.scale),
+                    theme.border_strong,
                 );
             }
         }
@@ -12689,39 +12622,39 @@ pub const Studio = struct {
             .y = viewport.slide_top_left.y,
             .width = viewport.slide_size.x,
             .height = viewport.slide_size.y,
-        }, .{ .r = 3, .g = 7, .b = 14, .a = 238 });
-        rl.drawRectangleRounded(layout.panel, 0.035, 12, .{ .r = 12, .g = 18, .b = 31, .a = 252 });
-        rl.drawRectangleRoundedLinesEx(layout.panel, 0.035, 12, 2, .{ .r = 80, .g = 215, .b = 255, .a = 220 });
+        }, theme.scrim);
+        rl.drawRectangleRounded(layout.panel, 0.035, 12, theme.raised);
+        rl.drawRectangleRoundedLinesEx(layout.panel, 0.035, 12, 1, theme.border_strong);
 
         const left = layout.panel.x + @as(f32, if (layout.compact) 14 else 22);
         const top = layout.panel.y + @as(f32, if (layout.compact) 11 else 18);
-        self.drawUiText("Create your first deck", .{ .x = left, .y = top }, heading_font, .white);
+        self.drawUiText("Create your first deck", .{ .x = left, .y = top }, heading_font, theme.text);
         if (!layout.compact) {
             self.drawUiText(
                 "Choose a source-native starter. Everything remains editable .sld text.",
                 .{ .x = left, .y = top + 42 },
                 body_font,
-                .{ .r = 173, .g = 190, .b = 211, .a = 255 },
+                theme.text_secondary,
             );
             self.drawUiText(
                 "Keys 1–4 choose instantly · Cmd/Ctrl-S names and saves the deck",
                 .{ .x = left, .y = top + 67 },
                 UiTypography.compact,
-                .{ .r = 114, .g = 226, .b = 255, .a = 255 },
+                theme.accent_bright,
             );
         } else {
             self.drawUiText(
                 "Choose a starter · keys 1–4",
                 .{ .x = left, .y = top + 29 },
                 UiTypography.compact,
-                .{ .r = 114, .g = 226, .b = 255, .a = 255 },
+                theme.accent_bright,
             );
         }
 
         for (layout.cards, studio_new_deck.all, 0..) |card, preset, index| {
             const colors = starterPalette(preset);
-            rl.drawRectangleRounded(card, 0.055, 8, .{ .r = 23, .g = 31, .b = 47, .a = 255 });
-            rl.drawRectangleRoundedLinesEx(card, 0.055, 8, 1, .{ .r = 91, .g = 110, .b = 139, .a = 230 });
+            rl.drawRectangleRounded(card, 0.055, 8, theme.control);
+            rl.drawRectangleRoundedLinesEx(card, 0.055, 8, 1, theme.border_strong);
             const inset: f32 = if (layout.compact) 7 else 10;
             const copy_height = @as(f32, @floatFromInt(card_title_font + UiTypography.compact)) +
                 @as(f32, if (layout.compact) 13 else 22);
@@ -12745,11 +12678,11 @@ pub const Studio = struct {
                 .width = 20,
                 .height = 20,
             };
-            rl.drawRectangleRounded(shortcut_rect, 0.25, 6, .{ .r = 7, .g = 12, .b = 22, .a = 220 });
-            self.drawUiText(shortcut, .{ .x = shortcut_rect.x + 6, .y = shortcut_rect.y + 2 }, UiTypography.compact, .white);
+            rl.drawRectangleRounded(shortcut_rect, 0.25, 6, theme.control);
+            self.drawUiText(shortcut, .{ .x = shortcut_rect.x + 6, .y = shortcut_rect.y + 2 }, UiTypography.compact, theme.text_secondary);
 
             const text_y = preview.y + preview.height + @as(f32, if (layout.compact) 5 else 9);
-            self.drawUiText(studio_new_deck.title(preset), .{ .x = card.x + inset, .y = text_y }, card_title_font, .white);
+            self.drawUiText(studio_new_deck.title(preset), .{ .x = card.x + inset, .y = text_y }, card_title_font, theme.text);
             if (!layout.compact or card.height >= 100) {
                 var description_buffer: [128]u8 = undefined;
                 const description = self.fitUiText(
@@ -12762,7 +12695,7 @@ pub const Studio = struct {
                     description,
                     .{ .x = card.x + inset, .y = text_y + @as(f32, @floatFromInt(card_title_font)) + 3 },
                     UiTypography.compact,
-                    .{ .r = 174, .g = 188, .b = 210, .a = 255 },
+                    theme.text_muted,
                 );
             }
         }
@@ -12806,22 +12739,15 @@ pub const Studio = struct {
             const row = objectRowRect(layout, visible_slot) orelse break;
             const selected = item.kind != .background and self.isIdentitySelected(item.identity);
             const row_color: rl.Color = if (selected)
-                .{ .r = 35, .g = 77, .b = 94, .a = 255 }
-            else if (item.kind == .background)
-                .{ .r = 30, .g = 29, .b = 41, .a = 248 }
-            else if (!item.visible or item.opacity <= 0)
-                .{ .r = 23, .g = 27, .b = 36, .a = 245 }
+                theme.accent_soft
+            else if (item.kind == .background or !item.visible or item.opacity <= 0)
+                theme.control_disabled
             else
-                .{ .r = 27, .g = 34, .b = 49, .a = 250 };
+                theme.row;
             rl.drawRectangleRec(row, row_color);
-            rl.drawRectangleLinesEx(row, if (selected) 2 else 1, if (selected)
-                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-            else if (item.kind == .background)
-                .{ .r = 153, .g = 116, .b = 177, .a = 210 }
-            else
-                .{ .r = 87, .g = 101, .b = 125, .a = 205 });
+            rl.drawRectangleLinesEx(row, if (selected) 2 else 1, if (selected) theme.accent else theme.border);
             if (self.active_search == .objects and paint_offset == self.objects_search.selected_result)
-                rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 2, .{ .r = 255, .g = 92, .b = 198, .a = 235 });
+                rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 1, theme.accent_bright);
 
             const visibility = objectVisibilityRect(row);
             const lock = objectLockRect(row);
@@ -12847,10 +12773,10 @@ pub const Studio = struct {
             const raw_name = objectDisplayName(item, &generated_name);
             var fitted_name_buffer: [192]u8 = undefined;
             const fitted_name = self.fitUiText(&fitted_name_buffer, raw_name, body_font, text_width);
-            self.drawUiText(fitted_name, .{ .x = text_x, .y = row.y + 6 * scale }, body_font, if (!item.visible or item.opacity <= 0)
-                .{ .r = 164, .g = 174, .b = 191, .a = 255 }
+            self.drawUiText(fitted_name, .{ .x = text_x, .y = row.y + 5 * scale }, body_font, if (!item.visible or item.opacity <= 0)
+                theme.text_disabled
             else
-                .white);
+                theme.text);
 
             const source = if (self.active_morph_state != null) item.effectiveSource() else item.effectiveBaseSource();
             const type_badge: []const u8 = switch (item.kind) {
@@ -12912,7 +12838,7 @@ pub const Studio = struct {
                 std.fmt.bufPrint(&metadata_buffer, "{s} · {s}{s}{s} · {d:.0}%{s}", .{ type_badge, base_badge, local_badge, morph_badge, item.opacity * 100, if (item.locked) " · locked" else "" }) catch type_badge;
             var fitted_metadata_buffer: [192]u8 = undefined;
             const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
-            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = row.y + 31 * scale }, compact_font, .{ .r = 181, .g = 193, .b = 213, .a = 255 });
+            self.drawUiText(fitted_metadata, .{ .x = text_x, .y = row.y + 24 * scale }, compact_font, theme.text_muted);
             rl.endScissorMode();
         }
 
@@ -12940,29 +12866,15 @@ pub const Studio = struct {
         const tools = [_]Tool{ .select, .add_text, .add_bullets, .add_image, .add_video, .add_shape, .add_line, .add_reusable };
         for (layout.tool_buttons, tools) |button, tool| {
             const active = self.tool == tool;
-            rl.drawRectangleRec(button, if (active)
-                .{ .r = 43, .g = 123, .b = 151, .a = 255 }
-            else
-                .{ .r = 31, .g = 38, .b = 55, .a = 245 });
-            rl.drawRectangleLinesEx(button, if (active) 2 else 1, if (active)
-                .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-            else
-                .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+            drawButtonSurface(button, active);
             const label = if (compact_toolbar) compactToolLabel(tool) else toolLabel(tool);
             const font_size = if (compact_toolbar) compact_font else body_font;
-            drawButtonLabel(self, button, label, font_size, .white);
+            drawButtonLabel(self, button, label, font_size, if (active) theme.text else theme.text_secondary);
         }
         drawActionButton(self, layout.new_slide, "+ Slide");
-        rl.drawRectangleRec(layout.grid_toggle, if (self.grid_snapping)
-            .{ .r = 43, .g = 123, .b = 151, .a = 255 }
-        else
-            .{ .r = 31, .g = 38, .b = 55, .a = 245 });
-        rl.drawRectangleLinesEx(layout.grid_toggle, if (self.grid_snapping) 2 else 1, if (self.grid_snapping)
-            .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-        else
-            .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+        drawButtonSurface(layout.grid_toggle, self.grid_snapping);
         const grid_label: [:0]const u8 = if (self.grid_snapping) "GRID ON" else "GRID";
-        drawButtonLabel(self, layout.grid_toggle, grid_label, compact_font, .white);
+        drawButtonLabel(self, layout.grid_toggle, grid_label, compact_font, if (self.grid_snapping) theme.text else theme.text_secondary);
         drawToggleButton(self, layout.grid_settings_toggle, "v", self.grid_settings_active);
         drawActionButton(self, layout.scene_previous, "<");
         var scene_buffer: [32]u8 = undefined;
@@ -13071,7 +12983,7 @@ pub const Studio = struct {
         cursor_buffer[cursor_line.len] = 0;
         const cursor_text: [:0]const u8 = cursor_buffer[0..cursor_line.len :0];
         const cursor_width = self.measureUiText(cursor_text, value_font);
-        const available_width = @max(0, rect.x + rect.width - reserved_right - value_x - 6);
+        const available_width = @max(0, rect.x + rect.width - reserved_right - value_x - InlineFieldPadding.right);
         const horizontal_offset = @max(0, cursor_width - @max(0, available_width - 2));
 
         const line_height = @as(f32, @floatFromInt(value_font + 2));
@@ -13112,22 +13024,22 @@ pub const Studio = struct {
         viewport: Viewport,
     ) void {
         if (rect.width <= 0 or rect.height <= 0) return;
-        const fill: rl.Color = if (active)
-            .{ .r = 22, .g = 52, .b = 65, .a = 255 }
-        else
-            .{ .r = 25, .g = 31, .b = 45, .a = 250 };
+        const fill: rl.Color = if (active) theme.field else theme.control;
         const border: rl.Color = if (invalid)
-            .{ .r = 255, .g = 128, .b = 114, .a = 255 }
+            theme.danger
         else if (active)
-            .{ .r = 80, .g = 215, .b = 255, .a = 255 }
+            theme.accent
         else
-            .{ .r = 103, .g = 117, .b = 140, .a = 220 };
+            theme.border_strong;
         rl.drawRectangleRec(rect, fill);
         rl.drawRectangleLinesEx(rect, if (active) 2 else 1, border);
         const label_font = @max(@as(i32, 14), scaledUiFont(uiScale(viewport), UiTypography.compact));
         const value_font = @max(@as(i32, 16), scaledUiFont(uiScale(viewport), UiTypography.body));
         const label_width = self.measureUiText(label, label_font);
-        const value_x = if (multiline) rect.x + 7 else rect.x + 7 + label_width + 7;
+        const value_x = if (multiline)
+            rect.x + InlineFieldPadding.left
+        else
+            rect.x + InlineFieldPadding.left + label_width + InlineFieldPadding.label_gap;
         const value_y = inlineFieldValueY(rect, multiline, value_font);
         const reset_rect = inlineResetRect(rect);
         const expand_rect = inlineTextExpandRect(rect, local_override);
@@ -13144,11 +13056,11 @@ pub const Studio = struct {
                 .line_height = @floatFromInt(value_font + 2),
                 .horizontal_offset = 0,
             };
-        self.drawUiText(label, .{ .x = rect.x + 7, .y = rect.y + if (multiline) 3 else (rect.height - @as(f32, @floatFromInt(label_font))) / 2 }, label_font, .{ .r = 164, .g = 180, .b = 204, .a = 255 });
+        self.drawUiText(label, .{ .x = rect.x + InlineFieldPadding.left, .y = rect.y + if (multiline) 3 else (rect.height - @as(f32, @floatFromInt(label_font))) / 2 }, label_font, theme.text_muted);
         rl.beginScissorMode(
             @intFromFloat(@floor(value_x)),
             @intFromFloat(@floor(value_y)),
-            @intFromFloat(@ceil(@max(0, rect.x + rect.width - reserved_right - value_x - 6))),
+            @intFromFloat(@ceil(@max(0, rect.x + rect.width - reserved_right - value_x - InlineFieldPadding.right))),
             @intFromFloat(@ceil(@max(0, rect.y + rect.height - value_y - 4))),
         );
         var display_buffer: [max_inline_input_bytes + 1]u8 = undefined;
@@ -13159,9 +13071,9 @@ pub const Studio = struct {
         display_buffer[display_len] = 0;
         const display: [:0]const u8 = display_buffer[0..display_len :0];
         self.drawUiText(display, .{ .x = draw_window.draw_x, .y = value_y }, value_font, if (std.mem.eql(u8, value, "Mixed"))
-            .{ .r = 255, .g = 190, .b = 104, .a = 255 }
+            theme.warning
         else
-            .white);
+            theme.text);
         if (active and !self.inline_editor.blocked_initial and @mod(@as(i64, @intFromFloat(rl.getTime() * 2)), 2) == 0) {
             const cursor_height = @min(
                 draw_window.line_height,
@@ -13176,8 +13088,8 @@ pub const Studio = struct {
         }
         rl.endScissorMode();
         if (expandable) {
-            rl.drawRectangleRec(expand_rect, .{ .r = 19, .g = 72, .b = 88, .a = 255 });
-            rl.drawRectangleLinesEx(expand_rect, 1, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
+            rl.drawRectangleRec(expand_rect, theme.control);
+            rl.drawRectangleLinesEx(expand_rect, 1, theme.border_strong);
             const open_label: [:0]const u8 = "...";
             const open_font: i32 = 14;
             const open_width = self.measureUiText(open_label, open_font);
@@ -13188,18 +13100,12 @@ pub const Studio = struct {
                     .y = expand_rect.y + (expand_rect.height - @as(f32, @floatFromInt(open_font))) / 2,
                 },
                 open_font,
-                .{ .r = 221, .g = 248, .b = 255, .a = 255 },
+                theme.text_secondary,
             );
         }
         if (local_override) {
-            rl.drawRectangleRec(reset_rect, if (resettable_override)
-                .{ .r = 99, .g = 67, .b = 25, .a = 255 }
-            else
-                .{ .r = 50, .g = 45, .b = 39, .a = 255 });
-            rl.drawRectangleLinesEx(reset_rect, 1, if (resettable_override)
-                .{ .r = 247, .g = 164, .b = 29, .a = 255 }
-            else
-                .{ .r = 133, .g = 117, .b = 93, .a = 255 });
+            rl.drawRectangleRec(reset_rect, if (resettable_override) theme.override_fill else theme.control_disabled);
+            rl.drawRectangleLinesEx(reset_rect, 1, if (resettable_override) theme.override_marker else theme.border_strong);
             const marker: [:0]const u8 = if (resettable_override) "R" else "L";
             const marker_font: i32 = 14;
             const marker_width = self.measureUiText(marker, marker_font);
@@ -13210,7 +13116,7 @@ pub const Studio = struct {
                     .y = reset_rect.y + (reset_rect.height - @as(f32, @floatFromInt(marker_font))) / 2,
                 },
                 marker_font,
-                if (resettable_override) .{ .r = 255, .g = 205, .b = 116, .a = 255 } else .{ .r = 181, .g = 168, .b = 145, .a = 255 },
+                if (resettable_override) theme.override_marker else theme.text_muted,
             );
         }
     }
@@ -13368,18 +13274,18 @@ pub const Studio = struct {
     }
 
     fn drawVideoPosterTimeline(_: Studio, rect: rl.Rectangle, poster: f32, duration: f32) void {
-        rl.drawRectangleRec(rect, .{ .r = 21, .g = 29, .b = 45, .a = 255 });
-        rl.drawRectangleLinesEx(rect, 1, .{ .r = 91, .g = 108, .b = 137, .a = 255 });
+        rl.drawRectangleRec(rect, theme.field);
+        rl.drawRectangleLinesEx(rect, 1, theme.border_strong);
         const track: rl.Rectangle = .{
             .x = rect.x + 8,
             .y = rect.y + rect.height / 2 - 2,
             .width = @max(0, rect.width - 16),
             .height = 4,
         };
-        rl.drawRectangleRec(track, .{ .r = 65, .g = 77, .b = 99, .a = 255 });
+        rl.drawRectangleRec(track, theme.control_hover);
         const fraction = if (duration > 0) std.math.clamp(poster / duration, 0, 1) else 0;
-        rl.drawRectangleRec(.{ .x = track.x, .y = track.y, .width = track.width * fraction, .height = track.height }, .{ .r = 80, .g = 215, .b = 255, .a = 255 });
-        rl.drawCircleV(.{ .x = track.x + track.width * fraction, .y = track.y + track.height / 2 }, @max(@as(f32, 4), rect.height * 0.25), .{ .r = 235, .g = 246, .b = 255, .a = 255 });
+        rl.drawRectangleRec(.{ .x = track.x, .y = track.y, .width = track.width * fraction, .height = track.height }, theme.accent);
+        rl.drawCircleV(.{ .x = track.x + track.width * fraction, .y = track.y + track.height / 2 }, @max(@as(f32, 4), rect.height * 0.25), theme.text);
     }
 
     fn compositionKindLabel(kind: ReusableInstanceKind) []const u8 {
@@ -13612,13 +13518,13 @@ pub const Studio = struct {
                 scaledUiFont(layout.scale, UiTypography.compact),
                 if (resolved) |value|
                     if (value.media_availability == .ready and value.media_audio != .unavailable)
-                        .{ .r = 177, .g = 192, .b = 214, .a = 255 }
+                        theme.text_muted
                     else if (value.media_availability.isWarning() or value.media_audio == .unavailable)
-                        .{ .r = 255, .g = 181, .b = 71, .a = 255 }
+                        theme.warning
                     else
-                        .{ .r = 255, .g = 128, .b = 114, .a = 255 }
+                        theme.danger
                 else
-                    .{ .r = 177, .g = 192, .b = 214, .a = 255 },
+                    theme.text_muted,
             );
             if (has_page_toggle)
                 drawCompactButton(self, mediaPageToggleRect(layout), if (selected_video_playback) "Layout" else "Playback");
@@ -13794,9 +13700,9 @@ pub const Studio = struct {
                     .{ .x = layout.inline_error.x, .y = layout.inline_error.y + 2 },
                     error_font,
                     if (self.inline_editor.error_value != null)
-                        .{ .r = 255, .g = 150, .b = 126, .a = 255 }
+                        theme.danger
                     else
-                        .{ .r = 177, .g = 192, .b = 214, .a = 255 },
+                        theme.text_muted,
                 );
             }
         }
@@ -13859,14 +13765,14 @@ pub const Studio = struct {
         if (layout.properties.width <= 0 or layout.properties.height <= 0) return;
         const heading_font = scaledUiFont(layout.scale, UiTypography.heading);
         const body_font = scaledUiFont(layout.scale, UiTypography.body);
-        const secondary: rl.Color = .{ .r = 205, .g = 214, .b = 230, .a = 255 };
+        const secondary: rl.Color = theme.text_secondary;
         drawStudioPanel(layout.properties);
         if (viewport.chrome != null) {
             self.drawInspectorTabs(viewport);
             self.drawInlineProperties(items, resolved_bounds, viewport, selected_locked);
             return;
         } else {
-            self.drawUiText("PROPERTIES", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + 11 * layout.scale }, heading_font, .white);
+            self.drawUiText("PROPERTIES", .{ .x = layout.properties.x + 12 * layout.scale, .y = layout.properties.y + 11 * layout.scale }, heading_font, theme.text_heading);
         }
         drawActionButton(self, layout.edit_text, "Text");
         drawActionButton(self, layout.duplicate_item, "Dup");
@@ -13968,8 +13874,8 @@ pub const Studio = struct {
         const scale = uiScale(viewport);
         const heading_font = scaledUiFont(scale, UiTypography.status_heading);
         const body_font = scaledUiFont(scale, UiTypography.body);
-        rl.drawRectangleRec(panel, .{ .r = 10, .g = 14, .b = 24, .a = 225 });
-        rl.drawRectangleLinesEx(panel, 1, .{ .r = 80, .g = 215, .b = 255, .a = 180 });
+        rl.drawRectangleRec(panel, theme.surface);
+        rl.drawRectangleLinesEx(panel, 1, theme.border);
 
         var status_buffer: [512]u8 = undefined;
         const status_text = if (self.selected_identity) |identity| selected: {
@@ -13991,7 +13897,7 @@ pub const Studio = struct {
             ) catch "STUDIO · selected item";
         } else if (self.dirty) "STUDIO * · click an item to select it" else "STUDIO · click an item to select it";
 
-        self.drawUiText(status_text, .{ .x = panel.x + 12 * scale, .y = panel.y + 9 * scale }, heading_font, .white);
+        self.drawUiText(status_text, .{ .x = panel.x + 12 * scale, .y = panel.y + 9 * scale }, heading_font, theme.text);
         const compact_status = panel.height < 100 * scale;
         var view_help_buffer: [192]u8 = undefined;
         if (compact_status and self.notice == .none) {
@@ -14004,7 +13910,7 @@ pub const Studio = struct {
                 view_help,
                 .{ .x = panel.x + 12 * scale, .y = panel.y + 43 * scale },
                 body_font,
-                .{ .r = 185, .g = 196, .b = 215, .a = 255 },
+                theme.text_muted,
             );
         } else {
             const view_help = std.fmt.bufPrintZ(
@@ -14016,7 +13922,7 @@ pub const Studio = struct {
                 view_help,
                 .{ .x = panel.x + 12 * scale, .y = panel.y + 39 * scale },
                 body_font,
-                .{ .r = 185, .g = 196, .b = 215, .a = 255 },
+                theme.text_muted,
             );
             self.drawUiText(
                 if (self.grid_snapping)
@@ -14025,7 +13931,7 @@ pub const Studio = struct {
                     "G grid · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo",
                 .{ .x = panel.x + 12 * scale, .y = panel.y + 64 * scale },
                 body_font,
-                .{ .r = 185, .g = 196, .b = 215, .a = 255 },
+                theme.text_muted,
             );
         }
         var notice_buffer: [256]u8 = undefined;
@@ -14087,9 +13993,9 @@ pub const Studio = struct {
         };
         if (notice_text) |message| {
             const notice_color: rl.Color = switch (self.notice) {
-                .saved, .copy_saved, .library_cleanup_empty => .{ .r = 126, .g = 231, .b = 177, .a = 255 },
-                .library_cleanup_ready => .{ .r = 255, .g = 190, .b = 105, .a = 255 },
-                else => .{ .r = 255, .g = 145, .b = 132, .a = 255 },
+                .saved, .copy_saved, .library_cleanup_empty => theme.success,
+                .library_cleanup_ready => theme.warning,
+                else => theme.danger,
             };
             self.drawUiText(message, .{ .x = panel.x + 12 * scale, .y = panel.y + @as(f32, if (compact_status) 43 else 89) * scale }, body_font, notice_color);
         }
@@ -14244,8 +14150,43 @@ fn inlineErrorMessage(reason: InlineError) [:0]const u8 {
 }
 
 fn drawStudioPanel(rect: rl.Rectangle) void {
-    rl.drawRectangleRec(rect, .{ .r = 10, .g = 14, .b = 24, .a = 235 });
-    rl.drawRectangleLinesEx(rect, 1, .{ .r = 80, .g = 215, .b = 255, .a = 180 });
+    rl.drawRectangleRec(rect, theme.surface);
+    rl.drawRectangleLinesEx(rect, 1, theme.border);
+}
+
+/// Shared chrome for the floating list overlays — the command palette and the
+/// reusable picker. They used to be two independent copies of the same drawing
+/// code, which is how one of them ended up with a "LIB" badge and the other
+/// with "CMD K". Both now share the panel, the search line, and the row.
+fn drawOverlayPanel(bounds: rl.Rectangle, panel: rl.Rectangle, scale: f32) void {
+    rl.drawRectangleRec(bounds, theme.scrim);
+    rl.drawRectangleRounded(.{
+        .x = panel.x + 4 * scale,
+        .y = panel.y + 10 * scale,
+        .width = panel.width,
+        .height = panel.height,
+    }, 0.05, 12, theme.alpha(theme.shadow, 60));
+    rl.drawRectangleRounded(.{
+        .x = panel.x + 2 * scale,
+        .y = panel.y + 4 * scale,
+        .width = panel.width,
+        .height = panel.height,
+    }, 0.05, 12, theme.alpha(theme.shadow, 100));
+    rl.drawRectangleRounded(panel, 0.05, 12, theme.raised);
+    rl.drawRectangleRoundedLinesEx(panel, 0.05, 12, scale, theme.border_strong);
+}
+
+/// Only the selected row is painted. Leaving the rest unfilled is what stops a
+/// long list from reading as a stack of boxes.
+fn drawOverlayRow(row: rl.Rectangle, selected: bool, scale: f32) void {
+    if (!selected) return;
+    rl.drawRectangleRounded(row, 0.16, 6, theme.accent_soft);
+    rl.drawRectangleRec(.{
+        .x = row.x,
+        .y = row.y + 5 * scale,
+        .width = @max(2, 2 * scale),
+        .height = @max(0, row.height - 10 * scale),
+    }, theme.accent);
 }
 
 fn fitButtonLabel(
@@ -14271,42 +14212,41 @@ fn drawButtonLabel(studio: Studio, rect: rl.Rectangle, label: []const u8, font_s
     );
 }
 
+/// Buttons share one resting appearance across the whole shell: a neutral fill
+/// with a quiet 1 px edge. Only the active state spends the accent, so a glance
+/// at any dock immediately answers "what is switched on here?".
+fn drawButtonSurface(rect: rl.Rectangle, active: bool) void {
+    rl.drawRectangleRec(rect, if (active) theme.accent_fill else theme.control);
+    rl.drawRectangleLinesEx(rect, 1, if (active) theme.accent else theme.border_strong);
+}
+
 fn drawActionButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
     if (rect.width <= 0 or rect.height <= 0) return;
-    rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
-    rl.drawRectangleLinesEx(rect, 1, .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+    drawButtonSurface(rect, false);
     const font_size: i32 = @max(UiTypography.body, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    drawButtonLabel(studio, rect, label, font_size, .white);
+    drawButtonLabel(studio, rect, label, font_size, theme.text);
 }
 
 fn drawCompactButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
     if (rect.width <= 0 or rect.height <= 0) return;
-    rl.drawRectangleRec(rect, .{ .r = 31, .g = 38, .b = 55, .a = 245 });
-    rl.drawRectangleLinesEx(rect, 1, .{ .r = 105, .g = 120, .b = 143, .a = 210 });
+    drawButtonSurface(rect, false);
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    drawButtonLabel(studio, rect, label, font_size, .white);
+    drawButtonLabel(studio, rect, label, font_size, theme.text);
 }
 
 fn drawDisabledBadge(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
     if (rect.width <= 0 or rect.height <= 0) return;
-    rl.drawRectangleRec(rect, .{ .r = 24, .g = 25, .b = 33, .a = 225 });
-    rl.drawRectangleLinesEx(rect, 1, .{ .r = 74, .g = 78, .b = 92, .a = 190 });
+    rl.drawRectangleRec(rect, theme.control_disabled);
+    rl.drawRectangleLinesEx(rect, 1, theme.border);
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    drawButtonLabel(studio, rect, label, font_size, .{ .r = 130, .g = 137, .b = 153, .a = 255 });
+    drawButtonLabel(studio, rect, label, font_size, theme.text_disabled);
 }
 
 fn drawToggleButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8, active: bool) void {
     if (rect.width <= 0 or rect.height <= 0) return;
-    rl.drawRectangleRec(rect, if (active)
-        .{ .r = 43, .g = 123, .b = 151, .a = 255 }
-    else
-        .{ .r = 31, .g = 38, .b = 55, .a = 245 });
-    rl.drawRectangleLinesEx(rect, if (active) 2 else 1, if (active)
-        .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-    else
-        .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+    drawButtonSurface(rect, active);
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    drawButtonLabel(studio, rect, label, font_size, .white);
+    drawButtonLabel(studio, rect, label, font_size, if (active) theme.text else theme.text_secondary);
 }
 
 fn drawPropertyToggleButton(
@@ -14322,14 +14262,7 @@ fn drawPropertyToggleButton(
         return;
     }
     if (rect.width <= 0 or rect.height <= 0) return;
-    rl.drawRectangleRec(rect, if (active)
-        .{ .r = 43, .g = 123, .b = 151, .a = 255 }
-    else
-        .{ .r = 31, .g = 38, .b = 55, .a = 245 });
-    rl.drawRectangleLinesEx(rect, if (active) 2 else 1, if (active)
-        .{ .r = 80, .g = 215, .b = 255, .a = 255 }
-    else
-        .{ .r = 115, .g = 128, .b = 150, .a = 200 });
+    drawButtonSurface(rect, active);
 
     const reset_rect = Studio.inlineResetRect(rect);
     const label_rect: rl.Rectangle = .{
@@ -14339,16 +14272,10 @@ fn drawPropertyToggleButton(
         .height = rect.height,
     };
     const font_size: i32 = @max(UiTypography.compact, @as(i32, @intFromFloat(@round(rect.height * 0.4))));
-    drawButtonLabel(studio, label_rect, label, font_size, .white);
+    drawButtonLabel(studio, label_rect, label, font_size, if (active) theme.text else theme.text_secondary);
 
-    rl.drawRectangleRec(reset_rect, if (resettable_override)
-        .{ .r = 99, .g = 67, .b = 25, .a = 255 }
-    else
-        .{ .r = 50, .g = 45, .b = 39, .a = 255 });
-    rl.drawRectangleLinesEx(reset_rect, 1, if (resettable_override)
-        .{ .r = 247, .g = 164, .b = 29, .a = 255 }
-    else
-        .{ .r = 133, .g = 117, .b = 93, .a = 255 });
+    rl.drawRectangleRec(reset_rect, if (resettable_override) theme.override_fill else theme.control_disabled);
+    rl.drawRectangleLinesEx(reset_rect, 1, if (resettable_override) theme.override_marker else theme.border_strong);
     const marker: [:0]const u8 = if (resettable_override) "R" else "L";
     const marker_font: i32 = 14;
     const marker_width = studio.measureUiText(marker, marker_font);
@@ -14359,7 +14286,7 @@ fn drawPropertyToggleButton(
             .y = reset_rect.y + (reset_rect.height - @as(f32, @floatFromInt(marker_font))) / 2,
         },
         marker_font,
-        if (resettable_override) .{ .r = 255, .g = 205, .b = 116, .a = 255 } else .{ .r = 181, .g = 168, .b = 145, .a = 255 },
+        if (resettable_override) theme.override_marker else theme.text_muted,
     );
 }
 
@@ -14373,8 +14300,8 @@ fn drawSwatches(rects: [palette.len]rl.Rectangle, current: ?rl.Color) void {
             false;
         rl.drawRectangleLinesEx(
             rect,
-            if (selected) 3 else 1,
-            if (selected) .{ .r = 80, .g = 215, .b = 255, .a = 255 } else .{ .r = 225, .g = 231, .b = 240, .a = 210 },
+            if (selected) 2 else 1,
+            if (selected) theme.accent else theme.text_muted,
         );
     }
 }
@@ -19419,8 +19346,8 @@ test "roomy inspector uses two-row geometry fields with representative values" {
         const reset = Studio.inlineResetRect(field);
         try expectRectangleContained(field, reset);
         try std.testing.expectEqual(@as(f32, 32), reset.width);
-        const value_x = field.x + 7 + studio.measureUiText(label, 14) + 7;
-        const available = field.x + field.width - value_x - 6;
+        const value_x = field.x + InlineFieldPadding.left + studio.measureUiText(label, 14) + InlineFieldPadding.label_gap;
+        const available = field.x + field.width - value_x - InlineFieldPadding.right;
         try std.testing.expect(studio.measureUiText(sample, 16) <= available);
     }
 }
@@ -19436,14 +19363,14 @@ test "inline draw window keeps long ASCII caret inside compact scalar field" {
     @memset(&long_value, '9');
     try std.testing.expect(studio.setInlineBuffer(&long_value));
     const field = layout.geometry_fields[0];
-    const value_x = field.x + 7 + studio.measureUiText("X", 14) + 7;
+    const value_x = field.x + InlineFieldPadding.left + studio.measureUiText("X", 14) + InlineFieldPadding.label_gap;
     const value_y = Studio.inlineFieldValueY(field, false, 16);
     const reset = Studio.inlineResetRect(field);
     const window = studio.inlineDrawWindow(field, value_x, value_y, 16, false, reset.width);
     try std.testing.expect(window.horizontal_offset > 0);
     try std.testing.expect(window.draw_x < value_x);
     try std.testing.expect(window.cursor_x >= value_x);
-    try std.testing.expect(window.cursor_x + 2 <= reset.x - 6);
+    try std.testing.expect(window.cursor_x + 2 <= reset.x - InlineFieldPadding.right);
     try std.testing.expect(window.cursor_y >= field.y);
     try std.testing.expect(window.cursor_y + window.line_height <= field.y + field.height - 4);
 }
@@ -19466,14 +19393,14 @@ test "inline draw window keeps multibyte tail and active multiline line visible"
     }
     try std.testing.expect(studio.setInlineBuffer(value[0..value_len]));
     const field = layout.edit_text;
-    const value_x = field.x + 7;
+    const value_x = field.x + InlineFieldPadding.left;
     const value_y = Studio.inlineFieldValueY(field, true, 16);
     const window = studio.inlineDrawWindow(field, value_x, value_y, 16, true, 0);
     try std.testing.expect(window.display_start >= prefix.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(studio.inlineEditText()[window.display_start..]));
     try std.testing.expect(window.horizontal_offset > 0);
     try std.testing.expect(window.cursor_x >= value_x);
-    try std.testing.expect(window.cursor_x + 2 <= field.x + field.width - 6);
+    try std.testing.expect(window.cursor_x + 2 <= field.x + field.width - InlineFieldPadding.right);
     try std.testing.expect(window.cursor_y >= value_y);
     try std.testing.expect(window.cursor_y + window.line_height <= field.y + field.height - 4);
 }

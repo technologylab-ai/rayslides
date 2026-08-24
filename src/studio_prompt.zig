@@ -1,5 +1,6 @@
 const std = @import("std");
 const rl = @import("raylib");
+const theme = @import("studio_theme.zig");
 
 pub const max_input_bytes = 8192;
 const editor_font_size: f32 = 21;
@@ -284,12 +285,12 @@ pub const Prompt = struct {
         media_browse_available: bool,
     ) void {
         if (!self.active) return;
-        rl.drawRectangle(0, 0, @intFromFloat(screen_size.x), @intFromFloat(screen_size.y), .{ .r = 2, .g = 5, .b = 12, .a = 175 });
+        rl.drawRectangle(0, 0, @intFromFloat(screen_size.x), @intFromFloat(screen_size.y), theme.scrim);
 
         const layout = promptLayout(screen_size);
         const panel = layout.panel;
-        rl.drawRectangleRounded(panel, 0.035, 12, .{ .r = 12, .g = 17, .b = 30, .a = 250 });
-        rl.drawRectangleRoundedLinesEx(panel, 0.035, 12, 2, .{ .r = 80, .g = 215, .b = 255, .a = 230 });
+        rl.drawRectangleRounded(panel, 0.035, 12, theme.raised);
+        rl.drawRectangleRoundedLinesEx(panel, 0.035, 12, 1, theme.border_strong);
 
         rl.drawTextEx(ui_font, promptTitle(self.kind), .{ .x = panel.x + 24, .y = panel.y + 20 }, 25, 0, .white);
         drawPromptButton(
@@ -299,14 +300,14 @@ pub const Prompt = struct {
             !self.notice.blocksEditing(),
             true,
         );
-        rl.drawTextEx(ui_font, promptHint(self.kind), .{ .x = panel.x + 24, .y = panel.y + 55 }, 16, 0, .{ .r = 175, .g = 188, .b = 211, .a = 255 });
+        rl.drawTextEx(ui_font, promptHint(self.kind), .{ .x = panel.x + 24, .y = panel.y + 55 }, 16, 0, theme.text_muted);
 
         const editor = layout.editor;
         const inner = editorInner(editor);
-        rl.drawRectangleRec(editor, .{ .r = 5, .g = 9, .b = 18, .a = 255 });
-        rl.drawRectangleLinesEx(editor, 1, .{ .r = 76, .g = 92, .b = 123, .a = 255 });
+        rl.drawRectangleRec(editor, theme.field);
+        rl.drawRectangleLinesEx(editor, 1, theme.border_strong);
         if (!self.notice.blocksEditing() and self.select_all)
-            rl.drawRectangleRec(inner, .{ .r = 31, .g = 91, .b = 116, .a = 130 });
+            rl.drawRectangleRec(inner, theme.selection);
 
         rl.beginScissorMode(
             @intFromFloat(inner.x),
@@ -319,7 +320,7 @@ pub const Prompt = struct {
             .x = inner.x - self.scroll_x,
             .y = inner.y - self.scroll_y,
         };
-        drawEditorText(ui_font, visible, content_origin, .{ .r = 235, .g = 241, .b = 252, .a = 255 });
+        drawEditorText(ui_font, visible, content_origin, theme.text);
 
         if (!self.notice.blocksEditing() and !self.select_all) {
             const caret = cursorContentPosition(self.text(), self.cursor, ui_font);
@@ -328,22 +329,19 @@ pub const Prompt = struct {
                 .y = content_origin.y + caret.y,
                 .width = 2,
                 .height = editor_font_size + 2,
-            }, .{ .r = 80, .g = 215, .b = 255, .a = 255 });
+            }, theme.accent_bright);
         }
         rl.endScissorMode();
         if (!self.notice.blocksEditing())
             drawEditorScrollbars(self.*, editor, ui_font);
 
         if (self.noticeMessage()) |message| {
-            rl.drawTextEx(ui_font, message, .{ .x = panel.x + 24, .y = panel.y + panel.height - 36 }, 16, 0, .{ .r = 255, .g = 184, .b = 92, .a = 255 });
+            rl.drawTextEx(ui_font, message, .{ .x = panel.x + 24, .y = panel.y + panel.height - 36 }, 16, 0, theme.warning);
         }
         if (media_browse_available and kindIsMediaPath(self.kind)) {
             const hovered = pointInRectangle(rl.getMousePosition(), layout.browse);
-            rl.drawRectangleRec(layout.browse, if (hovered)
-                .{ .r = 34, .g = 92, .b = 109, .a = 255 }
-            else
-                .{ .r = 24, .g = 61, .b = 76, .a = 255 });
-            rl.drawRectangleLinesEx(layout.browse, 1, .{ .r = 80, .g = 215, .b = 255, .a = 235 });
+            rl.drawRectangleRec(layout.browse, if (hovered) theme.control_hover else theme.control);
+            rl.drawRectangleLinesEx(layout.browse, 1, theme.border_strong);
             const label: [:0]const u8 = "Browse…";
             const font_size: f32 = 16;
             const label_width = rl.measureTextEx(ui_font, label, font_size, 0).x;
@@ -356,7 +354,7 @@ pub const Prompt = struct {
                 },
                 font_size,
                 0,
-                .{ .r = 225, .g = 247, .b = 255, .a = 255 },
+                theme.text,
             );
         }
     }
@@ -658,8 +656,8 @@ fn cursorAtEditorPoint(
 fn drawEditorScrollbars(prompt: Prompt, editor: rl.Rectangle, ui_font: rl.Font) void {
     const limits = editorScrollLimits(prompt.text(), editor, ui_font);
     const inner = editorInner(editor);
-    const track_color: rl.Color = .{ .r = 31, .g = 39, .b = 57, .a = 225 };
-    const thumb_color: rl.Color = .{ .r = 72, .g = 132, .b = 157, .a = 245 };
+    const track_color: rl.Color = theme.control;
+    const thumb_color: rl.Color = theme.border_strong;
     if (limits.y > 0) {
         const track: rl.Rectangle = .{
             .x = editor.x + editor.width - 7,
@@ -766,22 +764,23 @@ fn drawPromptButton(
     emphasized: bool,
 ) void {
     const hovered = enabled and pointInRectangle(rl.getMousePosition(), rect);
+    // The confirming action is the only filled button; everything else stays
+    // neutral so the dialog has a single obvious default.
     const fill: rl.Color = if (!enabled)
-        .{ .r = 22, .g = 27, .b = 39, .a = 255 }
-    else if (hovered)
-        .{ .r = 22, .g = 128, .b = 151, .a = 255 }
+        theme.control_disabled
     else if (emphasized)
-        .{ .r = 13, .g = 91, .b = 111, .a = 255 }
+        if (hovered) theme.accent else theme.accent_fill
+    else if (hovered)
+        theme.control_hover
     else
-        .{ .r = 24, .g = 61, .b = 76, .a = 255 };
-    const border: rl.Color = if (enabled)
-        .{ .r = 80, .g = 215, .b = 255, .a = 235 }
+        theme.control;
+    const border: rl.Color = if (!enabled)
+        theme.border
+    else if (emphasized)
+        theme.accent
     else
-        .{ .r = 70, .g = 78, .b = 94, .a = 180 };
-    const text_color: rl.Color = if (enabled)
-        .{ .r = 235, .g = 250, .b = 255, .a = 255 }
-    else
-        .{ .r = 112, .g = 121, .b = 139, .a = 255 };
+        theme.border_strong;
+    const text_color: rl.Color = if (enabled) theme.text else theme.text_disabled;
     rl.drawRectangleRec(rect, fill);
     rl.drawRectangleLinesEx(rect, 1, border);
     const font_size: f32 = 16;
