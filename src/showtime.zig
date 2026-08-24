@@ -242,6 +242,7 @@ fn mediaStatusText(status: slides.MediaAvailability) struct { title: []const u8,
         .video_poster_decode_failed => .{ .title = "Video poster frame cannot be decoded", .fix = "Choose another poster time or transcode the video." },
         .video_poster_out_of_range => .{ .title = "Video poster time is outside the clip", .fix = "Choose a poster time within the reported duration." },
         .video_poster_fallback => .{ .title = "Video poster uses the first-frame fallback", .fix = "Review the poster or choose a reliably decodable timestamp." },
+        .camera_device_unavailable => .{ .title = "Camera device cannot be opened", .fix = "Connect the camera, close other apps using it, and verify cam= and video_size=." },
     };
 }
 
@@ -386,9 +387,9 @@ pub fn analyze(
                             try report.addFmt(severity, .media, code, slide_index, morph_state, item.identity, sourceLine(item), "{s}: {s}", .{ status.title, std.fs.path.basename(path) }, "{s} Source: {s}", .{ status.fix, path });
                         }
                     }
-                    if (std.fs.path.isAbsolute(path) and !report.alreadyHas(.media_path_absolute, slide_index, item.identity)) {
+                    if (!item.vid_is_camera and std.fs.path.isAbsolute(path) and !report.alreadyHas(.media_path_absolute, slide_index, item.identity)) {
                         try report.addFmt(.warning, .portable, .media_path_absolute, slide_index, morph_state, item.identity, sourceLine(item), "Asset uses an absolute path", .{}, "Portable Show can copy and rewrite it; authored path: {s}", .{path});
-                    } else if (hasParentEscape(path) and !report.alreadyHas(.media_path_parent_escape, slide_index, item.identity)) {
+                    } else if (!item.vid_is_camera and hasParentEscape(path) and !report.alreadyHas(.media_path_parent_escape, slide_index, item.identity)) {
                         try report.addFmt(.warning, .portable, .media_path_parent_escape, slide_index, morph_state, item.identity, sourceLine(item), "Asset escapes the deck folder", .{}, "Portable Show can copy and rewrite it; authored path: {s}", .{path});
                     }
                 }
@@ -433,6 +434,7 @@ pub const AssetReferences = struct {
 fn assetKindForKey(key: []const u8) ?AssetKind {
     if (std.mem.eql(u8, key, "img")) return .image;
     if (std.mem.eql(u8, key, "vid")) return .video;
+    if (std.mem.eql(u8, key, "poster_image")) return .image;
     if (std.mem.eql(u8, key, "@font") or std.mem.eql(u8, key, "@font_bold") or
         std.mem.eql(u8, key, "@font_italic") or std.mem.eql(u8, key, "@font_bold_italic") or
         std.mem.eql(u8, key, "@font_extra")) return .font;

@@ -112,6 +112,7 @@ fn mediaAvailabilityLabel(value: MediaAvailability) []const u8 {
         .video_poster_decode_failed => "VIDEO POSTER DECODE FAILED · CHECK CODEC",
         .video_poster_out_of_range => "POSTER OUT OF RANGE · LAST FRAME",
         .video_poster_fallback => "POSTER DECODE FAILED · FIRST FRAME",
+        .camera_device_unavailable => "CAMERA UNAVAILABLE · CHECK DEVICE OR SIZE",
     };
 }
 
@@ -134,6 +135,7 @@ fn mediaAvailabilityInspectorLabel(value: MediaAvailability) []const u8 {
         .video_poster_decode_failed => "POSTER DECODE FAILED · CHECK CODEC",
         .video_poster_out_of_range => "POSTER: LAST FRAME",
         .video_poster_fallback => "POSTER: FIRST FRAME",
+        .camera_device_unavailable => "CAMERA UNAVAILABLE · CHECK DEVICE",
     };
 }
 
@@ -1272,6 +1274,7 @@ pub const Notice = enum {
     detach_instance_unsupported,
     morph_state_required,
     morph_structure_locked,
+    camera_start_failed,
 };
 
 /// The active canvas tool. Creation tools are deliberately one-shot: after a
@@ -12296,7 +12299,7 @@ pub const Studio = struct {
     /// Notices are cleared by the next interaction, so they can never live
     /// behind a hover: a failure the user never saw is a failure they never
     /// fixed. The toast floats above the band and needs no seeking.
-    fn drawNoticeToast(self: Studio, viewport: Viewport) void {
+    pub fn drawNoticeToast(self: Studio, viewport: Viewport) void {
         var message_buffer: [256]u8 = undefined;
         const message = self.noticeMessage(&message_buffer) orelse return;
         const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
@@ -14259,6 +14262,7 @@ pub const Studio = struct {
             .detach_instance_unsupported => "This reusable instance cannot be detached safely here",
             .morph_state_required => "Select a state card first; BASE cannot be renamed, deleted, or reordered",
             .morph_structure_locked => "That state move would break cumulative source ownership; no change was made",
+            .camera_start_failed => "Camera could not start - check the device, permissions, and video_size",
         };
     }
 

@@ -333,6 +333,9 @@ fn buildReusableGroupMember(
         builder.local_context.text = null;
         builder.local_context.img_path = null;
         builder.local_context.vid_path = null;
+        builder.local_context.vid_is_camera = null;
+        builder.local_context.vid_camera_size = null;
+        builder.local_context.vid_camera_poster = null;
         builder.post_context = builder.local_context;
         item_context.applyOtherIfNull(component);
     }
@@ -1382,6 +1385,30 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                 if (std.mem.eql(u8, attrname, "vid")) {
                     if (attr_it.next()) |vidpath| {
                         item_context.vid_path = vidpath;
+                        item_context.vid_is_camera = false;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "cam")) {
+                    if (attr_it.next()) |device| {
+                        item_context.vid_path = device;
+                        item_context.vid_is_camera = true;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "video_size")) {
+                    if (attr_it.next()) |size_str| {
+                        var parts = std.mem.tokenizeScalar(u8, size_str, 'x');
+                        const width = std.fmt.parseInt(i32, parts.next() orelse "", 10) catch 0;
+                        const height = std.fmt.parseInt(i32, parts.next() orelse "", 10) catch 0;
+                        if (width <= 0 or height <= 0 or parts.next() != null) {
+                            reportErrorInContext(ParserError.Syntax, context, "video_size= must be WIDTHxHEIGHT");
+                            continue;
+                        }
+                        item_context.vid_camera_size = .{ .x = @floatFromInt(width), .y = @floatFromInt(height) };
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "poster_image")) {
+                    if (attr_it.next()) |poster_path| {
+                        item_context.vid_camera_poster = poster_path;
                     }
                 }
                 if (std.mem.eql(u8, attrname, "autoplay")) {
@@ -1681,6 +1708,9 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
         parsing_item_context.has_h = parsing_item_context.has_h or item_context.has_h;
     }
     if (parsing_item_context.vid_path == null) parsing_item_context.vid_path = item_context.vid_path;
+    if (parsing_item_context.vid_is_camera == null) parsing_item_context.vid_is_camera = item_context.vid_is_camera;
+    if (parsing_item_context.vid_camera_size == null) parsing_item_context.vid_camera_size = item_context.vid_camera_size;
+    if (parsing_item_context.vid_camera_poster == null) parsing_item_context.vid_camera_poster = item_context.vid_camera_poster;
     if (parsing_item_context.vid_autoplay == null) parsing_item_context.vid_autoplay = item_context.vid_autoplay;
     if (parsing_item_context.vid_loop == null) parsing_item_context.vid_loop = item_context.vid_loop;
     if (parsing_item_context.vid_poster == null) parsing_item_context.vid_poster = item_context.vid_poster;
@@ -2041,6 +2071,9 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                 context.current_context.text = null;
                 context.current_context.img_path = null;
                 context.current_context.vid_path = null;
+                context.current_context.vid_is_camera = null;
+                context.current_context.vid_camera_size = null;
+                context.current_context.vid_camera_poster = null;
                 parsing_item_context.applyOtherIfNull(ctx);
                 component_source = .{
                     .scope = .direct,
@@ -2424,6 +2457,27 @@ test "image and video share fit fill crop and focal source semantics" {
     try std.testing.expect(!morphed_video.vid_autoplay);
     try std.testing.expect(!morphed_video.vid_loop);
     try std.testing.expect(!morphed_video.vid_muted);
+}
+
+test "camera items parse device size poster and playback controls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const input =
+        \\@slide
+        \\@box cam=/dev/video2 video_size=1920x1080 poster_image=assets/camera-off.png x=10 y=20 w=640 autoplay
+    ;
+    const context = try constructSlidesFromBuf(input, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const camera = slideshow.slides.items[0].items.?.items[0];
+    try std.testing.expectEqual(slides.SlideItemKind.vid, camera.kind);
+    try std.testing.expect(camera.vid_is_camera);
+    try std.testing.expectEqualStrings("/dev/video2", camera.vid_path.?);
+    try std.testing.expectEqual(@as(f32, 1920), camera.vid_camera_size.x);
+    try std.testing.expectEqual(@as(f32, 1080), camera.vid_camera_size.y);
+    try std.testing.expectEqualStrings("assets/camera-off.png", camera.vid_camera_poster.?);
+    try std.testing.expect(camera.vid_autoplay);
 }
 
 test "text alignment inherits and morphs through reusable content" {

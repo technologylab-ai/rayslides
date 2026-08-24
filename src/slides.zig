@@ -178,6 +178,7 @@ pub const MediaAvailability = enum {
     video_poster_decode_failed,
     video_poster_out_of_range,
     video_poster_fallback,
+    camera_device_unavailable,
 
     pub fn blocksPixels(self: MediaAvailability) bool {
         return switch (self) {
@@ -286,6 +287,9 @@ pub const TemplateItemValues = struct {
     text: ?[]const u8 = null,
     img_path: ?[]const u8 = null,
     vid_path: ?[]const u8 = null,
+    vid_is_camera: bool = false,
+    vid_camera_size: rl.Vector2 = .{ .x = 1280, .y = 720 },
+    vid_camera_poster: ?[]const u8 = null,
     media_fit: MediaFit = .stretch,
     media_focus: rl.Vector2 = .{ .x = 0.5, .y = 0.5 },
     vid_autoplay: bool = false,
@@ -375,6 +379,9 @@ pub const SlideItem = struct {
     background_color: ?rl.Color = null,
     img_path: ?[]const u8 = null,
     vid_path: ?[]const u8 = null,
+    vid_is_camera: bool = false,
+    vid_camera_size: rl.Vector2 = .{ .x = 1280, .y = 720 },
+    vid_camera_poster: ?[]const u8 = null,
     vid_autoplay: bool = false,
     vid_loop: bool = false,
     /// Timestamp (seconds) of the still shown before playback; 0 = frame 0.
@@ -440,6 +447,9 @@ pub const SlideItem = struct {
             .text = self.text,
             .img_path = self.img_path,
             .vid_path = self.vid_path,
+            .vid_is_camera = self.vid_is_camera,
+            .vid_camera_size = self.vid_camera_size,
+            .vid_camera_poster = self.vid_camera_poster,
             .media_fit = self.media_fit,
             .media_focus = self.media_focus,
             .vid_autoplay = self.vid_autoplay,
@@ -474,6 +484,9 @@ pub const SlideItem = struct {
 
         if (context.img_path) |img_path| self.img_path = img_path;
         if (context.vid_path) |vid_path| self.vid_path = vid_path;
+        if (context.vid_is_camera) |value| self.vid_is_camera = value;
+        if (context.vid_camera_size) |value| self.vid_camera_size = value;
+        if (context.vid_camera_poster) |value| self.vid_camera_poster = value;
         if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
         if (context.vid_poster) |vid_poster| self.vid_poster = vid_poster;
@@ -515,6 +528,9 @@ pub const SlideItem = struct {
         if (context.crowd) |crowd| self.crowd = crowd;
         if (context.img_path) |img_path| self.img_path = img_path;
         if (context.vid_path) |vid_path| self.vid_path = vid_path;
+        if (context.vid_is_camera) |value| self.vid_is_camera = value;
+        if (context.vid_camera_size) |value| self.vid_camera_size = value;
+        if (context.vid_camera_poster) |value| self.vid_camera_poster = value;
         if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
         if (context.vid_poster) |vid_poster| self.vid_poster = vid_poster;
@@ -698,6 +714,9 @@ pub const ItemContext = struct {
     has_background_color: bool = false,
     img_path: ?[]const u8 = null,
     vid_path: ?[]const u8 = null,
+    vid_is_camera: ?bool = null,
+    vid_camera_size: ?rl.Vector2 = null,
+    vid_camera_poster: ?[]const u8 = null,
     vid_autoplay: ?bool = null,
     vid_loop: ?bool = null,
     vid_poster: ?f32 = null,
@@ -749,6 +768,9 @@ pub const ItemContext = struct {
         if (self.vid_path == null) {
             if (other.vid_path) |vid_path| self.vid_path = vid_path;
         }
+        if (self.vid_is_camera == null) self.vid_is_camera = other.vid_is_camera;
+        if (self.vid_camera_size == null) self.vid_camera_size = other.vid_camera_size;
+        if (self.vid_camera_poster == null) self.vid_camera_poster = other.vid_camera_poster;
         if (self.vid_autoplay == null) {
             if (other.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         }

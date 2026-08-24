@@ -907,7 +907,49 @@ Videos are placed like images, with the `vid=` attribute instead of `img=`:
 
 # author the audio defaults used whenever the slide is entered:
 @box vid=assets/demo.mp4 x=320 y=200 w=1280 volume=0.65 muted
+
+# live camera (platform device syntax shown below), with an export-safe still:
+@box cam=0 video_size=1280x720 poster_image=assets/camera-off.png x=320 y=200 w=1280
 ```
+
+`cam=` uses ffmpeg's native capture input: AVFoundation on macOS (`cam=0` or a
+device name), V4L2 on Linux (`cam=/dev/video0`), and DirectShow on Windows
+(`cam=CameraName`). `video_size=` is the authored capture size and defaults to
+`1280x720`. Cameras are live and non-seekable. `poster_image=` is shown while
+the feed is stopped and is also used by Studio cards, Presenter preview,
+screenshots, and PDF export. Without it, the stopped poster is black. Play
+opens the device; pause/stop releases it and restores the poster. A failed
+open produces a red Studio notice, and Showtime reports a camera-device error
+after a failed attempt.
+
+The camera frame is an ordinary Rayslides media texture, so `fit=`, focal
+position, opacity, authored box geometry, morphing, and `rotation=` all work on
+the live feed. `video_size=` controls capture resolution; it is unrelated to
+the displayed box size or poster dimensions. For example:
+
+![A live USB camera feed rotated as a Rayslides video object](images/live-camera-rotation.png)
+
+```text
+@box cam=0 video_size=1920x1080 poster_image=assets/camera-off.png x=520 y=180 w=880 h=560 fit=cover rotation=-12
+```
+
+On macOS, build and launch `zig-out/Rayslides.app`; the app bundle contains the
+camera-purpose declaration required for the system permission prompt. The
+first Play can time out while that prompt is open: choose **Allow**, then press
+Play again.
+
+On Linux, the built-in camera is commonly `/dev/video0`, while a USB camera may
+appear as `/dev/video2` or another number:
+
+```text
+@box cam=/dev/video2 video_size=1280x720 poster_image=assets/camera-off.png x=320 y=200 w=1280 h=720 fit=cover
+```
+
+Use `v4l2-ctl --list-devices` to identify the intended camera. When available,
+prefer its stable `/dev/v4l/by-id/...` symlink over a changeable `/dev/videoN`
+name. The presenting user must have permission to open the device (commonly by
+membership in the `video` group), and another application must not hold it
+exclusively. Author a mode supported by the camera; `1280x720` is the default.
 
 ## Image and video fitting
 

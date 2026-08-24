@@ -59,6 +59,17 @@ During development, use `zig build run -- talk.sld`. On macOS,
 `zig build -Doptimize=ReleaseSafe macos-app` also creates
 `zig-out/Rayslides.app`.
 
+Live camera items use the video renderer and therefore support fitting,
+cropping, rotation, opacity, morphs, posters, and the existing playback pill:
+
+```text
+@box cam=0 video_size=1920x1080 poster_image=assets/camera-off.png x=520 y=180 w=880 h=560 fit=cover rotation=-12
+```
+
+On macOS, run camera decks from the bundled `Rayslides.app` so the system can
+request camera permission. On Linux, use the intended V4L2 path such as
+`cam=/dev/video0` or preferably its stable `/dev/v4l/by-id/...` symlink.
+
 ## Documentation
 
 - [Read the online documentation](https://technologylab-ai.github.io/rayslides/)

@@ -274,6 +274,9 @@ const RenderFingerprinter = struct {
         self.addOptionalColor(item.background_color);
         self.addOptionalString(item.img_path);
         self.addOptionalString(item.vid_path);
+        self.addBool(item.vid_is_camera);
+        self.addVector(item.vid_camera_size);
+        self.addOptionalString(item.vid_camera_poster);
         self.addBool(item.vid_autoplay);
         self.addBool(item.vid_loop);
         self.addOptionalF32(item.vid_poster);
@@ -814,6 +817,10 @@ pub const SlideshowRenderer = struct {
                 .video => element.video != null,
                 .crowd => element.crowd != null,
             } and element.opacity > 0;
+            const media_availability: slides.MediaAvailability = if (element.video) |player|
+                if (player.runtime_camera_failed) .camera_device_unavailable else element.media_availability
+            else
+                element.media_availability;
             var missing_codepoint: ?u21 = null;
             if (element.text) |text| {
                 var byte_index: usize = 0;
@@ -867,7 +874,7 @@ pub const SlideshowRenderer = struct {
                 }
                 previous.has_pixels = previous.has_pixels or has_pixels;
                 if (previous.media_duration <= 0 and element.media_duration > 0) previous.media_duration = element.media_duration;
-                if (element.media_availability != .ready) previous.media_availability = element.media_availability;
+                if (media_availability != .ready) previous.media_availability = media_availability;
                 if (element.media_audio != .not_applicable) previous.media_audio = element.media_audio;
                 if (previous.first_missing_codepoint == null) previous.first_missing_codepoint = missing_codepoint;
             } else {
@@ -878,7 +885,7 @@ pub const SlideshowRenderer = struct {
                     .has_bounds = has_bounds,
                     .has_pixels = has_pixels,
                     .media_duration = element.media_duration,
-                    .media_availability = element.media_availability,
+                    .media_availability = media_availability,
                     .media_audio = element.media_audio,
                     .first_missing_codepoint = missing_codepoint,
                 });
@@ -1734,7 +1741,8 @@ pub const SlideshowRenderer = struct {
     fn createVid(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem, slideshow_filp: []const u8) !void {
         if (item.vid_path) |p| {
             const poster_time: f64 = if (item.vid_poster) |poster| @max(0, poster) else 0;
-            const result = self.video_cache.getVideoPlayer(p, slideshow_filp, poster_time) catch |err| {
+            const camera_size: @Vector(2, i32) = .{ @intFromFloat(item.vid_camera_size.x), @intFromFloat(item.vid_camera_size.y) };
+            const result = self.video_cache.getVideoPlayer(p, slideshow_filp, poster_time, item.vid_is_camera, camera_size, item.vid_camera_poster) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 log.warn("Could not load video {s}: {}", .{ p, err });
                 try appendUnavailableMediaElement(renderSlide, self.allocator, item, .video_file_unreadable);
@@ -1815,6 +1823,10 @@ pub const SlideshowRenderer = struct {
     /// Drive all decoding pipelines; players that aren't playing are no-ops.
     pub fn tickVideos(self: *SlideshowRenderer, now: f64) void {
         self.video_cache.tickAll(now);
+    }
+
+    pub fn takeCameraFailure(self: *SlideshowRenderer) bool {
+        return self.video_cache.takeCameraFailure();
     }
 
     pub fn stopAllVideos(self: *SlideshowRenderer) void {
@@ -2869,6 +2881,7 @@ fn mediaAvailabilityForVideoFailure(failure: videoplayer.VideoLoadFailure) slide
         .tools_missing => .video_tools_missing,
         .probe_failed => .video_probe_failed,
         .poster_decode_failed => .video_poster_decode_failed,
+        .camera_device_unavailable => .camera_device_unavailable,
     };
 }
 

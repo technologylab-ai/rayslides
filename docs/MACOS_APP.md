@@ -24,6 +24,19 @@ The build embeds version metadata, an `.sld` document declaration, and an
 targets macOS 13 or newer. The architecture follows the selected Zig target;
 the ordinary native build on an Apple Silicon Mac is therefore arm64.
 
+## Camera permission
+
+Use the bundled `zig-out/Rayslides.app` for slides containing `cam=`. The
+bundle declares why Rayslides needs camera access, allowing macOS to show the
+system permission prompt and list Rayslides under **System Settings → Privacy
+& Security → Camera**. A bare `zig-out/bin/rayslides` development executable
+does not provide the bundle metadata macOS requires for that prompt.
+
+The first Play may time out while the system permission sheet is open. Choose
+**Allow**, then press Play again; subsequent starts use the granted permission.
+Rayslides opens a camera only when its video item plays and releases it on
+Pause, Stop, or when leaving the slide.
+
 ## Open decks
 
 - Double-click a `.sld` after selecting Rayslides as its application.

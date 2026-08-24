@@ -50,10 +50,10 @@ fn resolveTool(io: std.Io, gpa: std.mem.Allocator, comptime name: []const u8) ?[
     return null;
 }
 
-fn requireTools(io: std.Io, gpa: std.mem.Allocator) !void {
+fn requireTools(io: std.Io, gpa: std.mem.Allocator, needs_probe: bool) !void {
     if (ffmpeg_exe == null) ffmpeg_exe = resolveTool(io, gpa, "ffmpeg");
-    if (ffprobe_exe == null) ffprobe_exe = resolveTool(io, gpa, "ffprobe");
-    if (ffmpeg_exe == null or ffprobe_exe == null) {
+    if (needs_probe and ffprobe_exe == null) ffprobe_exe = resolveTool(io, gpa, "ffprobe");
+    if (ffmpeg_exe == null or (needs_probe and ffprobe_exe == null)) {
         log.err("video playback requires ffmpeg + ffprobe (e.g. `brew install ffmpeg`)", .{});
         return error.FfmpegNotFound;
     }
@@ -91,6 +91,7 @@ pub const VideoLoadFailure = enum {
     tools_missing,
     probe_failed,
     poster_decode_failed,
+    camera_device_unavailable,
 };
 
 pub const VideoLoadResult = union(enum) {
@@ -296,6 +297,9 @@ pub const VideoPlayer = struct {
     has_audio: bool,
     /// 0 when unknown; the overlay hides its seek bar then.
     duration: f64,
+    is_camera: bool = false,
+    runtime_camera_failed: bool = false,
+    camera_failure_notice_pending: bool = false,
     // Set from the initiating item's element each time playback starts;
     // players are shared per file, so this is not authoring state.
     loop: bool = false,
@@ -329,6 +333,25 @@ pub const VideoPlayer = struct {
 
     const Self = @This();
 
+    fn appendCameraInputArgs(argv: [][]const u8, len: *usize, device: []const u8, width: i32, height: i32, size_buf: *[32]u8, dshow_buf: *[std.fs.max_path_bytes]u8) !void {
+        const size = try std.fmt.bufPrint(size_buf, "{d}x{d}", .{ width, height });
+        const format = switch (builtin.os.tag) {
+            .macos => "avfoundation",
+            .linux => "v4l2",
+            .windows => "dshow",
+            else => return error.CameraPlatformUnsupported,
+        };
+        const input = switch (builtin.os.tag) {
+            .macos => if (std.mem.indexOfScalar(u8, device, ':') != null) device else try std.fmt.bufPrint(dshow_buf, "{s}:none", .{device}),
+            .windows => try std.fmt.bufPrint(dshow_buf, "video={s}", .{device}),
+            else => device,
+        };
+        for ([_][]const u8{ "-f", format, "-framerate", "30", "-video_size", size, "-i", input }) |arg| {
+            argv[len.*] = arg;
+            len.* += 1;
+        }
+    }
+
     fn decodePosterFrame(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, at: f64, frame_size: usize) ![]u8 {
         var seek_buf: [32]u8 = undefined;
         const seek_arg = std.fmt.bufPrint(&seek_buf, "{d:.3}", .{at}) catch "0";
@@ -358,14 +381,34 @@ pub const VideoPlayer = struct {
         return result.stdout;
     }
 
-    pub fn create(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, poster_time: f64) !*Self {
-        {
+    fn decodePosterImage(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, width: i32, height: i32, frame_size: usize) ![]u8 {
+        var scale_buf: [128]u8 = undefined;
+        const scale = try std.fmt.bufPrint(&scale_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease,pad={d}:{d}:(ow-iw)/2:(oh-ih)/2", .{ width, height, width, height });
+        const result = try std.process.run(gpa, io, .{
+            .argv = &.{ ffmpeg_exe.?, "-v", "error", "-i", realpath, "-vf", scale, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-" },
+            .stdout_limit = .limited(frame_size),
+            .stderr_limit = .limited(4096),
+        });
+        gpa.free(result.stderr);
+        errdefer gpa.free(result.stdout);
+        if (result.stdout.len != frame_size) return error.VideoPosterFailed;
+        return result.stdout;
+    }
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, poster_time: f64, is_camera: bool, camera_width: i32, camera_height: i32, camera_poster: ?[]const u8) !*Self {
+        if (!is_camera) {
             const file = try std.Io.Dir.cwd().openFile(io, realpath, .{});
             defer file.close(io);
             _ = try file.stat(io);
         }
-        try requireTools(io, gpa);
-        const meta = try probe(io, gpa, realpath);
+        try requireTools(io, gpa, !is_camera);
+        const meta: ProbeResult = if (is_camera) .{
+            .width = camera_width,
+            .height = camera_height,
+            .fps = 30,
+            .has_audio = false,
+            .duration = 0,
+        } else try probe(io, gpa, realpath);
         const frame_size: usize = @as(usize, @intCast(meta.width)) * @as(usize, @intCast(meta.height)) * 3;
 
         const poster_limit = @max(0, meta.duration - 0.1);
@@ -374,7 +417,13 @@ pub const VideoPlayer = struct {
         else
             @max(0, poster_time);
         var poster_status = posterStatusForRequest(meta.duration, poster_time);
-        const poster = decodePosterFrame(gpa, io, realpath, poster_at, frame_size) catch |err| fallback: {
+        const poster = if (is_camera) camera_poster_block: {
+            if (camera_poster) |poster_path|
+                break :camera_poster_block try decodePosterImage(gpa, io, poster_path, meta.width, meta.height, frame_size);
+            const blank = try gpa.alloc(u8, frame_size);
+            @memset(blank, 0);
+            break :camera_poster_block blank;
+        } else decodePosterFrame(gpa, io, realpath, poster_at, frame_size) catch |err| fallback: {
             if (poster_at <= 0.001) return err;
             // A poster= beyond what ffmpeg can reach must not lose the video.
             log.warn("poster at {d:.2}s failed for {s} ({}); using the first frame", .{ poster_at, realpath, err });
@@ -406,6 +455,7 @@ pub const VideoPlayer = struct {
             .fps = meta.fps,
             .has_audio = meta.has_audio,
             .duration = meta.duration,
+            .is_camera = is_camera,
             .texture = texture,
             .poster_texture = poster_texture,
             .poster = poster,
@@ -442,6 +492,10 @@ pub const VideoPlayer = struct {
 
     pub fn pause(self: *Self, now: f64) void {
         if (self.state != .playing) return;
+        if (self.is_camera) {
+            self.stop();
+            return;
+        }
         self.clock += now - self.last_tick;
         self.last_tick = now;
         if (self.pipeline) |p| {
@@ -535,14 +589,24 @@ pub const VideoPlayer = struct {
         const p = self.pipeline orelse return;
         self.feedAudio(p);
         self.presentDueFrames(p);
+        if (self.is_camera and self.state == .playing and self.frames_shown == 0 and self.clock >= 3) {
+            self.runtime_camera_failed = true;
+            self.camera_failure_notice_pending = true;
+            self.stop();
+        }
     }
 
     fn startPipeline(self: *Self, now: f64) void {
         self.killPipeline();
         self.pipeline = self.buildPipeline(0) catch |err| {
             log.warn("could not start playback for {s}: {}", .{ self.path, err });
+            if (self.is_camera) {
+                self.runtime_camera_failed = true;
+                self.camera_failure_notice_pending = true;
+            }
             return;
         };
+        self.runtime_camera_failed = false;
         self.seek_offset = 0;
         self.clock = 0;
         self.frames_shown = 0;
@@ -563,18 +627,31 @@ pub const VideoPlayer = struct {
         else
             null;
 
-        var video_argv_buf: [16][]const u8 = undefined;
+        // Camera inputs add format, frame-rate, size, and device arguments
+        // before the shared rawvideo output arguments.
+        var video_argv_buf: [24][]const u8 = undefined;
         var video_argv_len: usize = 0;
         for ([_][]const u8{ ffmpeg_exe.?, "-v", "error", "-noautorotate" }) |arg| {
             video_argv_buf[video_argv_len] = arg;
             video_argv_len += 1;
         }
-        if (seek_arg) |arg| {
+        if (seek_arg != null and !self.is_camera) {
+            const arg = seek_arg.?;
             video_argv_buf[video_argv_len] = "-ss";
             video_argv_buf[video_argv_len + 1] = arg;
             video_argv_len += 2;
         }
-        for ([_][]const u8{ "-i", self.path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-" }) |arg| {
+        var camera_size_buf: [32]u8 = undefined;
+        var dshow_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (self.is_camera) {
+            try appendCameraInputArgs(&video_argv_buf, &video_argv_len, self.path, self.width, self.height, &camera_size_buf, &dshow_buf);
+        } else {
+            for ([_][]const u8{ "-i", self.path }) |arg| {
+                video_argv_buf[video_argv_len] = arg;
+                video_argv_len += 1;
+            }
+        }
+        for ([_][]const u8{ "-f", "rawvideo", "-pix_fmt", "rgb24", "-" }) |arg| {
             video_argv_buf[video_argv_len] = arg;
             video_argv_len += 1;
         }
@@ -754,12 +831,16 @@ pub const VideoPlayer = struct {
             p.mutex.unlock(p.io);
             p.space_cond.broadcast(p.io);
         } else if (available == 0 and eof) {
+            if (self.is_camera) {
+                self.runtime_camera_failed = true;
+                self.camera_failure_notice_pending = true;
+            }
             self.finishPlayback();
         }
     }
 
     fn finishPlayback(self: *Self) void {
-        if (self.loop) {
+        if (self.loop and !self.is_camera) {
             self.startPipeline(self.last_tick);
         } else {
             self.killPipeline();
@@ -792,19 +873,20 @@ pub const VideoCache = struct {
         };
     }
 
-    pub fn getVideoPlayer(self: *Self, p: []const u8, refpath: ?[]const u8, poster_time: f64) !VideoLoadResult {
+    pub fn getVideoPlayer(self: *Self, p: []const u8, refpath: ?[]const u8, poster_time: f64, is_camera: bool, camera_size: @Vector(2, i32), camera_poster_path: ?[]const u8) !VideoLoadResult {
         const io = self.io orelse return .disabled;
-        const realpath = try pathRelativeTo(p, refpath);
+        const realpath = if (is_camera) p else try pathRelativeTo(p, refpath);
+        const poster_path = if (is_camera) if (camera_poster_path) |path| try pathRelativeTo(path, refpath) else null else null;
         // The poster is baked into a player's texture, so the same file with
         // different poster= stills becomes distinct cache entries.
-        var key_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buf, "{s}|poster={d:.3}", .{ realpath, poster_time });
+        var key_buf: [std.fs.max_path_bytes * 2 + 96]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "{s}|poster={d:.3}|cam={}|size={d}x{d}|image={s}", .{ realpath, poster_time, is_camera, camera_size[0], camera_size[1], poster_path orelse "" });
         if (self.path2player.get(key)) |cached| return cached;
 
         // pathRelativeTo returns a shared static buffer; own the key now.
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
-        const result: VideoLoadResult = if (VideoPlayer.create(self.allocator, io, realpath, poster_time)) |player|
+        const result: VideoLoadResult = if (VideoPlayer.create(self.allocator, io, realpath, poster_time, is_camera, camera_size[0], camera_size[1], poster_path)) |player|
             .{ .player = player }
         else |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -835,6 +917,18 @@ pub const VideoCache = struct {
         }
     }
 
+    pub fn takeCameraFailure(self: *Self) bool {
+        var it = self.path2player.valueIterator();
+        while (it.next()) |entry| switch (entry.*) {
+            .player => |player| if (player.camera_failure_notice_pending) {
+                player.camera_failure_notice_pending = false;
+                return true;
+            },
+            .failure, .disabled => {},
+        };
+        return false;
+    }
+
     pub fn deinit(self: *Self) void {
         var it = self.path2player.iterator();
         while (it.next()) |entry| {
@@ -859,6 +953,7 @@ fn classifyVideoLoadFailure(err: anyerror) VideoLoadFailure {
     }
     if (err == error.FfmpegNotFound) return .tools_missing;
     if (err == error.VideoProbeFailed) return .probe_failed;
+    if (err == error.CameraOpenFailed or err == error.CameraPlatformUnsupported) return .camera_device_unavailable;
     return .poster_decode_failed;
 }
 
@@ -868,6 +963,7 @@ test "video diagnostics distinguish tools probe poster and file failures" {
     try std.testing.expectEqual(VideoLoadFailure.tools_missing, classifyVideoLoadFailure(error.FfmpegNotFound));
     try std.testing.expectEqual(VideoLoadFailure.probe_failed, classifyVideoLoadFailure(error.VideoProbeFailed));
     try std.testing.expectEqual(VideoLoadFailure.poster_decode_failed, classifyVideoLoadFailure(error.VideoPosterFailed));
+    try std.testing.expectEqual(VideoLoadFailure.camera_device_unavailable, classifyVideoLoadFailure(error.CameraOpenFailed));
     try std.testing.expectEqual(PosterStatus.exact, posterStatusForRequest(10, 9.8));
     try std.testing.expectEqual(PosterStatus.out_of_range, posterStatusForRequest(10, 10));
     try std.testing.expectEqual(PosterStatus.exact, posterStatusForRequest(0, 100));

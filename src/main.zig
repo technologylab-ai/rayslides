@@ -4353,6 +4353,10 @@ pub fn main(init: std.process.Init) anyerror!void {
         const now = rl.getTime();
         G.playback.settle(now);
         G.slide_renderer.tickVideos(now);
+        if (G.slide_renderer.takeCameraFailure()) studio_mode.setNotice(.camera_start_failed);
+        if (!studio_mode.capturesInput() and studio_mode.notice == .camera_start_failed and
+            (rl.isMouseButtonPressed(.left) or rl.isKeyPressed(.escape)))
+            studio_mode.setNotice(.none);
         // Entering Studio must silence a playing video; editing over audio
         // is jarring and Studio always shows the static base scene anyway.
         if (studio_mode.capturesInput() and !studio_was_capturing_input) G.slide_renderer.stopAllVideos();
@@ -5540,6 +5544,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
             if (laser_pointer.show and !studio_mode.capturesInput()) try laser_pointer.draw();
             if (banner.show) banner.render();
+            if (!studio_mode.capturesInput()) studio_mode.drawNoticeToast(studio_viewport);
 
             frame_diagnostics.draw(G.studio_ui_font, beast_mode, frameDiagnosticsPlacement(studio_viewport, slide_tl));
             property_prompt.draw(window_size, G.studio_ui_font, builtin.os.tag == .macos);
@@ -9652,7 +9657,7 @@ fn materializeStudioItem(allocator: std.mem.Allocator, item: *const slides.Slide
         try directive.appendSlice(allocator, try studioLiteralToken(path));
     }
     if (item.vid_path) |path| {
-        try directive.appendSlice(allocator, " vid=");
+        try directive.appendSlice(allocator, if (item.vid_is_camera) " cam=" else " vid=");
         try directive.appendSlice(allocator, try studioLiteralToken(path));
     }
     if (item.kind == .img or item.kind == .vid) {
@@ -9670,6 +9675,13 @@ fn materializeStudioItem(allocator: std.mem.Allocator, item: *const slides.Slide
             try appendStudioToken(&directive, allocator, " focus_y={d}", .{item.media_focus.y});
     }
     if (item.kind == .vid) {
+        if (item.vid_is_camera) {
+            try appendStudioToken(&directive, allocator, " video_size={d}x{d}", .{ @as(i32, @intFromFloat(item.vid_camera_size.x)), @as(i32, @intFromFloat(item.vid_camera_size.y)) });
+            if (item.vid_camera_poster) |poster_path| {
+                try directive.appendSlice(allocator, " poster_image=");
+                try directive.appendSlice(allocator, try studioLiteralToken(poster_path));
+            }
+        }
         if (item.vid_poster) |poster| try appendStudioToken(&directive, allocator, " poster={d}", .{poster});
         if (item.vid_autoplay) try directive.appendSlice(allocator, " autoplay");
         if (item.vid_loop) try directive.appendSlice(allocator, " loop");

@@ -51,6 +51,7 @@ def info_plist(version: str) -> dict[str, object]:
         "LSMinimumSystemVersion": "13.0",
         "NSHighResolutionCapable": True,
         "NSHumanReadableCopyright": "Open-source software",
+        "NSCameraUsageDescription": "Rayslides uses a camera only when a presentation camera item is started.",
         "UTExportedTypeDeclarations": [
             {
                 "UTTypeConformsTo": ["public.plain-text"],
@@ -91,6 +92,8 @@ def verify_bundle(bundle: Path, version: str) -> None:
         raise RuntimeError("bundle version does not match the requested version")
     if plist.get("CFBundleExecutable") != "rayslides":
         raise RuntimeError("bundle executable metadata is invalid")
+    if not plist.get("NSCameraUsageDescription"):
+        raise RuntimeError("bundle does not declare its camera usage")
     extensions = plist["CFBundleDocumentTypes"][0]["CFBundleTypeExtensions"]
     if "sld" not in extensions:
         raise RuntimeError("bundle does not advertise .sld documents")

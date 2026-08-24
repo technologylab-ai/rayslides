@@ -21,6 +21,10 @@ projector pass remain open in
 - Video adds authored poster time, scrubber, autoplay, loop, mute, volume,
   duration/audio feedback, and ffmpeg/ffprobe diagnostics. Passive outputs use
   the poster frame and never disturb audience playback.
+- Live `cam=` items reuse the video texture pipeline on AVFoundation, V4L2,
+  and DirectShow. They support authored capture size, stopped/export posters,
+  the playback pill, rotation and the complete media transform stack, plus
+  device-start notifications and Showtime findings.
 
 On macOS, insertion and replacement offer a native file picker. Linux and
 Windows keep the portable manual-path prompt; all platforms accept media file
