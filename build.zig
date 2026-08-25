@@ -121,6 +121,15 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "rayslides",
         .root_module = exe_mod,
+        // raylib-zig records its `-lGL -lX11 ...` dependencies as shared-object
+        // members inside the static libraylib.a. LLD reports each one as
+        // "neither ET_REL nor LLVM bitcode", and Zig escalates that unexpected
+        // stderr into a build failure, so any LLD-linked build (ReleaseFast and
+        // friends, which use the LLVM backend) breaks. Zig's own ELF linker
+        // ignores those members, and the explicit glibc pin above already gave
+        // it csu objects it can handle. The exe links the system libraries
+        // directly regardless, so nothing is lost.
+        .use_lld = if (native_linux) false else null,
     });
 
     const raylib_dep = b.dependency("raylib_zig", .{
