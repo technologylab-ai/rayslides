@@ -2,12 +2,29 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_zon = @embedFile("build.zig.zon");
 
-const default_target: std.Target.Query = if (builtin.os.tag == .macos) .{
+const default_target: std.Target.Query = switch (builtin.os.tag) {
     // Native Zig otherwise records the exact host macOS version as the
     // deployment floor. Keep local CLI builds and the non-notarized .app
     // usable on the oldest macOS version advertised by the bundle instead.
-    .os_tag = .macos,
-    .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+    .macos => .{
+        .os_tag = .macos,
+        .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+    },
+    .linux => linux_default_target,
+    else => .{},
+};
+
+// A native glibc build links the host's crt1.o, and toolchains from GCC 16 on
+// emit a .sframe section into it whose R_X86_64_PC64 relocations Zig's ELF
+// linker cannot process ("unhandled relocation type"). Naming the host glibc
+// explicitly makes the query non-native, so Zig builds its own csu objects and
+// libc stubs from the ones it ships and never opens the host crt1.o. The build
+// stays host-compatible because the pinned version is the detected host one;
+// `addNativeSystemPaths` below restores the search roots this costs us.
+const linux_default_target: std.Target.Query = if (builtin.abi.isGnu()) .{
+    .os_tag = .linux,
+    .abi = .gnu,
+    .glibc_version = builtin.target.os.version_range.linux.glibc,
 } else .{};
 
 fn packageVersion() []const u8 {
@@ -27,10 +44,48 @@ fn macosSdkPath(b: *std.Build) []const u8 {
     return std.mem.trim(u8, output, " \r\n\t");
 }
 
+fn addNativeSystemPaths(b: *std.Build, mod: *std.Build.Module) void {
+    // Counterpart to the explicit glibc pin in `linux_default_target`: because
+    // the query is no longer native, Zig stops probing the host for the X11 and
+    // OpenGL headers and libraries raylib links against. Ask Zig for the same
+    // roots a native query would have found rather than assuming an FHS layout,
+    // so Nix-style hosts keep working.
+    const paths = std.zig.system.NativePaths.detect(
+        b.allocator,
+        b.graph.io,
+        &b.graph.host.result,
+        &b.graph.environ_map,
+    ) catch @panic("could not detect native system paths");
+    // Detection offers the union of every layout it knows about, and Zig turns
+    // each missing one into a warning that fails the compile, so drop the
+    // directories this host does not actually have.
+    for (paths.include_dirs.items) |dir| {
+        if (dirExists(b, dir)) mod.addSystemIncludePath(.{ .cwd_relative = dir });
+    }
+    for (paths.lib_dirs.items) |dir| {
+        if (dirExists(b, dir)) mod.addLibraryPath(.{ .cwd_relative = dir });
+    }
+    for (paths.rpaths.items) |dir| {
+        if (dirExists(b, dir)) mod.addRPathSpecial(dir);
+    }
+}
+
+fn dirExists(b: *std.Build, path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(b.graph.io, path, .{}) catch return false;
+    dir.close(b.graph.io);
+    return true;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .default_target = default_target });
 
     const optimize = b.standardOptimizeOption(.{});
+
+    // Only the pinned host build needs the host search roots back; a genuine
+    // `-Dtarget=` cross build must not be handed this machine's headers.
+    const native_linux = target.result.os.tag == .linux and
+        target.result.os.tag == builtin.os.tag and
+        target.result.cpu.arch == builtin.cpu.arch;
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -59,6 +114,8 @@ pub fn build(b: *std.Build) void {
         exe_mod.linkFramework("Foundation", .{});
     } else if (target.result.os.tag == .windows) {
         exe_mod.linkSystemLibrary("iphlpapi", .{});
+    } else if (native_linux) {
+        addNativeSystemPaths(b, exe_mod);
     }
 
     const exe = b.addExecutable(.{
@@ -75,6 +132,7 @@ pub fn build(b: *std.Build) void {
     const raygui = raylib_dep.module("raygui"); // raygui module
     const raylib_artifact = raylib_dep.artifact("raylib"); // raylib C library
     raylib_artifact.root_module.addCMacro("SUPPORT_FILEFORMAT_JPG", "1");
+    if (native_linux) addNativeSystemPaths(b, raylib_artifact.root_module);
 
     exe.root_module.linkLibrary(raylib_artifact);
     exe.root_module.addImport("raylib", raylib);
