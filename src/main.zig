@@ -5756,7 +5756,12 @@ pub fn main(init: std.process.Init) anyerror!void {
             if (banner.show) banner.render();
             if (!studio_mode.capturesInput()) studio_mode.drawNoticeToast(studio_viewport);
 
-            frame_diagnostics.draw(G.studio_ui_font, beast_mode, frameDiagnosticsPlacement(studio_viewport, slide_tl));
+            // The HUD is editor chrome like the laser and remote drawing above
+            // it, so it must not be baked into a passive output. Both capture
+            // paths render an ordinary frame and read it back, which would
+            // otherwise put the overlay into the PDF and the screenshot.
+            if (!export_controller.running and !screenshot_poster_render_pending)
+                frame_diagnostics.draw(G.studio_ui_font, beast_mode, frameDiagnosticsPlacement(studio_viewport, slide_tl));
             property_prompt.draw(window_size, G.studio_ui_font, builtin.os.tag == .macos);
             if (!export_controller.running) {
                 // Discovery chrome is intentionally last: command search and
