@@ -22,6 +22,7 @@ const studio_catalog = @import("studio_catalog.zig");
 const studio_library_preview = @import("studio_library_preview.zig");
 const studio_new_deck = @import("studio_new_deck.zig");
 const studio_prompt = @import("studio_prompt.zig");
+const file_browser = @import("file_browser.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const motion_schedule = @import("motion_schedule.zig");
 const videoplayer = @import("videoplayer.zig");
@@ -54,6 +55,7 @@ const cli_help =
     \\Diagnostics and visual QA:
     \\  --diagnostics                    Show the diagnostics HUD
     \\  --diagnostics-command-palette    Open Studio with Commands visible
+    \\  --diagnostics-file-browser       Open Studio with the deck file chooser visible
     \\  --diagnostics-command-tooltip    Show deterministic command hover help
     \\  --diagnostics-precision-view     Show rulers, guides, and precision tools
     \\  --diagnostics-grid-settings      Open the Studio grid appearance popover
@@ -96,7 +98,6 @@ const cli_help =
 const MacOpenDocuments = struct {
     extern fn rayslides_macos_install_open_document_handler() void;
     extern fn rayslides_macos_take_open_document(buffer: [*]u8, capacity: usize) usize;
-    extern fn rayslides_macos_choose_media(video: bool, initial_directory: [*:0]const u8, buffer: [*]u8, capacity: usize) usize;
 
     fn install() void {
         if (comptime builtin.os.tag == .macos) rayslides_macos_install_open_document_handler();
@@ -108,24 +109,15 @@ const MacOpenDocuments = struct {
         }
         return 0;
     }
-
-    fn chooseMedia(kind: StudioMediaKind, initial_directory: [:0]const u8, buffer: []u8) usize {
-        if (comptime builtin.os.tag == .macos) {
-            return rayslides_macos_choose_media(kind == .video, initial_directory.ptr, buffer.ptr, buffer.len);
-        }
-        return 0;
-    }
 };
 
 const StudioMediaKind = enum { image, video };
 
 fn studioMediaKindForPath(path: []const u8) ?StudioMediaKind {
     const extension = std.fs.path.extension(path);
-    const image_extensions = [_][]const u8{ ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tga", ".qoi", ".svg" };
-    const video_extensions = [_][]const u8{ ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpg", ".mpeg" };
-    for (image_extensions) |candidate|
+    for (file_browser.image_extensions) |candidate|
         if (std.ascii.eqlIgnoreCase(extension, candidate)) return .image;
-    for (video_extensions) |candidate|
+    for (file_browser.video_extensions) |candidate|
         if (std.ascii.eqlIgnoreCase(extension, candidate)) return .video;
     return null;
 }
@@ -469,6 +461,7 @@ test {
     std.testing.refAllDecls(studio_library_preview);
     std.testing.refAllDecls(studio_new_deck);
     std.testing.refAllDecls(studio_prompt);
+    std.testing.refAllDecls(file_browser);
     std.testing.refAllDecls(studio_roundtrip_test);
     std.testing.refAllDecls(motion_schedule);
 }
@@ -3376,6 +3369,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var suppress_startup_banner = false;
     var diagnostics_enabled = false;
     var diagnostics_command_palette = false;
+    var diagnostics_file_browser = false;
     var diagnostics_command_tooltip = false;
     var diagnostics_precision_view = false;
     var diagnostics_grid_settings = false;
@@ -3462,6 +3456,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
                 diagnostics_enabled = true;
                 diagnostics_command_palette = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-file-browser")) {
+                diagnostics_enabled = true;
+                diagnostics_file_browser = true;
                 launch_studio = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-command-tooltip")) {
                 diagnostics_enabled = true;
@@ -3759,6 +3757,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_library_preview_pending = diagnostics_library_preview_name;
     var diagnostics_library_definition_pending = diagnostics_library_definition_name;
     var diagnostics_command_palette_pending = diagnostics_command_palette;
+    var diagnostics_file_browser_pending = diagnostics_file_browser;
     var diagnostics_precision_view_pending = diagnostics_precision_view;
     var diagnostics_grid_settings_pending = diagnostics_grid_settings;
     var diagnostics_status_drawer_pending = diagnostics_status_drawer;
@@ -3911,7 +3910,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         const inline_edit_active_at_frame_start = studio_mode.inlineEditActive();
         const command_palette_active_at_frame_start = studio_mode.commandPaletteActive();
         const library_picker_active_at_frame_start = studio_mode.libraryPickerActive();
-        const text_input_active_at_frame_start = property_prompt.active or studio_mode.textEntryActive();
+        const text_input_active_at_frame_start = property_prompt.active or studio_file_browser.active or studio_mode.textEntryActive();
         const presenter_network_now = rl.getTime();
         if (presenter_runtime.isRunning() and !presenter_network.explicit and
             presenter_network_now >= presenter_network_refresh_at)
@@ -4165,6 +4164,12 @@ pub fn main(init: std.process.Init) anyerror!void {
                     log.err("Error while snapshotting: {any}", .{err});
                 }
             }
+        }
+
+        // Cmd/Ctrl-O works in Studio and in presentation alike, exactly like
+        // dropping a deck onto the window; the same open guards apply.
+        if (!text_input_active_at_frame_start and !export_controller.running and shortcutModifierDown() and rl.isKeyPressed(.o)) {
+            beginStudioFileBrowse(.deck);
         }
 
         if (!text_input_active_at_frame_start and rl.isKeyPressed(.s)) {
@@ -4831,6 +4836,10 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_mode.openCommandPaletteForDiagnostics(studio_items);
                 diagnostics_command_palette_pending = false;
             }
+            if (diagnostics_file_browser_pending) {
+                beginStudioFileBrowse(.deck);
+                diagnostics_file_browser_pending = false;
+            }
             if (diagnostics_precision_view_pending) {
                 studio_mode.showPrecisionViewForDiagnostics();
                 diagnostics_precision_view_pending = false;
@@ -4890,20 +4899,37 @@ pub fn main(init: std.process.Init) anyerror!void {
         var history_command_requested: ?bool = null;
         var studio_slide_to_select: ?usize = null;
         var source_graph_reparsed_this_frame = false;
+        const browser_was_active = studio_file_browser.active;
         const prompt_was_active = property_prompt.active;
-        if (prompt_was_active) {
-            switch (property_prompt.updateFromRaylib(window_size, G.studio_ui_font, builtin.os.tag == .macos)) {
+        // The file chooser stacks above a media prompt: while it is open the
+        // prompt underneath neither reads keys nor submits.
+        const modal_was_active = prompt_was_active or browser_was_active;
+        if (browser_was_active) {
+            switch (studio_file_browser.updateFromRaylib(window_size, G.studio_ui_font)) {
+                .none => {},
+                .chosen => {
+                    const chosen = studio_file_browser.chosenPath();
+                    switch (studio_file_browser.purpose) {
+                        .deck => _ = queueExternalDeckOpen(chosen, false, &studio_mode),
+                        .image, .video => if (property_prompt.active) {
+                            var source_path: [std.fs.max_path_bytes]u8 = undefined;
+                            const source_len = studioMediaSourcePath(chosen, &source_path);
+                            if (source_len > 0) property_prompt.begin(property_prompt.kind, source_path[0..source_len]);
+                        },
+                    }
+                    window_close_seen = false;
+                },
+                .cancelled => window_close_seen = false,
+            }
+        } else if (prompt_was_active) {
+            switch (property_prompt.updateFromRaylib(window_size, G.studio_ui_font, true)) {
                 .none => {},
                 .browse_requested => {
-                    var chosen_path: [std.fs.max_path_bytes]u8 = undefined;
-                    const prompt_kind = property_prompt.kind;
-                    const media_kind: StudioMediaKind = switch (prompt_kind) {
+                    beginStudioFileBrowse(switch (property_prompt.kind) {
                         .image_path => .image,
                         .video_path => .video,
                         else => unreachable,
-                    };
-                    const chosen_len = browseStudioMediaPath(media_kind, &chosen_path);
-                    if (chosen_len > 0) property_prompt.begin(prompt_kind, chosen_path[0..chosen_len]);
+                    });
                     window_close_seen = false;
                 },
                 .submitted => {
@@ -4976,7 +5002,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        const studio_command: ?studio.GeometryCommand = if (!export_controller.running and !prompt_was_active and !presenter_overlay_captures_input)
+        const studio_command: ?studio.GeometryCommand = if (!export_controller.running and !modal_was_active and !presenter_overlay_captures_input)
             studio_mode.updateWithWorkspaceFromRaylib(studio_items, studio_bounds.items, studio_viewport, studio_workspace)
         else
             null;
@@ -5000,9 +5026,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             studio_mode.showCommandTooltipForDiagnostics(studio_viewport);
         }
         const studio_geometry_batch: ?studio.GeometryBatchCommand = studio_mode.takeGeometryBatch();
-        if (!prompt_was_active) {
+        if (!modal_was_active) {
             if (studio_mode.takeSemanticCommand()) |command| {
                 switch (command) {
+                    .open_document => beginStudioFileBrowse(.deck),
                     .save_document => {
                         if (G.slideshow_filp == null) {
                             pending_save_as = true;
@@ -5774,7 +5801,8 @@ pub fn main(init: std.process.Init) anyerror!void {
             // otherwise put the overlay into the PDF and the screenshot.
             if (!export_controller.running and !screenshot_poster_render_pending)
                 frame_diagnostics.draw(G.studio_ui_font, beast_mode, frameDiagnosticsPlacement(studio_viewport, slide_tl));
-            property_prompt.draw(window_size, G.studio_ui_font, builtin.os.tag == .macos);
+            property_prompt.draw(window_size, G.studio_ui_font, true);
+            studio_file_browser.draw(window_size, G.studio_ui_font);
             if (!export_controller.running) {
                 // Discovery chrome is intentionally last: command search and
                 // hover help must remain legible above diagnostics and every
@@ -6075,7 +6103,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             window_close_seen = false;
         }
 
-        const keyboard_history_requested = !presenter_overlay_captures_input and !property_prompt.active and !studio_mode.textEntryActive() and
+        const keyboard_history_requested = !presenter_overlay_captures_input and !property_prompt.active and !studio_file_browser.active and !studio_mode.textEntryActive() and
             shortcutModifierDown() and rl.isKeyPressed(.z);
         if (!source_graph_reparsed_this_frame and studio_mode.capturesInput() and
             (keyboard_history_requested or history_command_requested != null))
@@ -6115,7 +6143,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             reversePresentation(rl.getTime());
         }
 
-        if (!presenter_overlay_captures_input and crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.o)) {
+        if (!presenter_overlay_captures_input and crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and !shortcutModifierDown() and rl.isKeyPressed(.o)) {
             _ = crowd_runtime.toggleOpen();
         }
         if (!presenter_overlay_captures_input and crowd_runtime.isRunning() and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.v)) {
@@ -6125,7 +6153,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             _ = crowd_runtime.resetActive();
         }
 
-        if (!presenter_overlay_captures_input and !property_prompt.active and !studio_mode.textEntryActive() and rl.isKeyPressed(.f)) {
+        if (!presenter_overlay_captures_input and !property_prompt.active and !studio_file_browser.active and !studio_mode.textEntryActive() and rl.isKeyPressed(.f)) {
             if (fullscreen_mode == .windowed) {
                 enterPresentationFullscreen(
                     &fullscreen_mode,
@@ -6148,7 +6176,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!presenter_overlay_captures_input and !property_prompt.active and !studio_mode.textEntryActive() and (rl.isKeyPressed(.q) or
+        if (!presenter_overlay_captures_input and !property_prompt.active and !studio_file_browser.active and !studio_mode.textEntryActive() and (rl.isKeyPressed(.q) or
             (rl.isKeyPressed(.escape) and !studio_active_at_frame_start and !presenter_pairing_visible_at_frame_start)))
         {
             if (readyToQuitPreservingEdits(&studio_mode)) break;
@@ -6170,7 +6198,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!presenter_overlay_captures_input and !studio_mode.capturesInput() and !property_prompt.active and rl.isKeyPressed(.b)) {
+        if (!presenter_overlay_captures_input and !studio_mode.capturesInput() and !property_prompt.active and !studio_file_browser.active and rl.isKeyPressed(.b)) {
             if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
                 banner.reset();
             } else {
@@ -6912,7 +6940,7 @@ var G = AppData{};
 
 fn studioMediaSourcePath(selected_path: []const u8, output: []u8) usize {
     var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_len = std.Io.Dir.cwd().realPath(G.io, &cwd_buffer) catch return 0;
+    const cwd_len = std.Io.Dir.cwd().realPathFile(G.io, ".", &cwd_buffer) catch return 0;
     const cwd = cwd_buffer[0..cwd_len];
     const source_path = studioMediaPathFromSelection(
         G.allocator,
@@ -6926,22 +6954,27 @@ fn studioMediaSourcePath(selected_path: []const u8, output: []u8) usize {
     return source_path.len;
 }
 
-fn browseStudioMediaPath(kind: StudioMediaKind, output: []u8) usize {
-    if (comptime builtin.os.tag != .macos) return 0;
+/// The one modal chooser for decks and media. Static because its entry arena
+/// is far too large for the main loop's stack frame.
+var studio_file_browser: file_browser.Browser = .{};
 
+/// The directory Browse opens in: beside the current deck when there is one,
+/// otherwise wherever the process was started.
+fn studioBrowseStartDirectory(buffer: []u8) []const u8 {
     var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_len = std.Io.Dir.cwd().realPath(G.io, &cwd_buffer) catch return 0;
+    const cwd_len = std.Io.Dir.cwd().realPathFile(G.io, ".", &cwd_buffer) catch return "";
     const cwd = cwd_buffer[0..cwd_len];
     const deck_dir = if (G.slideshow_filp) |path| std.fs.path.dirname(path) orelse "." else ".";
-    const absolute_deck_dir = std.fs.path.resolve(G.allocator, &.{ cwd, deck_dir }) catch return 0;
+    const absolute_deck_dir = std.fs.path.resolve(G.allocator, &.{ cwd, deck_dir }) catch return "";
     defer G.allocator.free(absolute_deck_dir);
+    if (absolute_deck_dir.len > buffer.len) return "";
+    @memcpy(buffer[0..absolute_deck_dir.len], absolute_deck_dir);
+    return buffer[0..absolute_deck_dir.len];
+}
 
-    var directory_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const directory = std.fmt.bufPrintZ(&directory_buffer, "{s}", .{absolute_deck_dir}) catch return 0;
-    var selected_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const selected_len = MacOpenDocuments.chooseMedia(kind, directory, &selected_buffer);
-    if (selected_len == 0) return 0;
-    return studioMediaSourcePath(selected_buffer[0..selected_len], output);
+fn beginStudioFileBrowse(purpose: file_browser.Purpose) void {
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    studio_file_browser.begin(G.io, purpose, studioBrowseStartDirectory(&directory_buffer));
 }
 
 var slicetocbuf: [1024]u8 = undefined;
@@ -9849,12 +9882,7 @@ test "Studio workspace cache avoids unchanged large-deck rescans" {
     try std.testing.expectEqual(@as(usize, 1), cache.scene_rebuild_count);
 
     const next = slideshow.slides.items[selected_index + 1];
-    try std.testing.expect(try cache.refreshScene(
-        selected_index + 1,
-        next,
-        try source_editor.slideItemInsertionOffset(source_builder.items, next.pos_in_editor),
-        try source_editor.slideEndOffset(source_builder.items, next.pos_in_editor),
-    &.{}, ""));
+    try std.testing.expect(try cache.refreshScene(selected_index + 1, next, try source_editor.slideItemInsertionOffset(source_builder.items, next.pos_in_editor), try source_editor.slideEndOffset(source_builder.items, next.pos_in_editor), &.{}, ""));
     try std.testing.expectEqual(@as(usize, 1), cache.document_rebuild_count);
     try std.testing.expectEqual(@as(usize, 2), cache.scene_rebuild_count);
 
@@ -11267,6 +11295,7 @@ fn applyStudioSemanticEdit(
         .undo,
         .redo,
         .pair_presenter_phone,
+        .open_document,
         .choose_presentation_display,
         .showtime_preflight,
         .create_portable_show,

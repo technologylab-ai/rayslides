@@ -72,6 +72,7 @@
                 <tr><td><kbd>Shift</kbd> + <kbd>M</kbd></td><td>Stop the videos on the current slide and rewind them.</td></tr>
                 <tr><td><kbd>B</kbd></td><td>Turn Beast Mode on or off. Beast Mode removes the 60 FPS limit.</td></tr>
                 <tr><td><kbd>E</kbd></td><td>Enter or leave Studio.</td></tr>
+                <tr><td><kbd>Cmd/Ctrl-O</kbd></td><td>Browse for and open another <code class="inline-code">.sld</code> deck.</td></tr>
                 <tr><td><kbd>F3</kbd></td><td>Show or hide the diagnostics display.</td></tr>
                 <tr><td><kbd>Q</kbd> or <kbd>Esc</kbd></td><td>Quit.</td></tr>
               </tbody>
@@ -123,7 +124,7 @@
               </tbody>
             </table>
           </div>
-          <p>On macOS, Image and Video prompts include a native file picker. Manual path entry remains available everywhere. Dropping a supported image or video over the Studio canvas creates that media item at the drop position. Saved decks use a relative path when possible.</p>
+          <p>Image and Video prompts include a <strong>Browse…</strong> file picker on every platform: the same Rayslides-drawn chooser used by <strong>Open deck…</strong> (<kbd>Cmd/Ctrl-O</kbd>), filtered to images or videos. Manual path entry remains available everywhere. Dropping a supported image or video over the Studio canvas creates that media item at the drop position. Saved decks use a relative path when possible.</p>
           <p>SVG files use the Image path, including picker, replacement, fitting, reusable ownership, diagnostics, and export. The embedded vector subset does not render SVG <code class="inline-code">&lt;text&gt;</code>; convert type to paths first.</p>
           <p>When an image or video is selected, Properties shows its effective <strong>IMAGE</strong> or <strong>VIDEO</strong> kind, its filename/path, and a separate <strong>...</strong> replacement button. Click <strong>...</strong>, or press <kbd>Enter</kbd> while Properties is visible, to choose a new source through the same picker and path policy without changing the object's geometry, ID, ordering, or other properties. On reusable instances, an amber <strong>R</strong> beside a local source override restores the inherited image or video.</p>
           <p>Both media kinds share <strong>Stretch</strong>, <strong>Fit</strong>, and <strong>Fill</strong> controls. Fit preserves the complete picture inside the box; Fill preserves aspect ratio while cropping to cover it. <code>FX</code> and <code>FY</code> choose the normalized focal position from <code>0</code> to <code>1</code>, and the panel shows natural pixels beside the authored box size.</p>
@@ -139,6 +140,7 @@
               <tbody>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd></td><td>Open the command palette.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>F</kbd></td><td>Find a slide, library item, or object.</td></tr>
+                <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>O</kbd></td><td>Open an existing deck through the built-in file chooser; also available as <strong>Open existing deck…</strong> on the starter chooser.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd></td><td>Name an untitled deck or save the named deck.</td></tr>
                 <tr><td><kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd></td><td>Save a unique <code>*.edited.sld</code> copy.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd></td><td>Undo the last source edit. After choosing a starter, return to the chooser.</td></tr>

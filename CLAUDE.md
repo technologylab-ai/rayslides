@@ -55,6 +55,8 @@ zig build -Doptimize=ReleaseSafe studio-baselines-update -- --workspace 12
 
 - **source_editor.zig** - Guarded, byte-preserving `.sld` rewriting for every Studio command: item/geometry patches, layer moves, duplication, morph-state blocks, and the motion primitives (`setItemReveal`/`removeItemReveal`, `setMorphStateTiming`, `setSlideTransition`/`removeSlideTransition`, `setDeckTransitionDefaults`). Writes minimal source and leaves unedited lines untouched.
 
+- **file_browser.zig** - Self-drawn modal file chooser used on every platform for Open deck (Cmd/Ctrl-O, Commands, the welcome chooser) and the image/video Browse… buttons. Allocation-free directory model (listing, extension/hidden/type-ahead filtering, navigation, per-purpose remembered folder) that is unit-tested against a temporary tree, plus raylib input/drawing. `--diagnostics-file-browser` opens it for visual QA captures.
+
 - **motion_schedule.zig** - Deterministic preview schedule for one logical slide: turns the renderer's step timeline plus an optional incoming transition into absolute time windows (click-gated steps get a fixed 0.75 s gap) and answers `stateAt(t)` as a pure function of time for the Studio live preview.
 
 - **playback.zig** - Presentation-time playback `State`: the visible/active reveal or morph step, automatic-step timing, direction, and the incoming slide transition clock.

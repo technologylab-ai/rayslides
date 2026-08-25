@@ -2105,6 +2105,7 @@ pub const Workspace = struct {
 pub const SemanticCommand = union(enum) {
     /// Application-level intentions surfaced through the command palette.
     /// The integration retains ownership of persistence and history stacks.
+    open_document: void,
     save_document: void,
     save_document_copy: void,
     undo: void,
@@ -2680,6 +2681,9 @@ pub fn libraryVisualFromItems(
 pub const NewDeckLayout = struct {
     panel: rl.Rectangle,
     cards: [studio_new_deck.all.len]rl.Rectangle,
+    /// "Open existing deck…" button in the header, for users who launched
+    /// without a deck but do not want a starter.
+    open_existing: rl.Rectangle,
     compact: bool,
 };
 
@@ -2718,7 +2722,14 @@ pub fn newDeckLayout(viewport: Viewport) NewDeckLayout {
             .height = card_height,
         };
     }
-    return .{ .panel = panel, .cards = cards, .compact = compact };
+    const open_width: f32 = if (compact) 150 else 190;
+    const open_existing: rl.Rectangle = .{
+        .x = panel.x + panel.width - padding - open_width,
+        .y = panel.y + padding,
+        .width = open_width,
+        .height = if (compact) 28 else 34,
+    };
+    return .{ .panel = panel, .cards = cards, .open_existing = open_existing, .compact = compact };
 }
 
 const StarterPalette = struct {
@@ -3745,6 +3756,7 @@ pub const MorphTimelineLayout = struct {
 };
 
 pub const CommandId = enum {
+    open,
     save,
     save_copy,
     undo,
@@ -3814,6 +3826,7 @@ const CommandSpec = struct {
 };
 
 const command_specs = [_]CommandSpec{
+    .{ .id = .open, .category = "FILE", .title = "Open deck…", .description = "Browse for an existing .sld deck", .keywords = "load file browse existing folder", .shortcut = "Cmd/Ctrl O" },
     .{ .id = .save, .category = "FILE", .title = "Save document", .description = "Save this source-backed deck", .keywords = "write persist document file", .shortcut = "Cmd/Ctrl S" },
     .{ .id = .save_copy, .category = "FILE", .title = "Save a copy", .description = "Write a new .edited.sld copy", .keywords = "duplicate export backup file", .shortcut = "Shift Cmd/Ctrl S" },
     .{ .id = .undo, .category = "HISTORY", .title = "Undo", .description = "Restore the previous source transaction", .keywords = "back history revert", .shortcut = "Cmd/Ctrl Z" },
@@ -5579,6 +5592,7 @@ pub const Studio = struct {
         else
             null;
         return switch (id) {
+            .open,
             .save,
             .save_copy,
             .tool_select,
@@ -6138,6 +6152,7 @@ pub const Studio = struct {
             else => {},
         };
         switch (id) {
+            .open => self.pending_semantic_command = .{ .open_document = {} },
             .save => self.pending_semantic_command = .{ .save_document = {} },
             .save_copy => self.pending_semantic_command = .{ .save_document_copy = {} },
             .undo => self.pending_semantic_command = .{ .undo = {} },
@@ -10611,6 +10626,11 @@ pub const Studio = struct {
         // changing the pristine source behind the chooser.
         if (!input.pointer_pressed) return true;
         const layout = newDeckLayout(viewport);
+        if (pointInRectangle(input.pointer_screen, layout.open_existing)) {
+            self.pending_semantic_command = .{ .open_document = {} };
+            self.notice = .none;
+            return true;
+        }
         for (layout.cards, studio_new_deck.all) |card, preset| {
             if (!pointInRectangle(input.pointer_screen, card)) continue;
             if (self.interaction != .idle) self.cancelInteraction(items);
@@ -15201,6 +15221,10 @@ pub const Studio = struct {
         const left = layout.panel.x + @as(f32, if (layout.compact) 14 else 22);
         const top = layout.panel.y + @as(f32, if (layout.compact) 11 else 18);
         self.drawUiText("Create your first deck", .{ .x = left, .y = top }, heading_font, theme.text);
+        if (layout.compact)
+            drawCompactButton(self, layout.open_existing, "Open existing…")
+        else
+            drawActionButton(self, layout.open_existing, "Open existing deck…");
         if (!layout.compact) {
             self.drawUiText(
                 "Choose a source-native starter. Everything remains editable .sld text.",
@@ -15209,7 +15233,7 @@ pub const Studio = struct {
                 theme.text_secondary,
             );
             self.drawUiText(
-                "Keys 1–4 choose instantly · Cmd/Ctrl-S names and saves the deck",
+                "Keys 1–4 choose instantly · Cmd/Ctrl-S names and saves the deck · Cmd/Ctrl-O opens an existing deck",
                 .{ .x = left, .y = top + 67 },
                 UiTypography.compact,
                 theme.accent_bright,
@@ -22975,6 +22999,30 @@ test "new deck chooser emits exact card and keyboard presets" {
             .create_starter_deck => |chosen| try std.testing.expectEqual(preset, chosen),
             else => return error.UnexpectedSemanticCommand,
         }
+    }
+}
+
+test "new deck chooser offers opening an existing deck" {
+    const workspace: Workspace = .{ .visible = true, .new_deck = true };
+    const frame = frameLayout(
+        .{ .x = 0, .y = 0, .width = 1280, .height = 720 },
+        true,
+        false,
+        .slides,
+    );
+    const layout = newDeckLayout(frame.viewport);
+    try std.testing.expect(pointInRectangle(rectangleCenter(layout.open_existing), layout.panel));
+    for (layout.cards) |card| try std.testing.expect(!pointInRectangle(rectangleCenter(layout.open_existing), card));
+
+    var studio: Studio = .{ .enabled = true, .active_dock = .slides };
+    var no_items: [0]slides.SlideItem = .{};
+    _ = studio.updateWithWorkspace(&no_items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.open_existing),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .open_document => {},
+        else => return error.UnexpectedSemanticCommand,
     }
 }
 

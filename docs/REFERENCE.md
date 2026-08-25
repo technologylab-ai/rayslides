@@ -113,6 +113,7 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>P</kbd> | Show or hide private Presenter Companion pairing |
 | <kbd>Shift-P</kbd> | Unpair the phone and stop the Presenter server |
 | <kbd>E</kbd> | Enter or leave Studio visual editing mode |
+| <kbd>Cmd/Ctrl-O</kbd> | Browse for and open another `.sld` deck |
 | <kbd>F3</kbd> | Toggle frame/rebuild diagnostics |
 
 **Beast Mode**: removes the 60 FPS limit
@@ -129,6 +130,13 @@ slides, source-native `@pushslide` layouts, a reusable `@pushgroup` footer,
 stable item IDs, and live
 `$slide_number` fields. Nothing is hidden in a project format: the result is
 ordinary readable `.sld` source and one Undo returns to the pristine chooser.
+Already have a deck? Click **Open existing deck…** on the chooser, press
+<kbd>Cmd/Ctrl-O</kbd>, or run **Open deck…** from Commands to browse for an
+`.sld` file. The chooser is drawn by Rayslides itself and behaves identically on
+macOS, Linux, and Windows: type to filter the list, <kbd>Enter</kbd> opens a
+folder or the selected deck, <kbd>Backspace</kbd> goes up, and typing `/` or
+`~` switches to direct path entry. Opening follows the same rules as dropping a
+deck onto the window, so an unsaved Studio document is never replaced silently.
 
 Press <kbd>Cmd/Ctrl-S</kbd> on an untitled deck to choose its path. Rayslides
 adds `.sld` when needed and refuses to overwrite an existing file. After the
@@ -377,9 +385,11 @@ The top toolbar contains these one-shot canvas tools:
 | Line | <kbd>L</kbd> | Click to add a plain line; use <kbd>A</kbd> for an arrow |
 | Library | <kbd>U</kbd> | Click, then name an existing reusable `@push` element |
 
-On macOS, Image and Video prompts include a native **Browse…** picker rooted at
-the saved deck's directory. Other platforms retain the portable path-entry
-prompt. A chosen file is stored relative to a saved deck when possible;
+Image and Video prompts include a **Browse…** picker rooted at the saved deck's
+directory on every platform. It is the same Rayslides-drawn chooser used by
+**Open deck…**, filtered to image or video files, and it remembers the last
+folder visited for each kind during the session. Manual path entry remains
+available. A chosen file is stored relative to a saved deck when possible;
 untitled decks retain the selected path. While Studio is open, dropping a
 supported image or video file over the canvas creates the corresponding media
 item at the drop position through the same source/history transaction. Drop
