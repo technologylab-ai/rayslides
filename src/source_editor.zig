@@ -175,6 +175,7 @@ pub const InheritedProperty = enum {
     opacity,
     img,
     vid,
+    cam,
     fit,
     focus_x,
     focus_y,
@@ -229,6 +230,7 @@ pub const InheritedPropertyOverrides = packed struct(u32) {
     opacity: bool = false,
     img: bool = false,
     vid: bool = false,
+    cam: bool = false,
     fit: bool = false,
     focus_x: bool = false,
     focus_y: bool = false,
@@ -242,7 +244,6 @@ pub const InheritedPropertyOverrides = packed struct(u32) {
     muted: bool = false,
     visible: bool = false,
     locked: bool = false,
-    _padding: u1 = 0,
 
     pub fn contains(self: InheritedPropertyOverrides, property: InheritedProperty) bool {
         return switch (property) {
@@ -264,6 +265,7 @@ pub const InheritedPropertyOverrides = packed struct(u32) {
             .opacity => self.opacity,
             .img => self.img,
             .vid => self.vid,
+            .cam => self.cam,
             .fit => self.fit,
             .focus_x => self.focus_x,
             .focus_y => self.focus_y,
@@ -5268,6 +5270,7 @@ fn propertyKey(property: InheritedProperty) []const u8 {
         .opacity => "opacity",
         .img => "img",
         .vid => "vid",
+        .cam => "cam",
         .fit => "fit",
         .focus_x => "focus_x",
         .focus_y => "focus_y",
@@ -5339,6 +5342,7 @@ fn setPropertyOverride(overrides: *InheritedPropertyOverrides, property: Inherit
         .opacity => overrides.opacity = true,
         .img => overrides.img = true,
         .vid => overrides.vid = true,
+        .cam => overrides.cam = true,
         .fit => overrides.fit = true,
         .focus_x => overrides.focus_x = true,
         .focus_y => overrides.focus_y = true,

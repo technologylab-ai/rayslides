@@ -89,6 +89,10 @@ deck ready. A live projector run of the QA deck remains a manual step.
   size field and a **FORMAT** button, both on the ordinary undoable source
   path. The metadata line reports `LIVE CAMERA` and its capture size rather
   than flagging the absent duration and audio stream as problems.
+- The Properties source field of a camera commits through `cam=` and asks for a
+  capture device rather than a browsable file. It previously wrote `vid=`
+  alongside the existing `cam=`, and because the parser takes the last one, a
+  committed edit turned the device into a video file and failed to probe.
 
 On macOS, insertion and replacement offer a native file picker. Linux and
 Windows keep the portable manual-path prompt; all platforms accept media file

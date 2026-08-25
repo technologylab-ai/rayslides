@@ -1122,3 +1122,43 @@ test "Studio camera capture size and format survive a source round trip" {
     try std.testing.expectEqual(@as(f32, 720), items[0].vid_camera_size.y);
     try std.testing.expectEqual(slides.CameraFormat.mjpeg, items[0].vid_camera_format);
 }
+
+test "Studio camera source replacement stays a camera" {
+    const allocator = std.testing.allocator;
+    var source = try allocator.dupe(u8, "@slide\n");
+    defer allocator.free(source);
+
+    adoptPatch(allocator, &source, try source_editor.insertDirective(
+        allocator,
+        source,
+        0,
+        "@box id=stage_cam cam=/dev/video0 video_size=1280x720 cam_format=mjpeg x=100 y=120 w=640 h=360 autoplay",
+    ));
+
+    // The Properties source field commits through the camera's own attribute.
+    // Writing `vid=` instead would leave both keys on the directive, and the
+    // parser takes the last one, so the device would be probed as a file.
+    const box_offset = std.mem.indexOf(u8, source, "@box").?;
+    const patch = [_]source_editor.LiteralAttributePatch{.{ .key = "cam", .value = "/dev/video2" }};
+    adoptPatch(allocator, &source, try source_editor.patchLiteralAttributes(allocator, source, box_offset, &patch));
+    try std.testing.expect(std.mem.indexOf(u8, source, "vid=") == null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expect(items[0].vid_is_camera);
+    try std.testing.expectEqualStrings("/dev/video2", items[0].vid_path.?);
+    try std.testing.expectEqual(slides.CameraFormat.mjpeg, items[0].vid_camera_format);
+}
+
+test "camera source overrides are tracked under their own attribute" {
+    const overrides = source_editor.InheritedPropertyOverrides{ .cam = true };
+    try std.testing.expect(overrides.contains(.cam));
+    try std.testing.expect(!overrides.contains(.vid));
+}

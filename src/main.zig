@@ -5132,7 +5132,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                         };
                         const kind: studio_prompt.Kind = switch (item.kind) {
                             .img => .image_path,
-                            .vid => .video_path,
+                            .vid => if (item.vid_is_camera) .camera_device else .video_path,
                             else => {
                                 studio_mode.setNotice(.property_unavailable);
                                 break :prompt;
@@ -7530,7 +7530,17 @@ fn studioResolvedBoundsByIdentity(bounds: []const studio.ResolvedBounds, identit
     return null;
 }
 
-fn inheritedPropertyForStudioProperty(property: studio.AuthoredProperty) source_editor.InheritedProperty {
+/// The source attribute one media item's content comes from. Images always
+/// use `img=`; a video is either a file (`vid=`) or a live camera (`cam=`).
+fn mediaSourceAttributeKey(item: *const slides.SlideItem) []const u8 {
+    if (item.kind == .img) return "img";
+    return if (item.vid_is_camera) "cam" else "vid";
+}
+
+fn inheritedPropertyForStudioProperty(
+    property: studio.AuthoredProperty,
+    is_camera: bool,
+) source_editor.InheritedProperty {
     return switch (property) {
         .text => .text,
         .x => .x,
@@ -7549,7 +7559,7 @@ fn inheritedPropertyForStudioProperty(property: studio.AuthoredProperty) source_
         .text_vertical_alignment => .valign,
         .opacity => .opacity,
         .image_source => .img,
-        .video_source => .vid,
+        .video_source => if (is_camera) .cam else .vid,
         .media_fit => .fit,
         .media_focus_x => .focus_x,
         .media_focus_y => .focus_y,
@@ -7571,6 +7581,7 @@ fn inheritedPropertyForStudioProperty(property: studio.AuthoredProperty) source_
 
 fn studioPropertyOverrides(
     source_overrides: source_editor.InheritedPropertyOverrides,
+    is_camera: bool,
 ) studio.PropertyOverrideSet {
     var result: studio.PropertyOverrideSet = .{};
     const properties = [_]studio.AuthoredProperty{
@@ -7605,7 +7616,7 @@ fn studioPropertyOverrides(
         .camera_poster,
     };
     for (properties) |property| {
-        if (source_overrides.contains(inheritedPropertyForStudioProperty(property))) result.set(property);
+        if (source_overrides.contains(inheritedPropertyForStudioProperty(property, is_camera))) result.set(property);
     }
     return result;
 }
@@ -7685,7 +7696,7 @@ fn studioCompositionContext(
     if (item.id != null) {
         if (studioResetOwner(source, slide, morph_state, item)) |owner| {
             if (source_editor.inheritedPropertyOverrides(source, owner, item.id.?)) |overrides| {
-                context.local_overrides = studioPropertyOverrides(overrides);
+                context.local_overrides = studioPropertyOverrides(overrides, item.vid_is_camera);
                 if (!context.local_overrides.empty() and item.effectiveSource().patchable) {
                     context.resettable_overrides = context.local_overrides;
                     context.reset_target = .{
@@ -7827,11 +7838,12 @@ test "Studio composition capabilities expose button-based media overrides" {
     try std.testing.expect(context.local_overrides.contains(.video_muted));
     try std.testing.expect(context.local_overrides.contains(.video_volume));
     try std.testing.expect(context.resettable_overrides.contains(.media_fit));
-    try std.testing.expectEqual(source_editor.InheritedProperty.fit, inheritedPropertyForStudioProperty(.media_fit));
-    try std.testing.expectEqual(source_editor.InheritedProperty.vid, inheritedPropertyForStudioProperty(.video_source));
-    try std.testing.expectEqual(source_editor.InheritedProperty.autoplay, inheritedPropertyForStudioProperty(.video_autoplay));
-    try std.testing.expectEqual(source_editor.InheritedProperty.loop, inheritedPropertyForStudioProperty(.video_loop));
-    try std.testing.expectEqual(source_editor.InheritedProperty.muted, inheritedPropertyForStudioProperty(.video_muted));
+    try std.testing.expectEqual(source_editor.InheritedProperty.fit, inheritedPropertyForStudioProperty(.media_fit, false));
+    try std.testing.expectEqual(source_editor.InheritedProperty.vid, inheritedPropertyForStudioProperty(.video_source, false));
+    try std.testing.expectEqual(source_editor.InheritedProperty.cam, inheritedPropertyForStudioProperty(.video_source, true));
+    try std.testing.expectEqual(source_editor.InheritedProperty.autoplay, inheritedPropertyForStudioProperty(.video_autoplay, false));
+    try std.testing.expectEqual(source_editor.InheritedProperty.loop, inheritedPropertyForStudioProperty(.video_loop, false));
+    try std.testing.expectEqual(source_editor.InheritedProperty.muted, inheritedPropertyForStudioProperty(.video_muted, false));
 }
 
 test "Studio composition capabilities authorize an exact reusable group detach" {
@@ -11571,13 +11583,17 @@ fn applyStudioSemanticEdit(
             if (item.kind != .img and item.kind != .vid) return error.ItemHasNoEditableMedia;
             if (item.locked) return error.StudioItemLocked;
             const path = try studioMediaSourceValue(prompted_text orelse return error.StudioPromptMissing);
+            // A live camera is authored with `cam=`, and writing `vid=` here
+            // would leave both keys on the directive. The parser takes the
+            // last one, so the device would then be probed as a video file
+            // and the item would fail to load.
             try applyStudioLiteralAttribute(
                 history,
                 slide,
                 morph_state,
                 item,
                 target.edit_scope,
-                if (item.kind == .img) "img" else "vid",
+                mediaSourceAttributeKey(item),
                 path,
             );
             return .{ .preserve_selection = true };
@@ -12310,7 +12326,7 @@ fn applyStudioSemanticEdit(
                 morph_state,
                 item,
             );
-            const property = inheritedPropertyForStudioProperty(reset.property);
+            const property = inheritedPropertyForStudioProperty(reset.property, item.vid_is_camera);
             if (!try source_editor.inheritedPropertyOverrideExists(
                 G.editor_memory[0..G.source_len],
                 owner,

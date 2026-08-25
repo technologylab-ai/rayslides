@@ -14,6 +14,10 @@ pub const Kind = enum {
     speaker_notes,
     image_path,
     video_path,
+    /// Live-camera device rather than a file: an AVFoundation index or name on
+    /// macOS, a V4L2 path on Linux, a DirectShow name on Windows. None of those
+    /// are pickable in a file dialog, so this kind offers no Browse button.
+    camera_device,
     reusable_name,
     coordinate,
     dimension,
@@ -827,6 +831,7 @@ fn promptTitle(kind: Kind) [:0]const u8 {
         .speaker_notes => "Edit speaker notes",
         .image_path => "Choose image",
         .video_path => "Choose video",
+        .camera_device => "Choose camera device",
         .reusable_name => "Name reusable or template",
         .coordinate => "Set coordinate",
         .dimension => "Set object size",
@@ -857,6 +862,12 @@ test "image and video prompts share browsing but retain specific copy" {
     try std.testing.expect(std.mem.indexOf(u8, promptHint(.video_path), "video") != null);
 }
 
+test "camera prompt asks for a device instead of a browsable file" {
+    try std.testing.expect(!kindIsMediaPath(.camera_device));
+    try std.testing.expectEqualStrings("Choose camera device", promptTitle(.camera_device));
+    try std.testing.expect(std.mem.indexOf(u8, promptHint(.camera_device), "/dev/video") != null);
+}
+
 fn promptCommitLabel(kind: Kind) [:0]const u8 {
     if (kindIsMultiline(kind)) return "COMMIT";
     return if (kind == .document_path) "SAVE" else if (kind == .portable_folder) "CREATE" else "OK";
@@ -870,6 +881,7 @@ fn promptHint(kind: Kind) [:0]const u8 {
         .speaker_notes => "Enter adds a line · COMMIT applies private notes",
         .image_path => "Browse for an image or enter a path relative to the slide file · Enter commits · Esc cancels",
         .video_path => "Browse for a video or enter a path relative to the slide file · Enter commits · Esc cancels",
+        .camera_device => "Capture device · index or name on macOS, /dev/video* on Linux · Enter commits · Esc cancels",
         .reusable_name => "Use letters, numbers, '_' or '-' · Enter commits · Esc cancels",
         .coordinate => "Logical slide pixels · decimals and negative values are allowed · Enter commits",
         .dimension => "Logical slide pixels · use a positive value · Enter commits",
