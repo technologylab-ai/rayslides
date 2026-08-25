@@ -69,7 +69,9 @@ cropping, rotation, opacity, morphs, posters, and the existing playback pill:
 
 On macOS, run camera decks from the bundled `Rayslides.app` so the system can
 request camera permission. On Linux, use the intended V4L2 path such as
-`cam=/dev/video0` or preferably its stable `/dev/v4l/by-id/...` symlink.
+`cam=/dev/video0` or preferably its stable `/dev/v4l/by-id/...` symlink, and add
+`cam_format=mjpeg` to reach a mode the camera offers in MJPEG alone - commonly
+every mode above `640x480`.
 
 ## Documentation
 

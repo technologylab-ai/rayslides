@@ -1087,3 +1087,38 @@ test "Studio reusable group promotion Library placement and detach round trip at
     try std.testing.expectEqual(@as(f32, 480), morph_items[0].position.y);
     try std.testing.expectEqual(@as(f32, 120), morph_items[2].position.y);
 }
+
+test "Studio camera capture size and format survive a source round trip" {
+    const allocator = std.testing.allocator;
+    var source = try allocator.dupe(u8, "@slide\n");
+    defer allocator.free(source);
+
+    adoptPatch(allocator, &source, try source_editor.insertDirective(
+        allocator,
+        source,
+        0,
+        "@box id=stage_cam cam=/dev/video0 video_size=640x480 x=100 y=120 w=640 h=360 autoplay",
+    ));
+
+    // Both controls edit the same directive the way the Playback page does.
+    const box_offset = std.mem.indexOf(u8, source, "@box").?;
+    const size_patch = [_]source_editor.LiteralAttributePatch{.{ .key = "video_size", .value = "1280x720" }};
+    adoptPatch(allocator, &source, try source_editor.patchLiteralAttributes(allocator, source, box_offset, &size_patch));
+    const format_patch = [_]source_editor.LiteralAttributePatch{.{ .key = "cam_format", .value = "mjpeg" }};
+    adoptPatch(allocator, &source, try source_editor.patchLiteralAttributes(allocator, source, box_offset, &format_patch));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expect(items[0].vid_is_camera);
+    try std.testing.expectEqualStrings("/dev/video0", items[0].vid_path.?);
+    try std.testing.expectEqual(@as(f32, 1280), items[0].vid_camera_size.x);
+    try std.testing.expectEqual(@as(f32, 720), items[0].vid_camera_size.y);
+    try std.testing.expectEqual(slides.CameraFormat.mjpeg, items[0].vid_camera_format);
+}

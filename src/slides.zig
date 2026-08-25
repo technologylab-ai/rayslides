@@ -167,6 +167,81 @@ pub const MediaFit = enum {
     cover,
 };
 
+/// Capture format requested from a live `cam=` device.
+///
+/// `auto` lets ffmpeg negotiate, which is what every deck authored before this
+/// option did. Naming a format is how a device reaches a mode it offers in
+/// that format alone: UVC webcams commonly expose 720p and 1080p through
+/// MJPEG only, and top out at 640x480 in the raw formats ffmpeg tries first.
+pub const CameraFormat = enum {
+    auto,
+    mjpeg,
+    yuyv422,
+    nv12,
+    h264,
+
+    /// Accepts the authored spelling plus the common device-listing aliases,
+    /// so a format copied out of `v4l2-ctl --list-formats` is understood.
+    pub fn parse(text: []const u8) ?CameraFormat {
+        const table = .{
+            .{ "auto", CameraFormat.auto },
+            .{ "mjpeg", CameraFormat.mjpeg },
+            .{ "mjpg", CameraFormat.mjpeg },
+            .{ "yuyv422", CameraFormat.yuyv422 },
+            .{ "yuyv", CameraFormat.yuyv422 },
+            .{ "nv12", CameraFormat.nv12 },
+            .{ "h264", CameraFormat.h264 },
+        };
+        inline for (table) |entry| {
+            if (std.ascii.eqlIgnoreCase(text, entry[0])) return entry[1];
+        }
+        return null;
+    }
+
+    /// The `-input_format` value ffmpeg expects, or null when the format is
+    /// left to negotiation and the argument must be omitted entirely.
+    pub fn ffmpegName(self: CameraFormat) ?[]const u8 {
+        return switch (self) {
+            .auto => null,
+            .mjpeg => "mjpeg",
+            .yuyv422 => "yuyv422",
+            .nv12 => "nv12",
+            .h264 => "h264",
+        };
+    }
+
+    /// The canonical `cam_format=` spelling written back by Studio.
+    pub fn attrValue(self: CameraFormat) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .mjpeg => "mjpeg",
+            .yuyv422 => "yuyv422",
+            .nv12 => "nv12",
+            .h264 => "h264",
+        };
+    }
+
+    /// Short uppercase label for the Studio button.
+    pub fn label(self: CameraFormat) [:0]const u8 {
+        return switch (self) {
+            .auto => "Auto",
+            .mjpeg => "MJPEG",
+            .yuyv422 => "YUYV",
+            .nv12 => "NV12",
+            .h264 => "H264",
+        };
+    }
+
+    /// Studio cycles through the formats with a single button.
+    pub fn next(self: CameraFormat) CameraFormat {
+        const order = [_]CameraFormat{ .auto, .mjpeg, .yuyv422, .nv12, .h264 };
+        for (order, 0..) |candidate, index| {
+            if (candidate == self) return order[(index + 1) % order.len];
+        }
+        return .auto;
+    }
+};
+
 /// Horizontal placement of laid-out text within its authored box.
 pub const TextAlignment = enum {
     left,
@@ -309,6 +384,7 @@ pub const TemplateItemValues = struct {
     vid_path: ?[]const u8 = null,
     vid_is_camera: bool = false,
     vid_camera_size: rl.Vector2 = .{ .x = 1280, .y = 720 },
+    vid_camera_format: CameraFormat = .auto,
     vid_camera_poster: ?[]const u8 = null,
     media_fit: MediaFit = .stretch,
     media_focus: rl.Vector2 = .{ .x = 0.5, .y = 0.5 },
@@ -401,6 +477,7 @@ pub const SlideItem = struct {
     vid_path: ?[]const u8 = null,
     vid_is_camera: bool = false,
     vid_camera_size: rl.Vector2 = .{ .x = 1280, .y = 720 },
+    vid_camera_format: CameraFormat = .auto,
     vid_camera_poster: ?[]const u8 = null,
     vid_autoplay: bool = false,
     vid_loop: bool = false,
@@ -469,6 +546,7 @@ pub const SlideItem = struct {
             .vid_path = self.vid_path,
             .vid_is_camera = self.vid_is_camera,
             .vid_camera_size = self.vid_camera_size,
+            .vid_camera_format = self.vid_camera_format,
             .vid_camera_poster = self.vid_camera_poster,
             .media_fit = self.media_fit,
             .media_focus = self.media_focus,
@@ -506,6 +584,7 @@ pub const SlideItem = struct {
         if (context.vid_path) |vid_path| self.vid_path = vid_path;
         if (context.vid_is_camera) |value| self.vid_is_camera = value;
         if (context.vid_camera_size) |value| self.vid_camera_size = value;
+        if (context.vid_camera_format) |value| self.vid_camera_format = value;
         if (context.vid_camera_poster) |value| self.vid_camera_poster = value;
         if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
@@ -553,6 +632,7 @@ pub const SlideItem = struct {
         if (context.vid_path) |vid_path| self.vid_path = vid_path;
         if (context.vid_is_camera) |value| self.vid_is_camera = value;
         if (context.vid_camera_size) |value| self.vid_camera_size = value;
+        if (context.vid_camera_format) |value| self.vid_camera_format = value;
         if (context.vid_camera_poster) |value| self.vid_camera_poster = value;
         if (context.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;
         if (context.vid_loop) |vid_loop| self.vid_loop = vid_loop;
@@ -739,6 +819,7 @@ pub const ItemContext = struct {
     vid_path: ?[]const u8 = null,
     vid_is_camera: ?bool = null,
     vid_camera_size: ?rl.Vector2 = null,
+    vid_camera_format: ?CameraFormat = null,
     vid_camera_poster: ?[]const u8 = null,
     vid_autoplay: ?bool = null,
     vid_loop: ?bool = null,
@@ -796,6 +877,7 @@ pub const ItemContext = struct {
         }
         if (self.vid_is_camera == null) self.vid_is_camera = other.vid_is_camera;
         if (self.vid_camera_size == null) self.vid_camera_size = other.vid_camera_size;
+        if (self.vid_camera_format == null) self.vid_camera_format = other.vid_camera_format;
         if (self.vid_camera_poster == null) self.vid_camera_poster = other.vid_camera_poster;
         if (self.vid_autoplay == null) {
             if (other.vid_autoplay) |vid_autoplay| self.vid_autoplay = vid_autoplay;

@@ -335,6 +335,7 @@ fn buildReusableGroupMember(
         builder.local_context.vid_path = null;
         builder.local_context.vid_is_camera = null;
         builder.local_context.vid_camera_size = null;
+        builder.local_context.vid_camera_format = null;
         builder.local_context.vid_camera_poster = null;
         builder.post_context = builder.local_context;
         item_context.applyOtherIfNull(component);
@@ -1466,6 +1467,15 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         item_context.vid_camera_size = .{ .x = @floatFromInt(width), .y = @floatFromInt(height) };
                     }
                 }
+                if (std.mem.eql(u8, attrname, "cam_format")) {
+                    if (attr_it.next()) |format_str| {
+                        const format = slides.CameraFormat.parse(format_str) orelse {
+                            reportErrorInContext(ParserError.Syntax, context, "cam_format= must be auto, mjpeg, yuyv422, nv12, or h264");
+                            continue;
+                        };
+                        item_context.vid_camera_format = format;
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "poster_image")) {
                     if (attr_it.next()) |poster_path| {
                         item_context.vid_camera_poster = poster_path;
@@ -1845,6 +1855,7 @@ fn mergeParserAndItemContext(parsing_item_context: *slides.ItemContext, item_con
     if (parsing_item_context.vid_path == null) parsing_item_context.vid_path = item_context.vid_path;
     if (parsing_item_context.vid_is_camera == null) parsing_item_context.vid_is_camera = item_context.vid_is_camera;
     if (parsing_item_context.vid_camera_size == null) parsing_item_context.vid_camera_size = item_context.vid_camera_size;
+    if (parsing_item_context.vid_camera_format == null) parsing_item_context.vid_camera_format = item_context.vid_camera_format;
     if (parsing_item_context.vid_camera_poster == null) parsing_item_context.vid_camera_poster = item_context.vid_camera_poster;
     if (parsing_item_context.vid_autoplay == null) parsing_item_context.vid_autoplay = item_context.vid_autoplay;
     if (parsing_item_context.vid_loop == null) parsing_item_context.vid_loop = item_context.vid_loop;
@@ -2212,6 +2223,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                 context.current_context.animation_disabled = false;
                 context.current_context.vid_is_camera = null;
                 context.current_context.vid_camera_size = null;
+                context.current_context.vid_camera_format = null;
                 context.current_context.vid_camera_poster = null;
                 parsing_item_context.applyOtherIfNull(ctx);
                 component_source = .{
@@ -2622,6 +2634,28 @@ test "camera items parse device size poster and playback controls" {
     try std.testing.expectEqual(@as(f32, 1080), camera.vid_camera_size.y);
     try std.testing.expectEqualStrings("assets/camera-off.png", camera.vid_camera_poster.?);
     try std.testing.expect(camera.vid_autoplay);
+    try std.testing.expectEqual(slides.CameraFormat.auto, camera.vid_camera_format);
+}
+
+test "cam_format selects a capture format and rejects an unknown one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const slideshow = try slides.SlideShow.new(arena.allocator());
+    const input =
+        \\@slide
+        \\@box id=a cam=/dev/video0 video_size=1280x720 cam_format=mjpeg x=10 y=20 w=640
+        \\@box id=b cam=/dev/video0 video_size=640x480 cam_format=MJPG x=10 y=20 w=640
+        \\@box id=c cam=/dev/video0 video_size=640x480 cam_format=nonsense x=10 y=20 w=640
+    ;
+    const context = try constructSlidesFromBuf(input, slideshow, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expectEqual(slides.CameraFormat.mjpeg, items[0].vid_camera_format);
+    // The alias spelling from `v4l2-ctl --list-formats` is accepted too.
+    try std.testing.expectEqual(slides.CameraFormat.mjpeg, items[1].vid_camera_format);
+    // A rejected value reports and leaves the item on the negotiated default.
+    try std.testing.expectEqual(slides.CameraFormat.auto, items[2].vid_camera_format);
 }
 
 test "text alignment inherits and morphs through reusable content" {

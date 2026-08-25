@@ -1453,6 +1453,26 @@ pub const VideoScalarCommand = struct {
 
 pub const VideoToggle = enum { autoplay, loop, muted };
 
+/// Parses the authored `video_size=` spelling. Studio and the parser must
+/// agree on what counts as valid, so the inline editor rejects exactly what
+/// the deck would refuse to load.
+pub fn parseCameraSize(text: []const u8) ?struct { width: i32, height: i32 } {
+    var parts = std.mem.tokenizeScalar(u8, text, 'x');
+    const width = std.fmt.parseInt(i32, parts.next() orelse return null, 10) catch return null;
+    const height = std.fmt.parseInt(i32, parts.next() orelse return null, 10) catch return null;
+    if (width <= 0 or height <= 0 or parts.next() != null) return null;
+    return .{ .width = width, .height = height };
+}
+
+pub const CameraFormatCommand = struct {
+    target: CommandTarget,
+    format: slides.CameraFormat,
+};
+
+pub const CameraSizeCommand = struct {
+    target: CommandTarget,
+};
+
 pub const VideoToggleCommand = struct {
     target: CommandTarget,
     property: VideoToggle,
@@ -1504,6 +1524,10 @@ pub const InlineField = enum {
     media_focus_y,
     video_poster,
     video_volume,
+    /// Live-camera field. A camera has no seekable timeline, so this takes
+    /// the place of the poster-time control on the Playback page rather than
+    /// crowding the panel with a row that only cameras would ever use.
+    camera_size,
     /// Motion inspector fields. Their rectangles come from `motionLayout`,
     /// not `uiLayout`; they share the inline editor, validation, and commit
     /// handshake with the Properties fields.
@@ -1563,6 +1587,9 @@ pub const AuthoredProperty = enum {
     video_autoplay,
     video_loop,
     video_muted,
+    camera_size,
+    camera_format,
+    camera_poster,
     reveal,
     morph_state,
     transition,
@@ -1586,6 +1613,7 @@ fn authoredPropertyForInlineField(field: InlineField) AuthoredProperty {
         .media_focus_y => .media_focus_y,
         .video_poster => .video_poster,
         .video_volume => .video_volume,
+        .camera_size => .camera_size,
         .reveal_delay, .reveal_after, .reveal_duration => .reveal,
         .state_label, .state_after, .state_duration => .morph_state,
         .transition_duration => .transition,
@@ -1605,6 +1633,7 @@ pub const InlineError = enum {
     invalid_opacity,
     invalid_unit_interval,
     invalid_video_poster,
+    invalid_camera_size,
     invalid_text,
     invalid_delay,
     invalid_seconds,
@@ -2114,6 +2143,9 @@ pub const SemanticCommand = union(enum) {
     set_video_poster: VideoScalarCommand,
     set_video_volume: VideoScalarCommand,
     set_video_toggle: VideoToggleCommand,
+    set_camera_format: CameraFormatCommand,
+    set_camera_size: CameraSizeCommand,
+    replace_camera_poster: CommandTarget,
     /// One preflighted value applied to every compatible selected item in a
     /// single source transaction.
     set_common_property: CommonPropertyCommand,
@@ -6522,7 +6554,9 @@ pub const Studio = struct {
             .x, .y, .width, .height, .opacity => true,
             .background => item.kind != .line,
             .media_focus_x, .media_focus_y => item.kind == .img or item.kind == .vid,
-            .video_poster, .video_volume => item.kind == .vid,
+            .video_poster => item.kind == .vid and !item.vid_is_camera,
+            .video_volume => item.kind == .vid,
+            .camera_size => item.kind == .vid and item.vid_is_camera,
             .reveal_delay, .reveal_after, .reveal_duration => item.animation != null and item.creation_morph_state == null,
             .state_label, .state_after, .state_duration, .transition_duration => false,
         };
@@ -6575,6 +6609,13 @@ pub const Studio = struct {
             .media_focus_y => formatInlineFloat(scalar_buffer, if (shared) |values| values.media_focus.y else item.media_focus.y),
             .video_poster => formatInlineFloat(scalar_buffer, if (shared) |values| values.vid_poster orelse 0 else item.vid_poster orelse 0),
             .video_volume => formatInlineFloat(scalar_buffer, if (shared) |values| values.vid_volume else item.vid_volume),
+            .camera_size => blk: {
+                const size = if (shared) |values| values.vid_camera_size else item.vid_camera_size;
+                break :blk std.fmt.bufPrint(scalar_buffer, "{d}x{d}", .{
+                    @as(i32, @intFromFloat(size.x)),
+                    @as(i32, @intFromFloat(size.y)),
+                }) catch "";
+            },
             .reveal_delay => if (item.animation) |spec| revealDelayText(spec, scalar_buffer) else "",
             .reveal_after => if (item.animation) |spec|
                 (if (spec.after) |after| formatInlineFloat(scalar_buffer, after) else "")
@@ -6741,6 +6782,7 @@ pub const Studio = struct {
                 if (!std.math.isFinite(parsed)) break :blk .invalid_unit_interval;
                 break :blk if (parsed >= 0 and parsed <= 1) null else .invalid_unit_interval;
             },
+            .camera_size => if (parseCameraSize(value) == null) .invalid_camera_size else null,
             .reveal_delay => blk: {
                 if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "click")) break :blk null;
                 const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_delay;
@@ -7046,7 +7088,7 @@ pub const Studio = struct {
         return if (video_playback)
             field != .background and field != .media_focus_x and field != .media_focus_y
         else
-            field != .video_poster and field != .video_volume;
+            field != .video_poster and field != .video_volume and field != .camera_size;
     }
 
     const motion_inline_fields = [_]InlineField{ .reveal_delay, .reveal_after, .reveal_duration };
@@ -7080,7 +7122,7 @@ pub const Studio = struct {
                 (current + 1) % motion_inline_fields.len;
             return motion_inline_fields[current];
         }
-        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .video_volume };
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .camera_size, .video_volume };
         var current: usize = 0;
         for (fields, 0..) |candidate, index| if (candidate == field) {
             current = index;
@@ -7112,7 +7154,7 @@ pub const Studio = struct {
             .opacity => layout.opacity,
             .media_focus_x => layout.media_scalar_fields[0],
             .media_focus_y => layout.media_scalar_fields[1],
-            .video_poster => videoPosterFieldRect(layout),
+            .video_poster, .camera_size => videoPosterFieldRect(layout),
             .video_volume => layout.font_size,
             .reveal_delay, .reveal_after, .reveal_duration, .state_label, .state_after, .state_duration, .transition_duration => empty_ui_rectangle,
         };
@@ -7168,7 +7210,7 @@ pub const Studio = struct {
     }
 
     fn inlineFieldAtPoint(layout: UiLayout, item: slides.SlideItem, pointer: rl.Vector2, video_playback: bool) ?InlineField {
-        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .video_volume };
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .camera_size, .video_volume };
         for (fields) |field| {
             if (inlineFieldVisible(field, item, video_playback) and
                 pointInRectangle(pointer, inlineFieldRectForItem(layout, field, item, video_playback))) return field;
@@ -7185,7 +7227,7 @@ pub const Studio = struct {
         const context = self.compositionContextForSelection(items) orelse return null;
         const item_index = self.selectedIndex(items) orelse return null;
         const item = items[item_index];
-        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .video_volume };
+        const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .camera_size, .video_volume };
         for (fields) |field| {
             if (!context.local_overrides.contains(authoredPropertyForInlineField(field))) continue;
             if (!inlineFieldVisible(field, item, self.video_properties_playback)) continue;
@@ -7250,6 +7292,12 @@ pub const Studio = struct {
             for (layout.media_fit_buttons, properties) |button, property| {
                 if (context.local_overrides.contains(property) and
                     pointInRectangle(pointer, inlineResetRect(button))) return property;
+            }
+            if (item.vid_is_camera) {
+                if (context.local_overrides.contains(.camera_format) and
+                    pointInRectangle(pointer, inlineResetRect(cameraFormatButtonRect(layout)))) return .camera_format;
+                if (context.local_overrides.contains(.camera_poster) and
+                    pointInRectangle(pointer, inlineResetRect(cameraPosterImageRect(layout)))) return .camera_poster;
             }
             return null;
         }
@@ -9333,6 +9381,63 @@ pub const Studio = struct {
         return true;
     }
 
+    fn emitCameraFormat(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() != 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (item.kind != .vid or !item.vid_is_camera) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
+        const shared = if (edit_scope == .shared_template) item.sharedTemplateValues() else null;
+        const current = if (shared) |values| values.vid_camera_format else item.vid_camera_format;
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_camera_format = .{
+            .target = target,
+            .format = current.next(),
+        } };
+        return true;
+    }
+
+    fn emitCameraPoster(
+        self: *Studio,
+        items: []slides.SlideItem,
+        allow_shared_edit: bool,
+    ) bool {
+        const index = self.selectedIndex(items) orelse return false;
+        if (self.selectionCount() != 1) {
+            self.notice = .multi_selection_property_unsupported;
+            return true;
+        }
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (item.kind != .vid or !item.vid_is_camera) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        const edit_scope = self.editScopeForItem(items, index, allow_shared_edit) orelse return true;
+        const target = self.selectedTarget(items, edit_scope) orelse return true;
+        self.notice = .none;
+        self.pending_semantic_command = .{ .replace_camera_poster = target };
+        return true;
+    }
+
     fn emitLineStyle(
         self: *Studio,
         items: []slides.SlideItem,
@@ -10825,9 +10930,14 @@ pub const Studio = struct {
                 for (layout.media_fit_buttons, toggles) |button, property| {
                     if (pointInRectangle(pointer, button)) return self.emitVideoToggle(items, allow_shared_edit, property);
                 }
+                const camera_item = selected_item.?.vid_is_camera;
                 if (pointInRectangle(pointer, videoPosterFieldRect(layout)))
-                    return self.beginInlineEdit(items, resolved_bounds, .video_poster, allow_shared_edit);
+                    return self.beginInlineEdit(items, resolved_bounds, if (camera_item) .camera_size else .video_poster, allow_shared_edit);
                 const timeline = videoTimelineRect(layout);
+                if (camera_item and pointInRectangle(pointer, cameraFormatButtonRect(layout)))
+                    return self.emitCameraFormat(items, allow_shared_edit);
+                if (camera_item and pointInRectangle(pointer, cameraPosterImageRect(layout)))
+                    return self.emitCameraPoster(items, allow_shared_edit);
                 if (pointInRectangle(pointer, timeline)) {
                     const resolved = resolvedBoundsForIdentity(resolved_bounds, selected_item.?.identity);
                     if (resolved) |value| {
@@ -15386,6 +15496,7 @@ pub const Studio = struct {
             .media_focus_y => a.media_focus.y == b.media_focus.y,
             .video_poster => a.vid_poster == b.vid_poster,
             .video_volume => a.vid_volume == b.vid_volume,
+            .camera_size => std.meta.eql(a.vid_camera_size, b.vid_camera_size),
             .reveal_delay => std.meta.eql(a.animation.?.delay, b.animation.?.delay) and a.animation.?.first_waits == b.animation.?.first_waits,
             .reveal_after => std.meta.eql(a.animation.?.after, b.animation.?.after),
             .reveal_duration => a.animation.?.duration == b.animation.?.duration,
@@ -15693,6 +15804,23 @@ pub const Studio = struct {
         };
     }
 
+    /// A camera's scrubber strip carries its two export-and-capture controls
+    /// instead: the capture format, and the poster image that every passive
+    /// output (Studio cards, Presenter preview, screenshots, PDF) actually
+    /// renders in place of the live feed.
+    fn cameraFormatButtonRect(layout: UiLayout) rl.Rectangle {
+        const strip = videoTimelineRect(layout);
+        const gap = @max(@as(f32, 2), strip.width * 0.02);
+        return .{ .x = strip.x, .y = strip.y, .width = (strip.width - gap) * 0.45, .height = strip.height };
+    }
+
+    fn cameraPosterImageRect(layout: UiLayout) rl.Rectangle {
+        const strip = videoTimelineRect(layout);
+        const format = cameraFormatButtonRect(layout);
+        const start = format.x + format.width + @max(@as(f32, 2), strip.width * 0.02);
+        return .{ .x = start, .y = strip.y, .width = @max(0, strip.x + strip.width - start), .height = strip.height };
+    }
+
     fn videoTimelineRect(layout: UiLayout) rl.Rectangle {
         return .{
             .x = layout.background_swatches[0].x,
@@ -15779,8 +15907,8 @@ pub const Studio = struct {
     }
 
     fn formatOverrideFields(buffer: []u8, overrides: PropertyOverrideSet) []const u8 {
-        const fields = [_]AuthoredProperty{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .line_direction, .line_arrows, .rotation, .text_alignment, .text_vertical_alignment, .opacity, .image_source, .video_source, .media_fit, .media_focus_x, .media_focus_y, .video_poster, .video_volume, .video_autoplay, .video_loop, .video_muted };
-        const labels = [_][]const u8{ "Text", "X", "Y", "W", "H", "FG", "BG", "Font", "Radius", "Stroke", "Direction", "Arrows", "Rotation", "Text H", "Text V", "Opacity", "Image", "Video", "Fit", "Focus X", "Focus Y", "Poster", "Volume", "Auto", "Loop", "Mute" };
+        const fields = [_]AuthoredProperty{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .line_direction, .line_arrows, .rotation, .text_alignment, .text_vertical_alignment, .opacity, .image_source, .video_source, .media_fit, .media_focus_x, .media_focus_y, .video_poster, .video_volume, .video_autoplay, .video_loop, .video_muted, .camera_size, .camera_format, .camera_poster };
+        const labels = [_][]const u8{ "Text", "X", "Y", "W", "H", "FG", "BG", "Font", "Radius", "Stroke", "Direction", "Arrows", "Rotation", "Text H", "Text V", "Opacity", "Image", "Video", "Fit", "Focus X", "Focus Y", "Poster", "Volume", "Auto", "Loop", "Mute", "Capture", "Format", "Still" };
         var used: usize = 0;
         for (fields, labels) |field, label| {
             if (!overrides.contains(field)) continue;
@@ -15953,6 +16081,15 @@ pub const Studio = struct {
                         .{mediaAvailabilityInspectorLabel(value.media_availability)},
                     ) catch "MEDIA UNAVAILABLE";
                 if (selected_video_playback) {
+                    // A live camera has neither duration nor an audio stream by
+                    // definition, so reporting their absence would flag normal
+                    // state as a problem. It reports what it is capturing.
+                    if (item.vid_is_camera)
+                        break :metadata std.fmt.bufPrintZ(
+                            &metadata_buffer,
+                            "LIVE CAMERA · {d:.0}×{d:.0}",
+                            .{ value.natural_size.x, value.natural_size.y },
+                        ) catch "LIVE CAMERA";
                     if (value.media_duration <= 0) break :metadata "DURATION UNAVAILABLE";
                     break :metadata if (value.media_audio == .unavailable)
                         std.fmt.bufPrintZ(
@@ -15986,7 +16123,8 @@ pub const Studio = struct {
                 .{ .x = metadata_rect.x, .y = metadata_rect.y + 3 * layout.scale },
                 scaledUiFont(layout.scale, UiTypography.compact),
                 if (resolved) |value|
-                    if (value.media_availability == .ready and value.media_audio != .unavailable)
+                    if (value.media_availability == .ready and
+                        (value.media_audio != .unavailable or (item.kind == .vid and item.vid_is_camera)))
                         theme.text_muted
                     else if (value.media_availability.isWarning() or value.media_audio == .unavailable)
                         theme.warning
@@ -16011,7 +16149,12 @@ pub const Studio = struct {
                     drawPropertyToggleButton(self, button, label, enabled, local_override, resettable_override);
                 }
 
-                const poster_field = InlineField.video_poster;
+                // A live camera cannot seek, so the poster-time field and the
+                // scrubber below it would both be dead controls. They carry the
+                // capture size and format instead, which are the two settings a
+                // camera slide actually needs on the machine it presents from.
+                const camera_item = item.vid_is_camera;
+                const poster_field = if (camera_item) InlineField.camera_size else InlineField.video_poster;
                 var poster_buffer: [64]u8 = undefined;
                 var poster_color_buffer: [9]u8 = undefined;
                 const poster_active = self.inline_editor.active and self.inline_editor.field == poster_field;
@@ -16027,7 +16170,7 @@ pub const Studio = struct {
                     false;
                 self.drawInlineField(
                     videoPosterFieldRect(layout),
-                    "POSTER",
+                    if (camera_item) "CAPTURE" else "POSTER",
                     poster_value,
                     poster_active,
                     poster_active and self.inline_editor.error_value != null,
@@ -16037,7 +16180,38 @@ pub const Studio = struct {
                     poster_resettable,
                     viewport,
                 );
-                self.drawVideoPosterTimeline(videoTimelineRect(layout), item.vid_poster orelse 0, if (resolved) |value| value.media_duration else 0);
+                if (camera_item) {
+                    var format_buffer: [32]u8 = undefined;
+                    const format_label = std.fmt.bufPrintZ(&format_buffer, "FORMAT  {s}", .{item.vid_camera_format.label()}) catch "FORMAT";
+                    const format_override = if (composition) |context| context.local_overrides.contains(.camera_format) else false;
+                    const format_resettable = if (composition) |context|
+                        context.reset_target != null and context.resettable_overrides.contains(.camera_format)
+                    else
+                        false;
+                    drawPropertyToggleButton(
+                        self,
+                        cameraFormatButtonRect(layout),
+                        format_label,
+                        item.vid_camera_format != .auto,
+                        format_override,
+                        format_resettable,
+                    );
+                    const poster_image_override = if (composition) |context| context.local_overrides.contains(.camera_poster) else false;
+                    const poster_image_resettable = if (composition) |context|
+                        context.reset_target != null and context.resettable_overrides.contains(.camera_poster)
+                    else
+                        false;
+                    self.drawMediaSourceField(
+                        cameraPosterImageRect(layout),
+                        "STILL",
+                        item.vid_camera_poster orelse "",
+                        poster_image_override,
+                        poster_image_resettable,
+                        viewport,
+                    );
+                } else {
+                    self.drawVideoPosterTimeline(videoTimelineRect(layout), item.vid_poster orelse 0, if (resolved) |value| value.media_duration else 0);
+                }
 
                 const volume_field = InlineField.video_volume;
                 var volume_buffer: [64]u8 = undefined;
@@ -16430,7 +16604,7 @@ pub const Studio = struct {
             .detach_instance_unsupported => "This reusable instance cannot be detached safely here",
             .morph_state_required => "Select a state card first; BASE cannot be renamed, deleted, or reordered",
             .morph_structure_locked => "That state move would break cumulative source ownership; no change was made",
-            .camera_start_failed => "Camera could not start - check the device, permissions, and video_size",
+            .camera_start_failed => "Camera could not start - check the device, permissions, video_size, and cam_format",
         };
     }
 
@@ -16588,6 +16762,7 @@ fn inlineErrorMessage(reason: InlineError) [:0]const u8 {
         .invalid_opacity => "Use 0–1 or 0–100%",
         .invalid_unit_interval => "Use a value from 0 to 1",
         .invalid_video_poster => "Poster time must be within the video duration",
+        .invalid_camera_size => "Capture size must be WIDTHxHEIGHT, such as 1280x720",
         .invalid_text => "Text value is invalid; correct it and press Enter",
         .invalid_delay => "Start delay: seconds (0 or more), click, or empty",
         .invalid_seconds => "Enter seconds as a number of 0 or more",
@@ -21599,6 +21774,78 @@ test "image and video Properties share fit and focal controls" {
         try std.testing.expectEqual(@as(?InlineField, .rotation), studio.inlineEditField());
         _ = studio.update(&items, &.{}, frame.viewport, .{ .cancel_pressed = true });
     }
+}
+
+test "camera Playback Properties replace the seek controls with capture controls" {
+    var items = [_]slides.SlideItem{testItem(741, .vid, 100, 120, 640, 360)};
+    items[0].vid_path = "/dev/video0";
+    items[0].vid_is_camera = true;
+    items[0].vid_camera_size = .{ .x = 640, .y = 480 };
+    items[0].source = .{ .scope = .direct, .line_offset = 50, .patchable = true };
+    const bounds = [_]ResolvedBounds{.{
+        .identity = 741,
+        .position = items[0].position,
+        .size = items[0].size,
+        .natural_size = .{ .x = 640, .y = 480 },
+        // A live camera is not seekable, so it reports no duration.
+        .media_duration = 0,
+    }};
+    var studio: Studio = .{
+        .enabled = true,
+        .active_dock = .properties,
+        .inspector_panel = .properties,
+        .selected_identity = 741,
+    };
+    const frame = studio.layoutFrame(.{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+    const layout = uiLayout(frame.viewport);
+
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.mediaPageToggleRect(layout)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(studio.video_properties_playback);
+
+    // The scrubber strip cycles the capture format instead of seeking.
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.cameraFormatButtonRect(layout)),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_camera_format => |change| try std.testing.expectEqual(slides.CameraFormat.mjpeg, change.format),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    // The right half offers the export still, which is what every passive
+    // output renders in place of the live feed.
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.cameraPosterImageRect(layout)),
+        .pointer_pressed = true,
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .replace_camera_poster => |target| try std.testing.expectEqual(@as(u64, 741), target.item_identity),
+        else => return error.UnexpectedSemanticCommand,
+    }
+
+    // The poster-time field edits the capture size instead.
+    _ = studio.update(&items, &bounds, frame.viewport, .{
+        .pointer_screen = rectangleCenter(Studio.videoPosterFieldRect(layout)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(@as(?InlineField, .camera_size), studio.inlineEditField());
+
+    var scalar_buffer: [max_inline_input_bytes]u8 = undefined;
+    var color_buffer: [9]u8 = undefined;
+    try std.testing.expectEqualStrings("640x480", studio.inlineDisplayValue(&items, &bounds, .camera_size, &scalar_buffer, &color_buffer));
+    try std.testing.expectEqual(@as(?InlineError, .invalid_camera_size), Studio.inlineValueError(.camera_size, "1280"));
+    try std.testing.expectEqual(@as(?InlineError, null), Studio.inlineValueError(.camera_size, "1280x720"));
+    _ = studio.update(&items, &bounds, frame.viewport, .{ .cancel_pressed = true });
+}
+
+test "a camera format cycles back round to auto" {
+    try std.testing.expectEqual(slides.CameraFormat.mjpeg, slides.CameraFormat.auto.next());
+    var format = slides.CameraFormat.auto;
+    for (0..5) |_| format = format.next();
+    try std.testing.expectEqual(slides.CameraFormat.auto, format);
 }
 
 test "video Playback Properties expose toggles poster scrubber and volume" {

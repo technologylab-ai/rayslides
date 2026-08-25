@@ -76,6 +76,19 @@ deck ready. A live projector run of the QA deck remains a manual step.
   and DirectShow. They support authored capture size, stopped/export posters,
   the playback pill, rotation and the complete media transform stack, plus
   device-start notifications and Showtime findings.
+- `cam_format=` (`auto`, `mjpeg`, `yuyv422`, `nv12`, `h264`) names the V4L2
+  capture format. Many UVC webcams offer every mode above 640x480 in MJPEG
+  alone, and the default negotiation begins with the raw formats, so
+  `cam_format=mjpeg` is what reaches 720p and 1080p on Linux.
+- Camera capture output is pinned to the authored `video_size=`. A driver that
+  substitutes a smaller mode now costs sharpness instead of shearing the
+  picture, which previously happened silently whenever an authored size was
+  unavailable.
+- Selecting a camera and opening its **Playback** page replaces the poster-time
+  field and the scrubber, which a live camera cannot use, with a **CAPTURE**
+  size field and a **FORMAT** button, both on the ordinary undoable source
+  path. The metadata line reports `LIVE CAMERA` and its capture size rather
+  than flagging the absent duration and audio stream as problems.
 
 On macOS, insertion and replacement offer a native file picker. Linux and
 Windows keep the portable manual-path prompt; all platforms accept media file

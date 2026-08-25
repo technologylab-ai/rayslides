@@ -283,7 +283,7 @@ fn mediaStatusText(status: slides.MediaAvailability) struct { title: []const u8,
         .video_poster_decode_failed => .{ .title = "Video poster frame cannot be decoded", .fix = "Choose another poster time or transcode the video." },
         .video_poster_out_of_range => .{ .title = "Video poster time is outside the clip", .fix = "Choose a poster time within the reported duration." },
         .video_poster_fallback => .{ .title = "Video poster uses the first-frame fallback", .fix = "Review the poster or choose a reliably decodable timestamp." },
-        .camera_device_unavailable => .{ .title = "Camera device cannot be opened", .fix = "Connect the camera, close other apps using it, and verify cam= and video_size=." },
+        .camera_device_unavailable => .{ .title = "Camera device cannot be opened", .fix = "Connect the camera, close other apps using it, and verify cam=, video_size=, and cam_format=." },
     };
 }
 

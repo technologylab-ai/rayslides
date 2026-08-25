@@ -1044,7 +1044,8 @@ Videos are placed like images, with the `vid=` attribute instead of `img=`:
 `cam=` uses ffmpeg's native capture input: AVFoundation on macOS (`cam=0` or a
 device name), V4L2 on Linux (`cam=/dev/video0`), and DirectShow on Windows
 (`cam=CameraName`). `video_size=` is the authored capture size and defaults to
-`1280x720`. Cameras are live and non-seekable. `poster_image=` is shown while
+`1280x720`. `cam_format=` names the capture format: `auto` (the default),
+`mjpeg`, `yuyv422`, `nv12`, or `h264`. Cameras are live and non-seekable. `poster_image=` is shown while
 the feed is stopped and is also used by Studio cards, Presenter preview,
 screenshots, and PDF export. Without it, the stopped poster is black. Play
 opens the device; pause/stop releases it and restores the poster. A failed
@@ -1079,6 +1080,29 @@ prefer its stable `/dev/v4l/by-id/...` symlink over a changeable `/dev/videoN`
 name. The presenting user must have permission to open the device (commonly by
 membership in the `video` group), and another application must not hold it
 exclusively. Author a mode supported by the camera; `1280x720` is the default.
+
+### Reaching a camera's larger modes with `cam_format=`
+
+Left at `auto`, ffmpeg negotiates the capture format from its own preference
+order, which begins with the raw formats. Many UVC webcams offer their larger
+modes in MJPEG alone and top out at `640x480` raw, so an authored `1280x720`
+is one the driver cannot serve and it substitutes a mode it has. Naming the
+format reaches those modes:
+
+```text
+@box cam=/dev/video0 video_size=1920x1080 cam_format=mjpeg x=320 y=200 w=1280 h=720 fit=cover
+```
+
+List what a device actually offers, and in which format, with:
+
+```sh
+v4l2-ctl -d /dev/video0 --list-formats-ext
+```
+
+`cam_format=` maps to ffmpeg's `-input_format`, which is a V4L2 option, so it
+applies on Linux and is ignored elsewhere. A substituted mode is never fatal:
+capture output is pinned to the authored `video_size=`, so a smaller mode is
+scaled up and costs sharpness rather than shearing the picture.
 
 ## Image and video fitting
 

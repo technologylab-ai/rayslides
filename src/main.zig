@@ -5142,6 +5142,18 @@ pub fn main(init: std.process.Init) anyerror!void {
                         pending_semantic_command = command;
                         property_prompt.begin(kind, initial);
                     },
+                    .replace_camera_poster => |target| prompt: {
+                        const item = studioItemByIdentity(studio_items, target.item_identity) orelse {
+                            studio_mode.setNotice(.edit_failed);
+                            break :prompt;
+                        };
+                        if (item.kind != .vid or !item.vid_is_camera) {
+                            studio_mode.setNotice(.property_unavailable);
+                            break :prompt;
+                        }
+                        pending_semantic_command = command;
+                        property_prompt.begin(.image_path, item.vid_camera_poster orelse "");
+                    },
                     .edit_numeric_geometry => |request| prompt: {
                         const item = studioItemByIdentity(studio_items, request.target.item_identity) orelse {
                             studio_mode.setNotice(.edit_failed);
@@ -7546,6 +7558,9 @@ fn inheritedPropertyForStudioProperty(property: studio.AuthoredProperty) source_
         .video_autoplay => .autoplay,
         .video_loop => .loop,
         .video_muted => .muted,
+        .camera_size => .video_size,
+        .camera_format => .cam_format,
+        .camera_poster => .poster_image,
         // Reveal ownership is handled by `set_item_reveal` (reset/remove
         // actions), never by the inherited-attribute reset path.
         .reveal => unreachable,
@@ -7585,6 +7600,9 @@ fn studioPropertyOverrides(
         .video_autoplay,
         .video_loop,
         .video_muted,
+        .camera_size,
+        .camera_format,
+        .camera_poster,
     };
     for (properties) |property| {
         if (source_overrides.contains(inheritedPropertyForStudioProperty(property))) result.set(property);
@@ -8208,6 +8226,9 @@ fn semanticCommandTargetsCustomizedSharedProperty(command: studio.SemanticComman
         .set_video_poster => |value| value.target,
         .set_video_volume => |value| value.target,
         .set_video_toggle => |value| value.target,
+        .set_camera_format => |value| value.target,
+        .set_camera_size => |value| value.target,
+        .replace_camera_poster => |value| value,
         .edit_numeric_geometry => |value| value.target,
         .set_foreground, .set_background => |value| value.target,
         .set_custom_foreground,
@@ -8997,6 +9018,7 @@ fn inlineSemanticEdit(commit: studio.InlineCommit) InlineSemanticEdit {
             .media_focus_y => .media_focus_y,
             .video_poster => .video_poster,
             .video_volume => .video_volume,
+            .camera_size => unreachable,
         };
         return .{
             .command = .{ .set_common_property = .{
@@ -9027,6 +9049,7 @@ fn inlineSemanticEdit(commit: studio.InlineCommit) InlineSemanticEdit {
         .media_focus_y => .{ .set_media_focus = .{ .target = commit.target, .axis = .y } },
         .video_poster => .{ .set_video_poster = .{ .target = commit.target } },
         .video_volume => .{ .set_video_volume = .{ .target = commit.target } },
+        .camera_size => .{ .set_camera_size = .{ .target = commit.target } },
         .reveal_delay, .reveal_after, .reveal_duration => unreachable,
         .state_label, .state_after, .state_duration, .transition_duration => unreachable,
     };
@@ -9085,6 +9108,10 @@ fn validateInlineCommit(commit: studio.InlineCommit) ?studio.InlineError {
         .video_volume => {
             var buffer: [64]u8 = undefined;
             _ = canonicalStudioUnitInterval(commit.value, &buffer) catch return .invalid_unit_interval;
+        },
+        .camera_size => {
+            var buffer: [64]u8 = undefined;
+            _ = canonicalStudioCameraSize(commit.value, &buffer) catch return .invalid_camera_size;
         },
         .reveal_delay => {
             const value = std.mem.trim(u8, commit.value, " \t\r\n");
@@ -9221,6 +9248,12 @@ fn inlineCommitChangesValue(
             const submitted = parseStudioFiniteFloat(commit.value) catch return true;
             break :changed @abs(current - submitted) > 0.000001;
         },
+        .camera_size => changed: {
+            const current = if (shared) |values| values.vid_camera_size else item.vid_camera_size;
+            const submitted = studio.parseCameraSize(std.mem.trim(u8, commit.value, " \t\r\n")) orelse break :changed true;
+            break :changed @as(i32, @intFromFloat(current.x)) != submitted.width or
+                @as(i32, @intFromFloat(current.y)) != submitted.height;
+        },
         .reveal_delay => changed: {
             const spec = item.animation orelse break :changed true;
             const value = std.mem.trim(u8, commit.value, " \t\r\n");
@@ -9243,6 +9276,15 @@ fn inlineCommitChangesValue(
         },
         .state_label, .state_after, .state_duration, .transition_duration => true,
     };
+}
+
+/// Normalises an authored capture size to the single `WIDTHxHEIGHT` spelling
+/// the parser accepts, so Studio never writes a variant it would then refuse
+/// to load.
+fn canonicalStudioCameraSize(input: []const u8, buffer: []u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    const size = studio.parseCameraSize(trimmed) orelse return error.InvalidStudioCameraSize;
+    return std.fmt.bufPrint(buffer, "{d}x{d}", .{ size.width, size.height });
 }
 
 fn canonicalOpacityValue(input: []const u8) !f32 {
@@ -10030,6 +10072,10 @@ fn materializeStudioItem(allocator: std.mem.Allocator, item: *const slides.Slide
     if (item.kind == .vid) {
         if (item.vid_is_camera) {
             try appendStudioToken(&directive, allocator, " video_size={d}x{d}", .{ @as(i32, @intFromFloat(item.vid_camera_size.x)), @as(i32, @intFromFloat(item.vid_camera_size.y)) });
+            if (item.vid_camera_format != .auto) {
+                try directive.appendSlice(allocator, " cam_format=");
+                try directive.appendSlice(allocator, item.vid_camera_format.attrValue());
+            }
             if (item.vid_camera_poster) |poster_path| {
                 try directive.appendSlice(allocator, " poster_image=");
                 try directive.appendSlice(allocator, try studioLiteralToken(poster_path));
@@ -11868,6 +11914,45 @@ fn applyStudioSemanticEdit(
                 if (change.axis == .x) "focus_x" else "focus_y",
                 value,
             );
+            return .{ .preserve_selection = true };
+        },
+        .replace_camera_poster => |target| {
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .vid or !item.vid_is_camera) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            const path = try studioMediaSourceValue(prompted_text orelse return error.StudioPromptMissing);
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, target.edit_scope, "poster_image", path);
+            return .{ .preserve_selection = true };
+        },
+        .set_camera_format => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .vid or !item.vid_is_camera) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            const current = if (change.target.edit_scope == .shared_template)
+                if (item.sharedTemplateValues()) |shared| shared.vid_camera_format else item.vid_camera_format
+            else
+                item.vid_camera_format;
+            if (current == change.format) return .{ .source_changed = false, .preserve_selection = true };
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "cam_format", change.format.attrValue());
+            return .{ .preserve_selection = true };
+        },
+        .set_camera_size => |change| {
+            const item = studioItemByIdentity(items, change.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.kind != .vid or !item.vid_is_camera) return error.ItemHasNoEditableMedia;
+            if (item.locked) return error.StudioItemLocked;
+            var value_buffer: [64]u8 = undefined;
+            const value = try canonicalStudioCameraSize(prompted_text orelse return error.StudioPromptMissing, &value_buffer);
+            const current = if (change.target.edit_scope == .shared_template)
+                if (item.sharedTemplateValues()) |shared| shared.vid_camera_size else item.vid_camera_size
+            else
+                item.vid_camera_size;
+            var current_buffer: [64]u8 = undefined;
+            const current_value = try std.fmt.bufPrint(&current_buffer, "{d}x{d}", .{
+                @as(i32, @intFromFloat(current.x)),
+                @as(i32, @intFromFloat(current.y)),
+            });
+            if (std.mem.eql(u8, current_value, value)) return .{ .source_changed = false, .preserve_selection = true };
+            try applyStudioLiteralAttribute(history, slide, morph_state, item, change.target.edit_scope, "video_size", value);
             return .{ .preserve_selection = true };
         },
         .set_video_poster => |change| {

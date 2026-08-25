@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rl = @import("raylib");
 const pathRelativeTo = @import("utils.zig").pathRelativeTo;
+const CameraFormat = @import("slides.zig").CameraFormat;
 
 const log = std.log.scoped(.videoplayer);
 
@@ -298,6 +299,7 @@ pub const VideoPlayer = struct {
     /// 0 when unknown; the overlay hides its seek bar then.
     duration: f64,
     is_camera: bool = false,
+    camera_format: CameraFormat = .auto,
     runtime_camera_failed: bool = false,
     camera_failure_notice_pending: bool = false,
     // Set from the initiating item's element each time playback starts;
@@ -333,7 +335,7 @@ pub const VideoPlayer = struct {
 
     const Self = @This();
 
-    fn appendCameraInputArgs(argv: [][]const u8, len: *usize, device: []const u8, width: i32, height: i32, size_buf: *[32]u8, dshow_buf: *[std.fs.max_path_bytes]u8) !void {
+    fn appendCameraInputArgs(argv: [][]const u8, len: *usize, device: []const u8, width: i32, height: i32, camera_format: CameraFormat, size_buf: *[32]u8, dshow_buf: *[std.fs.max_path_bytes]u8) !void {
         const size = try std.fmt.bufPrint(size_buf, "{d}x{d}", .{ width, height });
         const format = switch (builtin.os.tag) {
             .macos => "avfoundation",
@@ -346,10 +348,33 @@ pub const VideoPlayer = struct {
             .windows => try std.fmt.bufPrint(dshow_buf, "video={s}", .{device}),
             else => device,
         };
-        for ([_][]const u8{ "-f", format, "-framerate", "30", "-video_size", size, "-i", input }) |arg| {
+        for ([_][]const u8{ "-f", format }) |arg| {
             argv[len.*] = arg;
             len.* += 1;
         }
+        // Naming the capture format is what reaches a mode the device offers
+        // in that format alone. Without it ffmpeg negotiates from its own
+        // preference order and a request it cannot satisfy is quietly served
+        // at whatever size the driver substitutes.
+        if (cameraInputFormatArg(camera_format)) |input_format| {
+            for ([_][]const u8{ "-input_format", input_format }) |arg| {
+                argv[len.*] = arg;
+                len.* += 1;
+            }
+        }
+        for ([_][]const u8{ "-framerate", "30", "-video_size", size, "-i", input }) |arg| {
+            argv[len.*] = arg;
+            len.* += 1;
+        }
+    }
+
+    /// `-input_format` selects a V4L2 capture format. AVFoundation and
+    /// DirectShow spell the same idea differently, so the option is Linux-only
+    /// and an authored format elsewhere stays a no-op rather than becoming an
+    /// argument ffmpeg would reject.
+    fn cameraInputFormatArg(camera_format: CameraFormat) ?[]const u8 {
+        if (builtin.os.tag != .linux) return null;
+        return camera_format.ffmpegName();
     }
 
     fn decodePosterFrame(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, at: f64, frame_size: usize) ![]u8 {
@@ -395,7 +420,7 @@ pub const VideoPlayer = struct {
         return result.stdout;
     }
 
-    pub fn create(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, poster_time: f64, is_camera: bool, camera_width: i32, camera_height: i32, camera_poster: ?[]const u8) !*Self {
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, realpath: []const u8, poster_time: f64, is_camera: bool, camera_width: i32, camera_height: i32, camera_format: CameraFormat, camera_poster: ?[]const u8) !*Self {
         if (!is_camera) {
             const file = try std.Io.Dir.cwd().openFile(io, realpath, .{});
             defer file.close(io);
@@ -456,6 +481,7 @@ pub const VideoPlayer = struct {
             .has_audio = meta.has_audio,
             .duration = meta.duration,
             .is_camera = is_camera,
+            .camera_format = camera_format,
             .texture = texture,
             .poster_texture = poster_texture,
             .poster = poster,
@@ -644,9 +670,22 @@ pub const VideoPlayer = struct {
         var camera_size_buf: [32]u8 = undefined;
         var dshow_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (self.is_camera) {
-            try appendCameraInputArgs(&video_argv_buf, &video_argv_len, self.path, self.width, self.height, &camera_size_buf, &dshow_buf);
+            try appendCameraInputArgs(&video_argv_buf, &video_argv_len, self.path, self.width, self.height, self.camera_format, &camera_size_buf, &dshow_buf);
         } else {
             for ([_][]const u8{ "-i", self.path }) |arg| {
+                video_argv_buf[video_argv_len] = arg;
+                video_argv_len += 1;
+            }
+        }
+        // A camera size is authored, not probed, so the driver is free to
+        // substitute a mode it actually has. Pinning the output size keeps
+        // every frame exactly frame_size bytes: a substitution then costs
+        // sharpness, where an unpinned pipeline would slice one frame's worth
+        // of bytes out of several and shear the picture instead.
+        var output_size_buf: [32]u8 = undefined;
+        if (self.is_camera) {
+            const output_size = try std.fmt.bufPrint(&output_size_buf, "{d}x{d}", .{ self.width, self.height });
+            for ([_][]const u8{ "-s", output_size }) |arg| {
                 video_argv_buf[video_argv_len] = arg;
                 video_argv_len += 1;
             }
@@ -873,20 +912,20 @@ pub const VideoCache = struct {
         };
     }
 
-    pub fn getVideoPlayer(self: *Self, p: []const u8, refpath: ?[]const u8, poster_time: f64, is_camera: bool, camera_size: @Vector(2, i32), camera_poster_path: ?[]const u8) !VideoLoadResult {
+    pub fn getVideoPlayer(self: *Self, p: []const u8, refpath: ?[]const u8, poster_time: f64, is_camera: bool, camera_size: @Vector(2, i32), camera_format: CameraFormat, camera_poster_path: ?[]const u8) !VideoLoadResult {
         const io = self.io orelse return .disabled;
         const realpath = if (is_camera) p else try pathRelativeTo(p, refpath);
         const poster_path = if (is_camera) if (camera_poster_path) |path| try pathRelativeTo(path, refpath) else null else null;
         // The poster is baked into a player's texture, so the same file with
         // different poster= stills becomes distinct cache entries.
         var key_buf: [std.fs.max_path_bytes * 2 + 96]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buf, "{s}|poster={d:.3}|cam={}|size={d}x{d}|image={s}", .{ realpath, poster_time, is_camera, camera_size[0], camera_size[1], poster_path orelse "" });
+        const key = try std.fmt.bufPrint(&key_buf, "{s}|poster={d:.3}|cam={}|size={d}x{d}|format={s}|image={s}", .{ realpath, poster_time, is_camera, camera_size[0], camera_size[1], camera_format.attrValue(), poster_path orelse "" });
         if (self.path2player.get(key)) |cached| return cached;
 
         // pathRelativeTo returns a shared static buffer; own the key now.
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
-        const result: VideoLoadResult = if (VideoPlayer.create(self.allocator, io, realpath, poster_time, is_camera, camera_size[0], camera_size[1], poster_path)) |player|
+        const result: VideoLoadResult = if (VideoPlayer.create(self.allocator, io, realpath, poster_time, is_camera, camera_size[0], camera_size[1], camera_format, poster_path)) |player|
             .{ .player = player }
         else |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -967,4 +1006,33 @@ test "video diagnostics distinguish tools probe poster and file failures" {
     try std.testing.expectEqual(PosterStatus.exact, posterStatusForRequest(10, 9.8));
     try std.testing.expectEqual(PosterStatus.out_of_range, posterStatusForRequest(10, 10));
     try std.testing.expectEqual(PosterStatus.exact, posterStatusForRequest(0, 100));
+}
+
+test "camera input arguments name the capture format only where ffmpeg takes one" {
+    var argv_buf: [24][]const u8 = undefined;
+    var size_buf: [32]u8 = undefined;
+    var dshow_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    var len: usize = 0;
+    try VideoPlayer.appendCameraInputArgs(&argv_buf, &len, "/dev/video0", 1280, 720, .mjpeg, &size_buf, &dshow_buf);
+    const argv = argv_buf[0..len];
+    const has_input_format = for (argv, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, "-input_format")) break index;
+    } else null;
+    if (builtin.os.tag == .linux) {
+        const index = has_input_format orelse return error.TestExpectedInputFormat;
+        try std.testing.expectEqualStrings("mjpeg", argv[index + 1]);
+    } else {
+        // AVFoundation and DirectShow spell capture formats differently, so
+        // the option must not leak on to their command lines.
+        try std.testing.expect(has_input_format == null);
+    }
+    // The requested size still reaches the device on every platform.
+    try std.testing.expectEqualStrings("1280x720", argv[len - 3]);
+
+    len = 0;
+    try VideoPlayer.appendCameraInputArgs(&argv_buf, &len, "/dev/video0", 640, 480, .auto, &size_buf, &dshow_buf);
+    for (argv_buf[0..len]) |arg| {
+        try std.testing.expect(!std.mem.eql(u8, arg, "-input_format"));
+    }
 }

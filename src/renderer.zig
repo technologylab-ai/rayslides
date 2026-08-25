@@ -289,6 +289,7 @@ const RenderFingerprinter = struct {
         self.addOptionalString(item.vid_path);
         self.addBool(item.vid_is_camera);
         self.addVector(item.vid_camera_size);
+        self.addScalar(@as(u8, @intFromEnum(item.vid_camera_format)));
         self.addOptionalString(item.vid_camera_poster);
         self.addBool(item.vid_autoplay);
         self.addBool(item.vid_loop);
@@ -1883,7 +1884,7 @@ pub const SlideshowRenderer = struct {
         if (item.vid_path) |p| {
             const poster_time: f64 = if (item.vid_poster) |poster| @max(0, poster) else 0;
             const camera_size: @Vector(2, i32) = .{ @intFromFloat(item.vid_camera_size.x), @intFromFloat(item.vid_camera_size.y) };
-            const result = self.video_cache.getVideoPlayer(p, slideshow_filp, poster_time, item.vid_is_camera, camera_size, item.vid_camera_poster) catch |err| {
+            const result = self.video_cache.getVideoPlayer(p, slideshow_filp, poster_time, item.vid_is_camera, camera_size, item.vid_camera_format, item.vid_camera_poster) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 log.warn("Could not load video {s}: {}", .{ p, err });
                 try appendUnavailableMediaElement(renderSlide, self.allocator, item, .video_file_unreadable);
