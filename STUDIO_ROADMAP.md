@@ -331,8 +331,8 @@ and induced allocation failure after one replacement has already been built.
 - [x] Gate capture until the requested Aerospace process window is proven to
   be on workspace 12 and floating; abort rather than measure an unverified or
   tiled window, and quit every diagnostic process after capture.
-- [x] Add an explicit `--no-startup-banner` launch option so unattended QA is
-  independent from transient four-second startup timing.
+- [x] Removed the four-second startup banner entirely (2026-08), so unattended
+  QA no longer depends on transient startup timing.
 
 The ReleaseSafe reference run rebuilt 24-slide graphs in roughly 0.8–0.9 ms;
 the 160-slide scenario measured about 6.3 ms full and 0.3 ms partial. A second

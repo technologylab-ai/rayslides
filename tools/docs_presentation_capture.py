@@ -130,7 +130,6 @@ def run_capture(
 
     command = [
         str(binary),
-        "--no-startup-banner",
         "--no-crowd",
         "--diagnostics-presenter-session",
         "--diagnostics-presentation-capture",

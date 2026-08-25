@@ -41,7 +41,6 @@ const cli_help =
     \\
     \\Core options:
     \\  --studio                         Start with Studio authoring open
-    \\  --no-startup-banner              Skip the four-second presentation banner
     \\  --no-crowd                       Disable the Crowdplay server
     \\  --crowd-host=HOST                Bind Crowdplay to HOST
     \\  --crowd-port=PORT                Bind Crowdplay to PORT (default 7331)
@@ -2767,92 +2766,6 @@ test "remote drawing preserves normalized stroke boundaries" {
     try std.testing.expectEqual(@as(usize, 0), drawing.vertices.items.len);
 }
 
-const Banner = struct {
-    logo_texture: ?rl.Texture = null,
-    showtime_seconds: f64 = banner_display_time_seconds,
-    show: bool = false,
-    screen_width: i32,
-    screen_height: i32,
-
-    pub const banner_display_time_seconds: f64 = 4.0;
-
-    pub fn init(screenWidth: i32, screenHeight: i32) !Banner {
-        const img = try rl.loadImageFromMemory(".png", @embedFile("assets/raylib_96x96.png"));
-        defer rl.unloadImage(img);
-
-        return .{
-            .logo_texture = try rl.loadTextureFromImage(img),
-            .show = true,
-            .screen_width = screenWidth,
-            .screen_height = screenHeight,
-        };
-    }
-
-    pub fn reset(self: *Banner) void {
-        self.showtime_seconds = rl.getTime() + banner_display_time_seconds;
-        self.show = true;
-    }
-
-    pub fn render(self: *Banner) void {
-        if (self.show) {
-            if (rl.getTime() <= self.showtime_seconds) {
-                if (self.logo_texture) |logo| {
-                    const font_size: i32 = 75;
-                    const text1 = "Slides, now with ";
-                    const text1_width: i32 = rl.measureText(text1, font_size);
-                    const text2 = "100% more ";
-                    const text2_width: i32 = rl.measureText(text2, font_size);
-
-                    const w: i32 = 1200;
-                    const h: i32 = 350;
-                    const l: i32 = @divTrunc(self.screen_width - w, 2);
-                    const t: i32 = @divTrunc(self.screen_height - h, 2);
-                    const border_thick: f32 = 5.0;
-                    const border_inset: f32 = 10.0;
-                    const border_inset_i: i32 = @intFromFloat(border_inset);
-                    const padding: i32 = 30;
-                    const logo_size: i32 = 96;
-                    const font_size_rene: i32 = 30;
-                    const backdrop_thick: i32 = 20;
-                    const backdrop_color: rl.Color = rl.Color.alpha(rl.Color.white, 0.3);
-                    const bg_color: rl.Color = rl.Color.alpha(rl.Color.ray_white, 0.97);
-
-                    rl.drawRectangle(l - backdrop_thick, t - backdrop_thick, w + 2 * backdrop_thick, h + 2 * backdrop_thick, backdrop_color);
-                    rl.drawRectangle(l, t, w, h, bg_color);
-
-                    const border_rect: rl.Rectangle = .{
-                        .x = @as(f32, @floatFromInt(l)) + border_inset,
-                        .y = @as(f32, @floatFromInt(t)) + border_inset,
-                        .width = @as(f32, @floatFromInt(w)) - border_inset * 2,
-                        .height = @as(f32, @floatFromInt(h)) - border_inset * 2,
-                    };
-                    rl.drawRectangleLinesEx(border_rect, border_thick, rl.Color.sky_blue);
-
-                    rl.drawText(text1, l + padding + border_inset_i, t + h - padding - font_size, font_size, rl.Color.gold);
-                    rl.drawText(text2, text1_width + l + padding + border_inset_i, t + h - padding - font_size, font_size, rl.Color.red);
-
-                    rl.drawText("@renerocksai", l + padding + border_inset_i, t + padding + border_inset_i, font_size_rene, rl.Color.brightness(rl.Color.sky_blue, -0.2));
-
-                    logo.draw(
-                        text1_width + text2_width + l + padding + border_inset_i,
-                        t + h - padding - logo_size - 10,
-                        rl.Color.white,
-                    );
-                }
-            } else {
-                self.show = false;
-            }
-        }
-    }
-
-    pub fn deinit(self: *Banner) void {
-        if (self.logo_texture) |logo| {
-            rl.unloadTexture(logo);
-            self.logo_texture = null;
-        }
-    }
-};
-
 /// Raylib keeps the native close flag asserted after a close-button click.
 /// When an inline draft deferred that click, clear our edge-detection latch as
 /// soon as the draft closes or its synchronous commit is resolved so the next
@@ -3366,7 +3279,6 @@ pub fn main(init: std.process.Init) anyerror!void {
     var presenter_host_buffer: [256]u8 = undefined;
     presenter_options.host = defaultCrowdHost(&presenter_host_buffer);
     var launch_studio = false;
-    var suppress_startup_banner = false;
     var diagnostics_enabled = false;
     var diagnostics_command_palette = false;
     var diagnostics_file_browser = false;
@@ -3449,8 +3361,6 @@ pub fn main(init: std.process.Init) anyerror!void {
                 presenter_options.port = std.fmt.parseInt(u16, arg["--presenter-port=".len..], 10) catch std.process.fatal("Invalid --presenter-port value", .{});
             } else if (!positional_only and std.mem.eql(u8, arg, "--studio")) {
                 launch_studio = true;
-            } else if (!positional_only and std.mem.eql(u8, arg, "--no-startup-banner")) {
-                suppress_startup_banner = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics")) {
                 diagnostics_enabled = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
@@ -3780,9 +3690,6 @@ pub fn main(init: std.process.Init) anyerror!void {
     var remote_drawing: RemoteDrawing = try .init(gpa);
     defer remote_drawing.deinit();
     var remote_drawing_slide = G.current_slide;
-    var banner: Banner = try .init(screenWidth, screenHeight);
-    if (suppress_startup_banner) banner.show = false;
-    defer banner.deinit();
     var studio_mode: studio.Studio = .{
         .enabled = starts_in_studio,
         .dirty = slideshow_to_load == null,
@@ -5792,7 +5699,6 @@ pub fn main(init: std.process.Init) anyerror!void {
                 rl.drawCircleV(presenterPointerPosition(sample, slide_tl, slide_size_in_window), laser_pointer.size, laser_pointer.color);
             }
             if (laser_pointer.show and !studio_mode.capturesInput()) try laser_pointer.draw();
-            if (banner.show) banner.render();
             if (!studio_mode.capturesInput()) studio_mode.drawNoticeToast(studio_viewport);
 
             // The HUD is editor chrome like the laser and remote drawing above
@@ -6199,17 +6105,13 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
 
         if (!presenter_overlay_captures_input and !studio_mode.capturesInput() and !property_prompt.active and !studio_file_browser.active and rl.isKeyPressed(.b)) {
-            if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
-                banner.reset();
+            beast_mode = !beast_mode;
+            if (beast_mode) {
+                rl.clearWindowState(.{ .vsync_hint = true });
+                rl.setTargetFPS(0);
             } else {
-                beast_mode = !beast_mode;
-                if (beast_mode) {
-                    rl.clearWindowState(.{ .vsync_hint = true });
-                    rl.setTargetFPS(0);
-                } else {
-                    rl.setWindowState(.{ .vsync_hint = true });
-                    rl.setTargetFPS(60);
-                }
+                rl.setWindowState(.{ .vsync_hint = true });
+                rl.setTargetFPS(60);
             }
         }
 

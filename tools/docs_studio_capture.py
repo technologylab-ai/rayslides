@@ -174,7 +174,6 @@ def run_capture(
     command = [
         str(binary),
         "--studio",
-        "--no-startup-banner",
         "--no-crowd",
         f"--diagnostics-window={capture.width}x{capture.height}",
         f"--diagnostics-capture={image_path}",

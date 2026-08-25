@@ -23,8 +23,8 @@ fixture deck `testslides/studio-motion-qa.sld` (4 slides) instead:
 
 Each PNG is normalized to the requested logical client size. Its JSON partner
 records render mode/count/timing, frame sampling, Studio cache activity, deck
-size, active item/fragments, and parser-arena capacity. The startup banner and
-diagnostics HUD are intentionally hidden; the exercised Studio surfaces are
+size, active item/fragments, and parser-arena capacity. The diagnostics HUD is
+intentionally hidden; the exercised Studio surfaces are
 otherwise the real application UI.
 
 ## Run

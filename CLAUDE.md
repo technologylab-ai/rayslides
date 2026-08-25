@@ -37,7 +37,7 @@ zig build -Doptimize=ReleaseSafe studio-baselines-update -- --workspace 12
 
 ### Core Components
 
-- **main.zig** - Application entry point, main loop, input handling (keyboard/mouse), and window management. Contains `AppData` global state struct (`G`), `ExportController` for PDF export, `LaserPointer` for presentation annotations, and `Banner` for splash screen.
+- **main.zig** - Application entry point, main loop, input handling (keyboard/mouse), and window management. Contains `AppData` global state struct (`G`), `ExportController` for PDF export, `LaserPointer` for presentation annotations.
 
 - **parser.zig** - Parses `.sld` slideshow text files into slide data structures. Handles directives (`@bg`, `@box`, `@push`, `@pop`, `@slide`, `@pushslide`, `@popslide`), variable substitution (`@let`), and font configuration. The `ParserContext` manages parsing state and template contexts.
 

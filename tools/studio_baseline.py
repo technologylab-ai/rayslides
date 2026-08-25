@@ -367,7 +367,6 @@ def capture_scenario(
     command = [
         str(binary),
         "--studio",
-        "--no-startup-banner",
         f"--diagnostics-window={scenario.width}x{scenario.height}",
         f"--diagnostics-capture={image_path}",
         f"--diagnostics-report={report_path}",

@@ -580,9 +580,6 @@ key press. All of these are non-mutating; the parser-clean
 `testslides/studio-motion-qa.sld` fixture provides click and automatic bullet
 builds, an eased image reveal, inherited/overridden/deck-default transitions,
 and a three-state morph for them.
-`--no-startup-banner` suppresses the four-second launch banner for unattended
-captures, kiosk launches, and other cases that need the first frame to contain
-only the deck and Studio chrome.
 
 The repository includes an opt-in visual and performance baseline harness for
 compact Properties, the default command palette, large precision mode, and a
