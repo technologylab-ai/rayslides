@@ -5,9 +5,15 @@
 
 const std = @import("std");
 const rl = @import("raylib");
+const animation = @import("animation.zig");
+const parser = @import("parser.zig");
 const slides = @import("slides.zig");
 const renderer = @import("renderer.zig");
 const studio_catalog = @import("studio_catalog.zig");
+
+/// Automatic reveal/morph runs longer than this are reported: an audience
+/// waiting on a self-advancing slide for that long is rarely intended.
+pub const max_automatic_motion_seconds: f32 = 30;
 
 pub const slide_width: f32 = 1920;
 pub const slide_height: f32 = 1080;
@@ -30,6 +36,9 @@ pub const Code = enum {
     canvas_escape,
     duplicate_id,
     unstable_morph_id,
+    motion_long_automatic_run,
+    reveal_on_hidden_object,
+    morph_state_without_changes,
     display_unavailable,
     display_low_resolution,
     display_aspect_mismatch,
@@ -214,6 +223,38 @@ fn renderItemForOwner(items: []const renderer.SlideshowRenderer.ShowtimeRenderIt
     return null;
 }
 
+/// Motion audit for one logical slide: long self-advancing runs, reveals on
+/// hidden objects, and morph states that change nothing.
+fn auditSlideMotion(report: *Report, steps: []const animation.Step, slide: *const slides.Slide, slide_index: usize) !void {
+    var automatic_seconds: f32 = 0;
+    var automatic_steps: usize = 0;
+    for (steps) |step| {
+        const after = step.after orelse continue;
+        automatic_steps += 1;
+        automatic_seconds += after + @max(0, step.duration);
+    }
+    if (automatic_seconds > max_automatic_motion_seconds) {
+        try report.addFmt(.info, .deck, .motion_long_automatic_run, slide_index, null, null, null, "Slide {d} advances by itself for {d:.0} seconds across {d} steps", .{ slide_index + 1, automatic_seconds, automatic_steps }, "Confirm the audience is meant to wait; shorten delay=/after= values or make some steps wait for a click.", .{});
+    }
+    if (slide.items) |items| {
+        for (items.items) |item| {
+            if (item.animation != null and !item.visible and !report.alreadyHas(.reveal_on_hidden_object, slide_index, item.identity)) {
+                try report.addFmt(.warning, .deck, .reveal_on_hidden_object, slide_index, null, item.identity, sourceLine(item), "Object {d} has a reveal but is hidden", .{item.identity}, "Remove the reveal or the visible=false; a hidden object never appears.", .{});
+            }
+        }
+    }
+    for (slide.morph_states.items, 0..) |state, state_index| {
+        var changes: usize = 0;
+        for (state.items.items) |item| {
+            if ((item.creation_morph_state != null and item.creation_morph_state.? == state_index) or
+                (item.state_source_state != null and item.state_source_state.? == state_index)) changes += 1;
+        }
+        if (changes == 0) {
+            try report.addFmt(.info, .deck, .morph_state_without_changes, slide_index, state_index, null, state.source.line_number, "Slide {d} state {d} changes nothing", .{ slide_index + 1, state_index + 1 }, "Add @set/@show/@hide lines or delete the empty @state(morph) block.", .{});
+        }
+    }
+}
+
 fn sceneItems(slide: *const slides.Slide, morph_state: ?usize) []const slides.SlideItem {
     if (morph_state) |state| return slide.morph_states.items[state].items.items;
     return slide.items.?.items;
@@ -337,6 +378,7 @@ pub fn analyze(
         report.summary.reveal_endpoints += render.stepCount(@intCast(slide_index)) + 1;
         const scene_count = slide.morph_states.items.len + 1;
         report.summary.scenes += scene_count;
+        try auditSlideMotion(&report, render.stepsForSlide(@intCast(slide_index)), slide, slide_index);
         for (0..scene_count) |scene_index| {
             const morph_state: ?usize = if (scene_index == 0) null else scene_index - 1;
             const items = sceneItems(slide, morph_state);
@@ -775,4 +817,46 @@ test "Presenter health turns measured venue failures into an actionable warning"
     });
     try std.testing.expectEqual(@as(usize, 1), report.summary.warnings);
     try std.testing.expectEqual(Code.presenter_health_failures, report.findings.items[0].code);
+}
+
+test "motion audit reports long automatic runs hidden reveals and empty states" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const source =
+        "@slide\n" ++
+        "@box id=ghost x=1 y=1 visible=false anim=fade\n" ++
+        "@box id=hero x=1 y=1\n" ++
+        "@state(morph) label=empty\n" ++
+        "@state(morph) label=busy\n" ++
+        "@set hero x=50\n";
+    const context = try parser.constructSlidesFromBuf(source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const slide = deck.slides.items[0];
+
+    var report = Report.init(allocator);
+    defer report.deinit();
+    const steps = [_]animation.Step{
+        animation.Step.fromItemStep(.{ .effect = .fade, .after = 20, .duration = 1 }, 0, 1),
+        animation.Step.fromItemStep(.{ .effect = .fade, .after = 12, .duration = 0.5 }, 1, 1),
+        animation.Step.fromMorph(.{ .duration = 1 }, 0),
+    };
+    try auditSlideMotion(&report, &steps, slide, 0);
+    try std.testing.expect(report.alreadyHas(.reveal_on_hidden_object, 0, slide.items.?.items[0].identity));
+    var long_run = false;
+    var empty_state = false;
+    var busy_state = false;
+    for (report.findings.items) |finding| {
+        if (finding.code == .motion_long_automatic_run) long_run = true;
+        if (finding.code == .morph_state_without_changes) {
+            if (finding.morph_state != null and finding.morph_state.? == 0) empty_state = true;
+            if (finding.morph_state != null and finding.morph_state.? == 1) busy_state = true;
+        }
+    }
+    try std.testing.expect(long_run);
+    try std.testing.expect(empty_state);
+    try std.testing.expect(!busy_state);
+    try std.testing.expect(report.ready());
 }

@@ -282,6 +282,7 @@ pub const DockPanel = enum {
 pub const InspectorPanel = enum {
     objects,
     properties,
+    motion,
 };
 
 const empty_frame_rectangle: rl.Rectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
@@ -1232,6 +1233,13 @@ pub const Status = enum {
 
 pub const Notice = enum {
     none,
+    reveal_scene_required,
+    reveal_morph_born,
+    reveal_selection_required,
+    reveal_bullets_required,
+    reveal_shared_template,
+    morph_object_needs_id,
+    transition_needs_slide_directive,
     saved,
     copy_saved,
     save_failed,
@@ -1496,7 +1504,34 @@ pub const InlineField = enum {
     media_focus_y,
     video_poster,
     video_volume,
+    /// Motion inspector fields. Their rectangles come from `motionLayout`,
+    /// not `uiLayout`; they share the inline editor, validation, and commit
+    /// handshake with the Properties fields.
+    reveal_delay,
+    reveal_after,
+    reveal_duration,
+    /// Morph-state fields: they edit the active `@state(morph)` directive
+    /// rather than an item, so they use the scene inline-editor path.
+    state_label,
+    state_after,
+    state_duration,
+    /// Incoming transition duration of the current slide (scene field).
+    transition_duration,
 };
+
+pub fn inlineFieldIsMotion(field: InlineField) bool {
+    return switch (field) {
+        .reveal_delay, .reveal_after, .reveal_duration => true,
+        else => false,
+    };
+}
+
+pub fn inlineFieldIsScene(field: InlineField) bool {
+    return switch (field) {
+        .state_label, .state_after, .state_duration, .transition_duration => true,
+        else => false,
+    };
+}
 
 /// Source-authored properties that may be inherited from reusable content and
 /// reset independently. Most map to an editable InlineField; button-based
@@ -1528,6 +1563,9 @@ pub const AuthoredProperty = enum {
     video_autoplay,
     video_loop,
     video_muted,
+    reveal,
+    morph_state,
+    transition,
 };
 
 fn authoredPropertyForInlineField(field: InlineField) AuthoredProperty {
@@ -1548,6 +1586,9 @@ fn authoredPropertyForInlineField(field: InlineField) AuthoredProperty {
         .media_focus_y => .media_focus_y,
         .video_poster => .video_poster,
         .video_volume => .video_volume,
+        .reveal_delay, .reveal_after, .reveal_duration => .reveal,
+        .state_label, .state_after, .state_duration => .morph_state,
+        .transition_duration => .transition,
     };
 }
 
@@ -1565,6 +1606,9 @@ pub const InlineError = enum {
     invalid_unit_interval,
     invalid_video_poster,
     invalid_text,
+    invalid_delay,
+    invalid_seconds,
+    invalid_state_label,
     source_edit_failed,
 };
 
@@ -1578,6 +1622,8 @@ pub const InlineCommit = struct {
     targets: ItemBatchCommand = .{},
     field: InlineField,
     value: []const u8,
+    /// Zero-based morph state edited by scene fields; null for item fields.
+    scene_state: ?usize = null,
 };
 
 pub const CommonProperty = enum {
@@ -1702,6 +1748,233 @@ pub const MorphStateSummary = struct {
     source: slides.SourceRef = .{},
 };
 
+/// Borrowed metadata for one item's contiguous reveal steps, in slide step
+/// order. Studio draws BUILD timeline cards and canvas badges from it.
+pub const RevealBuildSummary = struct {
+    owner_identity: usize,
+    /// 1-based first step in the slide timeline.
+    first_step: usize,
+    step_count: usize,
+    spec: animation.ItemSpec,
+    label: []const u8 = "",
+    /// The reveal is authored on the item's own decorator/line rather than
+    /// inherited from a reusable `@push` definition.
+    authored_locally: bool = true,
+
+    pub fn lastStep(self: RevealBuildSummary) usize {
+        return self.first_step + self.step_count - 1;
+    }
+
+    pub fn containsStep(self: RevealBuildSummary, step: usize) bool {
+        return step >= self.first_step and step <= self.lastStep();
+    }
+};
+
+/// Integration-owned live preview state mirrored into Studio each frame so
+/// the transport controls and timeline highlight can draw it.
+pub const MotionPreviewStatus = struct {
+    /// The current slide has steps or an incoming transition to preview.
+    available: bool = false,
+    playing: bool = false,
+    /// Seeked or finished: a preview frame is shown but time does not advance.
+    paused: bool = false,
+    looping: bool = false,
+    time: f32 = 0,
+    total: f32 = 0,
+    /// 1-based step animating or last completed; 0 before the first step.
+    step: usize = 0,
+    in_transition: bool = false,
+
+    pub fn active(self: MotionPreviewStatus) bool {
+        return self.playing or self.paused;
+    }
+};
+
+pub const PreviewCommand = union(enum) {
+    play,
+    pause,
+    stop,
+    toggle_loop,
+    /// Absolute preview time in seconds.
+    seek: f32,
+};
+
+pub const TransitionProvenance = enum { none, slide, template, deck_default };
+
+/// The current slide's incoming transition and where it comes from.
+pub const TransitionSummary = struct {
+    transition: animation.Transition = .{},
+    provenance: TransitionProvenance = .none,
+    template_name: []const u8 = "",
+    /// Deck-wide default when `@transition=` is authored.
+    deck: ?animation.Transition = null,
+    /// The slide has a physical `@slide`/`@popslide` line to write to.
+    can_author: bool = false,
+    /// A previous slide exists, so the transition can be previewed.
+    has_previous_slide: bool = false,
+};
+
+/// Patch for the current slide's transition. `inherit` removes the local
+/// keys; `shared` targets the `@pushslide` template instead of the instance.
+pub const SlideTransitionCommand = struct {
+    effect: ?animation.Effect = null,
+    duration: ?f32 = null,
+    easing: ?animation.Easing = null,
+    inherit: bool = false,
+    shared: bool = false,
+};
+
+pub const StateChangeKind = enum { changed, born, hidden, shown };
+
+/// One object touched by the active morph state, computed by the
+/// integration from parser provenance and the renderer's morph plan.
+pub const StateChangeSummary = struct {
+    identity: usize,
+    label: []const u8 = "",
+    kind: StateChangeKind,
+    /// Attribute keys of the effective `@set/@show/@hide` line, e.g. "x, y".
+    keys: [48]u8 = [_]u8{0} ** 48,
+    keys_len: u8 = 0,
+    /// The renderer cross-fades this object instead of interpolating it.
+    cross_fades: bool = false,
+
+    pub fn keysText(self: *const StateChangeSummary) []const u8 {
+        return self.keys[0..self.keys_len];
+    }
+};
+
+/// Timing patch for the indexed morph state. Outer null leaves a key alone;
+/// `after` with an inner null makes the state wait for a click again.
+pub const MorphTimingCommand = struct {
+    state_index: usize,
+    after: ??f32 = null,
+    duration: ?f32 = null,
+    easing: ?animation.Easing = null,
+};
+
+pub const ExitDirection = enum { left, right, up, down };
+
+/// Move one reveal build earlier or later in the slide's step order without
+/// changing paint order (written as `order=` keys).
+pub const MoveRevealBuildCommand = struct {
+    owner_identity: usize,
+    direction: MorphStateMoveDirection,
+};
+
+pub const ExitMorphObjectCommand = struct {
+    target: CommandTarget,
+    direction: ExitDirection,
+};
+
+pub const default_auto_state_after: f32 = 1.0;
+
+pub const RevealTrigger = enum { click, auto, click_then_auto };
+
+pub const RevealDelay = union(enum) {
+    /// Remove the first-step delay; the first step follows `after`.
+    none,
+    /// `delay=click`: the first step waits for a presentation action.
+    click,
+    seconds: f32,
+};
+
+/// One or more reveal properties to change on every target. Outer `null`
+/// leaves a property untouched. Applied per target to its current spec (or
+/// to `ItemRevealCommand.template` when the item has no reveal yet).
+pub const RevealPatch = struct {
+    effect: ?animation.Effect = null,
+    by: ?animation.Grouping = null,
+    delay: ?RevealDelay = null,
+    after: ??f32 = null,
+    duration: ?f32 = null,
+    easing: ?animation.Easing = null,
+    trigger: ?RevealTrigger = null,
+    order: ?i32 = null,
+};
+
+pub const RevealAction = enum {
+    /// Apply `patch` (creating the reveal from `template` when absent).
+    patch,
+    /// Ensure the item shows no reveal: remove an authored reveal, or cancel
+    /// an inherited one with `anim=none`.
+    remove,
+    /// Remove only the item's locally authored reveal so an inherited one
+    /// resurfaces.
+    reset,
+};
+
+pub const ItemRevealCommand = struct {
+    targets: ItemBatchCommand = .{},
+    action: RevealAction = .patch,
+    patch: RevealPatch = .{},
+    template: animation.ItemSpec = .{},
+};
+
+pub const default_auto_reveal_delay: f32 = 0.5;
+pub const default_auto_reveal_after: f32 = 0.8;
+
+/// Pure patch application shared by Studio and the integration layer.
+pub fn applyRevealPatch(base: animation.ItemSpec, patch: RevealPatch) animation.ItemSpec {
+    var spec = base;
+    if (patch.effect) |effect| spec.effect = effect;
+    if (patch.by) |by| spec.by = by;
+    if (patch.delay) |delay| switch (delay) {
+        .none => {
+            spec.delay = null;
+            spec.first_waits = false;
+        },
+        .click => {
+            spec.delay = null;
+            spec.first_waits = true;
+        },
+        .seconds => |seconds| {
+            spec.delay = seconds;
+            spec.first_waits = false;
+        },
+    };
+    if (patch.after) |after| spec.after = after;
+    if (patch.duration) |duration| spec.duration = duration;
+    if (patch.easing) |easing| spec.easing = easing;
+    if (patch.order) |order| spec.order = order;
+    if (patch.trigger) |trigger| switch (trigger) {
+        .click => {
+            spec.first_waits = false;
+            spec.delay = null;
+            spec.after = null;
+        },
+        .auto => {
+            spec.first_waits = false;
+            if (spec.delay == null and spec.after == null) {
+                spec.delay = default_auto_reveal_delay;
+                spec.after = default_auto_reveal_after;
+            }
+        },
+        .click_then_auto => {
+            spec.first_waits = true;
+            spec.delay = null;
+            if (spec.after == null) spec.after = default_auto_reveal_after;
+        },
+    };
+    return spec;
+}
+
+/// The trigger a spec currently expresses, for the Motion inspector strip.
+pub fn revealTrigger(spec: animation.ItemSpec) RevealTrigger {
+    if (spec.first_waits) return .click_then_auto;
+    if (spec.delay != null or spec.after != null) return .auto;
+    return .click;
+}
+
+pub fn textHasBulletLines(text: ?[]const u8) bool {
+    const value = text orelse return false;
+    var lines = std.mem.splitScalar(u8, value, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (trimmed.len > 0 and (trimmed[0] == '-' or trimmed[0] == '>')) return true;
+    }
+    return false;
+}
+
 pub const AddReusableCommand = struct {
     position: rl.Vector2,
     suggested_size: rl.Vector2,
@@ -1728,6 +2001,7 @@ pub const SlideSummary = struct {
     title: []const u8 = "",
     item_count: usize = 0,
     morph_count: usize = 0,
+    transition_effect: animation.Effect = .none,
 };
 
 pub const LibraryEntryKind = enum {
@@ -1786,6 +2060,9 @@ pub const Workspace = struct {
     /// Explicit semantic states for the current slide. Base is always scene
     /// zero and therefore is not repeated in this slice.
     morph_states: []const MorphStateSummary = &.{},
+    /// Reveal builds of the current slide in step order (base scene only).
+    builds: []const RevealBuildSummary = &.{},
+    transition: TransitionSummary = .{},
     /// Application-owned capabilities surfaced to command discovery without
     /// exposing history or clipboard implementation details.
     undo_available: bool = false,
@@ -1849,6 +2126,21 @@ pub const SemanticCommand = union(enum) {
     set_locked: SetLockedCommand,
     set_visible: SetVisibleCommand,
     commit_inline: InlineCommit,
+    /// Motion inspector: author/replace/remove reveals on the selection.
+    set_item_reveal: ItemRevealCommand,
+    /// Editor-side live preview transport. Never touches source or history.
+    motion_preview: PreviewCommand,
+    set_morph_state_timing: MorphTimingCommand,
+    /// Removes `label=` from the indexed state.
+    clear_morph_state_label: usize,
+    /// Deletes every mutation of the target inside the active state.
+    reset_morph_object: CommandTarget,
+    /// Appends an off-canvas `@hide` for the target in the active state.
+    exit_morph_object: ExitMorphObjectCommand,
+    set_slide_transition: SlideTransitionCommand,
+    /// Writes (or clears with null) the deck-wide transition defaults.
+    set_deck_transition: ?animation.Transition,
+    move_reveal_build: MoveRevealBuildCommand,
     reset_local_override: ResetOverrideCommand,
     detach_reusable_instance: DetachInstanceCommand,
     promote_to_reusable: CommandTarget,
@@ -2519,6 +2811,7 @@ pub const ObjectsLayout = struct {
     panel: rl.Rectangle,
     objects_tab: rl.Rectangle,
     properties_tab: rl.Rectangle,
+    motion_tab: rl.Rectangle,
     layer_actions: [4]rl.Rectangle,
     rows_clip: rl.Rectangle,
     page_status: rl.Rectangle,
@@ -2532,6 +2825,7 @@ fn emptyObjectsLayout() ObjectsLayout {
         .panel = empty_frame_rectangle,
         .objects_tab = empty_frame_rectangle,
         .properties_tab = empty_frame_rectangle,
+        .motion_tab = empty_frame_rectangle,
         .layer_actions = [_]rl.Rectangle{empty_frame_rectangle} ** 4,
         .rows_clip = empty_frame_rectangle,
         .page_status = empty_frame_rectangle,
@@ -2548,7 +2842,7 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
     const scale = uiScale(viewport);
     const inset: f32 = 10 * scale;
     const gap: f32 = 5 * scale;
-    const tab_width = (panel.width - inset * 2 - gap) / 2;
+    const tab_width = (panel.width - inset * 2 - gap * 2) / 3;
     const objects_tab: rl.Rectangle = .{
         .x = panel.x + inset,
         .y = panel.y + 7 * scale,
@@ -2557,6 +2851,12 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
     };
     const properties_tab: rl.Rectangle = .{
         .x = objects_tab.x + objects_tab.width + gap,
+        .y = objects_tab.y,
+        .width = tab_width,
+        .height = objects_tab.height,
+    };
+    const motion_tab: rl.Rectangle = .{
+        .x = properties_tab.x + properties_tab.width + gap,
         .y = objects_tab.y,
         .width = tab_width,
         .height = objects_tab.height,
@@ -2595,6 +2895,7 @@ pub fn objectsLayout(viewport: Viewport) ObjectsLayout {
         .panel = panel,
         .objects_tab = objects_tab,
         .properties_tab = properties_tab,
+        .motion_tab = motion_tab,
         .layer_actions = layer_actions,
         .rows_clip = .{
             .x = panel.x + 7 * scale,
@@ -2655,6 +2956,200 @@ fn objectPaintOffsetByIdentity(items: []const slides.SlideItem, identity: usize)
 fn rowsThatFit(height: f32, row_height: f32, gap: f32) usize {
     if (height < row_height) return 0;
     return @intFromFloat(@floor((height + gap) / (row_height + gap)));
+}
+
+pub const motion_trigger_count: usize = 4;
+pub const motion_effect_count: usize = 6;
+pub const motion_choice_count: usize = 3;
+
+/// Stable hit targets for the Motion inspector. Every rectangle is derived
+/// from the right dock so drawing, clicking, and tests agree exactly.
+pub const MotionLayout = struct {
+    scale: f32 = 1,
+    compact: bool = false,
+    panel: rl.Rectangle = empty_frame_rectangle,
+    /// Context line: "REVEAL · Direct" / "Select an object".
+    context: rl.Rectangle = empty_frame_rectangle,
+    trigger: [motion_trigger_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_trigger_count,
+    effect: [motion_effect_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_effect_count,
+    grouping: [motion_choice_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_choice_count,
+    /// DELAY, AFTER, DUR inline fields.
+    fields: [3]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 3,
+    easing: [motion_choice_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_choice_count,
+    build_bullets: rl.Rectangle = empty_frame_rectangle,
+    remove_reveal: rl.Rectangle = empty_frame_rectangle,
+    summary: rl.Rectangle = empty_frame_rectangle,
+    inline_error: rl.Rectangle = empty_frame_rectangle,
+    /// Free space below the reveal section for state/transition sections.
+    below: rl.Rectangle = empty_frame_rectangle,
+    /// State section (drawn instead of the reveal section in a morph scene):
+    /// LABEL, AFTER, DUR fields; Click/Auto strip; easing strip; object info
+    /// line; Reset + Exit L/R/U/D; change rows.
+    state_fields: [3]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 3,
+    state_trigger: [2]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 2,
+    state_easing: [motion_choice_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_choice_count,
+    state_object_info: rl.Rectangle = empty_frame_rectangle,
+    state_actions: [5]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 5,
+    state_changes_heading: rl.Rectangle = empty_frame_rectangle,
+    state_change_rows: [max_state_change_rows]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** max_state_change_rows,
+    state_change_row_count: usize = 0,
+    /// Transition section (base scene, nothing selected): Inherit + None +
+    /// six effects in a 3x3 grid, DUR field, easing strip, deck default row.
+    transition_effects: [8]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 8,
+    transition_duration: rl.Rectangle = empty_frame_rectangle,
+    transition_easing: [motion_choice_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_choice_count,
+    transition_info: rl.Rectangle = empty_frame_rectangle,
+    transition_deck_info: rl.Rectangle = empty_frame_rectangle,
+    transition_deck_actions: [2]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 2,
+};
+
+pub const max_state_change_rows: usize = 8;
+
+pub fn motionLayout(viewport: Viewport) MotionLayout {
+    const chrome = viewport.chrome orelse return .{};
+    if (!chrome.visible or !chrome.right_visible or chrome.right_dock.width <= 0 or chrome.right_dock.height <= 0) return .{};
+    const panel = chrome.right_dock;
+    const scale = uiScale(viewport);
+    const compact = panel.height < 560 * scale;
+    const inset: f32 = 10 * scale;
+    const gap: f32 = @as(f32, if (compact) 4 else 6) * scale;
+    const row: f32 = @as(f32, if (compact) 26 else 28) * scale;
+    const field_height: f32 = @as(f32, if (compact) 30 else 34) * scale;
+    const line: f32 = 18 * scale;
+    const width = panel.width - inset * 2;
+    var y = panel.y + 43 * scale;
+    var layout: MotionLayout = .{ .scale = scale, .compact = compact, .panel = panel };
+
+    layout.context = .{ .x = panel.x + inset, .y = y, .width = width, .height = line };
+    y += line + gap;
+
+    const trigger_width = (width - gap * (motion_trigger_count - 1)) / motion_trigger_count;
+    for (&layout.trigger, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (trigger_width + gap),
+        .y = y,
+        .width = trigger_width,
+        .height = row,
+    };
+    y += row + gap;
+
+    const third = (width - gap * 2) / 3;
+    for (&layout.effect, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index % 3)) * (third + gap),
+        .y = y + @as(f32, @floatFromInt(index / 3)) * (row + gap),
+        .width = third,
+        .height = row,
+    };
+    y += (row + gap) * 2;
+
+    for (&layout.grouping, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (third + gap),
+        .y = y,
+        .width = third,
+        .height = row,
+    };
+    y += row + gap;
+
+    for (&layout.fields, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (third + gap),
+        .y = y,
+        .width = third,
+        .height = field_height,
+    };
+    y += field_height + gap;
+
+    for (&layout.easing, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (third + gap),
+        .y = y,
+        .width = third,
+        .height = row,
+    };
+    y += row + gap;
+
+    const half = (width - gap) / 2;
+    layout.build_bullets = .{ .x = panel.x + inset, .y = y, .width = half, .height = row };
+    layout.remove_reveal = .{ .x = panel.x + inset + half + gap, .y = y, .width = half, .height = row };
+    y += row + gap;
+
+    layout.summary = .{ .x = panel.x + inset, .y = y, .width = width, .height = line };
+    y += line + gap;
+    layout.inline_error = .{ .x = panel.x + inset, .y = y, .width = width, .height = line };
+    y += line + gap;
+    layout.below = .{
+        .x = panel.x + inset,
+        .y = y,
+        .width = width,
+        .height = @max(0, panel.y + panel.height - y - inset),
+    };
+
+    // State section shares the vertical origin with the reveal section.
+    var sy = layout.context.y + line + gap;
+    // LABEL gets half the width; AFTER and DUR share the rest.
+    const label_width = (width - gap * 2) * 0.5;
+    const timing_width = (width - gap * 2 - label_width) / 2;
+    layout.state_fields[0] = .{ .x = panel.x + inset, .y = sy, .width = label_width, .height = field_height };
+    layout.state_fields[1] = .{ .x = panel.x + inset + label_width + gap, .y = sy, .width = timing_width, .height = field_height };
+    layout.state_fields[2] = .{ .x = panel.x + inset + label_width + gap + timing_width + gap, .y = sy, .width = timing_width, .height = field_height };
+    sy += field_height + gap;
+    for (&layout.state_trigger, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (half + gap),
+        .y = sy,
+        .width = half,
+        .height = row,
+    };
+    sy += row + gap;
+    for (&layout.state_easing, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (third + gap),
+        .y = sy,
+        .width = third,
+        .height = row,
+    };
+    sy += row + gap * 2;
+    layout.state_object_info = .{ .x = panel.x + inset, .y = sy, .width = width, .height = line };
+    sy += line + gap;
+    const action_width = (width - gap * 4) / 5;
+    for (&layout.state_actions, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index)) * (action_width + gap),
+        .y = sy,
+        .width = action_width,
+        .height = row,
+    };
+    sy += row + gap * 2;
+    layout.state_changes_heading = .{ .x = panel.x + inset, .y = sy, .width = width, .height = line };
+    sy += line + gap;
+    const change_row: f32 = @as(f32, if (compact) 22 else 24) * scale;
+    var visible_rows: usize = 0;
+    for (&layout.state_change_rows) |*cell| {
+        if (sy + change_row > panel.y + panel.height - inset) break;
+        cell.* = .{ .x = panel.x + inset, .y = sy, .width = width, .height = change_row };
+        sy += change_row + 2 * scale;
+        visible_rows += 1;
+    }
+    layout.state_change_row_count = visible_rows;
+
+    // Transition section shares the vertical origin as well.
+    var ty = layout.context.y + line + gap;
+    for (&layout.transition_effects, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + @as(f32, @floatFromInt(index % 3)) * (third + gap),
+        .y = ty + @as(f32, @floatFromInt(index / 3)) * (row + gap),
+        .width = third,
+        .height = row,
+    };
+    ty += (row + gap) * 3;
+    layout.transition_duration = .{ .x = panel.x + inset, .y = ty, .width = third, .height = field_height };
+    for (&layout.transition_easing, 0..) |*cell, index| cell.* = .{
+        .x = panel.x + inset + third + gap + @as(f32, @floatFromInt(index)) * ((width - third - gap - gap * 2) / 3 + gap),
+        .y = ty,
+        .width = (width - third - gap - gap * 2) / 3,
+        .height = field_height,
+    };
+    ty += field_height + gap;
+    layout.transition_info = .{ .x = panel.x + inset, .y = ty, .width = width, .height = line };
+    ty += line + gap * 2;
+    layout.transition_deck_info = .{ .x = panel.x + inset, .y = ty, .width = width, .height = line };
+    ty += line + gap;
+    layout.transition_deck_actions[0] = .{ .x = panel.x + inset, .y = ty, .width = half, .height = row };
+    layout.transition_deck_actions[1] = .{ .x = panel.x + inset + half + gap, .y = ty, .width = half, .height = row };
+    return layout;
 }
 
 pub fn uiLayout(viewport: Viewport) UiLayout {
@@ -3207,6 +3702,14 @@ pub const MorphTimelineLayout = struct {
     card_width: f32,
     card_gap: f32,
     compact: bool,
+    /// Incoming-transition chip before the BASE card.
+    transition_chip: rl.Rectangle = empty_frame_rectangle,
+    /// Live preview transport, left of the state actions.
+    transport_play: rl.Rectangle = empty_frame_rectangle,
+    transport_stop: rl.Rectangle = empty_frame_rectangle,
+    transport_loop: rl.Rectangle = empty_frame_rectangle,
+    transport_scrubber: rl.Rectangle = empty_frame_rectangle,
+    transport_readout: rl.Rectangle = empty_frame_rectangle,
 };
 
 pub const CommandId = enum {
@@ -3258,6 +3761,15 @@ pub const CommandId = enum {
     duplicate_morph_state,
     rename_morph_state,
     delete_morph_state,
+    show_motion,
+    build_bullets,
+    remove_reveal,
+    preview_play,
+    preview_stop,
+    preview_loop,
+    toggle_motion_ghosts,
+    reset_morph_object,
+    edit_transition,
 };
 
 const CommandSpec = struct {
@@ -3318,6 +3830,15 @@ const command_specs = [_]CommandSpec{
     .{ .id = .duplicate_morph_state, .category = "MORPH", .title = "Duplicate morph state", .description = "Insert an empty state from this snapshot", .keywords = "animation scene copy" },
     .{ .id = .rename_morph_state, .category = "MORPH", .title = "Name morph state", .description = "Set the selected state's timeline label", .keywords = "animation scene label" },
     .{ .id = .delete_morph_state, .category = "MORPH", .title = "Delete morph state", .description = "Remove the selected complete state block", .keywords = "animation scene remove" },
+    .{ .id = .show_motion, .category = "MOTION", .title = "Show Motion", .description = "Open reveal, state, and transition authoring", .keywords = "animation inspector right dock reveal build timing" },
+    .{ .id = .build_bullets, .category = "MOTION", .title = "Build bullets one by one", .description = "Reveal the selected text box bullet by bullet", .keywords = "animation reveal list steps appear" },
+    .{ .id = .remove_reveal, .category = "MOTION", .title = "Remove reveal", .description = "Show the selection immediately when the slide enters", .keywords = "animation reveal delete none" },
+    .{ .id = .preview_play, .category = "MOTION", .title = "Play or pause preview", .description = "Play the current slide's reveals, states, and transition on the canvas", .keywords = "animation motion run watch timing", .shortcut = "Shift Space" },
+    .{ .id = .preview_stop, .category = "MOTION", .title = "Stop preview", .description = "Return the canvas to the selected scene", .keywords = "animation motion halt", .shortcut = "Esc" },
+    .{ .id = .preview_loop, .category = "MOTION", .title = "Loop preview", .description = "Repeat the preview until stopped", .keywords = "animation motion repeat" },
+    .{ .id = .toggle_motion_ghosts, .category = "MOTION", .title = "Toggle motion ghosts", .description = "Show where changed objects come from in the previous state", .keywords = "morph onion skin path previous outline" },
+    .{ .id = .reset_morph_object, .category = "MORPH", .title = "Reset object in this state", .description = "Remove every change to the selected object in the active state", .keywords = "morph inherit undo mutation set hide show" },
+    .{ .id = .edit_transition, .category = "MOTION", .title = "Edit slide transition", .description = "Choose how this slide enters and the deck default", .keywords = "fade slide-left duration ease incoming between slides deck default" },
 };
 
 pub const CommandPaletteLayout = struct {
@@ -3424,20 +3945,72 @@ pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
         .width = action_width,
         .height = action_height,
     };
-    return .{
+    const card_width = @as(f32, if (compact) 112 else 154) * scale;
+    const card_gap = 6 * scale;
+    const chip_width = @as(f32, if (compact) 44 else 58) * scale;
+
+    // Transport: play, stop, loop, scrubber, readout — only when at least two
+    // cards still fit beside it; otherwise the cards keep the whole band.
+    const transport_button: f32 = @as(f32, if (compact) 38 else 44) * scale;
+    const readout_width: f32 = 66 * scale;
+    const scrubber_width = @max(80 * scale, @min(220 * scale, panel.width * 0.16));
+    const transport_width = transport_button * 3 + scrubber_width + readout_width + gap * 4;
+    const transport_group_gap = 12 * scale;
+    const cards_available = actions_x - gap - (panel.x + padding + chip_width + card_gap) - transport_width - transport_group_gap;
+    var layout: MorphTimelineLayout = .{
         .scale = scale,
         .panel = panel,
-        .cards_clip = .{
+        .transition_chip = .{
             .x = panel.x + padding,
             .y = panel.y + padding,
-            .width = @max(0, actions_x - gap - (panel.x + padding)),
+            .width = chip_width,
+            .height = card_height,
+        },
+        .cards_clip = .{
+            .x = panel.x + padding + chip_width + card_gap,
+            .y = panel.y + padding,
+            .width = @max(0, actions_x - gap - (panel.x + padding + chip_width + card_gap)),
             .height = card_height,
         },
         .actions = actions,
-        .card_width = @as(f32, if (compact) 112 else 154) * scale,
-        .card_gap = 6 * scale,
+        .card_width = card_width,
+        .card_gap = card_gap,
         .compact = compact,
     };
+    const minimum_cards = card_width * 3 + card_gap * 2;
+    const y = panel.y + padding;
+    if (cards_available >= minimum_cards) {
+        layout.cards_clip.width = cards_available;
+        var x = actions_x - transport_group_gap - transport_width;
+        layout.transport_play = .{ .x = x, .y = y, .width = transport_button, .height = action_height };
+        x += transport_button + gap;
+        layout.transport_stop = .{ .x = x, .y = y, .width = transport_button, .height = action_height };
+        x += transport_button + gap;
+        layout.transport_loop = .{ .x = x, .y = y, .width = transport_button, .height = action_height };
+        x += transport_button + gap;
+        layout.transport_scrubber = .{ .x = x, .y = y, .width = scrubber_width, .height = action_height };
+        x += scrubber_width + gap;
+        layout.transport_readout = .{ .x = x, .y = y, .width = readout_width, .height = action_height };
+    } else {
+        // Compact tier: Play and Stop only, so at least three cards remain.
+        const minimal_width = transport_button * 2 + gap;
+        const minimal_available = actions_x - gap - (panel.x + padding + chip_width + card_gap) - minimal_width - transport_group_gap;
+        if (minimal_available >= minimum_cards) {
+            layout.cards_clip.width = minimal_available;
+            const x = actions_x - transport_group_gap - minimal_width;
+            layout.transport_play = .{ .x = x, .y = y, .width = transport_button, .height = action_height };
+            layout.transport_stop = .{ .x = x + transport_button + gap, .y = y, .width = transport_button, .height = action_height };
+        }
+    }
+    return layout;
+}
+
+/// Preview time for a pointer position on the scrubber track.
+pub fn transportSeekTime(layout: MorphTimelineLayout, pointer_x: f32, total: f32) f32 {
+    const track = layout.transport_scrubber;
+    if (track.width <= 0 or total <= 0) return 0;
+    const fraction = animation.clampProgress((pointer_x - track.x) / track.width);
+    return fraction * total;
 }
 
 pub const StatusRevealLayout = struct {
@@ -3510,6 +4083,24 @@ pub fn morphTimelineCardCapacity(layout: MorphTimelineLayout) usize {
     )));
 }
 
+pub const max_timeline_step_chips: usize = 12;
+
+/// Small per-step chips along the bottom of a BUILD card. Clicking one shows
+/// the slide through that exact step.
+pub fn timelineStepChipRect(layout: MorphTimelineLayout, card: rl.Rectangle, chip_index: usize, chip_count: usize) ?rl.Rectangle {
+    if (layout.compact or chip_count == 0 or chip_index >= chip_count) return null;
+    const inset: f32 = 9 * layout.scale;
+    const gap: f32 = 3 * layout.scale;
+    const available = card.width - inset * 2;
+    const chip_width = (available - gap * @as(f32, @floatFromInt(chip_count - 1))) / @as(f32, @floatFromInt(chip_count));
+    return .{
+        .x = card.x + inset + @as(f32, @floatFromInt(chip_index)) * (chip_width + gap),
+        .y = card.y + card.height - 11 * layout.scale,
+        .width = @max(2 * layout.scale, chip_width),
+        .height = 5 * layout.scale,
+    };
+}
+
 pub fn morphTimelineCardRect(layout: MorphTimelineLayout, visible_slot: usize) ?rl.Rectangle {
     if (visible_slot >= morphTimelineCardCapacity(layout)) return null;
     return .{
@@ -3547,6 +4138,8 @@ pub const FrameInput = struct {
     palette_previous_pressed: bool = false,
     palette_next_pressed: bool = false,
     cancel_pressed: bool = false,
+    /// Shift+Space: play or pause the motion preview.
+    preview_toggle_pressed: bool = false,
     pointer_screen: rl.Vector2 = .{ .x = 0, .y = 0 },
     pointer_pressed: bool = false,
     pointer_down: bool = false,
@@ -3660,6 +4253,7 @@ pub const FrameInput = struct {
             .palette_previous_pressed = keyPressedOrRepeated(.up),
             .palette_next_pressed = keyPressedOrRepeated(.down),
             .cancel_pressed = rl.isKeyPressed(.escape),
+            .preview_toggle_pressed = shift and rl.isKeyPressed(.space),
             .pointer_screen = rl.getMousePosition(),
             .pointer_pressed = rl.isMouseButtonPressed(.left),
             .pointer_down = rl.isMouseButtonDown(.left),
@@ -4052,6 +4646,22 @@ pub const Studio = struct {
     tool: Tool = .select,
     active_morph_state: ?usize = null,
     morph_state_count: usize = 0,
+    /// Reveal-step scene: when set (and no morph state is active), the canvas
+    /// shows the base slide revealed through this 1-based step. Items are
+    /// still edited in the base scene.
+    visible_reveal_step: ?usize = null,
+    build_count: usize = 0,
+    /// Borrowed for the current frame from Workspace.builds.
+    frame_builds: []const RevealBuildSummary = &.{},
+    motion_preview: MotionPreviewStatus = .{},
+    preview_scrubbing: bool = false,
+    /// Borrowed for the current frame: the previous scene's bounds and the
+    /// active state's change list, for ghosts and the State section.
+    frame_previous_bounds: []const ResolvedBounds = &.{},
+    frame_state_changes: []const StateChangeSummary = &.{},
+    frame_states: []const MorphStateSummary = &.{},
+    frame_transition: TransitionSummary = .{},
+    motion_ghosts_visible: bool = true,
     dirty: bool = false,
     copy_is_current: bool = false,
     notice: Notice = .none,
@@ -4691,9 +5301,63 @@ pub const Studio = struct {
         const inspector_targets = [_]TooltipTarget{
             .{ .key = 40, .anchor = objects.objects_tab, .title = "Objects", .detail = "Inspect paint order, visibility, locks, and provenance" },
             .{ .key = 41, .anchor = objects.properties_tab, .title = "Properties", .detail = "Edit exact values without leaving the canvas" },
+            .{ .key = 42, .anchor = objects.motion_tab, .title = "Motion", .detail = "Author reveals, morph-state timing, and the slide transition" },
         };
         for (inspector_targets) |target| {
             if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+        }
+        const timeline = morphTimelineLayout(viewport);
+        const timeline_targets = [_]TooltipTarget{
+            .{ .key = 130, .anchor = timeline.transition_chip, .title = "Slide transition", .detail = "How this slide enters; opens the Transition section" },
+            .{ .key = 131, .anchor = timeline.transport_play, .title = "Play preview", .detail = "Play this slide's reveals, states, and transition on the canvas", .shortcut = "Shift Space" },
+            .{ .key = 132, .anchor = timeline.transport_stop, .title = "Stop preview", .detail = "Return the canvas to the selected scene", .shortcut = "Esc" },
+            .{ .key = 133, .anchor = timeline.transport_loop, .title = "Loop preview", .detail = "Repeat the preview until stopped" },
+            .{ .key = 134, .anchor = timeline.transport_scrubber, .title = "Preview time", .detail = "Drag to scrub the preview forwards or backwards" },
+        };
+        for (timeline_targets) |target| {
+            if (target.anchor.width <= 0) continue;
+            if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+        }
+        if (self.inspector_panel == .motion) {
+            const motion = motionLayout(viewport);
+            if (self.active_morph_state != null) {
+                const state_targets = [_]TooltipTarget{
+                    .{ .key = 150, .anchor = motion.state_trigger[0], .title = "Wait for a click", .detail = "This state starts on the next presentation action" },
+                    .{ .key = 151, .anchor = motion.state_trigger[1], .title = "Automatic", .detail = "This state starts by itself after the AFTER delay" },
+                    .{ .key = 152, .anchor = motion.state_actions[0], .title = "Reset object", .detail = "Remove every change to the selected object in this state" },
+                    .{ .key = 153, .anchor = motion.state_actions[1], .title = "Exit left", .detail = "Hide the selected object while moving it off the left edge" },
+                    .{ .key = 154, .anchor = motion.state_actions[2], .title = "Exit right", .detail = "Hide the selected object while moving it off the right edge" },
+                    .{ .key = 155, .anchor = motion.state_actions[3], .title = "Exit up", .detail = "Hide the selected object while moving it off the top edge" },
+                    .{ .key = 156, .anchor = motion.state_actions[4], .title = "Exit down", .detail = "Hide the selected object while moving it off the bottom edge" },
+                };
+                for (state_targets) |target| {
+                    if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+                }
+            } else if (self.selectionCount() == 0) {
+                const transition_targets = [_]TooltipTarget{
+                    .{ .key = 160, .anchor = motion.transition_effects[0], .title = "Inherit", .detail = "Remove this slide's own transition so its template or the deck default applies" },
+                    .{ .key = 161, .anchor = motion.transition_deck_actions[0], .title = "Use for deck", .detail = "Write this transition as the deck-wide default" },
+                    .{ .key = 162, .anchor = motion.transition_deck_actions[1], .title = "Clear deck default", .detail = "Remove the @transition= preamble directives" },
+                };
+                for (transition_targets) |target| {
+                    if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+                }
+            } else {
+                const reveal_targets = [_]TooltipTarget{
+                    .{ .key = 140, .anchor = motion.trigger[0], .title = "No reveal", .detail = "Show the selection as soon as the slide enters" },
+                    .{ .key = 141, .anchor = motion.trigger[1], .title = "On click", .detail = "Every step waits for a presentation action" },
+                    .{ .key = 142, .anchor = motion.trigger[2], .title = "Automatic", .detail = "First step after DELAY, later steps after AFTER" },
+                    .{ .key = 143, .anchor = motion.trigger[3], .title = "Click, then automatic", .detail = "First step on a click, later steps follow by themselves" },
+                    .{ .key = 144, .anchor = motion.build_bullets, .title = "Build bullets", .detail = "Reveal the selected text box one bullet at a time" },
+                    .{ .key = 145, .anchor = motion.remove_reveal, .title = "Remove reveal", .detail = "Delete the authored reveal, or cancel an inherited one" },
+                    .{ .key = 146, .anchor = motion.fields[0], .title = "Start delay", .detail = "Seconds before the first step, click, or empty" },
+                    .{ .key = 147, .anchor = motion.fields[1], .title = "Between steps", .detail = "Seconds between steps, or empty to wait for clicks" },
+                    .{ .key = 148, .anchor = motion.fields[2], .title = "Duration", .detail = "Seconds each step takes to appear" },
+                };
+                for (reveal_targets) |target| {
+                    if (hoveredTooltip(pointer, target.key, target.anchor, target.title, target.detail, target.shortcut)) |hovered| return hovered;
+                }
+            }
         }
         if (self.inspector_panel == .objects) {
             if (hoveredTooltip(pointer, 56, objects.page_status, "Find objects", "Filter by name, text, type, source, or status", "Cmd/Ctrl F")) |target| return target;
@@ -4983,7 +5647,143 @@ pub const Studio = struct {
                 .{ .enabled = true }
             else
                 .{ .enabled = false, .reason = "Select a morph-state card first" },
+            .show_motion => .{ .enabled = true },
+            .build_bullets => if (self.active_morph_state != null)
+                .{ .enabled = false, .reason = "Reveals are authored in BASE; select BASE or a build card first" }
+            else if (selected_item) |item|
+                (if (item.kind == .textbox and textHasBulletLines(item.text))
+                    .{ .enabled = true }
+                else
+                    .{ .enabled = false, .reason = "Select a text box with bullet lines" })
+            else
+                .{ .enabled = false, .reason = "Select one text box with bullet lines" },
+            .remove_reveal => if (self.active_morph_state != null)
+                .{ .enabled = false, .reason = "Reveals are authored in BASE; select BASE or a build card first" }
+            else if (selection_count == 0)
+                .{ .enabled = false, .reason = "Select one or more objects with a reveal" }
+            else if (self.selectionHasReveal(items))
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "The selection has no reveal" },
+            .preview_play, .preview_loop => if (self.motion_preview.available)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "This slide has no reveals, states, or incoming transition" },
+            .preview_stop => if (self.motion_preview.active())
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "No preview is playing" },
+            .toggle_motion_ghosts => .{ .enabled = true },
+            .edit_transition => if (workspace.visible)
+                .{ .enabled = true }
+            else
+                .{ .enabled = false, .reason = "No active slide" },
+            .reset_morph_object => if (self.active_morph_state == null)
+                .{ .enabled = false, .reason = "Select a morph-state card first" }
+            else if (selected_item) |item|
+                (if (self.stateChangeForIdentity(item.identity) != null)
+                    .{ .enabled = true }
+                else
+                    .{ .enabled = false, .reason = "The selected object is unchanged in this state" })
+            else
+                .{ .enabled = false, .reason = "Select one object" },
         };
+    }
+
+    /// Collect the selection as reveal targets, refusing atomically when any
+    /// member cannot own a reveal in the current scene.
+    fn revealTargets(self: *Studio, items: []slides.SlideItem, allow_shared_edit: bool) ?ItemBatchCommand {
+        if (self.active_morph_state != null) {
+            self.notice = .reveal_scene_required;
+            return null;
+        }
+        if (self.definition_mode != null and !self.definitionStructureAllowed()) {
+            self.notice = .definition_structure_locked;
+            return null;
+        }
+        var targets: ItemBatchCommand = .{};
+        for (items, 0..) |candidate, candidate_index| {
+            if (!self.isIdentitySelected(candidate.identity)) continue;
+            if (candidate.locked) {
+                self.notice = .locked_item;
+                return null;
+            }
+            if (candidate.kind == .background) {
+                self.notice = .property_unavailable;
+                return null;
+            }
+            if (candidate.creation_morph_state != null) {
+                self.notice = .reveal_morph_born;
+                return null;
+            }
+            const edit_scope = self.editScopeForItem(items, candidate_index, allow_shared_edit) orelse return null;
+            targets.targets[targets.count] = .{
+                .item_identity = candidate.identity,
+                .source = self.commandSource(candidate, edit_scope),
+                .edit_scope = edit_scope,
+            };
+            targets.count += 1;
+        }
+        if (targets.count == 0) {
+            self.notice = .reveal_selection_required;
+            return null;
+        }
+        return targets;
+    }
+
+    /// Emit one reveal command for the whole selection. `command.targets` is
+    /// filled here; callers supply action, patch, and template.
+    pub fn emitRevealCommand(self: *Studio, items: []slides.SlideItem, command: ItemRevealCommand, allow_shared_edit: bool) bool {
+        var filled = command;
+        filled.targets = self.revealTargets(items, allow_shared_edit) orelse return true;
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.cancelInlineEdit();
+        self.tool = .select;
+        self.notice = .none;
+        self.pending_semantic_command = .{ .set_item_reveal = filled };
+        return true;
+    }
+
+    /// Preset: reveal the selected text box bullet by bullet with a fade,
+    /// keeping any timing the item already has.
+    pub fn emitBuildBullets(self: *Studio, items: []slides.SlideItem, allow_shared_edit: bool) bool {
+        const index = self.selectedIndex(items) orelse {
+            self.notice = .reveal_selection_required;
+            return true;
+        };
+        if (self.selectionCount() != 1 or items[index].kind != .textbox or !textHasBulletLines(items[index].text)) {
+            self.notice = .reveal_bullets_required;
+            return true;
+        }
+        return self.emitRevealCommand(items, .{
+            .action = .patch,
+            .patch = .{ .effect = .fade, .by = .bullet },
+        }, allow_shared_edit);
+    }
+
+    /// The spec shared by every selected item, or null when the selection is
+    /// empty, has no reveal, or mixes different reveals.
+    fn commonRevealSpec(self: Studio, items: []const slides.SlideItem) ?animation.ItemSpec {
+        var common: ?animation.ItemSpec = null;
+        var seen = false;
+        for (items) |item| {
+            if (!self.isIdentitySelected(item.identity)) continue;
+            const spec = item.animation orelse return null;
+            if (!seen) {
+                common = spec;
+                seen = true;
+            } else if (!std.meta.eql(common.?, spec)) {
+                return null;
+            }
+        }
+        return common;
+    }
+
+    fn selectionHasReveal(self: Studio, items: []const slides.SlideItem) bool {
+        for (items) |item| {
+            if (self.isIdentitySelected(item.identity) and item.animation != null) return true;
+        }
+        return false;
     }
 
     fn ensureCommandSelectionVisible(self: *Studio, viewport: Viewport) void {
@@ -5383,7 +6183,74 @@ pub const Studio = struct {
                 if (self.active_morph_state) |state|
                     self.pending_semantic_command = .{ .delete_morph_state = state };
             },
+            .show_motion => {
+                self.focus_canvas = false;
+                self.active_dock = .properties;
+                self.inspector_panel = .motion;
+            },
+            .build_bullets => _ = self.emitBuildBullets(items, false),
+            .remove_reveal => _ = self.emitRevealCommand(items, .{ .action = .remove }, false),
+            .preview_play => self.emitPreview(if (self.motion_preview.playing) .pause else .play),
+            .preview_stop => self.emitPreview(.stop),
+            .preview_loop => self.emitPreview(.toggle_loop),
+            .toggle_motion_ghosts => self.motion_ghosts_visible = !self.motion_ghosts_visible,
+            .reset_morph_object => _ = self.emitResetMorphObject(items),
+            .edit_transition => self.showTransitionSection(items),
         }
+    }
+
+    fn emitResetMorphObject(self: *Studio, items: []slides.SlideItem) bool {
+        if (self.active_morph_state == null) {
+            self.notice = .morph_state_required;
+            return true;
+        }
+        const index = self.selectedIndex(items) orelse {
+            self.notice = .reveal_selection_required;
+            return true;
+        };
+        const item = items[index];
+        if (item.id == null) {
+            self.notice = .morph_object_needs_id;
+            return true;
+        }
+        if (self.stateChangeForIdentity(item.identity) == null) {
+            self.notice = .property_unavailable;
+            return true;
+        }
+        self.cancelInlineEdit();
+        self.pending_semantic_command = .{ .reset_morph_object = .{
+            .item_identity = item.identity,
+            .source = item.source,
+        } };
+        self.notice = .none;
+        return true;
+    }
+
+    fn emitExitMorphObject(self: *Studio, items: []slides.SlideItem, direction: ExitDirection) bool {
+        if (self.active_morph_state == null) {
+            self.notice = .morph_state_required;
+            return true;
+        }
+        const index = self.selectedIndex(items) orelse {
+            self.notice = .reveal_selection_required;
+            return true;
+        };
+        const item = items[index];
+        if (item.locked) {
+            self.notice = .locked_item;
+            return true;
+        }
+        if (item.id == null) {
+            self.notice = .morph_object_needs_id;
+            return true;
+        }
+        self.cancelInlineEdit();
+        self.pending_semantic_command = .{ .exit_morph_object = .{
+            .target = .{ .item_identity = item.identity, .source = item.source },
+            .direction = direction,
+        } };
+        self.notice = .none;
+        return true;
     }
 
     fn handleCommandPalette(
@@ -5656,7 +6523,15 @@ pub const Studio = struct {
             .background => item.kind != .line,
             .media_focus_x, .media_focus_y => item.kind == .img or item.kind == .vid,
             .video_poster, .video_volume => item.kind == .vid,
+            .reveal_delay, .reveal_after, .reveal_duration => item.animation != null and item.creation_morph_state == null,
+            .state_label, .state_after, .state_duration, .transition_duration => false,
         };
+    }
+
+    fn revealDelayText(spec: animation.ItemSpec, buffer: []u8) []const u8 {
+        if (spec.first_waits) return "click";
+        if (spec.delay) |delay| return formatInlineFloat(buffer, delay);
+        return "";
     }
 
     fn inlineInitialValue(
@@ -5700,6 +6575,26 @@ pub const Studio = struct {
             .media_focus_y => formatInlineFloat(scalar_buffer, if (shared) |values| values.media_focus.y else item.media_focus.y),
             .video_poster => formatInlineFloat(scalar_buffer, if (shared) |values| values.vid_poster orelse 0 else item.vid_poster orelse 0),
             .video_volume => formatInlineFloat(scalar_buffer, if (shared) |values| values.vid_volume else item.vid_volume),
+            .reveal_delay => if (item.animation) |spec| revealDelayText(spec, scalar_buffer) else "",
+            .reveal_after => if (item.animation) |spec|
+                (if (spec.after) |after| formatInlineFloat(scalar_buffer, after) else "")
+            else
+                "",
+            .reveal_duration => if (item.animation) |spec| formatInlineFloat(scalar_buffer, spec.duration) else "",
+            .state_label, .state_after, .state_duration, .transition_duration => "",
+        };
+    }
+
+    fn sceneInitialValue(self: Studio, field: InlineField, scalar_buffer: []u8) []const u8 {
+        if (field == .transition_duration) return formatInlineFloat(scalar_buffer, self.frame_transition.transition.duration);
+        const state_index = self.active_morph_state orelse return "";
+        if (state_index >= self.frame_states.len) return "";
+        const summary = self.frame_states[state_index];
+        return switch (field) {
+            .state_label => summary.label,
+            .state_after => if (summary.after) |after| formatInlineFloat(scalar_buffer, after) else "",
+            .state_duration => formatInlineFloat(scalar_buffer, summary.duration),
+            else => "",
         };
     }
 
@@ -5846,6 +6741,37 @@ pub const Studio = struct {
                 if (!std.math.isFinite(parsed)) break :blk .invalid_unit_interval;
                 break :blk if (parsed >= 0 and parsed <= 1) null else .invalid_unit_interval;
             },
+            .reveal_delay => blk: {
+                if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "click")) break :blk null;
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_delay;
+                break :blk if (std.math.isFinite(parsed) and parsed >= 0) null else .invalid_delay;
+            },
+            .reveal_after => blk: {
+                if (value.len == 0) break :blk null;
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_seconds;
+                break :blk if (std.math.isFinite(parsed) and parsed >= 0) null else .invalid_seconds;
+            },
+            .reveal_duration => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_seconds;
+                break :blk if (std.math.isFinite(parsed) and parsed >= 0) null else .invalid_seconds;
+            },
+            .state_label => blk: {
+                if (value.len == 0) break :blk null;
+                if (!(std.ascii.isAlphabetic(value[0]) or value[0] == '_')) break :blk .invalid_state_label;
+                for (value[1..]) |byte| {
+                    if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) break :blk .invalid_state_label;
+                }
+                break :blk null;
+            },
+            .state_after => blk: {
+                if (value.len == 0) break :blk null;
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_seconds;
+                break :blk if (std.math.isFinite(parsed) and parsed >= 0) null else .invalid_seconds;
+            },
+            .state_duration, .transition_duration => blk: {
+                const parsed = std.fmt.parseFloat(f32, value) catch break :blk .invalid_seconds;
+                break :blk if (std.math.isFinite(parsed) and parsed >= 0) null else .invalid_seconds;
+            },
         };
     }
 
@@ -5946,6 +6872,143 @@ pub const Studio = struct {
             );
     }
 
+    /// Begin editing a morph-state field. Scene fields have no item target;
+    /// the commit carries the active state instead.
+    fn beginSceneInlineEdit(self: *Studio, items: []slides.SlideItem, field: InlineField) bool {
+        if (field == .transition_duration) {
+            if (!self.frame_transition.can_author) {
+                self.notice = .transition_needs_slide_directive;
+                return true;
+            }
+        } else {
+            const state_index = self.active_morph_state orelse {
+                self.notice = .morph_state_required;
+                return true;
+            };
+            if (state_index >= self.frame_states.len) return true;
+        }
+        if (self.interaction != .idle) self.cancelInteraction(items);
+        self.inline_editor = .{
+            .active = true,
+            .field = field,
+            .target = .{ .item_identity = 0, .source = .{} },
+        };
+        var scalar_buffer: [64]u8 = undefined;
+        _ = self.setInlineBuffer(self.sceneInitialValue(field, &scalar_buffer));
+        self.inline_editor.select_all = true;
+        self.inline_editor.dirty = false;
+        self.notice = .none;
+        return true;
+    }
+
+    fn refreshSceneInlineEditor(self: *Studio, items: []slides.SlideItem) void {
+        self.inline_editor.refresh_pending = false;
+        const requested_next = self.inline_editor.next_field_after_accept;
+        const advance = self.inline_editor.advance_after_accept;
+        const blur = self.inline_editor.blur_after_accept;
+        const previous_field = self.inline_editor.field;
+        if (blur) {
+            self.cancelInlineEdit();
+            return;
+        }
+        if (requested_next) |next| {
+            _ = self.beginSceneInlineEdit(items, next);
+            return;
+        }
+        if (advance != 0) {
+            _ = self.beginSceneInlineEdit(items, nextSceneInlineField(previous_field, advance));
+            return;
+        }
+        var scalar_buffer: [64]u8 = undefined;
+        _ = self.setInlineBuffer(self.sceneInitialValue(previous_field, &scalar_buffer));
+        self.inline_editor.select_all = true;
+        self.inline_editor.dirty = false;
+        self.inline_editor.advance_after_accept = 0;
+        self.inline_editor.next_field_after_accept = null;
+    }
+
+    fn handleSceneInlineEditor(
+        self: *Studio,
+        items: []slides.SlideItem,
+        viewport: Viewport,
+        input: FrameInput,
+    ) bool {
+        if (input.cancel_pressed) {
+            self.cancelInlineEdit();
+            self.notice = .none;
+            return true;
+        }
+        if (self.inline_editor.blocked_initial or self.inline_editor.awaiting_commit) return true;
+        const transition_field = self.inline_editor.field == .transition_duration;
+        if (!transition_field and self.active_morph_state == null) {
+            self.cancelInlineEdit();
+            return true;
+        }
+        if (transition_field and (self.active_morph_state != null or self.selectionCount() != 0)) {
+            self.cancelInlineEdit();
+            return true;
+        }
+        if (input.pointer_pressed) {
+            const layout = motionLayout(viewport);
+            if (self.inspector_panel == .motion) {
+                const clicked = if (transition_field) transitionFieldAtPoint(layout, input.pointer_screen) else sceneFieldAtPoint(layout, input.pointer_screen);
+                if (clicked) |field| {
+                    if (field == self.inline_editor.field) {
+                        self.inline_editor.select_all = true;
+                        return true;
+                    }
+                    if (self.inline_editor.dirty) {
+                        self.inline_editor.blur_after_accept = false;
+                        return self.queueInlineCommit(0, field, null);
+                    }
+                    return self.beginSceneInlineEdit(items, field);
+                }
+            }
+            if (self.inline_editor.dirty) {
+                self.inline_editor.blur_after_accept = true;
+                _ = self.queueInlineCommit(0, null, null);
+                return true;
+            }
+            self.cancelInlineEdit();
+            return false;
+        }
+        if (input.select_all_pressed) {
+            self.inline_editor.select_all = true;
+            return true;
+        }
+        if (input.inline_paste) |paste| _ = self.insertInlineBytes(paste);
+        if (input.inline_home_pressed) {
+            self.inline_editor.cursor = 0;
+            self.inline_editor.select_all = false;
+        }
+        if (input.inline_end_pressed) {
+            self.inline_editor.cursor = self.inline_editor.len;
+            self.inline_editor.select_all = false;
+        }
+        if (input.inline_left_pressed) self.moveInlineCursor(-1);
+        if (input.inline_right_pressed) self.moveInlineCursor(1);
+        if (input.inline_backspace_pressed) self.removeInlineBeforeCursor();
+        if (input.inline_delete_pressed) self.removeInlineAtCursor();
+        if (!input.shortcut_modifier_down and input.inline_chars_len > 0)
+            _ = self.insertInlineBytes(input.inline_chars[0..input.inline_chars_len]);
+        if (input.toggle_focus_canvas_pressed) {
+            const direction: i8 = if (input.shift_down) -1 else 1;
+            if (self.inline_editor.dirty) {
+                self.inline_editor.blur_after_accept = false;
+                return self.queueInlineCommit(direction, null, null);
+            }
+            return self.beginSceneInlineEdit(items, nextSceneInlineField(self.inline_editor.field, direction));
+        }
+        if (input.inline_submit_pressed) {
+            if (self.inline_editor.dirty) {
+                self.inline_editor.blur_after_accept = false;
+                return self.queueInlineCommit(0, null, null);
+            }
+            self.inline_editor.select_all = true;
+        }
+        return true;
+    }
+
     fn queueInlineCommit(
         self: *Studio,
         advance: i8,
@@ -5972,6 +7035,7 @@ pub const Studio = struct {
             .targets = self.inline_editor.targets,
             .field = self.inline_editor.field,
             .value = self.inline_editor.text(),
+            .scene_state = if (inlineFieldIsScene(self.inline_editor.field)) self.active_morph_state else null,
         } };
         return true;
     }
@@ -5985,7 +7049,37 @@ pub const Studio = struct {
             field != .video_poster and field != .video_volume;
     }
 
+    const motion_inline_fields = [_]InlineField{ .reveal_delay, .reveal_after, .reveal_duration };
+    const scene_inline_fields = [_]InlineField{ .state_label, .state_after, .state_duration };
+
+    fn nextSceneInlineField(field: InlineField, direction: i8) InlineField {
+        if (field == .transition_duration) return field;
+        var current: usize = 0;
+        for (scene_inline_fields, 0..) |candidate, index| if (candidate == field) {
+            current = index;
+            break;
+        };
+        current = if (direction < 0)
+            if (current == 0) scene_inline_fields.len - 1 else current - 1
+        else
+            (current + 1) % scene_inline_fields.len;
+        return scene_inline_fields[current];
+    }
+
     fn nextInlineField(field: InlineField, direction: i8, item: slides.SlideItem, video_playback: bool) InlineField {
+        if (inlineFieldIsScene(field)) return nextSceneInlineField(field, direction);
+        if (inlineFieldIsMotion(field)) {
+            var current: usize = 0;
+            for (motion_inline_fields, 0..) |candidate, index| if (candidate == field) {
+                current = index;
+                break;
+            };
+            current = if (direction < 0)
+                if (current == 0) motion_inline_fields.len - 1 else current - 1
+            else
+                (current + 1) % motion_inline_fields.len;
+            return motion_inline_fields[current];
+        }
         const fields = [_]InlineField{ .text, .x, .y, .width, .height, .foreground, .background, .font_size, .corner_radius, .line_width, .rotation, .opacity, .media_focus_x, .media_focus_y, .video_poster, .video_volume };
         var current: usize = 0;
         for (fields, 0..) |candidate, index| if (candidate == field) {
@@ -6020,7 +7114,41 @@ pub const Studio = struct {
             .media_focus_y => layout.media_scalar_fields[1],
             .video_poster => videoPosterFieldRect(layout),
             .video_volume => layout.font_size,
+            .reveal_delay, .reveal_after, .reveal_duration, .state_label, .state_after, .state_duration, .transition_duration => empty_ui_rectangle,
         };
+    }
+
+    /// Motion fields live in the Motion inspector, not in Properties.
+    fn motionFieldRect(layout: MotionLayout, field: InlineField) rl.Rectangle {
+        return switch (field) {
+            .reveal_delay => layout.fields[0],
+            .reveal_after => layout.fields[1],
+            .reveal_duration => layout.fields[2],
+            .state_label => layout.state_fields[0],
+            .state_after => layout.state_fields[1],
+            .state_duration => layout.state_fields[2],
+            .transition_duration => layout.transition_duration,
+            else => empty_ui_rectangle,
+        };
+    }
+
+    fn motionFieldAtPoint(layout: MotionLayout, pointer: rl.Vector2) ?InlineField {
+        for (motion_inline_fields) |field| {
+            if (pointInRectangle(pointer, motionFieldRect(layout, field))) return field;
+        }
+        return null;
+    }
+
+    fn sceneFieldAtPoint(layout: MotionLayout, pointer: rl.Vector2) ?InlineField {
+        for (scene_inline_fields) |field| {
+            if (pointInRectangle(pointer, motionFieldRect(layout, field))) return field;
+        }
+        return null;
+    }
+
+    fn transitionFieldAtPoint(layout: MotionLayout, pointer: rl.Vector2) ?InlineField {
+        if (pointInRectangle(pointer, layout.transition_duration)) return .transition_duration;
+        return null;
     }
 
     fn inlineFieldRectForItem(
@@ -6224,6 +7352,10 @@ pub const Studio = struct {
         resolved_bounds: []const ResolvedBounds,
     ) void {
         if (!self.inline_editor.active or !self.inline_editor.refresh_pending) return;
+        if (inlineFieldIsScene(self.inline_editor.field)) {
+            self.refreshSceneInlineEditor(items);
+            return;
+        }
         self.inline_editor.refresh_pending = false;
         const item_index = self.selectedIndex(items) orelse {
             self.inline_editor.error_value = .source_edit_failed;
@@ -6296,6 +7428,7 @@ pub const Studio = struct {
     ) bool {
         self.refreshInlineEditor(items, resolved_bounds);
         if (!self.inline_editor.active) return false;
+        if (inlineFieldIsScene(self.inline_editor.field)) return self.handleSceneInlineEditor(items, viewport, input);
         if (input.cancel_pressed) {
             self.cancelInlineEdit();
             self.notice = .none;
@@ -6339,7 +7472,11 @@ pub const Studio = struct {
                 _ = self.emitResetOverride(items, authoredPropertyForInlineField(field));
                 return true;
             }
-            if (inlineFieldAtPoint(layout, item, input.pointer_screen, self.video_properties_playback)) |field| {
+            const clicked_field: ?InlineField = if (self.inspector_panel == .motion)
+                motionFieldAtPoint(motionLayout(viewport), input.pointer_screen)
+            else
+                inlineFieldAtPoint(layout, item, input.pointer_screen, self.video_properties_playback);
+            if (clicked_field) |field| {
                 if (field == self.inline_editor.field) {
                     self.inline_editor.select_all = true;
                     return true;
@@ -6608,6 +7745,7 @@ pub const Studio = struct {
         self.cancelInlineEdit();
         self.clearSelection(items);
         self.active_morph_state = normalized;
+        if (normalized != null) self.visible_reveal_step = null;
         self.snap_guides = .{};
         self.selected_library_index = null;
         self.tool = .select;
@@ -6639,8 +7777,74 @@ pub const Studio = struct {
         self.pending_semantic_command = .{ .select_morph_scene = .{ .active_state = self.active_morph_state } };
     }
 
+    /// One card of the step timeline: BASE, then one BUILD per reveal build
+    /// (base scene shown through that build), then one STATE per morph state.
+    pub const TimelineScene = union(enum) {
+        base,
+        build: usize,
+        state: usize,
+    };
+
+    pub fn timelineSceneCount(self: Studio) usize {
+        return 1 + self.build_count + self.morph_state_count;
+    }
+
+    pub fn timelineSceneAt(self: Studio, index: usize) TimelineScene {
+        if (index == 0) return .base;
+        if (index - 1 < self.build_count) return .{ .build = index - 1 };
+        return .{ .state = index - 1 - self.build_count };
+    }
+
+    /// The card that represents what the canvas currently shows.
+    pub fn activeTimelineScene(self: Studio) usize {
+        if (self.active_morph_state) |state| return 1 + self.build_count + state;
+        if (self.visible_reveal_step) |step| {
+            for (self.frame_builds, 0..) |build, index| {
+                if (build.containsStep(step)) return 1 + index;
+            }
+        }
+        return 0;
+    }
+
+    /// Show the base scene revealed through `step` and select the owning
+    /// item. Editing continues to target the base scene.
+    pub fn selectRevealStep(self: *Studio, items: []slides.SlideItem, step: usize) void {
+        var owner: ?usize = null;
+        for (self.frame_builds) |build| {
+            if (build.containsStep(step)) owner = build.owner_identity;
+        }
+        if (owner == null) return;
+        if (self.active_morph_state != null) self.selectMorphScene(items, null);
+        self.cancelInlineEdit();
+        self.visible_reveal_step = step;
+        if (itemIndexByIdentity(items, owner.?)) |index| {
+            if (items[index].kind != .background) {
+                self.clearSelectionState();
+                self.setSingleSelection(items[index]);
+            }
+        }
+        self.tool = .select;
+        self.notice = .none;
+    }
+
+    pub fn selectTimelineScene(self: *Studio, items: []slides.SlideItem, index: usize) void {
+        switch (self.timelineSceneAt(index)) {
+            .base => {
+                self.visible_reveal_step = null;
+                self.selectMorphScene(items, null);
+            },
+            .build => |build_index| {
+                if (build_index < self.frame_builds.len) self.selectRevealStep(items, self.frame_builds[build_index].lastStep());
+            },
+            .state => |state_index| {
+                self.visible_reveal_step = null;
+                self.selectMorphScene(items, state_index);
+            },
+        }
+    }
+
     fn normalizeMorphTimeline(self: *Studio, viewport: Viewport, workspace: Workspace) void {
-        const scene_count = workspace.morph_states.len + 1;
+        const scene_count = 1 + workspace.builds.len + workspace.morph_states.len;
         const capacity = morphTimelineCardCapacity(morphTimelineLayout(viewport));
         if (capacity == 0 or scene_count <= capacity) {
             self.morph_first_visible = 0;
@@ -6648,7 +7852,7 @@ pub const Studio = struct {
         }
         const max_first = scene_count - capacity;
         self.morph_first_visible = @min(self.morph_first_visible, max_first);
-        const active_scene = if (self.active_morph_state) |state| state + 1 else 0;
+        const active_scene = self.activeTimelineScene();
         if (active_scene < self.morph_first_visible) {
             self.morph_first_visible = active_scene;
         } else if (active_scene >= self.morph_first_visible + capacity) {
@@ -6656,16 +7860,79 @@ pub const Studio = struct {
         }
     }
 
-    /// Cycles base -> state 1 ... state N -> base and emits the scene choice
-    /// for the integration layer to switch both item slice and renderer state.
+    /// Cycles BASE -> builds -> states -> BASE and emits the scene choice so
+    /// the integration layer can switch both item slice and renderer state.
     pub fn cycleMorphState(self: *Studio, items: []slides.SlideItem, delta: i8) void {
-        if (delta == 0 or self.morph_state_count == 0) return;
-        const scene_count: isize = @intCast(self.morph_state_count + 1);
-        const current: isize = if (self.active_morph_state) |state| @intCast(state + 1) else 0;
+        if (delta == 0) return;
+        const scene_count: isize = @intCast(self.timelineSceneCount());
+        if (scene_count <= 1) return;
+        const current: isize = @intCast(self.activeTimelineScene());
         const movement: isize = @intCast(delta);
-        const next_scene = @mod(current + movement, scene_count);
-        const next_state: ?usize = if (next_scene == 0) null else @intCast(next_scene - 1);
-        self.selectMorphScene(items, next_state);
+        const next_scene: usize = @intCast(@mod(current + movement, scene_count));
+        self.selectTimelineScene(items, next_scene);
+    }
+
+    /// Index of the active BUILD card, if the reveal-step scene is shown.
+    pub fn activeBuildIndex(self: Studio) ?usize {
+        if (self.active_morph_state != null) return null;
+        return switch (self.timelineSceneAt(self.activeTimelineScene())) {
+            .build => |build_index| build_index,
+            else => null,
+        };
+    }
+
+    pub fn setMorphSceneContext(self: *Studio, previous_bounds: []const ResolvedBounds, changes: []const StateChangeSummary) void {
+        self.frame_previous_bounds = previous_bounds;
+        self.frame_state_changes = changes;
+    }
+
+    fn stateChangeForIdentity(self: Studio, identity: usize) ?StateChangeSummary {
+        for (self.frame_state_changes) |change| if (change.identity == identity) return change;
+        return null;
+    }
+
+    pub fn setMotionPreview(self: *Studio, preview_status: MotionPreviewStatus) void {
+        self.motion_preview = preview_status;
+        if (!preview_status.active()) self.preview_scrubbing = false;
+    }
+
+    /// Timeline card that represents the preview's current step.
+    fn previewSceneIndex(self: Studio) usize {
+        const preview_status = self.motion_preview;
+        if (preview_status.in_transition or preview_status.step == 0) return 0;
+        for (self.frame_builds, 0..) |build, index| {
+            if (build.containsStep(preview_status.step)) return 1 + index;
+        }
+        const last_reveal_step = if (self.frame_builds.len > 0) self.frame_builds[self.frame_builds.len - 1].lastStep() else 0;
+        if (preview_status.step > last_reveal_step) {
+            const state_index = preview_status.step - last_reveal_step - 1;
+            if (state_index < self.morph_state_count) return 1 + self.build_count + state_index;
+        }
+        return 0;
+    }
+
+    fn emitPreview(self: *Studio, command: PreviewCommand) void {
+        self.pending_semantic_command = .{ .motion_preview = command };
+        self.notice = .none;
+    }
+
+    pub fn selectMorphSceneForDiagnostics(self: *Studio, items: []slides.SlideItem, state: ?usize) void {
+        self.selectMorphScene(items, state);
+        self.showMotionForDiagnostics();
+    }
+
+    pub fn showMotionForDiagnostics(self: *Studio) void {
+        self.focus_canvas = false;
+        self.active_dock = .properties;
+        self.inspector_panel = .motion;
+    }
+
+    /// Diagnostics run before the frame's update has borrowed the workspace,
+    /// so the builds are supplied explicitly.
+    pub fn selectRevealStepForDiagnostics(self: *Studio, items: []slides.SlideItem, builds: []const RevealBuildSummary, step: usize) void {
+        self.frame_builds = builds;
+        self.build_count = builds.len;
+        self.selectRevealStep(items, step);
     }
 
     pub fn cancelActiveInteraction(self: *Studio, items: []slides.SlideItem) void {
@@ -7103,8 +8370,26 @@ pub const Studio = struct {
             return null;
         }
         self.library_click_age = @min(10, self.library_click_age + @max(0, input.frame_time));
+        self.frame_builds = workspace.builds;
+        self.build_count = workspace.builds.len;
+        self.frame_states = workspace.morph_states;
+        self.frame_transition = workspace.transition;
+        if (self.visible_reveal_step) |step| {
+            var still_valid = false;
+            for (workspace.builds) |build| {
+                if (build.containsStep(step)) still_valid = true;
+            }
+            if (!still_valid) self.visible_reveal_step = null;
+        }
 
         self.validateSelection(items, resolved_bounds);
+        if (self.preview_scrubbing) {
+            if (input.pointer_down and self.motion_preview.available) {
+                self.emitPreview(.{ .seek = transportSeekTime(morphTimelineLayout(viewport), input.pointer_screen.x, self.motion_preview.total) });
+                return null;
+            }
+            self.preview_scrubbing = false;
+        }
         if (self.handleGridSettings(viewport, input)) return null;
         if (self.handleCommandPalette(items, resolved_bounds, viewport, workspace, input)) return null;
         if (self.handleReusablePicker(items, viewport, workspace, input)) return null;
@@ -7277,6 +8562,11 @@ pub const Studio = struct {
             return null;
         }
 
+        if (input.preview_toggle_pressed) {
+            if (self.motion_preview.available) self.emitPreview(if (self.motion_preview.playing) .pause else .play);
+            return null;
+        }
+
         if (input.new_slide_pressed) {
             if (self.definition_mode != null) {
                 self.notice = .definition_structure_locked;
@@ -7289,7 +8579,9 @@ pub const Studio = struct {
         }
 
         if (input.cancel_pressed) {
-            if (self.interaction != .idle) {
+            if (self.motion_preview.active()) {
+                self.emitPreview(.stop);
+            } else if (self.interaction != .idle) {
                 self.cancelInteraction(items);
             } else if (self.tool != .select) {
                 self.tool = .select;
@@ -9064,12 +10356,56 @@ pub const Studio = struct {
         if (!pointInRectangle(pointer, layout.panel)) return false;
         if (self.interaction != .idle) self.cancelInteraction(items);
 
+        if (layout.transition_chip.width > 0 and pointInRectangle(pointer, layout.transition_chip)) {
+            self.showTransitionSection(items);
+            return true;
+        }
+        if (layout.transport_play.width > 0 and self.motion_preview.available) {
+            if (pointInRectangle(pointer, layout.transport_play)) {
+                self.emitPreview(if (self.motion_preview.playing) .pause else .play);
+                return true;
+            }
+            if (pointInRectangle(pointer, layout.transport_stop)) {
+                if (self.motion_preview.active()) self.emitPreview(.stop);
+                return true;
+            }
+            if (layout.transport_loop.width > 0 and pointInRectangle(pointer, layout.transport_loop)) {
+                self.emitPreview(.toggle_loop);
+                return true;
+            }
+            var scrub_hit = layout.transport_scrubber;
+            scrub_hit.x -= 6 * layout.scale;
+            scrub_hit.width += 12 * layout.scale;
+            if (layout.transport_scrubber.width > 0 and pointInRectangle(pointer, scrub_hit)) {
+                self.preview_scrubbing = true;
+                self.emitPreview(.{ .seek = transportSeekTime(layout, pointer.x, self.motion_preview.total) });
+                return true;
+            }
+        }
+
         for (0..morphTimelineCardCapacity(layout)) |visible_slot| {
             const card = morphTimelineCardRect(layout, visible_slot) orelse continue;
             if (!pointInRectangle(pointer, card)) continue;
             const scene_index = self.morph_first_visible + visible_slot;
-            if (scene_index > workspace.morph_states.len) return true;
-            self.selectMorphScene(items, if (scene_index == 0) null else scene_index - 1);
+            if (scene_index >= 1 + workspace.builds.len + workspace.morph_states.len) return true;
+            switch (self.timelineSceneAt(scene_index)) {
+                .build => |build_index| {
+                    const build = workspace.builds[build_index];
+                    const chip_count = @min(build.step_count, max_timeline_step_chips);
+                    for (0..chip_count) |chip_index| {
+                        const chip = timelineStepChipRect(layout, card, chip_index, chip_count) orelse break;
+                        var hit = chip;
+                        hit.y -= 4 * layout.scale;
+                        hit.height += 8 * layout.scale;
+                        if (pointInRectangle(pointer, hit)) {
+                            self.selectRevealStep(items, build.first_step + chip_index);
+                            return true;
+                        }
+                    }
+                    self.selectTimelineScene(items, scene_index);
+                },
+                else => self.selectTimelineScene(items, scene_index),
+            }
             self.notice = .none;
             return true;
         }
@@ -9083,9 +10419,13 @@ pub const Studio = struct {
                 // Add inserts after the selected scene. Base therefore creates
                 // the first state; selecting a state inserts immediately after
                 // it and preserves the visible cumulative snapshot.
-                0 => self.pending_semantic_command = .{ .add_morph_state = .{
-                    .active_state = self.active_morph_state,
-                } },
+                0 => {
+                    self.pending_semantic_command = .{ .add_morph_state = .{
+                        .active_state = self.active_morph_state,
+                    } };
+                    self.inspector_panel = .motion;
+                    if (self.active_dock == .objects) self.active_dock = .properties;
+                },
                 1 => if (self.active_morph_state) |state_index| {
                     self.pending_semantic_command = .{ .duplicate_morph_state = state_index };
                 } else {
@@ -9101,7 +10441,14 @@ pub const Studio = struct {
                 } else {
                     self.notice = .morph_state_required;
                 },
-                4 => if (self.active_morph_state) |state_index| {
+                4 => if (self.activeBuildIndex()) |build_index| {
+                    if (build_index > 0) {
+                        self.pending_semantic_command = .{ .move_reveal_build = .{
+                            .owner_identity = workspace.builds[build_index].owner_identity,
+                            .direction = .earlier,
+                        } };
+                    }
+                } else if (self.active_morph_state) |state_index| {
                     if (state_index == 0) {
                         self.notice = .morph_state_required;
                     } else {
@@ -9113,7 +10460,14 @@ pub const Studio = struct {
                 } else {
                     self.notice = .morph_state_required;
                 },
-                5 => if (self.active_morph_state) |state_index| {
+                5 => if (self.activeBuildIndex()) |build_index| {
+                    if (build_index + 1 < workspace.builds.len) {
+                        self.pending_semantic_command = .{ .move_reveal_build = .{
+                            .owner_identity = workspace.builds[build_index].owner_identity,
+                            .direction = .later,
+                        } };
+                    }
+                } else if (self.active_morph_state) |state_index| {
                     if (state_index + 1 >= workspace.morph_states.len) {
                         self.notice = .morph_state_required;
                     } else {
@@ -9345,6 +10699,14 @@ pub const Studio = struct {
                 self.inspector_panel = .properties;
                 self.active_dock = .properties;
                 return true;
+            }
+            if (pointInRectangle(pointer, inspector.motion_tab)) {
+                self.inspector_panel = .motion;
+                self.active_dock = .properties;
+                return true;
+            }
+            if (self.inspector_panel == .motion) {
+                return self.handleMotionClick(items, resolved_bounds, viewport, workspace, pointer, allow_shared_edit);
             }
             if (self.inspector_panel == .objects) {
                 for (inspector.layer_actions, 0..) |button, index| {
@@ -9705,7 +11067,9 @@ pub const Studio = struct {
                 false;
             if (pointInRectangle(pointer, inlineTextExpandRect(layout.edit_text, text_local_override)))
                 return .pointing_hand;
-            const field = if (self.selectedIndex(items)) |index|
+            const field = if (inlineFieldIsMotion(self.inline_editor.field) or inlineFieldIsScene(self.inline_editor.field))
+                motionFieldRect(motionLayout(viewport), self.inline_editor.field)
+            else if (self.selectedIndex(items)) |index|
                 inlineFieldRectForItem(layout, self.inline_editor.field, items[index], self.video_properties_playback)
             else
                 inlineFieldRect(layout, self.inline_editor.field);
@@ -11224,6 +12588,9 @@ pub const Studio = struct {
             }
         }
 
+        if (self.active_morph_state == null and self.definition_mode == null) self.drawBuildBadges(items, resolved_bounds, viewport);
+        if (self.active_morph_state != null and self.motion_ghosts_visible and self.definition_mode == null) self.drawMorphGhosts(items, resolved_bounds, viewport);
+
         if (clip_canvas) rl.endScissorMode();
         if (self.rulers_visible and !self.focus_canvas) self.drawRulers(viewport);
 
@@ -11233,6 +12600,8 @@ pub const Studio = struct {
             if (viewport.chrome != null and viewport.chrome.?.right_visible) {
                 if (self.inspector_panel == .objects) {
                     self.drawObjects(items, viewport);
+                } else if (self.inspector_panel == .motion) {
+                    self.drawMotion(items, resolved_bounds, viewport);
                 } else {
                     const selected_locked = if (self.selectedIndex(items)) |index| items[index].locked else false;
                     self.drawProperties(items, resolved_bounds, viewport, selected_locked);
@@ -11243,6 +12612,681 @@ pub const Studio = struct {
             }
             self.drawStatus(viewport);
         }
+    }
+
+    /// Previous-state outlines, motion paths, and NEW/EXIT chips for every
+    /// object the active state changes. Editor chrome only.
+    fn drawMorphGhosts(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
+        if (self.frame_state_changes.len == 0) return;
+        const scale = uiScale(viewport);
+        const chip_font = scaledUiFont(scale, UiTypography.compact);
+        const ghost_color: rl.Color = .{ .r = theme.warning.r, .g = theme.warning.g, .b = theme.warning.b, .a = 200 };
+        const path_color: rl.Color = .{ .r = theme.warning.r, .g = theme.warning.g, .b = theme.warning.b, .a = 150 };
+        var placed_chips: [max_selection_items]rl.Rectangle = undefined;
+        var placed_count: usize = 0;
+        for (self.frame_state_changes) |change| {
+            const index = itemIndexByIdentity(items, change.identity) orelse continue;
+            const item = items[index];
+            const current = geometryToScreenRect(viewport, itemGeometry(item, resolved_bounds));
+            const previous_bounds = resolvedBoundsForIdentity(self.frame_previous_bounds, change.identity);
+            const previous: ?rl.Rectangle = if (previous_bounds) |bounds|
+                geometryToScreenRect(viewport, .{ .position = bounds.position, .size = bounds.size })
+            else
+                null;
+            var chip_text: ?[:0]const u8 = null;
+            switch (change.kind) {
+                .born => chip_text = "NEW",
+                .hidden => chip_text = "EXIT",
+                .shown => chip_text = "SHOW",
+                .changed => {},
+            }
+            if (previous) |ghost| {
+                if (change.kind != .born) {
+                    const moved = if (current) |now| @abs(now.x - ghost.x) > 0.5 or @abs(now.y - ghost.y) > 0.5 or
+                        @abs(now.width - ghost.width) > 0.5 or @abs(now.height - ghost.height) > 0.5 else true;
+                    if (moved or change.kind == .hidden) {
+                        drawDashedRectangle(ghost, 6 * scale, 4 * scale, @max(1, scale), ghost_color);
+                        if (current) |now| {
+                            const from: rl.Vector2 = .{ .x = ghost.x + ghost.width / 2, .y = ghost.y + ghost.height / 2 };
+                            const to: rl.Vector2 = .{ .x = now.x + now.width / 2, .y = now.y + now.height / 2 };
+                            rl.drawLineEx(from, to, @max(1, scale), path_color);
+                            rl.drawCircleV(to, 3 * scale, path_color);
+                        }
+                    }
+                }
+            }
+            if (chip_text) |text| {
+                // Hidden objects usually exit off-canvas: label where they
+                // were. Everything else is labelled at its top-left corner,
+                // clamped into the canvas so the chip always stays visible.
+                const anchor = (if (change.kind == .hidden) previous orelse current else current orelse previous) orelse continue;
+                const text_width = self.measureUiText(text, chip_font);
+                const padding = 5 * scale;
+                const canvas = viewport.canvasBounds();
+                var chip: rl.Rectangle = .{
+                    .x = anchor.x,
+                    .y = anchor.y - @as(f32, @floatFromInt(chip_font)) - 8 * scale,
+                    .width = text_width + padding * 2,
+                    .height = @as(f32, @floatFromInt(chip_font)) + 6 * scale,
+                };
+                chip.x = @max(canvas.x, @min(chip.x, canvas.x + canvas.width - chip.width));
+                chip.y = @max(canvas.y, @min(chip.y, canvas.y + canvas.height - chip.height));
+                // Objects that share a spot get stacked chips instead of one
+                // label hiding another.
+                var moved = true;
+                while (moved) {
+                    moved = false;
+                    for (placed_chips[0..placed_count]) |other| {
+                        if (rl.checkCollisionRecs(chip, other)) {
+                            // Stack upward: chips already sit above their
+                            // anchor, so the next one must not cover it.
+                            chip.y = other.y - chip.height - 2 * scale;
+                            moved = true;
+                        }
+                    }
+                }
+                if (placed_count < placed_chips.len) {
+                    placed_chips[placed_count] = chip;
+                    placed_count += 1;
+                }
+                rl.drawRectangleRec(chip, theme.warning_soft);
+                rl.drawRectangleLinesEx(chip, 1, theme.warning);
+                self.drawUiText(text, .{ .x = chip.x + padding, .y = chip.y + 3 * scale }, chip_font, theme.warning);
+            }
+        }
+    }
+
+    /// Numbered step badges above every item that owns a reveal, in slide
+    /// step order. Editor chrome only.
+    fn drawBuildBadges(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
+        if (self.frame_builds.len == 0) return;
+        const scale = uiScale(viewport);
+        const badge_font = scaledUiFont(scale, UiTypography.compact);
+        for (self.frame_builds) |build| {
+            const index = itemIndexByIdentity(items, build.owner_identity) orelse continue;
+            const item = items[index];
+            if (!isConcreteVisibleItem(item, resolved_bounds)) continue;
+            const rect = geometryToScreenRect(viewport, itemGeometry(item, resolved_bounds)) orelse continue;
+            var text_buffer: [24]u8 = undefined;
+            const text: [:0]const u8 = if (build.step_count == 1)
+                std.fmt.bufPrintZ(&text_buffer, "{d}", .{build.first_step}) catch "?"
+            else
+                std.fmt.bufPrintZ(&text_buffer, "{d}-{d}", .{ build.first_step, build.lastStep() }) catch "?";
+            const text_width = self.measureUiText(text, badge_font);
+            const padding = 6 * scale;
+            const height = @as(f32, @floatFromInt(badge_font)) + 6 * scale;
+            var badge: rl.Rectangle = .{
+                .x = rect.x,
+                .y = rect.y - height - 2 * scale,
+                .width = text_width + padding * 2,
+                .height = height,
+            };
+            const canvas = viewport.canvasBounds();
+            if (badge.y < canvas.y) badge.y = rect.y + 2 * scale;
+            const highlighted = if (self.visible_reveal_step) |step| build.containsStep(step) else false;
+            rl.drawRectangleRec(badge, if (highlighted) theme.accent else theme.accent_soft);
+            rl.drawRectangleLinesEx(badge, 1, theme.accent);
+            self.drawUiText(text, .{ .x = badge.x + padding, .y = badge.y + 3 * scale }, badge_font, if (highlighted) theme.surface else theme.text);
+        }
+    }
+
+    const motion_trigger_labels = [motion_trigger_count][:0]const u8{ "None", "Click", "Auto", "Click>Auto" };
+    const motion_effect_labels = [motion_effect_count][:0]const u8{ "Appear", "Fade", "Slide L", "Slide R", "Slide U", "Slide D" };
+    const motion_grouping_labels = [motion_choice_count][:0]const u8{ "Item", "Line", "Bullet" };
+    const motion_easing_labels = [motion_choice_count][:0]const u8{ "Linear", "Smooth", "Spring" };
+    const motion_field_labels = [3][:0]const u8{ "DELAY", "AFTER", "DUR" };
+
+    /// Default reveal for items that have none yet: fade, bullet-by-bullet
+    /// when the primary selection is a bulleted text box.
+    fn revealTemplate(self: Studio, items: []const slides.SlideItem) animation.ItemSpec {
+        const index = self.selectedIndex(items) orelse return .{};
+        const item = items[index];
+        return .{
+            .effect = .fade,
+            .by = if (item.kind == .textbox and textHasBulletLines(item.text)) .bullet else .item,
+        };
+    }
+
+    fn selectionHasMorphBorn(self: Studio, items: []const slides.SlideItem) bool {
+        for (items) |item| {
+            if (self.isIdentitySelected(item.identity) and item.creation_morph_state != null) return true;
+        }
+        return false;
+    }
+
+    fn buildForIdentity(self: Studio, identity: usize) ?RevealBuildSummary {
+        for (self.frame_builds) |build| if (build.owner_identity == identity) return build;
+        return null;
+    }
+
+    fn drawMotion(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
+        const layout = motionLayout(viewport);
+        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        drawStudioPanel(layout.panel);
+        self.drawInspectorTabs(viewport);
+        const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
+        const body_font = scaledUiFont(layout.scale, UiTypography.body);
+        const text_origin: rl.Vector2 = .{ .x = layout.context.x, .y = layout.context.y };
+
+        const selection_count = self.selectionCount();
+        if (self.active_morph_state != null) {
+            self.drawStateSection(items, layout, viewport);
+            return;
+        }
+        if (selection_count == 0) {
+            self.drawTransitionSection(layout, viewport);
+            return;
+        }
+        if (self.selectionHasMorphBorn(items)) {
+            self.drawUiText("REVEAL", text_origin, body_font, theme.text_heading);
+            self.drawUiText("Born in a morph state: it animates with that state.", .{ .x = layout.trigger[0].x, .y = layout.trigger[0].y }, compact_font, theme.text_muted);
+            return;
+        }
+        const primary_index = self.selectedIndex(items) orelse return;
+        const primary = items[primary_index];
+        const common = self.commonRevealSpec(items);
+        const any_reveal = self.selectionHasReveal(items);
+        const mixed = any_reveal and common == null;
+        const build = if (selection_count == 1) self.buildForIdentity(primary.identity) else null;
+
+        var context_buffer: [96]u8 = undefined;
+        const context_text: []const u8 = if (mixed)
+            "REVEAL · Mixed selection"
+        else if (!any_reveal)
+            "REVEAL · none (shown when the slide enters)"
+        else if (build != null and !build.?.authored_locally)
+            "REVEAL · inherited from its definition"
+        else if (selection_count > 1)
+            std.fmt.bufPrint(&context_buffer, "REVEAL · {d} objects", .{selection_count}) catch "REVEAL"
+        else switch (primary.source.scope) {
+            .component_instance => "REVEAL · this instance",
+            .slide_template => "REVEAL · shared template (Alt to edit)",
+            .group_instance_member => "REVEAL · group member (Definition mode)",
+            else => "REVEAL · direct",
+        };
+        var fitted_context: [96]u8 = undefined;
+        self.drawUiText(self.fitUiText(&fitted_context, context_text, compact_font, layout.context.width), text_origin, compact_font, theme.text_heading);
+
+        const trigger: ?RevealTrigger = if (common) |spec| revealTrigger(spec) else null;
+        for (layout.trigger, motion_trigger_labels, 0..) |cell, label, index| {
+            const active = if (index == 0)
+                !any_reveal
+            else
+                trigger != null and @intFromEnum(trigger.?) == index - 1;
+            const fitted_label: [:0]const u8 = if (index == 3 and layout.compact) "Clk>Auto" else label;
+            drawToggleButton(self, cell, fitted_label, active);
+        }
+        for (layout.effect, motion_effect_labels, 0..) |cell, label, index| {
+            const active = common != null and @intFromEnum(common.?.effect) == index + 1;
+            drawToggleButton(self, cell, label, active);
+        }
+        const grouping_applies = selection_count == 1 and primary.kind == .textbox and primary.text != null;
+        for (layout.grouping, motion_grouping_labels, 0..) |cell, label, index| {
+            if (grouping_applies) {
+                drawToggleButton(self, cell, label, common != null and @intFromEnum(common.?.by) == index);
+            } else {
+                drawDisabledBadge(self, cell, label);
+            }
+        }
+        for (motion_inline_fields, motion_field_labels, 0..) |field, label, index| {
+            if (!any_reveal) {
+                drawDisabledBadge(self, layout.fields[index], label);
+                continue;
+            }
+            const active = self.inline_editor.active and self.inline_editor.field == field;
+            var scalar_buffer: [64]u8 = undefined;
+            var color_buffer: [9]u8 = undefined;
+            const value = if (active)
+                self.inline_editor.text()
+            else
+                self.inlineDisplayValue(items, resolved_bounds, field, &scalar_buffer, &color_buffer);
+            self.drawInlineField(layout.fields[index], label, value, active, active and self.inline_editor.error_value != null, false, false, false, false, viewport);
+        }
+        for (layout.easing, motion_easing_labels, 0..) |cell, label, index| {
+            if (any_reveal) {
+                drawToggleButton(self, cell, label, common != null and @intFromEnum(common.?.easing) == index);
+            } else {
+                drawDisabledBadge(self, cell, label);
+            }
+        }
+        if (selection_count == 1 and primary.kind == .textbox and textHasBulletLines(primary.text))
+            drawCompactButton(self, layout.build_bullets, "Build bullets")
+        else
+            drawDisabledBadge(self, layout.build_bullets, "Build bullets");
+        if (any_reveal) {
+            const label: [:0]const u8 = if (build != null and !build.?.authored_locally)
+                "Cancel"
+            else if (build != null and primary.source.scope == .component_instance)
+                "Reset"
+            else
+                "Remove";
+            drawCompactButton(self, layout.remove_reveal, label);
+        } else {
+            drawDisabledBadge(self, layout.remove_reveal, "Remove");
+        }
+
+        var summary_buffer: [96]u8 = undefined;
+        const summary: []const u8 = if (build) |value|
+            (if (value.step_count == 1)
+                std.fmt.bufPrint(&summary_buffer, "Step {d} of the slide", .{value.first_step}) catch ""
+            else
+                std.fmt.bufPrint(&summary_buffer, "{d} steps · slide steps {d}-{d}", .{ value.step_count, value.first_step, value.lastStep() }) catch "")
+        else if (selection_count > 1 and any_reveal)
+            "Reveal order follows paint order"
+        else
+            "";
+        var fitted_summary: [96]u8 = undefined;
+        self.drawUiText(self.fitUiText(&fitted_summary, summary, compact_font, layout.summary.width), .{ .x = layout.summary.x, .y = layout.summary.y }, compact_font, theme.text_muted);
+
+        if (self.inline_editor.active and inlineFieldIsMotion(self.inline_editor.field)) {
+            if (self.inline_editor.error_value) |reason| {
+                var fitted_error: [160]u8 = undefined;
+                self.drawUiText(
+                    self.fitUiText(&fitted_error, inlineErrorMessage(reason), compact_font, layout.inline_error.width),
+                    .{ .x = layout.inline_error.x, .y = layout.inline_error.y },
+                    compact_font,
+                    theme.warning,
+                );
+            }
+        }
+    }
+
+    const transition_effect_labels = [8][:0]const u8{ "Inherit", "None", "Appear", "Fade", "Slide L", "Slide R", "Slide U", "Slide D" };
+
+    fn transitionEffectCell(effect: animation.Effect) usize {
+        return switch (effect) {
+            .none => 1,
+            .appear => 2,
+            .fade => 3,
+            .slide_left => 4,
+            .slide_right => 5,
+            .slide_up => 6,
+            .slide_down => 7,
+        };
+    }
+
+    fn transitionEffectForCell(cell: usize) ?animation.Effect {
+        return switch (cell) {
+            1 => .none,
+            2 => .appear,
+            3 => .fade,
+            4 => .slide_left,
+            5 => .slide_right,
+            6 => .slide_up,
+            7 => .slide_down,
+            else => null,
+        };
+    }
+
+    fn drawTransitionSection(self: Studio, layout: MotionLayout, viewport: Viewport) void {
+        const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
+        const summary = self.frame_transition;
+        var context_buffer: [96]u8 = undefined;
+        const context_text: []const u8 = switch (summary.provenance) {
+            .none => "TRANSITION · none",
+            .slide => "TRANSITION · this slide",
+            .template => std.fmt.bufPrint(&context_buffer, "TRANSITION · from template {s} (Alt edits it)", .{summary.template_name}) catch "TRANSITION · from template",
+            .deck_default => "TRANSITION · deck default",
+        };
+        var fitted_context: [96]u8 = undefined;
+        self.drawUiText(self.fitUiText(&fitted_context, context_text, compact_font, layout.context.width), .{ .x = layout.context.x, .y = layout.context.y }, compact_font, theme.text_heading);
+
+        const active_cell: usize = if (summary.provenance == .slide) transitionEffectCell(summary.transition.effect) else 0;
+        for (layout.transition_effects, transition_effect_labels, 0..) |cell, label, index| {
+            if (!summary.can_author) {
+                drawDisabledBadge(self, cell, label);
+                continue;
+            }
+            drawToggleButton(self, cell, label, index == active_cell);
+        }
+        const editable_timing = summary.can_author and summary.transition.effect != .none;
+        if (editable_timing) {
+            const active = self.inline_editor.active and self.inline_editor.field == .transition_duration;
+            var scalar_buffer: [64]u8 = undefined;
+            const value = if (active) self.inline_editor.text() else self.sceneInitialValue(.transition_duration, &scalar_buffer);
+            self.drawInlineField(layout.transition_duration, "DUR", value, active, active and self.inline_editor.error_value != null, false, false, false, false, viewport);
+            for (layout.transition_easing, motion_easing_labels, 0..) |cell, label, index| {
+                drawToggleButton(self, cell, label, @intFromEnum(summary.transition.easing) == index);
+            }
+        } else {
+            drawDisabledBadge(self, layout.transition_duration, "DUR");
+            for (layout.transition_easing, motion_easing_labels) |cell, label| drawDisabledBadge(self, cell, label);
+        }
+
+        var info_buffer: [128]u8 = undefined;
+        const info: []const u8 = if (!summary.can_author)
+            "Implicit first slide: add a @slide line to author a transition"
+        else if (summary.transition.effect == .none)
+            "Enters immediately"
+        else
+            std.fmt.bufPrint(&info_buffer, "Enters with {s} over {d:.2}s ({s}){s}", .{
+                animation.effectLiteral(summary.transition.effect),
+                summary.transition.duration,
+                animation.easingLiteral(summary.transition.easing),
+                if (summary.has_previous_slide) "" else " · first slide: no preview",
+            }) catch "";
+        var fitted_info: [128]u8 = undefined;
+        self.drawUiText(self.fitUiText(&fitted_info, info, compact_font, layout.transition_info.width), .{ .x = layout.transition_info.x, .y = layout.transition_info.y }, compact_font, theme.text_muted);
+
+        var deck_buffer: [96]u8 = undefined;
+        const deck_text: []const u8 = if (summary.deck) |deck|
+            std.fmt.bufPrint(&deck_buffer, "DECK DEFAULT · {s} {d:.2}s {s}", .{ animation.effectLiteral(deck.effect), deck.duration, animation.easingLiteral(deck.easing) }) catch "DECK DEFAULT"
+        else
+            "DECK DEFAULT · none";
+        var fitted_deck: [96]u8 = undefined;
+        self.drawUiText(self.fitUiText(&fitted_deck, deck_text, compact_font, layout.transition_deck_info.width), .{ .x = layout.transition_deck_info.x, .y = layout.transition_deck_info.y }, compact_font, theme.text_heading);
+        if (summary.transition.effect != .none)
+            drawCompactButton(self, layout.transition_deck_actions[0], "Use for deck")
+        else
+            drawDisabledBadge(self, layout.transition_deck_actions[0], "Use for deck");
+        if (summary.deck != null)
+            drawCompactButton(self, layout.transition_deck_actions[1], "Clear deck")
+        else
+            drawDisabledBadge(self, layout.transition_deck_actions[1], "Clear deck");
+
+        if (self.inline_editor.active and self.inline_editor.field == .transition_duration) {
+            if (self.inline_editor.error_value) |reason| {
+                var fitted_error: [160]u8 = undefined;
+                self.drawUiText(self.fitUiText(&fitted_error, inlineErrorMessage(reason), compact_font, layout.inline_error.width), .{ .x = layout.transition_deck_actions[0].x, .y = layout.transition_deck_actions[0].y + layout.transition_deck_actions[0].height + 4 * layout.scale }, compact_font, theme.warning);
+            }
+        }
+    }
+
+    fn handleTransitionClick(self: *Studio, items: []slides.SlideItem, layout: MotionLayout, pointer: rl.Vector2, allow_shared_edit: bool) bool {
+        const summary = self.frame_transition;
+        for (layout.transition_effects, 0..) |cell, index| {
+            if (!pointInRectangle(pointer, cell)) continue;
+            if (!summary.can_author) {
+                self.notice = .transition_needs_slide_directive;
+                return true;
+            }
+            self.cancelInlineEdit();
+            if (index == 0) {
+                if (summary.provenance == .slide) self.pending_semantic_command = .{ .set_slide_transition = .{ .inherit = true, .shared = allow_shared_edit } };
+                return true;
+            }
+            const effect = transitionEffectForCell(index) orelse return true;
+            self.pending_semantic_command = .{ .set_slide_transition = .{ .effect = effect, .shared = allow_shared_edit } };
+            self.notice = .none;
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.transition_duration)) {
+            if (!summary.can_author or summary.transition.effect == .none) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            return self.beginSceneInlineEdit(items, .transition_duration);
+        }
+        for (layout.transition_easing, 0..) |cell, index| {
+            if (!pointInRectangle(pointer, cell)) continue;
+            if (!summary.can_author or summary.transition.effect == .none) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            const easing: animation.Easing = @enumFromInt(index);
+            if (summary.transition.easing != easing) {
+                self.cancelInlineEdit();
+                self.pending_semantic_command = .{ .set_slide_transition = .{ .easing = easing, .shared = allow_shared_edit } };
+            }
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.transition_deck_actions[0])) {
+            if (summary.transition.effect != .none) {
+                self.cancelInlineEdit();
+                self.pending_semantic_command = .{ .set_deck_transition = summary.transition };
+            }
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.transition_deck_actions[1])) {
+            if (summary.deck != null) {
+                self.cancelInlineEdit();
+                self.pending_semantic_command = .{ .set_deck_transition = null };
+            }
+            return true;
+        }
+        return true;
+    }
+
+    /// View-only: show the current slide's transition section.
+    pub fn showTransitionSection(self: *Studio, items: []slides.SlideItem) void {
+        self.cancelInlineEdit();
+        if (self.active_morph_state != null) self.selectMorphScene(items, null);
+        self.visible_reveal_step = null;
+        self.clearSelection(items);
+        self.focus_canvas = false;
+        self.active_dock = .properties;
+        self.inspector_panel = .motion;
+        self.notice = .none;
+    }
+
+    const state_field_labels = [3][:0]const u8{ "LABEL", "AFTER", "DUR" };
+    const state_trigger_labels = [2][:0]const u8{ "Click", "Auto" };
+    const state_action_labels = [5][:0]const u8{ "Reset", "Exit L", "Exit R", "Exit U", "Exit D" };
+
+    fn drawStateSection(self: Studio, items: []const slides.SlideItem, layout: MotionLayout, viewport: Viewport) void {
+        const state_index = self.active_morph_state orelse return;
+        const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
+        var heading_buffer: [96]u8 = undefined;
+        const heading: []const u8 = if (state_index < self.frame_states.len and self.frame_states[state_index].label.len > 0)
+            std.fmt.bufPrint(&heading_buffer, "STATE {d} · {s}", .{ state_index + 1, self.frame_states[state_index].label }) catch "STATE"
+        else
+            std.fmt.bufPrint(&heading_buffer, "STATE {d} of {d}", .{ state_index + 1, self.morph_state_count }) catch "STATE";
+        var fitted_heading: [96]u8 = undefined;
+        self.drawUiText(self.fitUiText(&fitted_heading, heading, compact_font, layout.context.width), .{ .x = layout.context.x, .y = layout.context.y }, compact_font, theme.text_heading);
+
+        const summary: ?MorphStateSummary = if (state_index < self.frame_states.len) self.frame_states[state_index] else null;
+        for (scene_inline_fields, state_field_labels, 0..) |field, label, index| {
+            const active = self.inline_editor.active and self.inline_editor.field == field;
+            var scalar_buffer: [64]u8 = undefined;
+            const value = if (active) self.inline_editor.text() else self.sceneInitialValue(field, &scalar_buffer);
+            self.drawInlineField(layout.state_fields[index], label, value, active, active and self.inline_editor.error_value != null, false, false, false, false, viewport);
+        }
+        const automatic = if (summary) |value| value.after != null else false;
+        drawToggleButton(self, layout.state_trigger[0], state_trigger_labels[0], !automatic);
+        drawToggleButton(self, layout.state_trigger[1], state_trigger_labels[1], automatic);
+        for (layout.state_easing, motion_easing_labels, 0..) |cell, label, index| {
+            drawToggleButton(self, cell, label, summary != null and @intFromEnum(summary.?.easing) == index);
+        }
+
+        var info_buffer: [128]u8 = undefined;
+        const selected_item: ?slides.SlideItem = if (self.selectionCount() == 1)
+            if (self.selectedIndex(items)) |index| items[index] else null
+        else
+            null;
+        const change = if (selected_item) |item| self.stateChangeForIdentity(item.identity) else null;
+        const info: []const u8 = if (selected_item == null)
+            "Select an object to change it in this state"
+        else if (change) |value| switch (value.kind) {
+            .born => "Born in this state (fades in)",
+            .hidden => if (value.keys_len > 0)
+                std.fmt.bufPrint(&info_buffer, "Hidden here while moving: {s}", .{value.keysText()}) catch "Hidden here"
+            else
+                "Hidden here",
+            .shown => "Shown here",
+            .changed => if (value.cross_fades)
+                std.fmt.bufPrint(&info_buffer, "Cross-fades (content changed): {s}", .{value.keysText()}) catch "Cross-fades"
+            else
+                std.fmt.bufPrint(&info_buffer, "Changes here: {s}", .{value.keysText()}) catch "Changed here",
+        } else if (selected_item.?.id == null)
+            "Unchanged here; needs an id= to be changed by a state"
+        else
+            "Unchanged here (inherits the previous state)";
+        var fitted_info: [128]u8 = undefined;
+        self.drawUiText(self.fitUiText(&fitted_info, info, compact_font, layout.state_object_info.width), .{ .x = layout.state_object_info.x, .y = layout.state_object_info.y }, compact_font, if (change != null and change.?.cross_fades) theme.warning else theme.text_muted);
+
+        const can_reset = change != null and selected_item.?.id != null;
+        const can_exit = selected_item != null and selected_item.?.id != null and !selected_item.?.locked and selected_item.?.kind != .background;
+        for (layout.state_actions, state_action_labels, 0..) |cell, label, index| {
+            const enabled = if (index == 0) can_reset else can_exit;
+            if (enabled) drawCompactButton(self, cell, label) else drawDisabledBadge(self, cell, label);
+        }
+
+        var heading2: [64]u8 = undefined;
+        const changes_heading = std.fmt.bufPrint(&heading2, "CHANGES IN THIS STATE · {d}", .{self.frame_state_changes.len}) catch "CHANGES";
+        var fitted_changes: [64]u8 = undefined;
+        self.drawUiText(self.fitUiText(&fitted_changes, changes_heading, compact_font, layout.state_changes_heading.width), .{ .x = layout.state_changes_heading.x, .y = layout.state_changes_heading.y }, compact_font, theme.text_heading);
+        for (0..layout.state_change_row_count) |row_index| {
+            if (row_index >= self.frame_state_changes.len) break;
+            const entry = self.frame_state_changes[row_index];
+            const rect = layout.state_change_rows[row_index];
+            const selected = self.isIdentitySelected(entry.identity);
+            rl.drawRectangleRec(rect, if (selected) theme.accent_soft else theme.control);
+            var row_buffer: [128]u8 = undefined;
+            const kind_text: []const u8 = switch (entry.kind) {
+                .changed => if (entry.cross_fades) "cross-fade" else "set",
+                .born => "new",
+                .hidden => "exit",
+                .shown => "show",
+            };
+            const row_text = std.fmt.bufPrint(&row_buffer, "{s} · {s} {s}", .{ entry.label, kind_text, entry.keysText() }) catch entry.label;
+            var fitted_row: [128]u8 = undefined;
+            self.drawUiText(self.fitUiText(&fitted_row, row_text, compact_font, rect.width - 12 * layout.scale), .{ .x = rect.x + 6 * layout.scale, .y = rect.y + 3 * layout.scale }, compact_font, if (selected) theme.text else theme.text_secondary);
+        }
+        if (self.frame_state_changes.len > layout.state_change_row_count and layout.state_change_row_count > 0) {
+            // Overflow is reported rather than silently truncated.
+            var more_buffer: [48]u8 = undefined;
+            const more = std.fmt.bufPrint(&more_buffer, "+{d} more in Objects", .{self.frame_state_changes.len - layout.state_change_row_count}) catch "";
+            const last = layout.state_change_rows[layout.state_change_row_count - 1];
+            self.drawUiText(self.fitUiText(&fitted_changes, more, compact_font, last.width), .{ .x = last.x, .y = last.y + last.height + 2 * layout.scale }, compact_font, theme.text_muted);
+        }
+
+        if (self.inline_editor.active and inlineFieldIsScene(self.inline_editor.field)) {
+            if (self.inline_editor.error_value) |reason| {
+                var fitted_error: [160]u8 = undefined;
+                const error_rect = layout.state_changes_heading;
+                self.drawUiText(self.fitUiText(&fitted_error, inlineErrorMessage(reason), compact_font, error_rect.width), .{ .x = error_rect.x, .y = error_rect.y - (error_rect.height + 2 * layout.scale) }, compact_font, theme.warning);
+            }
+        }
+    }
+
+    fn handleStateSectionClick(
+        self: *Studio,
+        items: []slides.SlideItem,
+        layout: MotionLayout,
+        pointer: rl.Vector2,
+    ) bool {
+        const state_index = self.active_morph_state orelse return true;
+        const summary: ?MorphStateSummary = if (state_index < self.frame_states.len) self.frame_states[state_index] else null;
+        if (sceneFieldAtPoint(layout, pointer)) |field| return self.beginSceneInlineEdit(items, field);
+        if (pointInRectangle(pointer, layout.state_trigger[0])) {
+            if (summary != null and summary.?.after != null) {
+                self.cancelInlineEdit();
+                self.pending_semantic_command = .{ .set_morph_state_timing = .{ .state_index = state_index, .after = @as(?f32, null) } };
+            }
+            return true;
+        }
+        if (pointInRectangle(pointer, layout.state_trigger[1])) {
+            if (summary != null and summary.?.after == null) {
+                self.cancelInlineEdit();
+                self.pending_semantic_command = .{ .set_morph_state_timing = .{ .state_index = state_index, .after = @as(?f32, default_auto_state_after) } };
+            }
+            return true;
+        }
+        for (layout.state_easing, 0..) |cell, index| {
+            if (!pointInRectangle(pointer, cell)) continue;
+            const easing: animation.Easing = @enumFromInt(index);
+            if (summary != null and summary.?.easing != easing) {
+                self.cancelInlineEdit();
+                self.pending_semantic_command = .{ .set_morph_state_timing = .{ .state_index = state_index, .easing = easing } };
+            }
+            return true;
+        }
+        for (layout.state_actions, 0..) |cell, index| {
+            if (!pointInRectangle(pointer, cell)) continue;
+            return switch (index) {
+                0 => self.emitResetMorphObject(items),
+                1 => self.emitExitMorphObject(items, .left),
+                2 => self.emitExitMorphObject(items, .right),
+                3 => self.emitExitMorphObject(items, .up),
+                else => self.emitExitMorphObject(items, .down),
+            };
+        }
+        for (0..layout.state_change_row_count) |row_index| {
+            if (row_index >= self.frame_state_changes.len) break;
+            if (!pointInRectangle(pointer, layout.state_change_rows[row_index])) continue;
+            const identity = self.frame_state_changes[row_index].identity;
+            if (itemIndexByIdentity(items, identity)) |item_index| {
+                if (items[item_index].kind != .background) {
+                    self.cancelInlineEdit();
+                    self.clearSelectionState();
+                    self.setSingleSelection(items[item_index]);
+                    self.notice = .none;
+                }
+            }
+            return true;
+        }
+        return true;
+    }
+
+    fn handleMotionClick(
+        self: *Studio,
+        items: []slides.SlideItem,
+        resolved_bounds: []const ResolvedBounds,
+        viewport: Viewport,
+        workspace: Workspace,
+        pointer: rl.Vector2,
+        allow_shared_edit: bool,
+    ) bool {
+        _ = workspace;
+        const layout = motionLayout(viewport);
+        if (self.active_morph_state != null) return self.handleStateSectionClick(items, layout, pointer);
+        if (self.selectionCount() == 0) return self.handleTransitionClick(items, layout, pointer, allow_shared_edit);
+        const template = self.revealTemplate(items);
+        for (layout.trigger, 0..) |cell, index| {
+            if (!pointInRectangle(pointer, cell)) continue;
+            if (index == 0) return self.emitRevealCommand(items, .{ .action = .remove }, allow_shared_edit);
+            const trigger: RevealTrigger = @enumFromInt(index - 1);
+            return self.emitRevealCommand(items, .{ .patch = .{ .trigger = trigger }, .template = template }, allow_shared_edit);
+        }
+        for (layout.effect, 0..) |cell, index| {
+            if (!pointInRectangle(pointer, cell)) continue;
+            const effect: animation.Effect = @enumFromInt(index + 1);
+            return self.emitRevealCommand(items, .{ .patch = .{ .effect = effect }, .template = template }, allow_shared_edit);
+        }
+        const primary_index = self.selectedIndex(items) orelse return true;
+        const primary = items[primary_index];
+        const grouping_applies = self.selectionCount() == 1 and primary.kind == .textbox and primary.text != null;
+        for (layout.grouping, 0..) |cell, index| {
+            if (!pointInRectangle(pointer, cell)) continue;
+            if (!grouping_applies) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            const by: animation.Grouping = @enumFromInt(index);
+            return self.emitRevealCommand(items, .{ .patch = .{ .by = by }, .template = template }, allow_shared_edit);
+        }
+        if (motionFieldAtPoint(layout, pointer)) |field| {
+            if (!self.selectionHasReveal(items)) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            _ = self.beginInlineEdit(items, resolved_bounds, field, allow_shared_edit);
+            self.inline_editor.select_all = true;
+            return true;
+        }
+        for (layout.easing, 0..) |cell, index| {
+            if (!pointInRectangle(pointer, cell)) continue;
+            if (!self.selectionHasReveal(items)) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            const easing: animation.Easing = @enumFromInt(index);
+            return self.emitRevealCommand(items, .{ .patch = .{ .easing = easing }, .template = template }, allow_shared_edit);
+        }
+        if (pointInRectangle(pointer, layout.build_bullets)) return self.emitBuildBullets(items, allow_shared_edit);
+        if (pointInRectangle(pointer, layout.remove_reveal)) {
+            if (!self.selectionHasReveal(items)) {
+                self.notice = .property_unavailable;
+                return true;
+            }
+            const build = if (self.selectionCount() == 1) self.buildForIdentity(primary.identity) else null;
+            const action: RevealAction = if (build != null and build.?.authored_locally and primary.source.scope == .component_instance)
+                .reset
+            else
+                .remove;
+            return self.emitRevealCommand(items, .{ .action = action }, allow_shared_edit);
+        }
+        return true;
     }
 
     fn drawMediaAvailabilityWarnings(
@@ -11861,11 +13905,18 @@ pub const Studio = struct {
             const title = self.fitUiText(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title, body_font, text_width);
             self.drawUiText(title, .{ .x = text_x, .y = card.y + 23 * font_scale }, body_font, theme.text);
             var metadata_buffer: [96]u8 = undefined;
-            const metadata = std.fmt.bufPrintZ(
-                &metadata_buffer,
-                "{d} items · {d} states",
-                .{ summary.item_count, summary.morph_count },
-            ) catch "slide details";
+            const metadata = if (summary.transition_effect != .none)
+                std.fmt.bufPrintZ(
+                    &metadata_buffer,
+                    "{d} items · {d} states · {s}",
+                    .{ summary.item_count, summary.morph_count, animation.effectLiteral(summary.transition_effect) },
+                ) catch "slide details"
+            else
+                std.fmt.bufPrintZ(
+                    &metadata_buffer,
+                    "{d} items · {d} states",
+                    .{ summary.item_count, summary.morph_count },
+                ) catch "slide details";
             var fitted_metadata_buffer: [96]u8 = undefined;
             const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
             self.drawUiText(fitted_metadata, .{ .x = text_x, .y = card.y + 45 * font_scale }, compact_font, theme.text_muted);
@@ -12257,9 +14308,9 @@ pub const Studio = struct {
             var keys_fitted: [224]u8 = undefined;
             self.drawUiText(
                 self.fitUiText(&keys_fitted, if (self.grid_snapping)
-                    "GRID ON · G toggle · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo"
+                    "GRID ON · G toggle · [ ] scenes · Shift-Space preview · Commands: rulers, safe areas, measurements, ghosts · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo"
                 else
-                    "G grid · Commands: rulers, safe areas, measurements · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo", compact_font, text_width),
+                    "G grid · [ ] scenes · Shift-Space preview · Commands: rulers, safe areas, measurements, ghosts · Cmd/Ctrl-S save · Cmd/Ctrl-Z undo", compact_font, text_width),
                 .{ .x = text_x, .y = line_y },
                 compact_font,
                 theme.text_muted,
@@ -12824,9 +14875,10 @@ pub const Studio = struct {
     fn drawMorphTimeline(self: Studio, viewport: Viewport, workspace: Workspace) void {
         const layout = morphTimelineLayout(viewport);
         if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
-        const active_scene = if (self.active_morph_state) |state| state + 1 else 0;
+        const active_scene = if (self.motion_preview.active()) self.previewSceneIndex() else self.activeTimelineScene();
         const body_font = scaledUiFont(layout.scale, if (layout.compact) UiTypography.compact else UiTypography.body);
         const meta_font = scaledUiFont(layout.scale, UiTypography.compact);
+        const scene_count = 1 + workspace.builds.len + workspace.morph_states.len;
 
         rl.beginScissorMode(
             @intFromFloat(@floor(layout.cards_clip.x)),
@@ -12836,22 +14888,27 @@ pub const Studio = struct {
         );
         for (0..morphTimelineCardCapacity(layout)) |visible_slot| {
             const scene_index = self.morph_first_visible + visible_slot;
-            if (scene_index > workspace.morph_states.len) break;
+            if (scene_index >= scene_count) break;
             const card = morphTimelineCardRect(layout, visible_slot) orelse break;
             const active = scene_index == active_scene;
-            const base = scene_index == 0;
+            const scene = self.timelineSceneAt(scene_index);
             const fill: rl.Color = if (active) theme.accent_soft else theme.control;
             const border: rl.Color = if (active) theme.accent else theme.border_strong;
             rl.drawRectangleRec(card, fill);
             rl.drawRectangleLinesEx(card, if (active) 2 else 1, border);
 
             var title_buffer: [96]u8 = undefined;
-            const title_source: []const u8 = if (base)
-                "BASE"
-            else if (workspace.morph_states[scene_index - 1].label.len > 0)
-                workspace.morph_states[scene_index - 1].label
-            else
-                std.fmt.bufPrint(&title_buffer, "STATE {d}", .{scene_index}) catch "STATE";
+            const title_source: []const u8 = switch (scene) {
+                .base => "BASE",
+                .build => |build_index| if (workspace.builds[build_index].label.len > 0)
+                    workspace.builds[build_index].label
+                else
+                    std.fmt.bufPrint(&title_buffer, "BUILD {d}", .{build_index + 1}) catch "BUILD",
+                .state => |state_index| if (workspace.morph_states[state_index].label.len > 0)
+                    workspace.morph_states[state_index].label
+                else
+                    std.fmt.bufPrint(&title_buffer, "STATE {d}", .{state_index + 1}) catch "STATE",
+            };
             var fitted_title_buffer: [96]u8 = undefined;
             const fitted_title = self.fitUiText(
                 &fitted_title_buffer,
@@ -12866,19 +14923,30 @@ pub const Studio = struct {
 
             if (!layout.compact) {
                 var metadata_buffer: [96]u8 = undefined;
-                const metadata: []const u8 = if (base)
-                    "AUTHORED ROOT"
-                else state: {
-                    const summary = workspace.morph_states[scene_index - 1];
-                    const easing = switch (summary.easing) {
-                        .linear => "linear",
-                        .smooth => "smooth",
-                        .spring => "spring",
-                    };
-                    break :state if (summary.after) |delay|
-                        std.fmt.bufPrint(&metadata_buffer, "+{d:.1}s · {d:.1}s {s}", .{ delay, summary.duration, easing }) catch easing
-                    else
-                        std.fmt.bufPrint(&metadata_buffer, "{d:.1}s · {s}", .{ summary.duration, easing }) catch easing;
+                const metadata: []const u8 = switch (scene) {
+                    .base => "AUTHORED ROOT",
+                    .build => |build_index| build: {
+                        const build = workspace.builds[build_index];
+                        const trigger: []const u8 = switch (revealTrigger(build.spec)) {
+                            .click => "click",
+                            .auto => "auto",
+                            .click_then_auto => "click>auto",
+                        };
+                        break :build std.fmt.bufPrint(&metadata_buffer, "{d} step{s} · {s} · {s}", .{
+                            build.step_count,
+                            if (build.step_count == 1) "" else "s",
+                            animation.effectLiteral(build.spec.effect),
+                            trigger,
+                        }) catch "BUILD";
+                    },
+                    .state => |state_index| state: {
+                        const summary = workspace.morph_states[state_index];
+                        const easing = animation.easingLiteral(summary.easing);
+                        break :state if (summary.after) |delay|
+                            std.fmt.bufPrint(&metadata_buffer, "+{d:.1}s · {d:.1}s {s}", .{ delay, summary.duration, easing }) catch easing
+                        else
+                            std.fmt.bufPrint(&metadata_buffer, "{d:.1}s · {s}", .{ summary.duration, easing }) catch easing;
+                    },
                 };
                 var fitted_metadata_buffer: [96]u8 = undefined;
                 const fitted_metadata = self.fitUiText(
@@ -12888,6 +14956,17 @@ pub const Studio = struct {
                     card.width - 18 * layout.scale,
                 );
                 self.drawUiText(fitted_metadata, .{ .x = card.x + 9 * layout.scale, .y = card.y + 38 * layout.scale }, meta_font, theme.text_muted);
+
+                if (scene == .build) {
+                    const build = workspace.builds[scene.build];
+                    const chip_count = @min(build.step_count, max_timeline_step_chips);
+                    for (0..chip_count) |chip_index| {
+                        const chip = timelineStepChipRect(layout, card, chip_index, chip_count) orelse break;
+                        const step = build.first_step + chip_index;
+                        const reached = if (self.visible_reveal_step) |visible| active and step <= visible else false;
+                        rl.drawRectangleRec(chip, if (reached) theme.accent else theme.border_strong);
+                    }
+                }
             }
 
             if (scene_index > 0 and visible_slot > 0) {
@@ -12902,13 +14981,20 @@ pub const Studio = struct {
         }
         rl.endScissorMode();
 
+        self.drawTransport(layout);
+        self.drawTransitionChip(layout);
+
         const labels = [_][:0]const u8{ "+", "Dup", "Name", "Del", "<", ">" };
         for (layout.actions, labels, 0..) |button, label, action| {
+            const active_build: ?usize = switch (self.timelineSceneAt(self.activeTimelineScene())) {
+                .build => |build_index| build_index,
+                else => null,
+            };
             const enabled = switch (action) {
                 0, 1 => true,
                 2, 3 => self.active_morph_state != null,
-                4 => if (self.active_morph_state) |state| state > 0 else false,
-                5 => if (self.active_morph_state) |state| state + 1 < workspace.morph_states.len else false,
+                4 => if (self.active_morph_state) |state| state > 0 else if (active_build) |build| build > 0 else false,
+                5 => if (self.active_morph_state) |state| state + 1 < workspace.morph_states.len else if (active_build) |build| build + 1 < workspace.builds.len else false,
                 else => false,
             };
             if (enabled)
@@ -12916,6 +15002,74 @@ pub const Studio = struct {
             else
                 drawDisabledBadge(self, button, label);
         }
+    }
+
+    fn drawTransitionChip(self: Studio, layout: MorphTimelineLayout) void {
+        const chip = layout.transition_chip;
+        if (chip.width <= 0) return;
+        const summary = self.frame_transition;
+        const active = self.inspector_panel == .motion and self.selectionCount() == 0 and self.active_morph_state == null and self.visible_reveal_step == null;
+        rl.drawRectangleRec(chip, if (active) theme.accent_soft else theme.control);
+        rl.drawRectangleLinesEx(chip, if (active) 2 else 1, if (active) theme.accent else theme.border_strong);
+        const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
+        self.drawUiText("IN", .{ .x = chip.x + 7 * layout.scale, .y = chip.y + @as(f32, if (layout.compact) 9 else 8) * layout.scale }, compact_font, if (active) theme.text else theme.text_secondary);
+        if (!layout.compact) {
+            const effect: [:0]const u8 = switch (summary.transition.effect) {
+                .none => "none",
+                .appear => "appear",
+                .fade => "fade",
+                .slide_left => "left",
+                .slide_right => "right",
+                .slide_up => "up",
+                .slide_down => "down",
+            };
+            var fitted: [16]u8 = undefined;
+            self.drawUiText(self.fitUiText(&fitted, effect, compact_font, chip.width - 12 * layout.scale), .{ .x = chip.x + 7 * layout.scale, .y = chip.y + 38 * layout.scale }, compact_font, theme.text_muted);
+        }
+    }
+
+    fn drawTransport(self: Studio, layout: MorphTimelineLayout) void {
+        if (layout.transport_play.width <= 0) return;
+        const preview_status = self.motion_preview;
+        const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
+        if (!preview_status.available) {
+            drawDisabledBadge(self, layout.transport_play, "Play");
+            drawDisabledBadge(self, layout.transport_stop, "Stop");
+            if (layout.transport_loop.width > 0) drawDisabledBadge(self, layout.transport_loop, "Loop");
+        } else {
+            drawToggleButton(self, layout.transport_play, if (preview_status.playing) "Pause" else "Play", preview_status.playing);
+            if (preview_status.active())
+                drawCompactButton(self, layout.transport_stop, "Stop")
+            else
+                drawDisabledBadge(self, layout.transport_stop, "Stop");
+            if (layout.transport_loop.width > 0) drawToggleButton(self, layout.transport_loop, "Loop", preview_status.looping);
+        }
+        if (layout.transport_scrubber.width <= 0) return;
+        // Scrubber track and playhead.
+        const track = layout.transport_scrubber;
+        const track_height = 6 * layout.scale;
+        const track_rect: rl.Rectangle = .{
+            .x = track.x,
+            .y = track.y + (track.height - track_height) / 2,
+            .width = track.width,
+            .height = track_height,
+        };
+        rl.drawRectangleRounded(track_rect, 1, 4, if (preview_status.available) theme.border_strong else theme.control);
+        if (preview_status.available and preview_status.total > 0) {
+            const fraction = animation.clampProgress(preview_status.time / preview_status.total);
+            const played: rl.Rectangle = .{ .x = track_rect.x, .y = track_rect.y, .width = track_rect.width * fraction, .height = track_rect.height };
+            if (preview_status.active()) rl.drawRectangleRounded(played, 1, 4, theme.accent);
+            const knob_radius = 6 * layout.scale;
+            rl.drawCircleV(.{ .x = track_rect.x + track_rect.width * fraction, .y = track_rect.y + track_rect.height / 2 }, knob_radius, if (preview_status.active()) theme.accent_bright else theme.text_muted);
+        }
+        var readout_buffer: [32]u8 = undefined;
+        const readout: [:0]const u8 = if (!preview_status.available)
+            "--"
+        else if (preview_status.active())
+            std.fmt.bufPrintZ(&readout_buffer, "{d:.1}/{d:.1}s", .{ preview_status.time, preview_status.total }) catch "--"
+        else
+            std.fmt.bufPrintZ(&readout_buffer, "{d:.1}s", .{preview_status.total}) catch "--";
+        drawButtonLabel(self, layout.transport_readout, readout, compact_font, if (preview_status.active()) theme.text else theme.text_muted);
     }
 
     fn drawNewDeckChooser(self: Studio, viewport: Viewport) void {
@@ -13013,6 +15167,7 @@ pub const Studio = struct {
         const layout = objectsLayout(viewport);
         drawToggleButton(self, layout.objects_tab, "Objects", self.inspector_panel == .objects);
         drawToggleButton(self, layout.properties_tab, "Properties", self.inspector_panel == .properties);
+        drawToggleButton(self, layout.motion_tab, "Motion", self.inspector_panel == .motion);
     }
 
     fn drawObjects(self: Studio, items: []const slides.SlideItem, viewport: Viewport) void {
@@ -13186,10 +15341,12 @@ pub const Studio = struct {
         drawToggleButton(self, layout.grid_settings_toggle, "v", self.grid_settings_active);
         drawActionButton(self, layout.scene_previous, "<");
         var scene_buffer: [32]u8 = undefined;
-        const scene_label: [:0]const u8 = if (self.active_morph_state) |state|
-            std.fmt.bufPrintZ(&scene_buffer, "STATE {d}/{d}", .{ state + 1, self.morph_state_count }) catch "MORPH"
-        else
-            "BASE";
+        const active_scene = self.activeTimelineScene();
+        const scene_label: [:0]const u8 = switch (self.timelineSceneAt(active_scene)) {
+            .state => |state| std.fmt.bufPrintZ(&scene_buffer, "STATE {d}/{d}", .{ state + 1, self.morph_state_count }) catch "MORPH",
+            .build => |build| std.fmt.bufPrintZ(&scene_buffer, "BUILD {d}/{d}", .{ build + 1, self.build_count }) catch "BUILD",
+            .base => "BASE",
+        };
         drawActionButton(self, layout.scene_label, scene_label);
         drawActionButton(self, layout.scene_next, ">");
         drawToggleButton(self, layout.slides_dock_toggle, "Slides", self.active_dock == .slides);
@@ -13229,6 +15386,10 @@ pub const Studio = struct {
             .media_focus_y => a.media_focus.y == b.media_focus.y,
             .video_poster => a.vid_poster == b.vid_poster,
             .video_volume => a.vid_volume == b.vid_volume,
+            .reveal_delay => std.meta.eql(a.animation.?.delay, b.animation.?.delay) and a.animation.?.first_waits == b.animation.?.first_waits,
+            .reveal_after => std.meta.eql(a.animation.?.after, b.animation.?.after),
+            .reveal_duration => a.animation.?.duration == b.animation.?.duration,
+            .state_label, .state_after, .state_duration, .transition_duration => false,
         };
     }
 
@@ -14209,6 +16370,13 @@ pub const Studio = struct {
     pub fn noticeMessage(self: Studio, buffer: *[256]u8) ?[:0]const u8 {
         return switch (self.notice) {
             .none => null,
+            .reveal_scene_required => "Reveals are authored in BASE; select BASE or a build card first",
+            .reveal_morph_born => "Objects born in a morph state animate with that state and cannot own a reveal",
+            .reveal_selection_required => "Select one or more objects to author their reveal",
+            .reveal_bullets_required => "Build bullets needs a text box with bullet lines starting with - or >",
+            .reveal_shared_template => "That reveal belongs to a shared definition; hold Alt or edit it in Definition mode",
+            .morph_object_needs_id => "Give the object a unique id= first; state edits address objects by ID",
+            .transition_needs_slide_directive => "This implicit first slide has no @slide line; add one to author its transition",
             .saved => "Saved to the original .sld",
             .copy_saved => "Saved an .edited.sld copy",
             .save_failed => "Save failed - see the log for details",
@@ -14421,6 +16589,9 @@ fn inlineErrorMessage(reason: InlineError) [:0]const u8 {
         .invalid_unit_interval => "Use a value from 0 to 1",
         .invalid_video_poster => "Poster time must be within the video duration",
         .invalid_text => "Text value is invalid; correct it and press Enter",
+        .invalid_delay => "Start delay: seconds (0 or more), click, or empty",
+        .invalid_seconds => "Enter seconds as a number of 0 or more",
+        .invalid_state_label => "Labels start with a letter or _ and use letters, digits, _ or - (empty removes it)",
         .source_edit_failed => "Source changed; Esc cancels this guarded draft",
     };
 }
@@ -21207,4 +23378,614 @@ fn expectRectangleContained(outer: rl.Rectangle, inner: rl.Rectangle) !void {
     try std.testing.expect(inner.x >= outer.x and inner.y >= outer.y);
     try std.testing.expect(inner.x + inner.width <= outer.x + outer.width + 0.001);
     try std.testing.expect(inner.y + inner.height <= outer.y + outer.height + 0.001);
+}
+
+test "reveal patches express trigger, timing, and grouping changes" {
+    const click = applyRevealPatch(.{ .delay = 0.5, .after = 0.8 }, .{ .trigger = .click });
+    try std.testing.expectEqual(@as(?f32, null), click.delay);
+    try std.testing.expectEqual(@as(?f32, null), click.after);
+    try std.testing.expect(!click.first_waits);
+    try std.testing.expectEqual(RevealTrigger.click, revealTrigger(click));
+
+    const auto = applyRevealPatch(.{}, .{ .trigger = .auto });
+    try std.testing.expectEqual(@as(?f32, default_auto_reveal_delay), auto.delay);
+    try std.testing.expectEqual(@as(?f32, default_auto_reveal_after), auto.after);
+    try std.testing.expectEqual(RevealTrigger.auto, revealTrigger(auto));
+
+    const kept = applyRevealPatch(.{ .after = 0.3 }, .{ .trigger = .auto });
+    try std.testing.expectEqual(@as(?f32, 0.3), kept.after);
+    try std.testing.expectEqual(@as(?f32, null), kept.delay);
+
+    const click_then_auto = applyRevealPatch(.{}, .{ .trigger = .click_then_auto });
+    try std.testing.expect(click_then_auto.first_waits);
+    try std.testing.expectEqual(@as(?f32, default_auto_reveal_after), click_then_auto.after);
+    try std.testing.expectEqual(RevealTrigger.click_then_auto, revealTrigger(click_then_auto));
+
+    const seconds = applyRevealPatch(click_then_auto, .{ .delay = .{ .seconds = 1.5 }, .effect = .slide_up, .by = .bullet, .easing = .spring, .duration = 0.4 });
+    try std.testing.expect(!seconds.first_waits);
+    try std.testing.expectEqual(@as(?f32, 1.5), seconds.delay);
+    try std.testing.expectEqual(animation.Effect.slide_up, seconds.effect);
+    try std.testing.expectEqual(animation.Grouping.bullet, seconds.by);
+    try std.testing.expectEqual(animation.Easing.spring, seconds.easing);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), seconds.duration, 0.0001);
+
+    try std.testing.expect(textHasBulletLines("Intro\n- one\n    - two"));
+    try std.testing.expect(textHasBulletLines("> quoted"));
+    try std.testing.expect(!textHasBulletLines("plain\nlines"));
+    try std.testing.expect(!textHasBulletLines(null));
+}
+
+test "Motion inspector strips and fields emit reveal commands for the selection" {
+    var items = [_]slides.SlideItem{
+        testItem(7, .textbox, 100, 100, 400, 300),
+        testItem(8, .img, 700, 100, 300, 300),
+    };
+    items[0].text = "Intro\n- one\n- two";
+    items[0].animation = .{ .effect = .fade, .by = .bullet, .duration = 0.25 };
+    const builds = [_]RevealBuildSummary{
+        .{ .owner_identity = 7, .first_step = 1, .step_count = 2, .spec = items[0].animation.?, .label = "list" },
+    };
+    const workspace: Workspace = .{ .visible = true, .builds = &builds };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const inspector = objectsLayout(viewport);
+    const layout = motionLayout(viewport);
+    try std.testing.expect(layout.panel.width > 0);
+
+    var studio: Studio = .{ .enabled = true, .inspector_panel = .properties };
+    setTestSelection(&studio, &items, &.{7});
+
+    // The tab switch is view-only.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(inspector.motion_tab),
+    });
+    try std.testing.expectEqual(InspectorPanel.motion, studio.inspector_panel);
+    try std.testing.expect(!studio.dirty);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(@as(usize, 1), studio.build_count);
+
+    // Trigger: Auto.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.trigger[2]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_item_reveal => |command| {
+            try std.testing.expectEqual(RevealAction.patch, command.action);
+            try std.testing.expectEqual(@as(usize, 1), command.targets.count);
+            try std.testing.expectEqual(@as(usize, 7), command.targets.targets[0].item_identity);
+            try std.testing.expectEqual(RevealTrigger.auto, command.patch.trigger.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Effect and grouping strips.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.effect[4]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_item_reveal => |command| try std.testing.expectEqual(animation.Effect.slide_up, command.patch.effect.?),
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.grouping[1]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_item_reveal => |command| try std.testing.expectEqual(animation.Grouping.line, command.patch.by.?),
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.easing[2]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_item_reveal => |command| try std.testing.expectEqual(animation.Easing.spring, command.patch.easing.?),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Inline delay field: click, type, submit -> commit_inline for reveal_delay.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.fields[0]),
+    });
+    try std.testing.expect(studio.inline_editor.active);
+    try std.testing.expectEqual(InlineField.reveal_delay, studio.inline_editor.field);
+    var typed: FrameInput = .{};
+    typed.inline_chars[0] = '0';
+    typed.inline_chars[1] = '.';
+    typed.inline_chars[2] = '5';
+    typed.inline_chars_len = 3;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .commit_inline => |commit| {
+            try std.testing.expectEqual(InlineField.reveal_delay, commit.field);
+            try std.testing.expectEqualStrings("0.5", commit.value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    studio.acceptInlineCommit(.reveal_delay);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cancel_pressed = true });
+    try std.testing.expect(!studio.inline_editor.active);
+
+    // Remove reveal on a direct item.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.remove_reveal),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_item_reveal => |command| try std.testing.expectEqual(RevealAction.remove, command.action),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // An image without a reveal: an effect click creates one from the template.
+    setTestSelection(&studio, &items, &.{8});
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.effect[1]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_item_reveal => |command| {
+            try std.testing.expectEqual(animation.Effect.fade, command.patch.effect.?);
+            try std.testing.expectEqual(animation.Grouping.item, command.template.by);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Reveals cannot be authored in a morph scene.
+    studio.setMorphStateCount(1);
+    studio.setActiveMorphState(&items, 0);
+    setTestSelection(&studio, &items, &.{7});
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.trigger[2]),
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+}
+
+test "timeline BUILD cards and chips select reveal steps and scene cycling visits builds" {
+    var items = [_]slides.SlideItem{
+        testItem(7, .textbox, 100, 100, 400, 300),
+        testItem(9, .img, 700, 100, 300, 300),
+    };
+    items[0].animation = .{ .effect = .fade, .by = .bullet };
+    items[1].animation = .{ .effect = .slide_up };
+    const builds = [_]RevealBuildSummary{
+        .{ .owner_identity = 7, .first_step = 1, .step_count = 3, .spec = items[0].animation.?, .label = "list" },
+        .{ .owner_identity = 9, .first_step = 4, .step_count = 1, .spec = items[1].animation.?, .label = "pic" },
+    };
+    const states = [_]MorphStateSummary{.{ .index = 0, .label = "focus" }};
+    const workspace: Workspace = .{ .visible = true, .builds = &builds, .morph_states = &states };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const layout = morphTimelineLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+    studio.setMorphStateCount(1);
+
+    // Card 1 = first build: show through its last step and select its owner.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(morphTimelineCardRect(layout, 1).?),
+    });
+    try std.testing.expectEqual(@as(?usize, 3), studio.visible_reveal_step);
+    try std.testing.expectEqual(@as(?usize, null), studio.active_morph_state);
+    try std.testing.expectEqual(@as(?usize, 7), studio.selected_identity);
+    try std.testing.expectEqual(@as(usize, 1), studio.activeTimelineScene());
+    try std.testing.expect(!studio.dirty);
+    _ = studio.takeSemanticCommand();
+
+    // A step chip narrows the visible step.
+    const card = morphTimelineCardRect(layout, 1).?;
+    const chip = timelineStepChipRect(layout, card, 0, 3).?;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(chip),
+    });
+    try std.testing.expectEqual(@as(?usize, 1), studio.visible_reveal_step);
+    _ = studio.takeSemanticCommand();
+
+    // Cycling: build 1 -> build 2 -> state -> base -> build 1.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cycle_morph_scene = 1 });
+    try std.testing.expectEqual(@as(?usize, 4), studio.visible_reveal_step);
+    try std.testing.expectEqual(@as(?usize, 9), studio.selected_identity);
+    _ = studio.takeSemanticCommand();
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cycle_morph_scene = 1 });
+    try std.testing.expectEqual(@as(?usize, 0), studio.active_morph_state);
+    try std.testing.expectEqual(@as(?usize, null), studio.visible_reveal_step);
+    try std.testing.expectEqual(@as(usize, 3), studio.activeTimelineScene());
+    _ = studio.takeSemanticCommand();
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cycle_morph_scene = 1 });
+    try std.testing.expectEqual(@as(?usize, null), studio.active_morph_state);
+    try std.testing.expectEqual(@as(usize, 0), studio.activeTimelineScene());
+    _ = studio.takeSemanticCommand();
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cycle_morph_scene = 1 });
+    try std.testing.expectEqual(@as(?usize, 3), studio.visible_reveal_step);
+    _ = studio.takeSemanticCommand();
+
+    // The BASE card clears the reveal-step scene.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(morphTimelineCardRect(layout, 0).?),
+    });
+    try std.testing.expectEqual(@as(?usize, null), studio.visible_reveal_step);
+    try std.testing.expectEqual(@as(usize, 0), studio.activeTimelineScene());
+    _ = studio.takeSemanticCommand();
+
+    // A stale step (no matching build in the next workspace) is dropped.
+    studio.visible_reveal_step = 2;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, .{ .visible = true, .morph_states = &states }, .{});
+    try std.testing.expectEqual(@as(?usize, null), studio.visible_reveal_step);
+}
+
+test "timeline transport tiers keep at least three cards and emit preview commands only" {
+    const compact_viewport = frameLayout(.{ .x = 0, .y = 0, .width = 900, .height = 506 }, true, false, .slides).viewport;
+    const compact_layout = morphTimelineLayout(compact_viewport);
+    try std.testing.expect(morphTimelineCardCapacity(compact_layout) >= 3);
+    try std.testing.expect(compact_layout.transport_play.width > 0);
+    try std.testing.expect(compact_layout.transport_scrubber.width == 0);
+
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const layout = morphTimelineLayout(viewport);
+    try std.testing.expect(layout.transport_scrubber.width > 0);
+    try std.testing.expect(layout.transport_loop.width > 0);
+    try std.testing.expect(morphTimelineCardCapacity(layout) >= 3);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), transportSeekTime(layout, layout.transport_scrubber.x + layout.transport_scrubber.width / 2, 4.0), 0.01);
+
+    var items = [_]slides.SlideItem{testItem(7, .textbox, 100, 100, 400, 300)};
+    items[0].animation = .{ .effect = .fade };
+    const builds = [_]RevealBuildSummary{.{ .owner_identity = 7, .first_step = 1, .step_count = 1, .spec = items[0].animation.? }};
+    const workspace: Workspace = .{ .visible = true, .builds = &builds };
+    var studio: Studio = .{ .enabled = true };
+
+    // Unavailable preview: the transport is inert.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transport_play),
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    studio.setMotionPreview(.{ .available = true, .total = 4.0 });
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transport_play),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .motion_preview => |command| try std.testing.expectEqual(PreviewCommand.play, command),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!studio.dirty);
+
+    studio.setMotionPreview(.{ .available = true, .playing = true, .time = 1.0, .total = 4.0, .step = 1 });
+    try std.testing.expectEqual(@as(usize, 1), studio.previewSceneIndex());
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transport_play),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .motion_preview => |command| try std.testing.expectEqual(PreviewCommand.pause, command),
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .preview_toggle_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .motion_preview => |command| try std.testing.expectEqual(PreviewCommand.pause, command),
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transport_loop),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .motion_preview => |command| try std.testing.expectEqual(PreviewCommand.toggle_loop, command),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Scrubbing: press seeks, dragging keeps seeking, release ends the scrub.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_down = true,
+        .pointer_screen = .{ .x = layout.transport_scrubber.x + layout.transport_scrubber.width / 4, .y = rectangleCenter(layout.transport_scrubber).y },
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .motion_preview => |command| switch (command) {
+            .seek => |seconds| try std.testing.expectApproxEqAbs(@as(f32, 1.0), seconds, 0.05),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(studio.preview_scrubbing);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_down = true,
+        .pointer_screen = .{ .x = layout.transport_scrubber.x + layout.transport_scrubber.width, .y = 0 },
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .motion_preview => |command| switch (command) {
+            .seek => |seconds| try std.testing.expectApproxEqAbs(@as(f32, 4.0), seconds, 0.05),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .pointer_released = true });
+    try std.testing.expect(!studio.preview_scrubbing);
+
+    // Escape stops an active preview instead of leaving Studio.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cancel_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .motion_preview => |command| try std.testing.expectEqual(PreviewCommand.stop, command),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(studio.enabled);
+    try std.testing.expect(!studio.dirty);
+    try std.testing.expect(studio.takeGeometryBatch() == null);
+}
+
+test "State section edits the active morph state and its objects without touching the base scene" {
+    var items = [_]slides.SlideItem{
+        testItem(7, .textbox, 100, 100, 400, 300),
+        testItem(8, .img, 700, 100, 300, 300),
+    };
+    items[0].id = "title";
+    items[0].state_source_state = 0;
+    items[0].state_source = .{ .scope = .morph_item, .line_offset = 10, .patchable = true };
+    items[1].id = "hero";
+    const states = [_]MorphStateSummary{.{ .index = 0, .label = "focus", .duration = 0.8, .easing = .spring }};
+    const workspace: Workspace = .{ .visible = true, .morph_states = &states };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const layout = motionLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .inspector_panel = .motion };
+    studio.setMorphStateCount(1);
+    studio.setActiveMorphState(&items, 0);
+    const changes = [_]StateChangeSummary{.{ .identity = 7, .label = "title", .kind = .changed }};
+    studio.setMorphSceneContext(&.{}, &changes);
+
+    // Auto trigger and easing patch the state directive.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.state_trigger[1]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_morph_state_timing => |timing| {
+            try std.testing.expectEqual(@as(usize, 0), timing.state_index);
+            try std.testing.expectEqual(@as(?f32, default_auto_state_after), timing.after.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.state_easing[0]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_morph_state_timing => |timing| try std.testing.expectEqual(animation.Easing.linear, timing.easing.?),
+        else => return error.TestUnexpectedResult,
+    }
+    // Clicking the already-active easing is a no-op.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.state_easing[2]),
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    // Scene inline field: label, then Tab to AFTER.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.state_fields[0]),
+    });
+    try std.testing.expect(studio.inline_editor.active);
+    try std.testing.expectEqual(InlineField.state_label, studio.inline_editor.field);
+    try std.testing.expectEqualStrings("focus", studio.inline_editor.text());
+    var typed: FrameInput = .{};
+    typed.inline_chars[0] = 'z';
+    typed.inline_chars_len = 1;
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, typed);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .inline_submit_pressed = true });
+    switch (studio.takeSemanticCommand().?) {
+        .commit_inline => |commit| {
+            try std.testing.expectEqual(InlineField.state_label, commit.field);
+            try std.testing.expectEqual(@as(?usize, 0), commit.scene_state);
+            try std.testing.expectEqualStrings("z", commit.value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    studio.acceptInlineCommit(.state_label);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .toggle_focus_canvas_pressed = true });
+    try std.testing.expect(studio.inline_editor.active);
+    try std.testing.expectEqual(InlineField.state_after, studio.inline_editor.field);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cancel_pressed = true });
+    try std.testing.expect(!studio.inline_editor.active);
+    try std.testing.expect(studio.enabled);
+
+    // Reset and Exit need a selected object with an ID; change rows select.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.state_change_rows[0]),
+    });
+    try std.testing.expectEqual(@as(?usize, 7), studio.selected_identity);
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.state_actions[0]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .reset_morph_object => |target| try std.testing.expectEqual(@as(usize, 7), target.item_identity),
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.state_actions[2]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .exit_morph_object => |exit| {
+            try std.testing.expectEqual(@as(usize, 7), exit.target.item_identity);
+            try std.testing.expectEqual(ExitDirection.right, exit.direction);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    setTestSelection(&studio, &items, &.{8});
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.state_actions[0]),
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.property_unavailable, studio.notice);
+    try std.testing.expect(!studio.dirty);
+    try std.testing.expect(studio.takeGeometryBatch() == null);
+}
+
+test "Transition section and timeline chip author the slide transition without touching items" {
+    var items = [_]slides.SlideItem{testItem(7, .textbox, 100, 100, 400, 300)};
+    const workspace: Workspace = .{
+        .visible = true,
+        .transition = .{
+            .transition = .{ .effect = .slide_left, .duration = 0.45 },
+            .provenance = .template,
+            .template_name = "content",
+            .deck = .{ .effect = .fade, .duration = 0.35 },
+            .can_author = true,
+            .has_previous_slide = true,
+        },
+    };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const layout = motionLayout(viewport);
+    const timeline = morphTimelineLayout(viewport);
+    var studio: Studio = .{ .enabled = true, .inspector_panel = .objects };
+    setTestSelection(&studio, &items, &.{7});
+
+    // The chip clears the selection and opens Motion on the transition.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(timeline.transition_chip),
+    });
+    try std.testing.expectEqual(InspectorPanel.motion, studio.inspector_panel);
+    try std.testing.expectEqual(@as(usize, 0), studio.selectionCount());
+    try std.testing.expect(!studio.dirty);
+    _ = studio.takeSemanticCommand();
+
+    // Effect cell writes a local override; Inherit is a no-op while the
+    // value is inherited from the template.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transition_effects[3]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_slide_transition => |change| {
+            try std.testing.expectEqual(animation.Effect.fade, change.effect.?);
+            try std.testing.expect(!change.inherit);
+            try std.testing.expect(!change.shared);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transition_effects[0]),
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+
+    // Alt targets the shared template.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .allow_shared_edit = true,
+        .pointer_screen = rectangleCenter(layout.transition_effects[6]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_slide_transition => |change| {
+            try std.testing.expectEqual(animation.Effect.slide_up, change.effect.?);
+            try std.testing.expect(change.shared);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Easing strip and duration field.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transition_easing[2]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_slide_transition => |change| try std.testing.expectEqual(animation.Easing.spring, change.easing.?),
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transition_duration),
+    });
+    try std.testing.expect(studio.inline_editor.active);
+    try std.testing.expectEqual(InlineField.transition_duration, studio.inline_editor.field);
+    try std.testing.expectEqualStrings("0.45", studio.inline_editor.text());
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{ .cancel_pressed = true });
+    try std.testing.expect(!studio.inline_editor.active);
+
+    // Deck default actions.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transition_deck_actions[0]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_deck_transition => |defaults| try std.testing.expectEqual(animation.Effect.slide_left, defaults.?.effect),
+        else => return error.TestUnexpectedResult,
+    }
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transition_deck_actions[1]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .set_deck_transition => |defaults| try std.testing.expect(defaults == null),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Implicit first slide: nothing can be authored.
+    const implicit: Workspace = .{ .visible = true, .transition = .{ .can_author = false } };
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, implicit, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.transition_effects[3]),
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expectEqual(Notice.transition_needs_slide_directive, studio.notice);
+    try std.testing.expect(!studio.dirty);
+}
+
+test "timeline arrows reorder the active build without changing paint order" {
+    var items = [_]slides.SlideItem{
+        testItem(7, .textbox, 100, 100, 400, 300),
+        testItem(9, .img, 700, 100, 300, 300),
+    };
+    items[0].animation = .{ .effect = .fade, .by = .bullet };
+    items[1].animation = .{ .effect = .slide_up };
+    const builds = [_]RevealBuildSummary{
+        .{ .owner_identity = 7, .first_step = 1, .step_count = 2, .spec = items[0].animation.?, .label = "list" },
+        .{ .owner_identity = 9, .first_step = 3, .step_count = 1, .spec = items[1].animation.?, .label = "pic" },
+    };
+    const workspace: Workspace = .{ .visible = true, .builds = &builds };
+    const viewport = frameLayout(.{ .x = 0, .y = 0, .width = 1600, .height = 900 }, true, false, .slides).viewport;
+    const layout = morphTimelineLayout(viewport);
+    var studio: Studio = .{ .enabled = true };
+
+    // Select the second build, then move it earlier.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(morphTimelineCardRect(layout, 2).?),
+    });
+    try std.testing.expectEqual(@as(?usize, 1), studio.activeBuildIndex());
+    _ = studio.takeSemanticCommand();
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.actions[4]),
+    });
+    switch (studio.takeSemanticCommand().?) {
+        .move_reveal_build => |move| {
+            try std.testing.expectEqual(@as(usize, 9), move.owner_identity);
+            try std.testing.expectEqual(MorphStateMoveDirection.earlier, move.direction);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // The last build cannot move later; no command is emitted.
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(morphTimelineCardRect(layout, 2).?),
+    });
+    _ = studio.takeSemanticCommand();
+    _ = studio.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_pressed = true,
+        .pointer_screen = rectangleCenter(layout.actions[5]),
+    });
+    try std.testing.expect(studio.takeSemanticCommand() == null);
+    try std.testing.expect(!studio.dirty);
 }

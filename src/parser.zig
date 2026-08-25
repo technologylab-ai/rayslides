@@ -731,6 +731,17 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
                 continue;
             }
 
+            if (std.mem.startsWith(u8, line, "@transition=") or
+                std.mem.startsWith(u8, line, "@transition_duration=") or
+                std.mem.startsWith(u8, line, "@transition_ease="))
+            {
+                parseDefaultTransition(line, slideshow, context) catch |err| {
+                    reportErrorInContext(err, context, null);
+                    continue;
+                };
+                continue;
+            }
+
             if (std.mem.startsWith(u8, line, "@")) {
                 // commit current parsing_item_context
                 commitParsingContext(&parsing_item_context, context) catch |err| {
@@ -803,6 +814,7 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
     validateCurrentMorphIds(context, &parsing_item_context) catch |err| {
         reportErrorInContext(err, context, "could not validate morph ids");
     };
+    context.current_slide.applyDefaultTransition(context.slideshow);
     context.slideshow.slides.append(context.allocator, context.current_slide) catch |err| {
         reportErrorInContext(err, context, null);
     };
@@ -915,6 +927,41 @@ fn parseDefaultBulletColor(line: []const u8, slideshow: *slides.SlideShow, conte
             slideshow.default_bullet_color = try parseColor(line[8..], context); // line[8] is beginning of word 'color' inside @bullet_color
             log.debug("global default_bullet_color: {any}", .{slideshow.default_bullet_color});
         }
+    }
+}
+
+/// Deck-wide transition defaults: `@transition=EFFECT` enables the default,
+/// `@transition_duration=SECONDS` and `@transition_ease=EASING` refine it.
+fn parseDefaultTransition(line: []const u8, slideshow: *slides.SlideShow, context: *ParserContext) !void {
+    var it = std.mem.tokenizeScalar(u8, line, '=');
+    const word = it.next() orelse return;
+    const raw_value = it.next() orelse {
+        reportErrorInContext(ParserError.Syntax, context, "global transition directive needs a value");
+        return;
+    };
+    const value = std.mem.trim(u8, raw_value, " \t\r");
+    if (std.mem.eql(u8, word, "@transition")) {
+        slideshow.default_transition.effect = animation.parseEffect(value) catch {
+            reportErrorInContext(ParserError.Syntax, context, "unknown @transition= effect");
+            return;
+        };
+        slideshow.has_default_transition = true;
+        log.debug("global default transition: {s}", .{value});
+    } else if (std.mem.eql(u8, word, "@transition_duration")) {
+        const duration = std.fmt.parseFloat(f32, value) catch {
+            reportErrorInContext(ParserError.Syntax, context, "@transition_duration= value not float-parseable");
+            return;
+        };
+        if (!std.math.isFinite(duration) or duration < 0) {
+            reportErrorInContext(ParserError.Syntax, context, "@transition_duration= must not be negative");
+            return;
+        }
+        slideshow.default_transition.duration = duration;
+    } else if (std.mem.eql(u8, word, "@transition_ease")) {
+        slideshow.default_transition.easing = animation.parseEasing(value) catch {
+            reportErrorInContext(ParserError.Syntax, context, "unknown @transition_ease= easing; use linear, smooth, or spring");
+            return;
+        };
     }
 }
 
@@ -1066,6 +1113,19 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
             }
             var attr_it = std.mem.tokenizeScalar(u8, word, '=');
             if (attr_it.next()) |attrname| {
+                // `@anim` and `@state(morph)` have closed vocabularies. A
+                // silently ignored key (`name=`, `easing=`, a typo) would lose
+                // authored intent, so it is diagnosed instead.
+                if (std.mem.eql(u8, item_context.directive, "@anim") and !isRevealAttribute(attrname)) {
+                    const errmsg = try std.fmt.allocPrint(context.allocator, "unknown @anim attribute `{s}`", .{attrname});
+                    reportErrorInContext(ParserError.Syntax, context, errmsg);
+                    continue;
+                }
+                if (std.mem.eql(u8, item_context.directive, "@state") and !isMorphStateAttribute(attrname)) {
+                    const errmsg = try std.fmt.allocPrint(context.allocator, "unknown @state(morph) attribute `{s}`", .{attrname});
+                    reportErrorInContext(ParserError.Syntax, context, errmsg);
+                    continue;
+                }
                 if (std.mem.eql(u8, attrname, "id")) {
                     if (attr_it.next()) |id| {
                         item_context.id = id;
@@ -1505,6 +1565,9 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                             continue;
                         };
                         item_context.animation = spec;
+                        // `anim=none` on an instance line explicitly disables a
+                        // reveal inherited from its `@push` definition.
+                        item_context.animation_disabled = spec.effect == .none;
                     }
                 }
                 if (std.mem.eql(u8, attrname, "by")) {
@@ -1538,18 +1601,66 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         }
                     }
                 }
-                if (std.mem.eql(u8, attrname, "ease")) {
-                    if (attr_it.next()) |easingstr| {
-                        if (!std.mem.eql(u8, item_context.directive, "@state")) {
-                            reportErrorInContext(ParserError.Syntax, context, "ease= is only valid on @state(morph)");
+                if (std.mem.eql(u8, attrname, "delay")) {
+                    if (attr_it.next()) |delaystr| {
+                        if (std.mem.eql(u8, item_context.directive, "@state")) {
+                            reportErrorInContext(ParserError.Syntax, context, "delay= is only valid on reveal animations; use after= on @state(morph)");
                             continue;
                         }
-                        var spec = item_context.morph orelse animation.MorphSpec{};
-                        spec.easing = animation.parseEasing(easingstr) catch |err| {
-                            reportErrorInContext(err, context, "unknown morph easing");
+                        var spec = item_context.animation orelse animation.ItemSpec{};
+                        if (std.mem.eql(u8, delaystr, "click")) {
+                            spec.first_waits = true;
+                            spec.delay = null;
+                            item_context.animation = spec;
+                            continue;
+                        }
+                        const delay = std.fmt.parseFloat(f32, delaystr) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse animation delay= (use seconds or click)");
                             continue;
                         };
-                        item_context.morph = spec;
+                        if (!std.math.isFinite(delay) or delay < 0) {
+                            reportErrorInContext(ParserError.Syntax, context, "animation delay= must not be negative");
+                            continue;
+                        }
+                        spec.first_waits = false;
+                        spec.delay = delay;
+                        item_context.animation = spec;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "order")) {
+                    if (attr_it.next()) |orderstr| {
+                        if (std.mem.eql(u8, item_context.directive, "@state")) {
+                            reportErrorInContext(ParserError.Syntax, context, "order= is only valid on reveal animations");
+                            continue;
+                        }
+                        const order = std.fmt.parseInt(i32, orderstr, 10) catch |err| {
+                            reportErrorInContext(err, context, "cannot parse animation order=");
+                            continue;
+                        };
+                        var spec = item_context.animation orelse animation.ItemSpec{};
+                        spec.order = order;
+                        item_context.animation = spec;
+                    }
+                }
+                if (std.mem.eql(u8, attrname, "ease")) {
+                    if (attr_it.next()) |easingstr| {
+                        const easing = animation.parseEasing(easingstr) catch |err| {
+                            reportErrorInContext(err, context, "unknown easing; use linear, smooth, or spring");
+                            continue;
+                        };
+                        if (std.mem.eql(u8, item_context.directive, "@state")) {
+                            var spec = item_context.morph orelse animation.MorphSpec{};
+                            spec.easing = easing;
+                            item_context.morph = spec;
+                        } else if (isSlideBoundaryDirectiveName(item_context.directive)) {
+                            var transition = item_context.transition orelse animation.Transition{};
+                            transition.easing = easing;
+                            item_context.transition = transition;
+                        } else {
+                            var spec = item_context.animation orelse animation.ItemSpec{};
+                            spec.easing = easing;
+                            item_context.animation = spec;
+                        }
                     }
                 }
                 if (std.mem.eql(u8, attrname, "label")) {
@@ -1620,6 +1731,30 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
         item_context.morph = animation.MorphSpec{};
     }
     return item_context;
+}
+
+fn isRevealAttribute(name: []const u8) bool {
+    return std.mem.eql(u8, name, "anim") or
+        std.mem.eql(u8, name, "effect") or
+        std.mem.eql(u8, name, "by") or
+        std.mem.eql(u8, name, "after") or
+        std.mem.eql(u8, name, "delay") or
+        std.mem.eql(u8, name, "duration") or
+        std.mem.eql(u8, name, "ease") or
+        std.mem.eql(u8, name, "order");
+}
+
+fn isMorphStateAttribute(name: []const u8) bool {
+    return std.mem.eql(u8, name, "label") or
+        std.mem.eql(u8, name, "after") or
+        std.mem.eql(u8, name, "duration") or
+        std.mem.eql(u8, name, "ease");
+}
+
+fn isSlideBoundaryDirectiveName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@slide") or
+        std.mem.eql(u8, name, "@popslide") or
+        std.mem.eql(u8, name, "@pushslide");
 }
 
 fn isMorphStateLabel(label: []const u8) bool {
@@ -2071,6 +2206,10 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                 context.current_context.text = null;
                 context.current_context.img_path = null;
                 context.current_context.vid_path = null;
+                // A reveal belongs to the instance, never to the style context
+                // that later items on the slide inherit.
+                context.current_context.animation = null;
+                context.current_context.animation_disabled = false;
                 context.current_context.vid_is_camera = null;
                 context.current_context.vid_camera_size = null;
                 context.current_context.vid_camera_poster = null;
@@ -2103,6 +2242,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
             var previous_slide_context = parsing_item_context.*;
             previous_slide_context.transition = null;
             context.current_slide.applyContext(&previous_slide_context); // ignore the new slide's transition
+            context.current_slide.applyDefaultTransition(context.slideshow);
             try context.slideshow.slides.append(context.allocator, context.current_slide);
         }
         context.first_slide_emitted = true;
@@ -2123,7 +2263,10 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                     context.current_slide = try slides.Slide.fromSlide(sld, context.allocator);
                     context.current_slide.pos_in_editor = parsing_item_context.line_offset;
                     context.current_slide.line_in_editor = parsing_item_context.line_number;
-                    if (parsing_item_context.transition) |transition| context.current_slide.transition = transition;
+                    if (parsing_item_context.transition) |transition| {
+                        context.current_slide.transition = transition;
+                        context.current_slide.transition_authored = true;
+                    }
                     context.template_instance_base_open = true;
                 }
             } else {
@@ -2148,6 +2291,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
             var previous_slide_context = parsing_item_context.*;
             previous_slide_context.transition = null;
             context.current_slide.applyContext(&previous_slide_context); // ignore the new slide's transition
+            context.current_slide.applyDefaultTransition(context.slideshow);
             try context.slideshow.slides.append(context.allocator, context.current_slide);
         }
         context.first_slide_emitted = true;
@@ -3973,4 +4117,162 @@ test "reusable group syntax rejects dynamic names missing ids dangling anim and 
     try std.testing.expect(context.parser_errors.items.len >= 3);
     try std.testing.expectEqual(@as(usize, 0), slideshow.slides.items[0].items.?.items.len);
     try std.testing.expectEqual(@as(usize, 0), context.reusable_groups.count());
+}
+
+fn testParserHasErrorContaining(context: *const ParserContext, needle: []const u8) bool {
+    for (context.parser_errors.items) |err| {
+        if (err.message) |message| {
+            if (std.mem.indexOf(u8, message, needle) != null) return true;
+        }
+    }
+    return false;
+}
+
+test "reveal delay easing and order parse on decorators and inline forms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        "@slide\n" ++
+        "@anim(slide-left) by=bullet delay=0.5 after=0.8 duration=0.25 ease=spring order=2\n" ++
+        "@box id=list x=1 y=1 w=100 h=100\n" ++
+        "- a\n" ++
+        "@box id=pic img=x.png x=1 y=1 anim=fade delay=0.2 ease=linear\n" ++
+        "@box id=plain x=1 y=1 anim=slide-up\n" ++
+        "@anim(fade) by=line delay=click after=0.4\n" ++
+        "@box id=lines x=1 y=1 w=100 h=100\n" ++
+        "one\n" ++
+        "two\n";
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    const list = items[0].animation.?;
+    try std.testing.expectEqual(animation.Effect.slide_left, list.effect);
+    try std.testing.expectEqual(animation.Grouping.bullet, list.by);
+    try std.testing.expectEqual(@as(?f32, 0.5), list.delay);
+    try std.testing.expectEqual(@as(?f32, 0.8), list.after);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), list.duration, 0.0001);
+    try std.testing.expectEqual(animation.Easing.spring, list.easing);
+    try std.testing.expectEqual(@as(i32, 2), list.order);
+    const pic = items[1].animation.?;
+    try std.testing.expectEqual(@as(?f32, 0.2), pic.delay);
+    try std.testing.expectEqual(@as(?f32, null), pic.after);
+    try std.testing.expectEqual(animation.Easing.linear, pic.easing);
+    const plain = items[2].animation.?;
+    try std.testing.expectEqual(@as(?f32, null), plain.delay);
+    try std.testing.expectEqual(animation.Easing.smooth, plain.easing);
+    try std.testing.expectEqual(@as(i32, 0), plain.order);
+    const lines = items[3].animation.?;
+    try std.testing.expect(lines.first_waits);
+    try std.testing.expectEqual(@as(?f32, null), lines.afterForStep(0));
+    try std.testing.expectEqual(@as(?f32, 0.4), lines.afterForStep(1));
+}
+
+test "unknown @anim and @state keys and misplaced timing keys are diagnosed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        "@slide\n" ++
+        "@anim(fade) name=x\n" ++
+        "@box id=a x=1 y=1\n" ++
+        "@anim(fade) ease=rubber\n" ++
+        "@box id=b x=1 y=1\n" ++
+        "@box id=c x=1 y=1 delay=-1\n" ++
+        "@state(morph) name=review\n" ++
+        "@state(morph) delay=1\n" ++
+        "@state(morph) order=1\n";
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expect(testParserHasErrorContaining(context, "unknown @anim attribute `name`"));
+    try std.testing.expect(testParserHasErrorContaining(context, "unknown easing"));
+    try std.testing.expect(testParserHasErrorContaining(context, "delay= must not be negative"));
+    try std.testing.expect(testParserHasErrorContaining(context, "unknown @state(morph) attribute `name`"));
+    try std.testing.expect(testParserHasErrorContaining(context, "unknown @state(morph) attribute `delay`"));
+    try std.testing.expect(testParserHasErrorContaining(context, "unknown @state(morph) attribute `order`"));
+}
+
+test "deck transition defaults apply to unauthored slides only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        "@transition=fade\n" ++
+        "@transition_duration=0.5\n" ++
+        "@transition_ease=spring\n" ++
+        "@pushslide tpl transition=slide-left\n" ++
+        "@box id=t x=1 y=1\n" ++
+        "@slide\n" ++
+        "@box id=a x=1 y=1\n" ++
+        "@slide transition=none\n" ++
+        "@box id=b x=1 y=1\n" ++
+        "@popslide tpl\n" ++
+        "@popslide tpl transition=slide-up duration=0.2 ease=linear\n" ++
+        "@slide\n" ++
+        "@box id=z x=1 y=1\n";
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expect(slideshow.has_default_transition);
+    const s = slideshow.slides.items;
+    try std.testing.expectEqual(@as(usize, 5), s.len);
+    try std.testing.expectEqual(animation.Effect.fade, s[0].transition.effect);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), s[0].transition.duration, 0.0001);
+    try std.testing.expectEqual(animation.Easing.spring, s[0].transition.easing);
+    try std.testing.expect(!s[0].transition_authored);
+    try std.testing.expectEqual(animation.Effect.none, s[1].transition.effect);
+    try std.testing.expect(s[1].transition_authored);
+    try std.testing.expectEqual(animation.Effect.slide_left, s[2].transition.effect);
+    try std.testing.expect(s[2].transition_authored);
+    try std.testing.expectEqual(animation.Effect.slide_up, s[3].transition.effect);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), s[3].transition.duration, 0.0001);
+    try std.testing.expectEqual(animation.Easing.linear, s[3].transition.easing);
+    // The final slide is emitted at EOF and still receives the deck default.
+    try std.testing.expectEqual(animation.Effect.fade, s[4].transition.effect);
+    try std.testing.expectEqual(animation.Easing.spring, s[4].transition.easing);
+}
+
+test "a component reveal does not leak into later items through the popped context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        "@push comp x=1 y=1 w=100 h=100 fontsize=40 anim=fade\n" ++
+        "@slide\n" ++
+        "@pop comp\n" ++
+        "@box id=after x=1 y=1 text=Plain\n";
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expect(items[0].animation != null);
+    try std.testing.expectEqual(@as(?animation.ItemSpec, null), items[1].animation);
+    // Style context still flows from the popped component as before.
+    try std.testing.expectEqual(@as(?i32, 40), items[1].fontSize);
+}
+
+test "anim=none cancels an inherited reveal and creates no step" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        "@push comp x=1 y=1 w=100 h=100 anim=fade\n" ++
+        "@slide\n" ++
+        "@pop comp\n" ++
+        "@pop comp id=quiet anim=none\n" ++
+        "@anim(none)\n" ++
+        "@box id=direct x=1 y=1\n";
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = slideshow.slides.items[0].items.?.items;
+    try std.testing.expect(items[0].animation != null);
+    try std.testing.expectEqual(@as(?animation.ItemSpec, null), items[1].animation);
+    try std.testing.expectEqual(@as(?animation.ItemSpec, null), items[2].animation);
 }

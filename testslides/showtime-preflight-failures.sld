@@ -14,7 +14,7 @@
 @box id=outside x=1750 y=760 w=420 h=180 color=#ffb547ff
 @box id=glyph x=1064 y=520 w=700 h=90 fontsize=48 text=Unsupported glyph: 界
 
-@state(morph) name=review
+@state(morph) label=review
 @set outside x=1820
 
 @slide

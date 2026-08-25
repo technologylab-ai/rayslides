@@ -51,7 +51,7 @@
             <li><b>2</b><span><strong>Library</strong> lists reusable items, groups, and slide templates.</span></li>
             <li><b>3</b><span><strong>Canvas</strong> selects and moves the visible objects.</span></li>
             <li><b>4</b><span><strong>Inspector</strong> shows the object list or exact properties.</span></li>
-            <li><b>5</b><span><strong>Timeline</strong> selects the base scene or a morph state.</span></li>
+            <li><b>5</b><span><strong>Timeline</strong> selects the transition, the base scene, a reveal build, or a morph state, and plays the preview.</span></li>
           </ol>
 
           <h2>Create an object</h2>
@@ -201,6 +201,11 @@
             <figcaption><strong>Each row shows the source name and object type.</strong> Use Vis and U to change visibility or locking.</figcaption>
           </figure>
           <p>The Back, Down, Up, and Front buttons change the paint order. Studio makes each layer change one undo step.</p>
+
+          <h2>Author motion</h2>
+          <p>The third inspector tab, <strong>Motion</strong>, edits the selected object's reveal, the active morph state's timing, or the slide's incoming transition. Each choice writes the matching <code>.sld</code> keys in one undo step.</p>
+          <p>The timeline shows an <code>IN</code> transition chip, BASE, one BUILD card per reveal, and the STATE cards. Its transport plays the slide on the canvas: click <strong>Play</strong> or press <kbd>Shift</kbd> + <kbd>Space</kbd>, drag the scrubber, and press <kbd>Esc</kbd> or <strong>Stop</strong> to return to the selected scene.</p>
+          <p>See <a href="motion.html#author-motion-in-studio">Author motion in Studio</a> for the complete workflow.</p>
 
           <h2>Copy, paste, and duplicate</h2>
           <figure class="diagram">

@@ -16,6 +16,12 @@ pub const SlideShow = struct {
     default_color: rl.Color = .light_gray,
     default_bullet_color: rl.Color = .red,
     default_bullet_symbol: []const u8 = ">",
+    /// Deck-wide incoming transition applied to every slide whose own
+    /// boundary (or `@pushslide` template) does not author one. Enabled by a
+    /// global `@transition=EFFECT` directive; `@transition_duration=` and
+    /// `@transition_ease=` refine it.
+    default_transition: animation.Transition = .{},
+    has_default_transition: bool = false,
 
     // TODO: maybe later: font encountered while parsing
     fonts: std.ArrayList([]u8) = undefined,
@@ -50,6 +56,10 @@ pub const Slide = struct {
     underline_width: i32 = 1,
     line_height_factor: ?f32 = null,
     transition: animation.Transition = .{},
+    /// True when a slide boundary or its template authored `transition=`
+    /// explicitly (including `transition=none`). Unauthored slides receive
+    /// the deck default transition when they are emitted.
+    transition_authored: bool = false,
     morph_states: std.ArrayList(MorphState) = undefined,
     next_item_identity: usize = 1,
 
@@ -79,7 +89,16 @@ pub const Slide = struct {
         if (ctx.underline_width) |uw| self.underline_width = uw;
         if (ctx.bullet_symbol) |bs| self.bullet_symbol = bs;
         if (ctx.line_height_factor) |lhf| self.line_height_factor = lhf;
-        if (ctx.transition) |transition| self.transition = transition;
+        if (ctx.transition) |transition| {
+            self.transition = transition;
+            self.transition_authored = true;
+        }
+    }
+
+    /// Apply the deck default transition when this slide authored none.
+    pub fn applyDefaultTransition(self: *Slide, slideshow: *const SlideShow) void {
+        if (self.transition_authored or !slideshow.has_default_transition) return;
+        self.transition = slideshow.default_transition;
     }
 
     pub fn fromSlide(orig: *Slide, a: std.mem.Allocator) !*Slide {
@@ -94,6 +113,7 @@ pub const Slide = struct {
         n.underline_width = orig.underline_width;
         n.line_height_factor = orig.line_height_factor;
         n.transition = orig.transition;
+        n.transition_authored = orig.transition_authored;
         n.next_item_identity = orig.next_item_identity;
         try n.items.?.appendSlice(n.allocator, orig.items.?.items);
         for (orig.morph_states.items) |state| {
@@ -514,7 +534,10 @@ pub const SlideItem = struct {
         if (context.line_height_factor) |lhf| self.line_height_factor = lhf;
         if (context.scale) |s| self.scale = s;
         if (context.ratio) |r| self.ratio = r;
-        if (context.animation) |anim| self.animation = anim;
+        // `none` is "no reveal": it neither creates a step nor keeps an
+        // inherited one, so `anim=none` can cancel a reusable definition's
+        // reveal on one instance.
+        if (context.animation) |anim| self.animation = if (anim.effect == .none) null else anim;
         if (context.text_shadow) |shadow| self.text_shadow = shadow;
         if (context.crowd) |crowd| self.crowd = crowd;
         if (context.id) |id| self.id = id;
@@ -742,6 +765,9 @@ pub const ItemContext = struct {
     scale: ?f32 = null,
     ratio: ?f32 = null,
     animation: ?animation.ItemSpec = null,
+    /// `anim=none` was authored on this directive: no reveal is inherited
+    /// from a reusable definition and none is generated.
+    animation_disabled: bool = false,
     transition: ?animation.Transition = null,
     text_shadow: ?TextShadow = null,
     crowd: ?CrowdSpec = null,
@@ -846,7 +872,7 @@ pub const ItemContext = struct {
         if (self.ratio == null) {
             if (other.ratio) |r| self.ratio = r;
         }
-        if (self.animation == null) {
+        if (self.animation == null and !self.animation_disabled) {
             if (other.animation) |anim| self.animation = anim;
         }
         if (self.transition == null) {

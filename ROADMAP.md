@@ -366,6 +366,13 @@ Shipped increments:
   was invalidated and regenerated after the new render graph committed,
   yielding `READY FOR SHOW` with 9 fragments, 2 assets, and 1 definition.
 
+## Next: visual motion authoring
+
+The next Studio phase makes every reveal, morph-state, and transition
+capability of the `.sld` format visually authorable and previewable. It is
+sequenced in the [Motion Studio roadmap](MOTION_STUDIO_ROADMAP.md) and
+follows the same completion rules as the topics above.
+
 ## Final release gate
 
 - [x] Run the complete unit and round-trip suite in ReleaseSafe.

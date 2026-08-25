@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "scenario": "default-timeline",
+  "capture": { "width": 1600, "height": 900 },
+  "deck": { "slides": 4, "active_items": 3, "render_fragments": 8 },
+  "render": {
+    "events": 1, "last_mode": "full", "last_rebuilt": 4, "total_slides": 4,
+    "full_count": 1, "partial_count": 0, "unchanged_count": 0,
+    "last_full_ms": 26.996, "last_partial_ms": 0.000, "last_unchanged_ms": 0.000
+  },
+  "studio": { "prepare_ms": 0.025, "document_cache_builds": 1, "scene_cache_builds": 2, "composition_cache_builds": 1, "gallery_cache_builds": 2, "gallery_projected": 1, "gallery_placeholders": 0 },
+  "frame": { "latest_ms": 33.549, "sampled_peak_ms": 40.140, "sampled_slow_frames": 17 },
+  "parser_arena_bytes": 75050
+}

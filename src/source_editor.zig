@@ -1,4 +1,5 @@
 const std = @import("std");
+const animation = @import("animation.zig");
 
 /// Geometry values to write to one item directive. Width and height are left
 /// untouched when they are null.
@@ -1983,6 +1984,515 @@ pub fn renameMorphState(
     }
     const patches = [_]LiteralAttributePatch{.{ .key = "label", .value = label }};
     return patchLiteralAttributes(allocator, source, state_directive_offset, &patches);
+}
+
+// ---------------------------------------------------------------------------
+// Motion authoring primitives
+// ---------------------------------------------------------------------------
+
+/// Timing patch for one `@state(morph)` directive. Outer `null` leaves a key
+/// untouched; for `after`, an inner `null` removes the key so the state waits
+/// for a presentation action again.
+pub const MorphTimingPatch = struct {
+    after: ??f32 = null,
+    duration: ?f32 = null,
+    easing: ?animation.Easing = null,
+};
+
+fn formatSeconds(buffer: *[64]u8, value: f32) PatchError![]const u8 {
+    if (!std.math.isFinite(value) or value < 0) return error.InvalidLiteralValue;
+    const normalized: f32 = if (value == 0) 0 else value;
+    return std.fmt.bufPrint(buffer, "{d}", .{normalized}) catch return error.InvalidLiteralValue;
+}
+
+/// Remove every `key=value` (or bare `key`) token named in `keys` from one
+/// directive line, together with the whitespace run before each token. The
+/// remainder after `text=` is never scanned. Missing keys are not an error.
+pub fn removeLiteralAttributes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    directive_offset: usize,
+    keys: []const []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const line = try directiveLine(source, directive_offset);
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+
+    var cursor = line.start;
+    // Skip the directive token itself.
+    while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+    while (cursor < line.content_end) {
+        const whitespace_start = cursor;
+        while (cursor < line.content_end and isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        if (cursor == line.content_end) break;
+        const token_start = cursor;
+        while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token = source[token_start..cursor];
+        const key = if (std.mem.indexOfScalar(u8, token, '=')) |equals| token[0..equals] else token;
+        if (std.mem.eql(u8, key, "text")) break;
+        for (keys) |candidate| {
+            if (std.mem.eql(u8, candidate, key)) {
+                try edits.append(allocator, .{ .start = whitespace_start, .end = cursor, .replacement = "" });
+                break;
+            }
+        }
+    }
+    if (edits.items.len == 0) {
+        const copy = try allocator.dupe(u8, source);
+        return .{ .source = copy, .byte_delta = 0 };
+    }
+    return applyEdits(allocator, source, edits.items);
+}
+
+fn isGlobalValueDirective(name: []const u8) bool {
+    return std.mem.indexOfScalar(u8, name, '=') != null or std.mem.eql(u8, name, "@let");
+}
+
+/// Offset of the `@anim` decorator line the parser will attach to the item
+/// directive at `item_offset`, if any. The parser carries a pending reveal
+/// across global `@name=value` lines, `@let`, comments, and blank lines, but
+/// any other directive ends the search.
+pub fn ownedRevealDecorator(source: []const u8, item_offset: usize) PatchError!?usize {
+    const item_line = try directiveLine(source, item_offset);
+    var cursor = item_line.start;
+    while (previousPhysicalLine(source, cursor)) |line| {
+        const content = source[line.start..line.content_end];
+        if (content.len > 0 and content[0] == '@') {
+            const name = directiveName(content);
+            if (isAnimationDirective(name)) return line.start;
+            if (!isGlobalValueDirective(name)) return null;
+        }
+        if (line.start == sourceStart(source)) break;
+        cursor = line.start;
+    }
+    return null;
+}
+
+fn isInsideMorphState(source: []const u8, offset: usize) bool {
+    var inside = false;
+    var cursor = sourceStart(source);
+    while (cursor < offset) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const name = directiveName(source[cursor..line.content_end]);
+            if (isMorphStateDirective(name)) inside = true;
+            if (isSlideBoundaryDirective(name)) inside = false;
+        }
+        cursor = line.full_end;
+    }
+    return inside;
+}
+
+fn directiveHasInlineReveal(source: []const u8, line: DirectiveLine) bool {
+    var cursor = line.start;
+    while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+    while (cursor < line.content_end) {
+        while (cursor < line.content_end and isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token_start = cursor;
+        while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token = source[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals];
+        if (std.mem.eql(u8, key, "text")) return false;
+        if (std.mem.eql(u8, key, "anim") or std.mem.eql(u8, key, "effect")) return true;
+    }
+    return false;
+}
+
+const reveal_attribute_keys = [_][]const u8{ "anim", "effect", "by", "after", "delay", "duration", "ease", "order" };
+
+/// Canonical decorator text for one reveal spec. Only values that differ
+/// from the parser defaults are written, so a plain click-triggered fade on
+/// bullets becomes `@anim(fade) by=bullet`.
+pub fn formatRevealDirective(allocator: std.mem.Allocator, spec: animation.ItemSpec) (std.mem.Allocator.Error || PatchError)![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, "@anim(");
+    try output.appendSlice(allocator, animation.effectLiteral(spec.effect));
+    try output.append(allocator, ')');
+    var buffer: [64]u8 = undefined;
+    if (spec.by != .item) {
+        try output.appendSlice(allocator, " by=");
+        try output.appendSlice(allocator, animation.groupingLiteral(spec.by));
+    }
+    if (spec.first_waits) {
+        try output.appendSlice(allocator, " delay=click");
+    } else if (spec.delay) |delay| {
+        try output.appendSlice(allocator, " delay=");
+        try output.appendSlice(allocator, try formatSeconds(&buffer, delay));
+    }
+    if (spec.after) |after| {
+        try output.appendSlice(allocator, " after=");
+        try output.appendSlice(allocator, try formatSeconds(&buffer, after));
+    }
+    if (spec.duration != (animation.ItemSpec{}).duration) {
+        try output.appendSlice(allocator, " duration=");
+        try output.appendSlice(allocator, try formatSeconds(&buffer, spec.duration));
+    }
+    if (spec.easing != .smooth) {
+        try output.appendSlice(allocator, " ease=");
+        try output.appendSlice(allocator, animation.easingLiteral(spec.easing));
+    }
+    if (spec.order != 0) {
+        const order_text = std.fmt.bufPrint(&buffer, "{d}", .{spec.order}) catch return error.InvalidLiteralValue;
+        try output.appendSlice(allocator, " order=");
+        try output.appendSlice(allocator, order_text);
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+/// Author or replace the reveal of the item directive at `item_offset`.
+///
+/// An owned `@anim` decorator line is rewritten canonically; an inline
+/// `anim=` form is patched in place; otherwise a decorator line is inserted
+/// immediately before the item. Items born inside morph states, generated
+/// lines, and lines with `@let` expansion are refused.
+pub fn setItemReveal(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    item_offset: usize,
+    spec: animation.ItemSpec,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const item_line = try directiveLine(source, item_offset);
+    if (hasPotentialLetExpansion(source[item_line.start..item_line.content_end])) return error.InvalidDirectiveOffset;
+    if (isInsideMorphState(source, item_offset)) return error.InvalidItemScene;
+    const name = directiveName(source[item_line.start..item_line.content_end]);
+    if (!(directiveEmitsSlideItem(name) or std.mem.eql(u8, name, "@line"))) return error.InvalidDirectiveOffset;
+
+    if (directiveHasInlineReveal(source, item_line)) {
+        const removed = try removeLiteralAttributes(allocator, source, item_offset, &reveal_attribute_keys);
+        defer removed.deinit(allocator);
+        var patches = std.ArrayList(LiteralAttributePatch).empty;
+        defer patches.deinit(allocator);
+        var delay_buffer: [64]u8 = undefined;
+        var after_buffer: [64]u8 = undefined;
+        var duration_buffer: [64]u8 = undefined;
+        var order_buffer: [64]u8 = undefined;
+        try patches.append(allocator, .{ .key = "anim", .value = animation.effectLiteral(spec.effect) });
+        if (spec.by != .item) try patches.append(allocator, .{ .key = "by", .value = animation.groupingLiteral(spec.by) });
+        if (spec.first_waits) {
+            try patches.append(allocator, .{ .key = "delay", .value = "click" });
+        } else if (spec.delay) |delay| {
+            try patches.append(allocator, .{ .key = "delay", .value = try formatSeconds(&delay_buffer, delay) });
+        }
+        if (spec.after) |after| try patches.append(allocator, .{ .key = "after", .value = try formatSeconds(&after_buffer, after) });
+        if (spec.duration != (animation.ItemSpec{}).duration) {
+            try patches.append(allocator, .{ .key = "duration", .value = try formatSeconds(&duration_buffer, spec.duration) });
+        }
+        if (spec.easing != .smooth) try patches.append(allocator, .{ .key = "ease", .value = animation.easingLiteral(spec.easing) });
+        if (spec.order != 0) {
+            const order_text = std.fmt.bufPrint(&order_buffer, "{d}", .{spec.order}) catch return error.InvalidLiteralValue;
+            try patches.append(allocator, .{ .key = "order", .value = order_text });
+        }
+        return patchLiteralAttributes(allocator, removed.source, item_offset, patches.items);
+    }
+
+    const directive = try formatRevealDirective(allocator, spec);
+    defer allocator.free(directive);
+    if (try ownedRevealDecorator(source, item_offset)) |decorator_offset| {
+        const decorator_line = try directiveLine(source, decorator_offset);
+        if (hasPotentialLetExpansion(source[decorator_line.start..decorator_line.content_end])) return error.InvalidDirectiveOffset;
+        return replaceRange(allocator, source, decorator_line.start, decorator_line.content_end, directive);
+    }
+    return insertDirectiveAt(allocator, source, item_line.start, directive);
+}
+
+/// True when the item directive at `item_offset` authors a reveal itself
+/// (an owned `@anim` decorator or inline `anim=`), as opposed to inheriting
+/// one from a reusable definition. Invalid offsets report false.
+pub fn itemAuthorsReveal(source: []const u8, item_offset: usize) bool {
+    const item_line = directiveLine(source, item_offset) catch return false;
+    if (directiveHasInlineReveal(source, item_line)) return true;
+    const decorator = ownedRevealDecorator(source, item_offset) catch return false;
+    return decorator != null;
+}
+
+/// Remove the reveal authored on or before the item directive at
+/// `item_offset`: the owned `@anim` decorator line is deleted, or the inline
+/// reveal keys are removed. Returns `NoLocalPropertyOverride` when the item
+/// authors no reveal of its own (an inherited reveal is cancelled by writing
+/// `anim=none` through `setItemReveal`).
+pub fn removeItemReveal(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    item_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const item_line = try directiveLine(source, item_offset);
+    if (hasPotentialLetExpansion(source[item_line.start..item_line.content_end])) return error.InvalidDirectiveOffset;
+    if (directiveHasInlineReveal(source, item_line)) {
+        return removeLiteralAttributes(allocator, source, item_offset, &reveal_attribute_keys);
+    }
+    if (try ownedRevealDecorator(source, item_offset)) |decorator_offset| {
+        const decorator_line = try directiveLine(source, decorator_offset);
+        return replaceRange(allocator, source, decorator_line.start, decorator_line.full_end, "");
+    }
+    return error.NoLocalPropertyOverride;
+}
+
+/// Patch the automatic delay, duration, and easing of one morph state.
+pub fn setMorphStateTiming(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    state_directive_offset: usize,
+    timing: MorphTimingPatch,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    _ = try morphStateRange(source, slide_offset, state_directive_offset);
+    const line = try directiveLine(source, state_directive_offset);
+    if (hasPotentialLetExpansion(source[line.start..line.content_end])) return error.InvalidMorphStateOffset;
+
+    var removals = std.ArrayList([]const u8).empty;
+    defer removals.deinit(allocator);
+    var patches = std.ArrayList(LiteralAttributePatch).empty;
+    defer patches.deinit(allocator);
+    var after_buffer: [64]u8 = undefined;
+    var duration_buffer: [64]u8 = undefined;
+    if (timing.after) |after_option| {
+        if (after_option) |after| {
+            try patches.append(allocator, .{ .key = "after", .value = try formatSeconds(&after_buffer, after) });
+        } else {
+            try removals.append(allocator, "after");
+        }
+    }
+    if (timing.duration) |duration| {
+        try patches.append(allocator, .{ .key = "duration", .value = try formatSeconds(&duration_buffer, duration) });
+    }
+    if (timing.easing) |easing| {
+        try patches.append(allocator, .{ .key = "ease", .value = animation.easingLiteral(easing) });
+    }
+
+    const removed = try removeLiteralAttributes(allocator, source, state_directive_offset, removals.items);
+    defer removed.deinit(allocator);
+    return patchLiteralAttributes(allocator, removed.source, state_directive_offset, patches.items);
+}
+
+const transition_attribute_keys = [_][]const u8{ "transition", "duration", "ease" };
+
+/// Author the incoming transition on one slide boundary directive
+/// (`@slide`, `@popslide`, or `@pushslide`). Duration and easing are written
+/// only when they differ from the defaults; default-valued keys already on
+/// the line are removed so the line stays minimal.
+pub fn setSlideTransition(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_directive_offset: usize,
+    transition: animation.Transition,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const line = try directiveLine(source, slide_directive_offset);
+    if (hasPotentialLetExpansion(source[line.start..line.content_end])) return error.InvalidSlideOffset;
+    const name = directiveName(source[line.start..line.content_end]);
+    if (!isSlideBoundaryDirective(name)) return error.InvalidSlideOffset;
+
+    const removed = try removeLiteralAttributes(allocator, source, slide_directive_offset, &transition_attribute_keys);
+    defer removed.deinit(allocator);
+    var patches = std.ArrayList(LiteralAttributePatch).empty;
+    defer patches.deinit(allocator);
+    var duration_buffer: [64]u8 = undefined;
+    try patches.append(allocator, .{ .key = "transition", .value = animation.effectLiteral(transition.effect) });
+    if (transition.effect != .none) {
+        if (transition.duration != (animation.Transition{}).duration) {
+            try patches.append(allocator, .{ .key = "duration", .value = try formatSeconds(&duration_buffer, transition.duration) });
+        }
+        if (transition.easing != .smooth) {
+            try patches.append(allocator, .{ .key = "ease", .value = animation.easingLiteral(transition.easing) });
+        }
+    }
+    return patchLiteralAttributes(allocator, removed.source, slide_directive_offset, patches.items);
+}
+
+/// Remove the transition keys from one slide boundary directive so the
+/// slide inherits its template or deck default again.
+pub fn removeSlideTransition(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_directive_offset: usize,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const line = try directiveLine(source, slide_directive_offset);
+    if (hasPotentialLetExpansion(source[line.start..line.content_end])) return error.InvalidSlideOffset;
+    const name = directiveName(source[line.start..line.content_end]);
+    if (!isSlideBoundaryDirective(name)) return error.InvalidSlideOffset;
+    return removeLiteralAttributes(allocator, source, slide_directive_offset, &transition_attribute_keys);
+}
+
+const deck_transition_directives = [_][]const u8{ "@transition=", "@transition_duration=", "@transition_ease=" };
+
+fn findGlobalDirectiveLine(source: []const u8, prefix: []const u8) ?DirectiveLine {
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        if (std.mem.startsWith(u8, source[cursor..line.content_end], prefix)) return line;
+        cursor = line.full_end;
+    }
+    return null;
+}
+
+/// First line that is neither blank, a comment, nor a global `@name=value`
+/// or `@let` directive: the deck preamble ends here.
+fn deckPreambleEnd(source: []const u8) usize {
+    var cursor = sourceStart(source);
+    while (cursor < source.len) {
+        const line = physicalLineAt(source, cursor);
+        const content = source[cursor..line.content_end];
+        const trimmed = std.mem.trim(u8, content, " \t");
+        if (trimmed.len > 0 and trimmed[0] != '#') {
+            if (trimmed[0] != '@') return cursor;
+            if (!isGlobalValueDirective(directiveName(trimmed))) return cursor;
+        }
+        cursor = line.full_end;
+    }
+    return source.len;
+}
+
+/// True when the directive line at `offset` carries `key=` before `text=`.
+pub fn directiveHasAttribute(source: []const u8, offset: usize, key: []const u8) bool {
+    const line = directiveLine(source, offset) catch return false;
+    var cursor = line.start;
+    while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+    while (cursor < line.content_end) {
+        while (cursor < line.content_end and isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token_start = cursor;
+        while (cursor < line.content_end and !isHorizontalWhitespace(source[cursor])) : (cursor += 1) {}
+        const token = source[token_start..cursor];
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const token_key = token[0..equals];
+        if (std.mem.eql(u8, token_key, "text")) return false;
+        if (std.mem.eql(u8, token_key, key)) return true;
+    }
+    return false;
+}
+
+/// Directive name at `offset` (`@slide`, `@popslide`, ...) or null when the
+/// offset is not a directive line start.
+pub fn directiveNameAt(source: []const u8, offset: usize) ?[]const u8 {
+    const line = directiveLine(source, offset) catch return null;
+    return directiveName(source[line.start..line.content_end]);
+}
+
+/// Template name of a `@popslide NAME` anchor, or null for other anchors.
+pub fn slideAnchorTemplateName(source: []const u8, slide_offset: usize) ?[]const u8 {
+    const line = directiveLine(source, slide_offset) catch return null;
+    const text = source[line.start..line.content_end];
+    const name = directiveName(text);
+    if (!std.mem.eql(u8, name, "@popslide")) return null;
+    return directiveContextName(text, name.len);
+}
+
+/// Set (`defaults != null`) or clear the deck-level transition directives.
+/// Existing `@transition*=` lines are patched in place; missing ones are
+/// inserted beside them or at the end of the preamble. Duration and easing
+/// lines are written only for non-default values.
+pub fn setDeckTransitionDefaults(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    defaults: ?animation.Transition,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    var owned_values = std.ArrayList([]u8).empty;
+    defer {
+        for (owned_values.items) |value| allocator.free(value);
+        owned_values.deinit(allocator);
+    }
+
+    const newline = lineEndingNear(source, sourceStart(source));
+    var insert_after: ?usize = null; // full_end of the last existing transition line
+    var existing: [3]?DirectiveLine = .{ null, null, null };
+    for (deck_transition_directives, 0..) |prefix, index| {
+        existing[index] = findGlobalDirectiveLine(source, prefix);
+        if (existing[index]) |line| {
+            if (hasPotentialLetExpansion(source[line.start..line.content_end])) return error.UnsafeSlideGlobalDirective;
+            if (insert_after == null or line.full_end > insert_after.?) insert_after = line.full_end;
+        }
+    }
+
+    const transition = defaults orelse {
+        for (existing) |line_option| {
+            if (line_option) |line| try edits.append(allocator, .{ .start = line.start, .end = line.full_end, .replacement = "" });
+        }
+        if (edits.items.len == 0) {
+            const copy = try allocator.dupe(u8, source);
+            return .{ .source = copy, .byte_delta = 0 };
+        }
+        sortEditsByPosition(edits.items);
+        return applyEdits(allocator, source, edits.items);
+    };
+
+    var duration_buffer: [64]u8 = undefined;
+    const duration_text = try formatSeconds(&duration_buffer, transition.duration);
+    const values = [3][]const u8{
+        animation.effectLiteral(transition.effect),
+        duration_text,
+        animation.easingLiteral(transition.easing),
+    };
+    const wanted = [3]bool{
+        true,
+        transition.duration != (animation.Transition{}).duration,
+        transition.easing != .smooth,
+    };
+
+    var insertion = std.ArrayList(u8).empty;
+    defer insertion.deinit(allocator);
+    for (deck_transition_directives, 0..) |prefix, index| {
+        if (existing[index]) |line| {
+            const value_start = line.start + prefix.len;
+            try edits.append(allocator, .{ .start = value_start, .end = line.content_end, .replacement = values[index] });
+        } else if (wanted[index]) {
+            try insertion.appendSlice(allocator, prefix);
+            try insertion.appendSlice(allocator, values[index]);
+            try insertion.appendSlice(allocator, newline);
+        }
+    }
+    if (insertion.items.len > 0) {
+        var insertion_offset = insert_after orelse deckPreambleEnd(source);
+        var prefix_newline = false;
+        if (insertion_offset == source.len and source.len > 0 and source[source.len - 1] != '\n') {
+            prefix_newline = true;
+        }
+        if (insertion_offset < sourceStart(source)) insertion_offset = sourceStart(source);
+        const replacement = if (prefix_newline)
+            try std.mem.concat(allocator, u8, &.{ newline, insertion.items })
+        else
+            try allocator.dupe(u8, insertion.items);
+        try owned_values.append(allocator, replacement);
+        try edits.append(allocator, .{ .start = insertion_offset, .end = insertion_offset, .replacement = replacement });
+    }
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
+}
+
+/// Delete every `@set`, `@show`, and `@hide` line targeting `item_id` inside
+/// one morph state so the object inherits the previous scene again.
+pub fn deleteMorphMutationsForItem(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_offset: usize,
+    state_directive_offset: usize,
+    item_id: []const u8,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    if (item_id.len == 0 or std.mem.indexOfAny(u8, item_id, " \t\r\n=") != null) return error.InvalidLiteralValue;
+    const range = try morphStateRange(source, slide_offset, state_directive_offset);
+    var edits = std.ArrayList(Edit).empty;
+    defer edits.deinit(allocator);
+    var cursor = range.start;
+    while (cursor < range.end) {
+        const line = physicalLineAt(source, cursor);
+        if (cursor < line.content_end and source[cursor] == '@') {
+            const text = source[cursor..line.content_end];
+            const name = directiveName(text);
+            if (isMorphMutationDirective(name)) {
+                const target = directiveContextName(text, name.len);
+                if (target != null and std.mem.eql(u8, target.?, item_id)) {
+                    if (hasPotentialLetExpansion(text)) return error.InvalidMorphStateOffset;
+                    try edits.append(allocator, .{ .start = cursor, .end = line.full_end, .replacement = "" });
+                    try appendBodyDeletionEdits(allocator, source, line.full_end, &edits);
+                }
+            }
+        }
+        cursor = line.full_end;
+    }
+    if (edits.items.len == 0) return error.NoLocalPropertyOverride;
+    sortEditsByPosition(edits.items);
+    return applyEdits(allocator, source, edits.items);
 }
 
 /// Promote one direct `@box` item to a reusable component in place.
@@ -4609,10 +5119,10 @@ fn duplicateMorphDirective(
     while (tokens.next()) |token| {
         const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
         const key = token[0..equals];
+        // Labels are author-facing names for one state; the copy stays
+        // unnamed until the author names it. Every other key is timing and
+        // is copied verbatim (the parser rejects unknown state keys).
         if (std.mem.eql(u8, key, "label")) continue;
-        if (!(std.mem.eql(u8, key, "after") or
-            std.mem.eql(u8, key, "duration") or
-            std.mem.eql(u8, key, "ease"))) continue;
         try output.append(allocator, ' ');
         try output.appendSlice(allocator, token);
     }
@@ -10584,4 +11094,155 @@ test "speaker notes preserve directive-looking prose and reject a literal termin
         error.UnterminatedSpeakerNotes,
         setSpeakerNotes(std.testing.allocator, malformed, 0, "Replacement"),
     );
+}
+
+test "setItemReveal inserts a canonical decorator and removeItemReveal restores the original bytes" {
+    const allocator = std.testing.allocator;
+    const source = "\xEF\xBB\xBF@slide\r\n@box id=list x=10 y=20 w=500 h=300\r\n- one\r\n- two\r\n";
+    const item_offset = std.mem.indexOf(u8, source, "@box").?;
+
+    const added = try setItemReveal(allocator, source, item_offset, .{ .effect = .fade, .by = .bullet, .delay = 0.5, .after = 0.8, .duration = 0.25, .easing = .spring });
+    defer added.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "\xEF\xBB\xBF@slide\r\n@anim(fade) by=bullet delay=0.5 after=0.8 duration=0.25 ease=spring\r\n@box id=list x=10 y=20 w=500 h=300\r\n- one\r\n- two\r\n",
+        added.source,
+    );
+
+    // Editing again rewrites the owned decorator instead of stacking one.
+    const box_offset = std.mem.indexOf(u8, added.source, "@box").?;
+    const changed = try setItemReveal(allocator, added.source, box_offset, .{ .effect = .appear, .by = .bullet });
+    defer changed.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "\xEF\xBB\xBF@slide\r\n@anim(appear) by=bullet\r\n@box id=list x=10 y=20 w=500 h=300\r\n- one\r\n- two\r\n",
+        changed.source,
+    );
+
+    const click_first = try setItemReveal(allocator, changed.source, std.mem.indexOf(u8, changed.source, "@box").?, .{ .effect = .fade, .by = .bullet, .first_waits = true, .after = 0.8 });
+    defer click_first.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, click_first.source, "@anim(fade) by=bullet delay=click after=0.8\r\n") != null);
+
+    const removed = try removeItemReveal(allocator, changed.source, std.mem.indexOf(u8, changed.source, "@box").?);
+    defer removed.deinit(allocator);
+    try std.testing.expectEqualStrings(source, removed.source);
+    try std.testing.expectError(error.NoLocalPropertyOverride, removeItemReveal(allocator, removed.source, item_offset));
+}
+
+test "setItemReveal patches inline reveal keys in place and respects text= ownership" {
+    const allocator = std.testing.allocator;
+    const source = "@slide\n@box id=pic img=a.png x=1 y=2 anim=fade after=1 duration=0.4 text=after=9 stays\n";
+    const item_offset = std.mem.indexOf(u8, source, "@box").?;
+    const patched = try setItemReveal(allocator, source, item_offset, .{ .effect = .slide_up, .delay = 0.2, .easing = .linear });
+    defer patched.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "@slide\n@box id=pic img=a.png x=1 y=2 anim=slide-up delay=0.2 ease=linear text=after=9 stays\n",
+        patched.source,
+    );
+    const removed = try removeItemReveal(allocator, patched.source, item_offset);
+    defer removed.deinit(allocator);
+    try std.testing.expectEqualStrings("@slide\n@box id=pic img=a.png x=1 y=2 text=after=9 stays\n", removed.source);
+}
+
+test "ownedRevealDecorator crosses global directives but not other items or states" {
+    const source =
+        "@slide\n" ++
+        "@anim(fade)\n" ++
+        "@fontsize=20\n" ++
+        "# comment\n" ++
+        "@box id=a x=1 y=1\n" ++
+        "@anim(fade)\n" ++
+        "@box id=b x=1 y=1\n" ++
+        "@box id=c x=1 y=1\n" ++
+        "@state(morph)\n" ++
+        "@box id=d x=1 y=1\n";
+    const a = std.mem.indexOf(u8, source, "@box id=a").?;
+    const b = std.mem.indexOf(u8, source, "@box id=b").?;
+    const c = std.mem.indexOf(u8, source, "@box id=c").?;
+    const d = std.mem.indexOf(u8, source, "@box id=d").?;
+    try std.testing.expectEqual(@as(?usize, std.mem.indexOf(u8, source, "@anim(fade)\n@fontsize").?), try ownedRevealDecorator(source, a));
+    try std.testing.expectEqual(@as(?usize, std.mem.lastIndexOf(u8, source, "@anim(fade)").?), try ownedRevealDecorator(source, b));
+    try std.testing.expectEqual(@as(?usize, null), try ownedRevealDecorator(source, c));
+    try std.testing.expectError(error.InvalidItemScene, setItemReveal(std.testing.allocator, source, d, .{}));
+}
+
+test "setMorphStateTiming patches and removes timing keys without touching the label" {
+    const allocator = std.testing.allocator;
+    const source = "@slide\n@box id=hero x=1 y=1\n@state(morph) label=focus after=0.2\n@set hero x=100\n";
+    const state_offset = std.mem.indexOf(u8, source, "@state").?;
+    const timed = try setMorphStateTiming(allocator, source, 0, state_offset, .{ .after = @as(?f32, 1.5), .duration = 0.8, .easing = .spring });
+    defer timed.deinit(allocator);
+    try std.testing.expectEqualStrings("@slide\n@box id=hero x=1 y=1\n@state(morph) label=focus after=1.5 duration=0.8 ease=spring\n@set hero x=100\n", timed.source);
+    const clicked = try setMorphStateTiming(allocator, timed.source, 0, state_offset, .{ .after = @as(?f32, null) });
+    defer clicked.deinit(allocator);
+    try std.testing.expectEqualStrings("@slide\n@box id=hero x=1 y=1\n@state(morph) label=focus duration=0.8 ease=spring\n@set hero x=100\n", clicked.source);
+}
+
+test "setSlideTransition writes minimal transition keys on slide anchors and removal restores the original" {
+    const allocator = std.testing.allocator;
+    const source = "@pushslide content\n@box id=t x=1 y=1\n@popslide content\n@box id=a x=1 y=1\n@slide\n@box id=b x=1 y=1\n";
+    const pop_offset = std.mem.indexOf(u8, source, "@popslide").?;
+    const slide_offset = std.mem.indexOf(u8, source, "@slide\n").?;
+    const set_pop = try setSlideTransition(allocator, source, pop_offset, .{ .effect = .slide_left, .duration = 0.5, .easing = .spring });
+    defer set_pop.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, set_pop.source, "@popslide content transition=slide-left duration=0.5 ease=spring\n") != null);
+    const set_default = try setSlideTransition(allocator, set_pop.source, pop_offset, .{ .effect = .fade });
+    defer set_default.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, set_default.source, "@popslide content transition=fade\n") != null);
+    const slide_offset_after = std.mem.indexOf(u8, set_default.source, "@slide\n").?;
+    const set_none = try setSlideTransition(allocator, set_default.source, slide_offset_after, .{ .effect = .none, .duration = 9 });
+    defer set_none.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, set_none.source, "@slide transition=none\n") != null);
+    const cleared_pop = try removeSlideTransition(allocator, set_none.source, pop_offset);
+    defer cleared_pop.deinit(allocator);
+    const cleared_slide = try removeSlideTransition(allocator, cleared_pop.source, std.mem.indexOf(u8, cleared_pop.source, "@slide ").?);
+    defer cleared_slide.deinit(allocator);
+    try std.testing.expectEqualStrings(source, cleared_slide.source);
+    try std.testing.expectError(error.InvalidSlideOffset, setSlideTransition(allocator, source, std.mem.indexOf(u8, source, "@box id=a").?, .{}));
+    _ = slide_offset;
+}
+
+test "setDeckTransitionDefaults inserts after the preamble, patches in place, and clears to the original" {
+    const allocator = std.testing.allocator;
+    const source = "# deck\n@fontsize=32\n@color=#ffffffff\n\n@slide\n@box id=a x=1 y=1\n";
+    const added = try setDeckTransitionDefaults(allocator, source, .{ .effect = .fade, .duration = 0.5, .easing = .spring });
+    defer added.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "# deck\n@fontsize=32\n@color=#ffffffff\n\n@transition=fade\n@transition_duration=0.5\n@transition_ease=spring\n@slide\n@box id=a x=1 y=1\n",
+        added.source,
+    );
+    const patched = try setDeckTransitionDefaults(allocator, added.source, .{ .effect = .slide_left, .duration = 0.4 });
+    defer patched.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "# deck\n@fontsize=32\n@color=#ffffffff\n\n@transition=slide-left\n@transition_duration=0.4\n@transition_ease=smooth\n@slide\n@box id=a x=1 y=1\n",
+        patched.source,
+    );
+    const cleared = try setDeckTransitionDefaults(allocator, patched.source, null);
+    defer cleared.deinit(allocator);
+    try std.testing.expectEqualStrings(source, cleared.source);
+
+    const minimal = try setDeckTransitionDefaults(allocator, "@slide\n@box id=a x=1 y=1", .{ .effect = .fade });
+    defer minimal.deinit(allocator);
+    try std.testing.expectEqualStrings("@transition=fade\n@slide\n@box id=a x=1 y=1", minimal.source);
+}
+
+test "deleteMorphMutationsForItem removes every mutation of one object inside one state" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@slide\n@box id=hero x=1 y=1\n@box id=other x=1 y=1\n" ++
+        "@state(morph)\n@set hero x=100\n@set other x=5\n@hide hero y=900\nbody line\n" ++
+        "@state(morph)\n@set hero x=200\n";
+    const first_state = std.mem.indexOf(u8, source, "@state").?;
+    const cleaned = try deleteMorphMutationsForItem(allocator, source, 0, first_state, "hero");
+    defer cleaned.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "@slide\n@box id=hero x=1 y=1\n@box id=other x=1 y=1\n@state(morph)\n@set other x=5\n@state(morph)\n@set hero x=200\n",
+        cleaned.source,
+    );
+    try std.testing.expectError(error.NoLocalPropertyOverride, deleteMorphMutationsForItem(allocator, cleaned.source, 0, first_state, "hero"));
+}
+
+test "duplicateMorphDirective keeps every timing key and drops only the label" {
+    const allocator = std.testing.allocator;
+    const copy = try duplicateMorphDirective(allocator, "@state label=x after=0.2 duration=0.8 ease=spring");
+    defer allocator.free(copy);
+    try std.testing.expectEqualStrings("@state(morph) after=0.2 duration=0.8 ease=spring", copy);
 }

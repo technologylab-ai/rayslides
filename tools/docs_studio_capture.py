@@ -41,6 +41,8 @@ class Capture:
     settle_frames: int = 120
 
 
+MOTION_QA_DECK = "testslides/studio-motion-qa.sld"
+
 CAPTURES: tuple[Capture, ...] = (
     Capture(
         "overview-properties",
@@ -110,6 +112,34 @@ CAPTURES: tuple[Capture, ...] = (
         1440,
         "testslides/studio-showcase.sld",
         ("--diagnostics-select=headline", "--diagnostics-status-drawer"),
+    ),
+    Capture(
+        "motion-inspector",
+        2560,
+        1440,
+        MOTION_QA_DECK,
+        ("--diagnostics-motion=click_bullets",),
+    ),
+    Capture(
+        "timeline-build",
+        2560,
+        1440,
+        MOTION_QA_DECK,
+        ("--diagnostics-slide=2", "--diagnostics-timeline-step=2"),
+    ),
+    Capture(
+        "morph-ghosts",
+        2560,
+        1440,
+        MOTION_QA_DECK,
+        ("--diagnostics-slide=3", "--diagnostics-motion-state=2", "--diagnostics-motion=title"),
+    ),
+    Capture(
+        "motion-preview",
+        2560,
+        1440,
+        MOTION_QA_DECK,
+        ("--diagnostics-slide=3", "--diagnostics-motion-preview=1.5"),
     ),
     Capture("new-deck", 2560, 1440, None),
 )

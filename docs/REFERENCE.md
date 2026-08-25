@@ -258,6 +258,112 @@ replacement, reuse, diagnostics, and export path as raster images. Rayslides'
 embedded NanoSVG subset renders vector shapes and paths deterministically but
 does not implement SVG `<text>`; convert text to paths before presenting.
 
+The inspector's third tab, **Motion**, edits reveals, morph-state timing, and
+slide transitions through the same source-backed, undoable path as
+Properties; **Show Motion** in the command palette opens it, and the chosen
+tab is remembered like the other two. The tab is context-sensitive and shows
+one of three sections. With one or more objects selected in BASE or a build
+scene it shows **Reveal**: a trigger strip **None** / **Click** / **Auto** /
+**Click>Auto**, an effect strip (Appear, Fade, Slide L/R/U/D), a
+**By** strip (Item, Line, Bullet), inline **DELAY**, **AFTER**, and **DUR**
+fields, an easing strip (Linear, Smooth, Spring), a **Build bullets** preset
+(also **Build bullets one by one** in the palette), and a remove action.
+**Click** makes every step wait for a presentation action; **Auto** starts
+the first step after `delay=` and later steps after `after=` (an item with
+no timing is seeded with `delay=0.5 after=0.8`); **Click>Auto** writes
+`delay=click` so the first step waits and the rest follow automatically
+(seeded with `after=0.8`). Choosing an effect, easing, or grouping on an
+object without a reveal creates one from a template: fade, `by=bullet` for a
+bulleted text box, otherwise `by=item`. DELAY accepts seconds, `click`, or
+empty; AFTER accepts seconds or empty (wait for a click); DUR accepts
+seconds; all three use the Enter/Tab/Esc handshake of Properties. The
+remove action reads **Remove** on a direct item (it deletes the `@anim`
+decorator or inline keys), **Cancel** on an instance that only inherits its
+reveal from a `@push` (it writes `anim=none`), and **Reset** on an instance
+that authors a local reveal (it removes only the local reveal so the
+inherited one resurfaces). Multi-selection shows common values or "Mixed" and
+patches every selected item in one transaction. Studio writes minimal
+source: a click-triggered bullet fade is exactly `@anim(fade) by=bullet`, and
+default-valued `duration=`/`ease=` keys are omitted.
+
+While a STATE card is active the tab shows **State** instead: inline
+**LABEL**, **AFTER**, and **DUR** fields, a **Click** / **Auto** strip
+(**Auto** on a click-gated state seeds `after=1.0`; **Click** removes
+`after=`; emptying LABEL removes `label=`), the easing strip, the selected
+object's status line, **Reset** and **Exit L/R/U/D**, and a "Changes in this
+state" list whose rows select the object they name. Objects that cross-fade
+instead of gliding (changed text, media, wrapping, or fragment structure) are
+marked "cross-fade" in the list and status line using the renderer's real
+morph plan. **Reset** (also **Reset object in this state** in the palette)
+deletes every `@set`/`@show`/`@hide` line for the selected object in the
+active state so it inherits the previous state again; **Exit** appends an
+`@hide ID x=…`/`y=…` line 100 px beyond the chosen slide edge, computed from
+the object's current size. Both need an object with a unique `id=`. The
+timeline's **+** button switches the inspector to Motion so a new state's
+timing is immediately editable.
+
+With nothing selected in the base scene the tab shows **Transition** for the
+current slide's incoming transition; the timeline's `IN` chip and **Edit
+slide transition** in the palette jump there. The effect grid offers
+**Inherit**, None, Appear, Fade, and Slide L/R/U/D, followed by **DUR** and
+the easing strip (editable only when the effect is not None) and a
+provenance line reading "this slide", "from template NAME", "deck default",
+or "none". **Inherit** removes the slide's own `transition=`, `duration=`,
+and `ease=` keys so the template or deck default applies again. Choosing an
+effect on a slide that inherits from a `@pushslide` template writes a local
+override on the `@popslide` line; hold <kbd>Alt</kbd> to change the
+template's line instead so every instance follows. **Use for deck** writes
+the current slide's transition as `@transition=`, `@transition_duration=`,
+and `@transition_ease=` in the preamble and **Clear deck** removes those
+lines; per-slide overrides are left alone. The implicit first slide of a deck
+without any `@slide` line cannot author a transition, and the section says
+so instead of writing an invalid directive.
+
+Reveals on shared-template members require <kbd>Alt</kbd> (or Definition
+mode), group members must be edited in Definition mode, and objects born in
+a morph state cannot own a reveal, which the parser also rejects. The same
+ownership rule applies to reordering their builds.
+
+The bottom timeline shows one logical slide as an ordered sequence: the `IN`
+transition chip, **BASE**, one **BUILD** card per item with a reveal (titled
+by its id or first text line, with "N steps · effect · trigger" and one chip
+per step), then the **STATE** cards. Clicking a BUILD card shows the slide
+through that build's last step and selects the item; a chip narrows the
+canvas to one step. Editing in a build scene still edits the base scene.
+<kbd>[</kbd>/<kbd>]</kbd> and the toolbar `<`/`>` cycle BASE → builds →
+states. With a BUILD card selected, the timeline `<`/`>` buttons move that
+build earlier or later in reveal order without changing paint order; Studio
+writes the minimal `order=` keys for the new sequence and removes keys that
+fall back to `0`. The other timeline actions keep their state meaning while a
+build is selected: **+** and **Dup** still add a state, and **Name**/**Del**
+stay disabled until a STATE card is chosen. Slide cards in the organizer show the transition effect
+after "items · states" (for example "· fade").
+
+The timeline band also carries the live-preview transport: **Play**/**Pause**,
+**Stop**, **Loop**, a scrubber, and a `time/total` readout. On narrow
+windows (900 px) only Play and Stop remain so at least three timeline cards
+stay visible. <kbd>Shift</kbd>+<kbd>Space</kbd> plays or pauses and
+<kbd>Esc</kbd> stops; the palette offers **Play or pause preview**, **Stop
+preview**, and **Loop preview**. Play starts from the selected scene: BASE
+plays the whole slide, including the incoming transition when a previous
+slide exists (clicking the `IN` chip selects BASE, so Play from there begins
+with the transition); a BUILD card starts after that build; a STATE card
+starts after that state. Click-gated steps are given a fixed 0.75 s preview gap so the
+whole slide plays through, and the schedule is a pure function of time, so
+scrubbing backwards is exact. At the end the last frame stays paused for
+inspection; Stop returns to the selected scene and Loop restarts. Any source
+edit, Undo/Redo, slide or scene change, tool change, or canvas drag stops
+the preview; a plain click that only changes the selection does not. Videos
+stay on their poster during preview.
+
+The canvas draws numbered badges (`1`, `2-4`) above every item with a reveal
+in BASE. While a morph state is active it draws a dashed outline of each
+changed object's previous-scene bounds, a path to its current center, and
+`NEW`, `EXIT`, or `SHOW` chips for objects born, hidden, or shown in that
+state. **Toggle motion ghosts** in the palette turns the ghosts off and on
+(default on). Badges and ghosts are editor chrome only and never reach
+presentation, export, thumbnails, or Presenter output.
+
 The top toolbar contains these one-shot canvas tools:
 
 | Tool | Shortcut | Action |
@@ -448,6 +554,22 @@ definition and opens its isolated read-only canvas preview.
 Definition scene. The parser-clean `testslides/studio-library-qa.sld` fixture
 contains representative ITEM, GROUP, and SLIDE definitions for deterministic
 gallery/editor captures at default and minimum window sizes.
+`--diagnostics-motion=ID` selects the unique authored `id=` and opens the
+Motion inspector on its Reveal section, and `--diagnostics-timeline-step=N`
+shows the current slide through reveal step `N`, as clicking a BUILD chip
+would. `--diagnostics-slide=N` opens Studio on the one-based slide `N` so the
+other motion flags can target any slide of a fixture.
+`--diagnostics-motion-state=N` selects the one-based morph state `N` with the
+Motion tab on its State section and the motion ghosts visible; it composes
+with `--diagnostics-slide=N` and `--diagnostics-motion=ID`.
+`--diagnostics-motion-transition` opens the Motion inspector on the current
+slide's Transition section. `--diagnostics-motion-preview=SECONDS` starts the
+live preview from the current scene and pauses it at that time, so a
+mid-motion frame and its transport readout are reproducible without a timed
+key press. All of these are non-mutating; the parser-clean
+`testslides/studio-motion-qa.sld` fixture provides click and automatic bullet
+builds, an eased image reveal, inherited/overridden/deck-default transitions,
+and a three-state morph for them.
 `--no-startup-banner` suppresses the four-second launch banner for unattended
 captures, kiosk launches, and other cases that need the first frame to contain
 only the deck and Studio chrome.
@@ -512,7 +634,9 @@ scoped, so a library item can only be placed after its definition.
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, or save an `*.edited.sld` copy of a named deck |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Undo the last visual edit; after choosing a starter, return to the chooser |
 | <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>Z</kbd> | Redo the last visual edit |
-| <kbd>[</kbd> / <kbd>]</kbd> | Edit the base scene, previous morph state, or next morph state |
+| <kbd>[</kbd> / <kbd>]</kbd> | Cycle the base scene, each reveal build, and each morph state |
+| <kbd>Shift</kbd> + <kbd>Space</kbd> | Play or pause the live motion preview |
+| <kbd>Esc</kbd> while a preview runs | Stop the preview and return to the selected scene |
 | <kbd>G</kbd> | Toggle grid display and grid snapping |
 | <kbd>Cmd/Ctrl</kbd> + mouse wheel | Zoom the canvas around the pointer |
 | Mouse wheel / trackpad scroll | Pan the canvas |
@@ -549,9 +673,10 @@ The `*` beside `STUDIO` means the in-memory document differs from the original
 file. Automatic file reload is paused while those unsaved changes exist.
 Transitions are paused in Studio and ordinary reveal items are shown. The scene
 control in the toolbar switches between the base scene and each semantic morph
-state. The bottom timeline makes that cumulative structure explicit: BASE is
-the authored root, followed by cards showing each state's label, automatic
-delay, duration, and easing. Click a card to preview/edit it. The adjacent
+state. The bottom timeline makes that cumulative structure explicit: the `IN`
+transition chip and BASE come first, then one BUILD card per reveal, then
+cards showing each state's label, automatic delay, duration, and easing.
+Click a card to preview/edit it. The adjacent
 controls add a state after the current scene, duplicate the current visual
 snapshot, name, delete, or move a state earlier/later. Every structural action
 is one source transaction and one Undo entry; unsafe dynamic/global ownership
@@ -675,7 +800,11 @@ Showtime treats missing or undecodable presentation pixels, malformed source,
 missing runtime glyphs, and required unavailable services as blockers. It uses
 warnings for conditions that may be deliberate but deserve review, including
 overflow, off-canvas staging, absolute or parent-escaping asset paths,
-non-16:9/low-refresh displays, and an untested Presenter connection. Each
+non-16:9/low-refresh displays, an untested Presenter connection, and a reveal
+on a `visible=false` object (`reveal_on_hidden_object`). Two motion findings
+are informational: `motion_long_automatic_run` when a slide advances by
+itself for more than 30 seconds, and `morph_state_without_changes` for a
+`@state(morph)` block that changes nothing. Each
 render finding carries a slide, object, morph state, reusable definition, or
 source line when that identity exists. Select a finding and press
 <kbd>Enter</kbd> to open its slide/object or editable Library definition.
@@ -1134,6 +1263,35 @@ automatically after the previous animation finishes:
 - Then this appears 0.8 seconds after the first animation finishes
 ```
 
+`delay=` gives the first step of a build its own automatic start delay,
+measured from the moment the slide (or the previous step) settles; later
+steps keep using `after=`. `delay=` alone makes only the first step
+automatic and leaves the remaining steps waiting for a presentation action;
+`delay=click` does the opposite: the first step waits for a presentation
+action while later steps follow automatically through `after=`.
+`ease=linear|smooth|spring` selects the reveal easing (default `smooth`);
+`spring` briefly overshoots the travel of slide effects. `order=N` sorts a
+build earlier or later than its paint order (see below).
+
+```text
+@anim(fade) by=bullet delay=0.5 after=0.8 duration=0.25 ease=spring
+@box x=100 y=200 w=1200 h=700
+- Appears half a second after the slide settles
+- Then this one 0.8 seconds later
+```
+
+Reveal order follows paint (source) order. `order=N` overrides it: steps are
+sorted by `order` first and by source position second, so a later item with
+`order=-1` reveals before everything at the default `order=0`, and an early
+item with `order=1` waits until the others are shown. Studio writes the
+smallest set of `order=` keys that expresses the sequence chosen with the
+timeline's `<`/`>` buttons.
+
+`anim=none` (or `@anim(none)`) means "no reveal". On a `@pop` instance it
+cancels a reveal inherited from the `@push` definition. `@anim` and
+`@state(morph)` accept only their documented keys; an unknown key such as
+`name=` is a parser error rather than a silently ignored token.
+
 The same annotation works on other items, including images:
 
 ```text
@@ -1164,7 +1322,21 @@ Transitions use the same effect names. PDF export renders the final state of
 each logical slide, so builds still produce one PDF page per source slide. A
 transition lasts 0.4 seconds by default, automatically reverses direction when
 navigating backwards, and can be disabled for one slide with
-`transition=none`.
+`transition=none`. `ease=linear|smooth|spring` on the same slide directive
+selects the transition easing.
+
+Deck-wide defaults avoid repeating the same transition on every slide. They
+are ordinary global directives, best placed in the deck preamble:
+
+```text
+@transition=fade
+@transition_duration=0.35
+@transition_ease=smooth
+```
+
+`@transition=` enables the default; the other two refine it. A slide (or its
+`@pushslide` template) that authors its own `transition=`, including
+`transition=none`, keeps that value.
 
 ## Semantic morph states
 
@@ -1216,6 +1388,13 @@ For example:
 previous step settles, wait that many seconds and start automatically. Going
 backward pauses automatic progression and reverses the same interpolation.
 Changing direction during a morph continues from the current frame.
+
+Studio edits the same line: select a STATE card and open the **Motion** tab
+to change `label=`, `after=`, `duration=`, and `ease=` through the State
+section (its **Click**/**Auto** strip adds or removes `after=`). With an
+object selected there, **Reset** deletes every `@set`/`@show`/`@hide` line
+for that object in the state, and **Exit L/R/U/D** appends an off-slide
+`@hide`; both need a unique `id=`.
 
 Morphable properties include position and size (`x`, `y`, `w`, `h`),
 `fontsize`, `rotation`, `radius`, text `align`/`valign`, line stroke/direction/

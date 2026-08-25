@@ -40,11 +40,16 @@ class Scenario:
     extra_args: tuple[str, ...] = ()
     expected_mode: str = "full"
     expected_rebuilt: int | None = None
+    # Repository fixture deck (relative to ROOT) instead of the generated
+    # stress deck. `slides` must then match the fixture's slide count.
+    deck: str | None = None
 
     @property
     def rebuilt(self) -> int:
         return self.slides if self.expected_rebuilt is None else self.expected_rebuilt
 
+
+MOTION_QA_DECK = "testslides/studio-motion-qa.sld"
 
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
@@ -76,6 +81,54 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("--diagnostics-incremental-edit=1",),
         expected_mode="partial",
         expected_rebuilt=1,
+    ),
+    Scenario(
+        "compact-motion",
+        900,
+        506,
+        4,
+        ("--diagnostics-motion=click_bullets",),
+        deck=MOTION_QA_DECK,
+    ),
+    Scenario(
+        "default-timeline",
+        1600,
+        900,
+        4,
+        ("--diagnostics-slide=2", "--diagnostics-timeline-step=2"),
+        deck=MOTION_QA_DECK,
+    ),
+    Scenario(
+        "default-preview",
+        1600,
+        900,
+        4,
+        ("--diagnostics-slide=3", "--diagnostics-motion-preview=1.5"),
+        deck=MOTION_QA_DECK,
+    ),
+    Scenario(
+        "large-motion",
+        2560,
+        1440,
+        4,
+        ("--diagnostics-motion=click_bullets",),
+        deck=MOTION_QA_DECK,
+    ),
+    Scenario(
+        "large-morph-ghosts",
+        2560,
+        1440,
+        4,
+        ("--diagnostics-slide=3", "--diagnostics-motion-state=2", "--diagnostics-motion=title"),
+        deck=MOTION_QA_DECK,
+    ),
+    Scenario(
+        "compact-transition",
+        900,
+        506,
+        4,
+        ("--diagnostics-slide=2", "--diagnostics-motion-transition"),
+        deck=MOTION_QA_DECK,
     ),
 )
 
@@ -315,7 +368,6 @@ def capture_scenario(
         str(binary),
         "--studio",
         "--no-startup-banner",
-        f"--diagnostics-large-deck={scenario.slides}",
         f"--diagnostics-window={scenario.width}x{scenario.height}",
         f"--diagnostics-capture={image_path}",
         f"--diagnostics-report={report_path}",
@@ -326,6 +378,10 @@ def capture_scenario(
         "--diagnostics-hide-hud",
         *scenario.extra_args,
     ]
+    if scenario.deck is None:
+        command.insert(3, f"--diagnostics-large-deck={scenario.slides}")
+    else:
+        command.append(str((ROOT / scenario.deck).resolve()))
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             command,

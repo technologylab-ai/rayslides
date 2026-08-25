@@ -386,6 +386,15 @@ open-source project's scope. The local ad-hoc seal merely keeps the assembled
 bundle internally valid; the app is a build convenience, not a replacement for
 the portable command-line application or a second document format.
 
+## Motion authoring
+
+Visual editing of reveals, morph timing, and slide transitions, together
+with a step timeline, canvas motion overlays, and an editor-side live
+preview, is planned and tracked in the
+[Motion Studio roadmap](MOTION_STUDIO_ROADMAP.md). That file owns the
+vocabulary additions (`delay=`, reveal/transition `ease=`, deck-level
+`@transition*=` defaults, optional `order=`) and the tranche order.
+
 ## Cross-product completion and release gates
 
 The next phase is tracked in the top-level [product roadmap](ROADMAP.md).

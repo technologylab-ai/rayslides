@@ -57,6 +57,23 @@ This file tracks the documentation work that remains after the first site draft.
   - Compare an instance override with a definition edit.
   - Show the affected use count before a shared edit.
 
+## Motion authoring workflows
+
+- [x] Capture the Motion inspector Reveal section.
+  - Show a selected bullet box with the trigger, effect, By, DELAY, AFTER, DUR,
+    and easing controls.
+  - Show the numbered build badges on the canvas.
+- [x] Capture the State section with ghosts.
+  - Show a selected STATE card with LABEL, AFTER, DUR, Click/Auto, and easing.
+  - Show dashed ghosts, motion paths, and NEW/EXIT/SHOW chips.
+  - Show the "Changes in this state" list and the Reset and Exit actions.
+- [x] Capture the Transition section.
+  - Show the Inherit/None/effect grid, DUR, easing, and the provenance line.
+  - Show Use for deck and Clear deck.
+- [x] Capture the timeline with the transport mid-preview.
+  - Show the IN chip, BASE, an expanded BUILD card, and STATE cards.
+  - Show Pause, Stop, Loop, the scrubber, and the time readout.
+
 ## Phone interfaces
 
 - [x] Replace the Presenter phone mock-up with real interface evidence.

@@ -23,6 +23,7 @@ const studio_library_preview = @import("studio_library_preview.zig");
 const studio_new_deck = @import("studio_new_deck.zig");
 const studio_prompt = @import("studio_prompt.zig");
 const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
+const motion_schedule = @import("motion_schedule.zig");
 const videoplayer = @import("videoplayer.zig");
 const showtime = @import("showtime.zig");
 const SlideShow = slides.SlideShow;
@@ -68,6 +69,13 @@ const cli_help =
     \\  --diagnostics-incremental-edit=N Edit slide N after the initial render
     \\  --diagnostics-window=WIDTHxHEIGHT
     \\  --diagnostics-select=ID
+    \\  --diagnostics-motion=ID        Select an item and open the Motion inspector
+    \\  --diagnostics-timeline-step=N  Show the current slide through reveal step N
+    \\  --diagnostics-slide=N          Open Studio on slide N (1-based)
+    \\  --diagnostics-motion-state=N   Select morph state N (1-based) with ghosts and the State section
+    \\  --diagnostics-motion-transition Open the Motion inspector on the slide transition
+    \\  --diagnostics-motion-preview=SECONDS
+    \\                                 Pause the live preview at that time
     \\  --diagnostics-video-playback   Open a selected video's Playback page
     \\  --diagnostics-library-preview=NAME
     \\  --diagnostics-library-definition=NAME
@@ -462,6 +470,7 @@ test {
     std.testing.refAllDecls(studio_new_deck);
     std.testing.refAllDecls(studio_prompt);
     std.testing.refAllDecls(studio_roundtrip_test);
+    std.testing.refAllDecls(motion_schedule);
 }
 
 const CrowdOptions = struct {
@@ -1040,7 +1049,7 @@ test "Studio structural history reparses duplicated slides in both directions" {
     const source =
         "@slide\n" ++
         "@box id=hero x=20 y=30 text=Hero\n" ++
-        "@state(morph) name=detail\n" ++
+        "@state(morph) label=detail\n" ++
         "@set hero x=120\n" ++
         "@slide\n" ++
         "@box id=tail x=40 y=50 text=Tail\n";
@@ -3393,6 +3402,13 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_hide_hud = false;
     var diagnostics_select_buffer: [128]u8 = undefined;
     var diagnostics_select_id: ?[]const u8 = null;
+    var diagnostics_motion_buffer: [128]u8 = undefined;
+    var diagnostics_motion_id: ?[]const u8 = null;
+    var diagnostics_timeline_step: ?usize = null;
+    var diagnostics_motion_preview: ?f32 = null;
+    var diagnostics_slide: ?usize = null;
+    var diagnostics_motion_state: ?usize = null;
+    var diagnostics_motion_transition = false;
     var diagnostics_video_playback = false;
     var diagnostics_library_preview_buffer: [128]u8 = undefined;
     var diagnostics_library_preview_name: ?[]const u8 = null;
@@ -3559,6 +3575,42 @@ pub fn main(init: std.process.Init) anyerror!void {
                     "{s}",
                     .{arg["--diagnostics-select=".len..]},
                 ) catch std.process.fatal("Diagnostics selection ID is too long", .{});
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-motion=")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_motion_id = std.fmt.bufPrint(
+                    &diagnostics_motion_buffer,
+                    "{s}",
+                    .{arg["--diagnostics-motion=".len..]},
+                ) catch std.process.fatal("Diagnostics motion ID is too long", .{});
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-slide=")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                const one_based = std.fmt.parseInt(usize, arg["--diagnostics-slide=".len..], 10) catch
+                    std.process.fatal("Diagnostics slide must be a whole number", .{});
+                if (one_based == 0) std.process.fatal("Diagnostics slide numbers start at 1", .{});
+                diagnostics_slide = one_based - 1;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-motion-transition")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_motion_transition = true;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-motion-state=")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                const one_based = std.fmt.parseInt(usize, arg["--diagnostics-motion-state=".len..], 10) catch
+                    std.process.fatal("Diagnostics motion state must be a whole number", .{});
+                if (one_based == 0) std.process.fatal("Diagnostics motion states start at 1", .{});
+                diagnostics_motion_state = one_based - 1;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-motion-preview=")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_motion_preview = std.fmt.parseFloat(f32, arg["--diagnostics-motion-preview=".len..]) catch
+                    std.process.fatal("Diagnostics motion preview time must be a number of seconds", .{});
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-timeline-step=")) {
+                diagnostics_enabled = true;
+                launch_studio = true;
+                diagnostics_timeline_step = std.fmt.parseInt(usize, arg["--diagnostics-timeline-step=".len..], 10) catch
+                    std.process.fatal("Diagnostics timeline step must be a whole number", .{});
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-video-playback")) {
                 diagnostics_enabled = true;
                 launch_studio = true;
@@ -3696,6 +3748,14 @@ pub fn main(init: std.process.Init) anyerror!void {
     var beast_mode: bool = false;
     var frame_diagnostics = FrameDiagnostics{ .enabled = diagnostics_enabled and !diagnostics_hide_hud };
     var diagnostics_selection_pending = diagnostics_select_id;
+    var diagnostics_motion_pending = diagnostics_motion_id;
+    var diagnostics_timeline_step_pending = diagnostics_timeline_step;
+    var diagnostics_motion_preview_pending = diagnostics_motion_preview;
+    var diagnostics_slide_pending = diagnostics_slide;
+    var diagnostics_motion_state_pending = diagnostics_motion_state;
+    var diagnostics_motion_transition_pending = diagnostics_motion_transition;
+    var studio_preview: StudioMotionPreview = .{};
+    defer studio_preview.stop(gpa);
     var diagnostics_library_preview_pending = diagnostics_library_preview_name;
     var diagnostics_library_definition_pending = diagnostics_library_definition_name;
     var diagnostics_command_palette_pending = diagnostics_command_palette;
@@ -3748,6 +3808,12 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer studio_bounds.deinit(gpa);
     var studio_render_bounds = std.ArrayList(renderer.SlideshowRenderer.ItemRenderBounds).empty;
     defer studio_render_bounds.deinit(gpa);
+    var studio_previous_bounds = std.ArrayList(studio.ResolvedBounds).empty;
+    defer studio_previous_bounds.deinit(gpa);
+    var studio_previous_render_bounds = std.ArrayList(renderer.SlideshowRenderer.ItemRenderBounds).empty;
+    defer studio_previous_render_bounds.deinit(gpa);
+    var studio_state_changes = std.ArrayList(studio.StateChangeSummary).empty;
+    defer studio_state_changes.deinit(gpa);
     var studio_workspace_cache = StudioWorkspaceCache.init(gpa);
     defer studio_workspace_cache.deinit();
     var studio_library_gallery_cache = StudioLibraryGalleryCache.init(gpa);
@@ -4487,6 +4553,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                 current_slide,
                 item_insertion_offset,
                 slide_insertion_offset,
+                G.slide_renderer.revealBuilds(G.current_slide),
+                G.editor_memory[0..G.source_len],
             )) or workspace_cache_rebuilt;
             frame_studio_catalog = studio_workspace_cache.catalog;
             if (frame_studio_catalog) |catalog| gallery_cache_rebuilt = try studio_library_gallery_cache.refresh(
@@ -4504,6 +4572,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .library = studio_workspace_cache.library_entries.items,
                 .library_visuals = studio_library_gallery_cache.visuals.items,
                 .morph_states = studio_workspace_cache.morph_summaries.items,
+                .builds = studio_workspace_cache.build_summaries.items,
+                .transition = if (current_slide) |slide| studioTransitionSummary(slide) else .{},
                 .new_deck = pristineUntitledDeck(),
                 .undo_available = studio_history.undo_stack.items.len > 0,
                 .redo_available = studio_history.redo_stack.items.len > 0,
@@ -4648,6 +4718,45 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_mode.active_morph_state,
                 studio_items,
             );
+        // Morph scene context for ghosts and the State section: the previous
+        // scene's bounds plus every object the active state touches.
+        studio_previous_bounds.clearRetainingCapacity();
+        studio_state_changes.clearRetainingCapacity();
+        if (studio_mode.capturesInput() and definition_preview_entry == null) {
+            if (studio_mode.active_morph_state) |state_index| {
+                if (current_slide) |slide| if (state_index < slide.morph_states.items.len) {
+                    const previous_items = if (state_index == 0) (if (slide.items) |*list| list.items else &.{}) else slide.morph_states.items[state_index - 1].items.items;
+                    _ = try collectStudioBounds(
+                        &studio_previous_bounds,
+                        &studio_previous_render_bounds,
+                        gpa,
+                        G.current_slide,
+                        if (state_index == 0) null else state_index - 1,
+                        previous_items,
+                    );
+                    try collectStudioStateChanges(&studio_state_changes, gpa, slide, state_index, studio_items);
+                };
+            }
+        }
+        studio_mode.setMorphSceneContext(studio_previous_bounds.items, studio_state_changes.items);
+        if (diagnostics_slide_pending) |slide_index| {
+            if (slide_index < G.slideshow.slides.items.len and @as(i32, @intCast(slide_index)) != G.current_slide) {
+                jumpToSlide(@intCast(slide_index), rl.getTime());
+            }
+            diagnostics_slide_pending = null;
+            // Selection and scene hooks must see the requested slide's items.
+            continue;
+        }
+        if (diagnostics_motion_state_pending) |state_index| {
+            if (current_slide != null and state_index < current_slide.?.morph_states.items.len) {
+                studio_mode.selectMorphSceneForDiagnostics(studio_items, state_index);
+            } else {
+                log.warn("diagnostics could not select morph state {d}", .{state_index + 1});
+            }
+            diagnostics_motion_state_pending = null;
+            _ = studio_mode.takeSemanticCommand();
+            continue;
+        }
         if (diagnostics_selection_pending) |item_id| {
             if (studio_mode.selectItemByIdOrSource(studio_items, item_id, .{})) {
                 studio_mode.active_dock = .properties;
@@ -4657,6 +4766,61 @@ pub fn main(init: std.process.Init) anyerror!void {
                 log.warn("diagnostics could not select unique item id={s}", .{item_id});
             }
             diagnostics_selection_pending = null;
+        }
+        if (diagnostics_motion_transition_pending) {
+            studio_mode.showTransitionSection(studio_items);
+            _ = studio_mode.takeSemanticCommand();
+            diagnostics_motion_transition_pending = false;
+        }
+        if (diagnostics_motion_pending) |item_id| {
+            if (studio_mode.selectItemByIdOrSource(studio_items, item_id, .{})) {
+                studio_mode.showMotionForDiagnostics();
+            } else {
+                log.warn("diagnostics could not select unique motion item id={s}", .{item_id});
+            }
+            diagnostics_motion_pending = null;
+        }
+        if (diagnostics_timeline_step_pending) |step| {
+            if (studio_workspace.builds.len > 0) {
+                studio_mode.selectRevealStepForDiagnostics(studio_items, studio_workspace.builds, step);
+                diagnostics_timeline_step_pending = null;
+            }
+        }
+        // Live preview: any source, slide, scene, tool, or gesture change
+        // stops it; otherwise the deterministic clock advances.
+        if (studio_preview.active()) {
+            const scene_changed = studio_mode.active_morph_state != studio_preview.morph_state or
+                studio_mode.visible_reveal_step != studio_preview.reveal_step;
+            if (!studio_mode.capturesInput() or G.source_revision != studio_preview.revision or
+                G.current_slide != studio_preview.slide or scene_changed or
+                studio_mode.interaction != .idle or studio_mode.tool != .select)
+            {
+                studio_preview.stop(gpa);
+            } else {
+                studio_preview.advance(rl.getFrameTime());
+            }
+        }
+        if (diagnostics_motion_preview_pending) |seconds| {
+            if (studio_mode.capturesInput() and G.slide_renderer.stepCount(G.current_slide) > 0) {
+                studio_preview.start(gpa, G.slide_renderer, G.current_slide, G.source_revision, studio_mode.active_morph_state, studio_mode.visible_reveal_step) catch {};
+                studio_preview.seek(seconds);
+                diagnostics_motion_preview_pending = null;
+            }
+        }
+        if (studio_mode.capturesInput()) {
+            const preview_available = G.slide_renderer.stepCount(G.current_slide) > 0 or
+                (G.current_slide > 0 and G.slide_renderer.transitionForSlide(G.current_slide).effect != .none);
+            const preview_state = studio_preview.state();
+            studio_mode.setMotionPreview(.{
+                .available = preview_available,
+                .playing = studio_preview.playing,
+                .paused = studio_preview.paused,
+                .looping = studio_preview.looping,
+                .time = studio_preview.clock,
+                .total = studio_preview.total(),
+                .step = if (preview_state) |value| (value.active_step orelse value.visible_through) else 0,
+                .in_transition = if (preview_state) |value| value.transition_progress != null else false,
+            });
         }
         // The release-QA harness moves the native window to its isolated
         // workspace before opening focus-sensitive diagnostic UI. Otherwise
@@ -5242,6 +5406,31 @@ pub fn main(init: std.process.Init) anyerror!void {
                     },
                     .select_slide => |slide_index| studio_slide_to_select = slide_index,
                     .select_morph_scene => {},
+                    .motion_preview => |preview_command| switch (preview_command) {
+                        .play => if (studio_preview.active()) {
+                            if (studio_preview.clock >= studio_preview.total()) studio_preview.clock = 0;
+                            studio_preview.playing = true;
+                            studio_preview.paused = false;
+                        } else {
+                            studio_preview.start(gpa, G.slide_renderer, G.current_slide, G.source_revision, studio_mode.active_morph_state, studio_mode.visible_reveal_step) catch |err| {
+                                log.err("motion preview failed to start: {any}", .{err});
+                            };
+                        },
+                        .pause => {
+                            studio_preview.playing = false;
+                            studio_preview.paused = studio_preview.active();
+                        },
+                        .stop => studio_preview.stop(gpa),
+                        .toggle_loop => studio_preview.looping = !studio_preview.looping,
+                        .seek => |seconds| {
+                            if (!studio_preview.active()) {
+                                studio_preview.start(gpa, G.slide_renderer, G.current_slide, G.source_revision, studio_mode.active_morph_state, studio_mode.visible_reveal_step) catch |err| {
+                                    log.err("motion preview failed to start: {any}", .{err});
+                                };
+                            }
+                            studio_preview.seek(seconds);
+                        },
+                    },
                     else => semantic_to_apply = command,
                 }
             }
@@ -5366,24 +5555,45 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         const reveal_state: renderer.RevealState = if (export_controller.running)
             .{ .visible_through = G.slide_renderer.stepCount(G.current_slide) }
-        else if (studio_mode.capturesInput())
-            .{ .visible_through = G.slide_renderer.baseRevealStepCount(G.current_slide) + if (studio_mode.active_morph_state) |state| state + 1 else 0 }
-        else
-            .{
-                .visible_through = G.playback.visible_step,
-                .active_step = G.playback.active_step,
-                .active_progress = G.playback.activeStepProgress(now),
+        else if (studio_mode.capturesInput()) blk: {
+            if (studio_preview.state()) |preview_state| break :blk .{
+                .visible_through = preview_state.visible_through,
+                .active_step = preview_state.active_step,
+                .active_progress = preview_state.active_progress,
             };
-        const transition_state: renderer.TransitionState = if (export_controller.running or studio_mode.capturesInput())
+            break :blk .{ .visible_through = if (studio_mode.active_morph_state) |state|
+                G.slide_renderer.baseRevealStepCount(G.current_slide) + state + 1
+            else if (studio_mode.visible_reveal_step) |step|
+                step
+            else
+                G.slide_renderer.baseRevealStepCount(G.current_slide) };
+        } else .{
+            .visible_through = G.playback.visible_step,
+            .active_step = G.playback.active_step,
+            .active_progress = G.playback.activeStepProgress(now),
+        };
+        const transition_state: renderer.TransitionState = if (export_controller.running)
             .{}
-        else
-            .{
-                .previous_slide = G.playback.previous_slide,
-                .previous_step = G.playback.previous_step,
-                .spec = G.playback.transition,
-                .progress = G.playback.transitionProgress(now),
-                .direction = G.playback.direction,
-            };
+        else if (studio_mode.capturesInput()) blk: {
+            if (studio_preview.state()) |preview_state| {
+                if (preview_state.transition_progress) |progress| {
+                    if (G.current_slide > 0) break :blk .{
+                        .previous_slide = G.current_slide - 1,
+                        .previous_step = G.slide_renderer.stepCount(G.current_slide - 1),
+                        .spec = G.slide_renderer.transitionForSlide(G.current_slide),
+                        .progress = progress,
+                        .direction = 1,
+                    };
+                }
+            }
+            break :blk .{};
+        } else .{
+            .previous_slide = G.playback.previous_slide,
+            .previous_step = G.playback.previous_step,
+            .spec = G.playback.transition,
+            .progress = G.playback.transitionProgress(now),
+            .direction = G.playback.direction,
+        };
         const crowd_snapshot: ?crowdplay.Snapshot = if (crowd_runtime.isRunning()) crowd_runtime.snapshotFor(current_crowd_spec) else null;
         const previous_crowd_snapshot: ?crowdplay.Snapshot = if (crowd_runtime.isRunning()) blk: {
             const previous_slide = G.playback.previous_slide orelse break :blk null;
@@ -5701,6 +5911,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                             => .structural_source_locked,
                             error.UnsupportedDefinitionStructure => .definition_structure_unsupported,
                             error.StudioClipboardEmpty => .clipboard_empty,
+                            error.RevealMorphBorn => .reveal_morph_born,
+                            error.RevealSceneRequired => .reveal_scene_required,
+                            error.RevealSharedTemplate => .reveal_shared_template,
+                            error.TransitionNeedsSlideDirective => .transition_needs_slide_directive,
+                            error.TransitionSharedUnavailable => .structural_source_locked,
                             error.LockedLayerBarrier,
                             error.StudioItemLocked,
                             => .locked_item,
@@ -5742,6 +5957,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                         error.StudioSourcePatchInvalid,
                         => if (semanticCommandIsMorphTimeline(command)) .morph_structure_locked else .edit_failed,
                         error.StudioClipboardEmpty => .clipboard_empty,
+                        error.RevealMorphBorn => .reveal_morph_born,
+                        error.RevealSceneRequired => .reveal_scene_required,
+                        error.RevealSharedTemplate => .reveal_shared_template,
+                        error.TransitionNeedsSlideDirective => .transition_needs_slide_directive,
+                        error.TransitionSharedUnavailable => .structural_source_locked,
                         error.LockedLayerBarrier,
                         error.StudioItemLocked,
                         => .locked_item,
@@ -6860,7 +7080,7 @@ fn diagnosticLargeDeckSource(output: []u8, slide_count: usize) ![]const u8 {
             try appendDiagnosticDeckText(
                 output,
                 &cursor,
-                "@state(morph) name=focus_{d} duration=0.35\n@set title_{d} x=140 color=#55d9ffff\n",
+                "@state(morph) label=focus_{d} duration=0.35\n@set title_{d} x=140 color=#55d9ffff\n",
                 .{ slide_index, slide_index },
             );
         }
@@ -7321,6 +7541,11 @@ fn inheritedPropertyForStudioProperty(property: studio.AuthoredProperty) source_
         .video_autoplay => .autoplay,
         .video_loop => .loop,
         .video_muted => .muted,
+        // Reveal ownership is handled by `set_item_reveal` (reset/remove
+        // actions), never by the inherited-attribute reset path.
+        .reveal => unreachable,
+        .morph_state => unreachable,
+        .transition => unreachable,
     };
 }
 
@@ -8699,10 +8924,59 @@ const InlineSemanticEdit = struct {
 /// command surface. Keeping the mapping here means legacy modal actions and
 /// inline fields share exactly the same ownership, canonicalization, history,
 /// and reparse implementation.
+/// Motion inspector fields patch one reveal property on every target; the
+/// per-target current spec is resolved when the command is applied.
+fn revealInlineCommand(commit: studio.InlineCommit) studio.ItemRevealCommand {
+    const value = std.mem.trim(u8, commit.value, " \t\r\n");
+    var patch: studio.RevealPatch = .{};
+    switch (commit.field) {
+        .reveal_delay => patch.delay = if (value.len == 0)
+            .none
+        else if (std.ascii.eqlIgnoreCase(value, "click"))
+            .click
+        else
+            .{ .seconds = parseStudioFiniteFloat(value) catch 0 },
+        .reveal_after => patch.after = if (value.len == 0) @as(?f32, null) else (parseStudioFiniteFloat(value) catch 0),
+        .reveal_duration => patch.duration = parseStudioFiniteFloat(value) catch 0,
+        else => {},
+    }
+    var targets = commit.targets;
+    if (targets.count == 0) {
+        targets.targets[0] = commit.target;
+        targets.count = 1;
+    }
+    return .{ .targets = targets, .action = .patch, .patch = patch };
+}
+
+fn sceneInlineSemanticEdit(commit: studio.InlineCommit) InlineSemanticEdit {
+    const state_index = commit.scene_state orelse 0;
+    const value = std.mem.trim(u8, commit.value, " \t\r\n");
+    const command: studio.SemanticCommand = switch (commit.field) {
+        .state_label => if (value.len == 0) .{ .clear_morph_state_label = state_index } else .{ .rename_morph_state = state_index },
+        .state_after => .{ .set_morph_state_timing = .{
+            .state_index = state_index,
+            .after = if (value.len == 0) @as(?f32, null) else (parseStudioFiniteFloat(value) catch 0),
+        } },
+        .state_duration => .{ .set_morph_state_timing = .{
+            .state_index = state_index,
+            .duration = parseStudioFiniteFloat(value) catch 0,
+        } },
+        .transition_duration => .{ .set_slide_transition = .{ .duration = parseStudioFiniteFloat(value) catch 0 } },
+        else => unreachable,
+    };
+    return .{ .command = command, .value = value };
+}
+
 fn inlineSemanticEdit(commit: studio.InlineCommit) InlineSemanticEdit {
+    if (studio.inlineFieldIsScene(commit.field)) return sceneInlineSemanticEdit(commit);
+    if (studio.inlineFieldIsMotion(commit.field)) {
+        return .{ .command = .{ .set_item_reveal = revealInlineCommand(commit) }, .value = commit.value };
+    }
     if (commit.targets.count > 1) {
         const property: studio.CommonProperty = switch (commit.field) {
             .text => unreachable,
+            .reveal_delay, .reveal_after, .reveal_duration => unreachable,
+            .state_label, .state_after, .state_duration, .transition_duration => unreachable,
             .x => .x,
             .y => .y,
             .width => .width,
@@ -8748,6 +9022,8 @@ fn inlineSemanticEdit(commit: studio.InlineCommit) InlineSemanticEdit {
         .media_focus_y => .{ .set_media_focus = .{ .target = commit.target, .axis = .y } },
         .video_poster => .{ .set_video_poster = .{ .target = commit.target } },
         .video_volume => .{ .set_video_volume = .{ .target = commit.target } },
+        .reveal_delay, .reveal_after, .reveal_duration => unreachable,
+        .state_label, .state_after, .state_duration, .transition_duration => unreachable,
     };
     return .{ .command = command, .value = commit.value };
 }
@@ -8805,6 +9081,39 @@ fn validateInlineCommit(commit: studio.InlineCommit) ?studio.InlineError {
             var buffer: [64]u8 = undefined;
             _ = canonicalStudioUnitInterval(commit.value, &buffer) catch return .invalid_unit_interval;
         },
+        .reveal_delay => {
+            const value = std.mem.trim(u8, commit.value, " \t\r\n");
+            if (value.len != 0 and !std.ascii.eqlIgnoreCase(value, "click")) {
+                const parsed = parseStudioFiniteFloat(value) catch return .invalid_delay;
+                if (parsed < 0) return .invalid_delay;
+            }
+        },
+        .reveal_after => {
+            const value = std.mem.trim(u8, commit.value, " \t\r\n");
+            if (value.len != 0) {
+                const parsed = parseStudioFiniteFloat(value) catch return .invalid_seconds;
+                if (parsed < 0) return .invalid_seconds;
+            }
+        },
+        .reveal_duration => {
+            const parsed = parseStudioFiniteFloat(commit.value) catch return .invalid_seconds;
+            if (parsed < 0) return .invalid_seconds;
+        },
+        .state_label => {
+            const value = std.mem.trim(u8, commit.value, " \t\r\n");
+            if (value.len != 0 and !validReusableName(value)) return .invalid_state_label;
+        },
+        .state_after => {
+            const value = std.mem.trim(u8, commit.value, " \t\r\n");
+            if (value.len != 0) {
+                const parsed = parseStudioFiniteFloat(value) catch return .invalid_seconds;
+                if (parsed < 0) return .invalid_seconds;
+            }
+        },
+        .state_duration, .transition_duration => {
+            const parsed = parseStudioFiniteFloat(commit.value) catch return .invalid_seconds;
+            if (parsed < 0) return .invalid_seconds;
+        },
     }
     return null;
 }
@@ -8826,6 +9135,7 @@ fn inlineCommitChangesValue(
         }
         return false;
     }
+    if (studio.inlineFieldIsScene(commit.field)) return true;
     const item = studioItemByIdentity(items, commit.target.item_identity) orelse return true;
     const shared = if (commit.target.edit_scope == .shared_template) item.sharedTemplateValues() else null;
     const geometry = if (shared) |values|
@@ -8906,6 +9216,27 @@ fn inlineCommitChangesValue(
             const submitted = parseStudioFiniteFloat(commit.value) catch return true;
             break :changed @abs(current - submitted) > 0.000001;
         },
+        .reveal_delay => changed: {
+            const spec = item.animation orelse break :changed true;
+            const value = std.mem.trim(u8, commit.value, " \t\r\n");
+            if (value.len == 0) break :changed spec.delay != null or spec.first_waits;
+            if (std.ascii.eqlIgnoreCase(value, "click")) break :changed !spec.first_waits;
+            const parsed = parseStudioFiniteFloat(value) catch break :changed true;
+            break :changed spec.first_waits or spec.delay == null or spec.delay.? != parsed;
+        },
+        .reveal_after => changed: {
+            const spec = item.animation orelse break :changed true;
+            const value = std.mem.trim(u8, commit.value, " \t\r\n");
+            if (value.len == 0) break :changed spec.after != null;
+            const parsed = parseStudioFiniteFloat(value) catch break :changed true;
+            break :changed spec.after == null or spec.after.? != parsed;
+        },
+        .reveal_duration => changed: {
+            const spec = item.animation orelse break :changed true;
+            const parsed = parseStudioFiniteFloat(commit.value) catch break :changed true;
+            break :changed spec.duration != parsed;
+        },
+        .state_label, .state_after, .state_duration, .transition_duration => true,
     };
 }
 
@@ -9171,6 +9502,7 @@ const StudioWorkspaceCache = struct {
     catalog: ?studio_catalog.Catalog = null,
     slide_summaries: std.ArrayList(studio.SlideSummary) = .empty,
     morph_summaries: std.ArrayList(studio.MorphStateSummary) = .empty,
+    build_summaries: std.ArrayList(studio.RevealBuildSummary) = .empty,
     library_entries: std.ArrayList(studio.LibraryEntry) = .empty,
     library_catalog_indices: std.ArrayList(usize) = .empty,
     morph_slide_index: ?usize = null,
@@ -9188,6 +9520,7 @@ const StudioWorkspaceCache = struct {
         self.catalog = null;
         self.slide_summaries.deinit(self.allocator);
         self.morph_summaries.deinit(self.allocator);
+        self.build_summaries.deinit(self.allocator);
         self.library_entries.deinit(self.allocator);
         self.library_catalog_indices.deinit(self.allocator);
     }
@@ -9209,6 +9542,7 @@ const StudioWorkspaceCache = struct {
         self.catalog = catalog;
         self.revision = revision;
         self.morph_summaries.clearRetainingCapacity();
+        self.build_summaries.clearRetainingCapacity();
         self.library_entries.clearRetainingCapacity();
         self.library_catalog_indices.clearRetainingCapacity();
         self.morph_slide_index = null;
@@ -9224,11 +9558,30 @@ const StudioWorkspaceCache = struct {
         slide: ?*const slides.Slide,
         item_insertion_offset: usize,
         slide_insertion_offset: usize,
+        builds: []const renderer.RevealBuild,
+        source: []const u8,
     ) !bool {
         var rebuilt = false;
         if (self.morph_slide_index != slide_index) {
             self.morph_summaries.clearRetainingCapacity();
+            self.build_summaries.clearRetainingCapacity();
             if (slide) |current| {
+                if (current.items) |base_items| {
+                    for (builds) |build| {
+                        const owner = studioItemByIdentity(base_items.items, build.owner_identity);
+                        try self.build_summaries.append(self.allocator, .{
+                            .owner_identity = build.owner_identity,
+                            .first_step = build.first_step,
+                            .step_count = build.step_count,
+                            .spec = build.spec,
+                            .label = if (owner) |item| studioItemLabel(item.*) else "",
+                            .authored_locally = if (owner) |item|
+                                item.source.patchable and source_editor.itemAuthorsReveal(source, item.source.line_offset)
+                            else
+                                true,
+                        });
+                    }
+                }
                 for (current.morph_states.items, 0..) |state, state_index| {
                     try self.morph_summaries.append(self.allocator, .{
                         .index = state_index,
@@ -9345,6 +9698,7 @@ fn collectStudioSlideSummaries(
             .title = studioSlideTitle(slide),
             .item_count = if (slide.items) |items| items.items.len else 0,
             .morph_count = slide.morph_states.items.len,
+            .transition_effect = slide.transition.effect,
         });
     }
 }
@@ -9423,7 +9777,7 @@ test "Studio workspace cache avoids unchanged large-deck rescans" {
     const selected = slideshow.slides.items[selected_index];
     const item_offset = try source_editor.slideItemInsertionOffset(source_builder.items, selected.pos_in_editor);
     const slide_offset = try source_editor.slideEndOffset(source_builder.items, selected.pos_in_editor);
-    try std.testing.expect(try cache.refreshScene(selected_index, selected, item_offset, slide_offset));
+    try std.testing.expect(try cache.refreshScene(selected_index, selected, item_offset, slide_offset, &.{}, ""));
     try std.testing.expectEqual(definition_count, cache.library_entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), cache.document_rebuild_count);
     try std.testing.expectEqual(@as(usize, 1), cache.scene_rebuild_count);
@@ -9431,7 +9785,7 @@ test "Studio workspace cache avoids unchanged large-deck rescans" {
     // A steady Studio frame performs no catalog, slide-summary, morph, or
     // library rebuild regardless of deck size.
     try std.testing.expect(!try cache.refreshDocument(11, source_builder.items, slideshow));
-    try std.testing.expect(!try cache.refreshScene(selected_index, selected, item_offset, slide_offset));
+    try std.testing.expect(!try cache.refreshScene(selected_index, selected, item_offset, slide_offset, &.{}, ""));
     try std.testing.expectEqual(@as(usize, 1), cache.document_rebuild_count);
     try std.testing.expectEqual(@as(usize, 1), cache.scene_rebuild_count);
 
@@ -9441,7 +9795,7 @@ test "Studio workspace cache avoids unchanged large-deck rescans" {
         next,
         try source_editor.slideItemInsertionOffset(source_builder.items, next.pos_in_editor),
         try source_editor.slideEndOffset(source_builder.items, next.pos_in_editor),
-    ));
+    &.{}, ""));
     try std.testing.expectEqual(@as(usize, 1), cache.document_rebuild_count);
     try std.testing.expectEqual(@as(usize, 2), cache.scene_rebuild_count);
 
@@ -9567,24 +9921,25 @@ fn appendStudioToken(
     try output.appendSlice(allocator, token);
 }
 
-fn animationEffectLiteral(effect: animation.Effect) []const u8 {
-    return switch (effect) {
-        .none => "none",
-        .appear => "appear",
-        .fade => "fade",
-        .slide_left => "slide-left",
-        .slide_right => "slide-right",
-        .slide_up => "slide-up",
-        .slide_down => "slide-down",
-    };
-}
-
-fn animationGroupingLiteral(grouping: animation.Grouping) []const u8 {
-    return switch (grouping) {
-        .item => "item",
-        .line => "line",
-        .bullet => "bullet",
-    };
+/// Emit the complete inline reveal form for a materialized item, including
+/// the first-step delay, easing, and order so Detach stays lossless.
+fn appendStudioRevealAttributes(directive: *std.ArrayList(u8), allocator: std.mem.Allocator, spec: animation.ItemSpec) !void {
+    try directive.appendSlice(allocator, " anim=");
+    try directive.appendSlice(allocator, animation.effectLiteral(spec.effect));
+    try directive.appendSlice(allocator, " by=");
+    try directive.appendSlice(allocator, animation.groupingLiteral(spec.by));
+    if (spec.first_waits) {
+        try directive.appendSlice(allocator, " delay=click");
+    } else if (spec.delay) |delay| {
+        try appendStudioToken(directive, allocator, " delay={d}", .{delay});
+    }
+    if (spec.after) |after| try appendStudioToken(directive, allocator, " after={d}", .{after});
+    try appendStudioToken(directive, allocator, " duration={d}", .{spec.duration});
+    if (spec.easing != .smooth) {
+        try directive.appendSlice(allocator, " ease=");
+        try directive.appendSlice(allocator, animation.easingLiteral(spec.easing));
+    }
+    if (spec.order != 0) try appendStudioToken(directive, allocator, " order={d}", .{spec.order});
 }
 
 fn studioLiteralToken(value: []const u8) ![]const u8 {
@@ -9641,14 +9996,7 @@ fn materializeStudioItem(allocator: std.mem.Allocator, item: *const slides.Slide
             if (item.visible) "true" else "false",
             if (item.locked) "true" else "false",
         });
-        if (item.animation) |spec| {
-            try directive.appendSlice(allocator, " anim=");
-            try directive.appendSlice(allocator, animationEffectLiteral(spec.effect));
-            try directive.appendSlice(allocator, " by=");
-            try directive.appendSlice(allocator, animationGroupingLiteral(spec.by));
-            if (spec.after) |after| try appendStudioToken(&directive, allocator, " after={d}", .{after});
-            try appendStudioToken(&directive, allocator, " duration={d}", .{spec.duration});
-        }
+        if (item.animation) |spec| try appendStudioRevealAttributes(&directive, allocator, spec);
         return directive.toOwnedSlice(allocator);
     }
 
@@ -9758,14 +10106,7 @@ fn materializeStudioItem(allocator: std.mem.Allocator, item: *const slides.Slide
     } else {
         try directive.appendSlice(allocator, " shadow=none");
     }
-    if (item.animation) |spec| {
-        try directive.appendSlice(allocator, " anim=");
-        try directive.appendSlice(allocator, animationEffectLiteral(spec.effect));
-        try directive.appendSlice(allocator, " by=");
-        try directive.appendSlice(allocator, animationGroupingLiteral(spec.by));
-        if (spec.after) |after| try appendStudioToken(&directive, allocator, " after={d}", .{after});
-        try appendStudioToken(&directive, allocator, " duration={d}", .{spec.duration});
-    }
+    if (item.animation) |spec| try appendStudioRevealAttributes(&directive, allocator, spec);
 
     if (item.text) |text_value| {
         return itemTextSnippet(allocator, directive.items, text_value);
@@ -10121,6 +10462,364 @@ fn applyStudioLockEdit(
         "locked",
         if (command.locked) "true" else "false",
     );
+}
+
+/// Minimal `order=` keys for a desired build sequence. Walking the sequence,
+/// the key only increases where the next build sits earlier in the source
+/// than the previous one; every other build keeps the previous key. Builds
+/// that end up with key 0 need no `order=` at all.
+fn revealOrderAssignments(source_positions: []const usize, orders: []i32) void {
+    var current: i32 = 0;
+    for (source_positions, 0..) |position, index| {
+        if (index > 0 and position < source_positions[index - 1]) current += 1;
+        orders[index] = current;
+    }
+}
+
+test "reveal order assignments stay minimal and only rise on source inversions" {
+    var orders: [4]i32 = undefined;
+    revealOrderAssignments(&.{ 10, 20, 30, 40 }, &orders);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 0, 0 }, &orders);
+    revealOrderAssignments(&.{ 30, 10, 20, 40 }, &orders);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 1, 1 }, &orders);
+    revealOrderAssignments(&.{ 40, 30, 20, 10 }, &orders);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3 }, &orders);
+    var two: [2]i32 = undefined;
+    revealOrderAssignments(&.{ 20, 10 }, &two);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, &two);
+}
+
+/// The current slide's incoming transition with its provenance.
+fn studioTransitionSummary(slide: *const slides.Slide) studio.TransitionSummary {
+    const source = G.editor_memory[0..G.source_len];
+    const anchor_name = source_editor.directiveNameAt(source, slide.pos_in_editor);
+    const can_author = anchor_name != null and
+        (std.mem.eql(u8, anchor_name.?, "@slide") or std.mem.eql(u8, anchor_name.?, "@popslide"));
+    const local = can_author and source_editor.directiveHasAttribute(source, slide.pos_in_editor, "transition");
+    const provenance: studio.TransitionProvenance = if (local)
+        .slide
+    else if (slide.transition_authored)
+        .template
+    else if (G.slideshow.has_default_transition)
+        .deck_default
+    else
+        .none;
+    return .{
+        .transition = slide.transition,
+        .provenance = provenance,
+        .template_name = source_editor.slideAnchorTemplateName(source, slide.pos_in_editor) orelse "",
+        .deck = if (G.slideshow.has_default_transition) G.slideshow.default_transition else null,
+        .can_author = can_author,
+        .has_previous_slide = G.current_slide > 0,
+    };
+}
+
+/// Editor-side live preview. It owns a deterministic clock and a schedule
+/// built from the renderer's real step timeline; presentation playback,
+/// export, and Presenter never see it.
+const StudioMotionPreview = struct {
+    schedule: ?motion_schedule.Schedule = null,
+    playing: bool = false,
+    paused: bool = false,
+    looping: bool = false,
+    clock: f32 = 0,
+    slide: i32 = -1,
+    revision: usize = 0,
+    morph_state: ?usize = null,
+    reveal_step: ?usize = null,
+
+    fn active(self: StudioMotionPreview) bool {
+        return self.schedule != null;
+    }
+
+    fn stop(self: *StudioMotionPreview, allocator: std.mem.Allocator) void {
+        if (self.schedule) |schedule| schedule.deinit(allocator);
+        const looping = self.looping;
+        self.* = .{ .looping = looping };
+    }
+
+    /// Start from the scene Studio currently shows: BASE plays the whole
+    /// slide (with its incoming transition when a previous slide exists), a
+    /// build scene starts after that build, a state scene starts after it.
+    fn start(
+        self: *StudioMotionPreview,
+        allocator: std.mem.Allocator,
+        slide_renderer: *const renderer.SlideshowRenderer,
+        slide: i32,
+        revision: usize,
+        morph_state: ?usize,
+        reveal_step: ?usize,
+    ) !void {
+        self.stop(allocator);
+        const steps = slide_renderer.stepsForSlide(slide);
+        const start_step: usize = if (morph_state) |state_index|
+            slide_renderer.baseRevealStepCount(slide) + state_index + 1
+        else
+            reveal_step orelse 0;
+        const transition: ?animation.Transition = if (start_step == 0 and slide > 0)
+            slide_renderer.transitionForSlide(slide)
+        else
+            null;
+        self.schedule = try motion_schedule.build(allocator, steps, .{
+            .start_step = start_step,
+            .transition = transition,
+        });
+        self.slide = slide;
+        self.revision = revision;
+        self.morph_state = morph_state;
+        self.reveal_step = reveal_step;
+        self.clock = 0;
+        self.playing = true;
+        self.paused = false;
+    }
+
+    fn total(self: StudioMotionPreview) f32 {
+        return if (self.schedule) |schedule| schedule.total else 0;
+    }
+
+    fn state(self: StudioMotionPreview) ?motion_schedule.State {
+        const schedule = self.schedule orelse return null;
+        return schedule.stateAt(self.clock);
+    }
+
+    fn advance(self: *StudioMotionPreview, frame_time: f32) void {
+        if (!self.playing) return;
+        const schedule = self.schedule orelse return;
+        self.clock += @max(0, frame_time);
+        if (self.clock >= schedule.total) {
+            if (self.looping) {
+                self.clock = 0;
+            } else {
+                self.clock = schedule.total;
+                self.playing = false;
+                self.paused = true;
+            }
+        }
+    }
+
+    fn seek(self: *StudioMotionPreview, seconds: f32) void {
+        const schedule = self.schedule orelse return;
+        self.clock = @max(0, @min(schedule.total, seconds));
+        self.playing = false;
+        self.paused = true;
+    }
+};
+
+/// Short author-facing name for timeline cards and badges: the stable ID,
+/// otherwise the first text line, otherwise the item kind.
+fn studioItemLabel(item: slides.SlideItem) []const u8 {
+    if (item.id) |id| return id;
+    if (item.text) |text| {
+        const first_line = if (std.mem.indexOfScalar(u8, text, '\n')) |newline| text[0..newline] else text;
+        const trimmed = std.mem.trim(u8, first_line, " \t\r-> ");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return switch (item.kind) {
+        .textbox => if (item.text == null) "Shape" else "Text",
+        .img => "Image",
+        .vid => "Video",
+        .line => "Line",
+        .background => "Background",
+        .crowd => "Crowdplay",
+    };
+}
+
+const StudioRevealTarget = struct {
+    offset: usize,
+    spec: ?animation.ItemSpec,
+    text_item: bool,
+};
+
+/// Resolve the physical directive that owns a target's reveal. Instances edit
+/// their own `@pop`/`@box` line; shared-template members require the explicit
+/// shared scope because a slide-instance `@set` cannot carry a reveal.
+fn studioRevealTarget(target: studio.CommandTarget, items: []const slides.SlideItem) !StudioRevealTarget {
+    const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+    if (item.locked) return error.StudioItemLocked;
+    if (item.kind == .background) return error.ItemHasNoReveal;
+    if (item.creation_morph_state != null) return error.RevealMorphBorn;
+    if (target.edit_scope == .shared_template) {
+        if (target.source.scope == .none or !target.source.patchable) return error.StudioItemHasNoPatchableSource;
+        return .{ .offset = target.source.line_offset, .spec = item.animation, .text_item = item.kind == .textbox and item.text != null };
+    }
+    switch (item.source.scope) {
+        .slide_template, .group_instance_member => return error.RevealSharedTemplate,
+        else => {},
+    }
+    if (item.source.scope == .none or !item.source.patchable) return error.StudioItemHasNoPatchableSource;
+    return .{ .offset = item.source.line_offset, .spec = item.animation, .text_item = item.kind == .textbox and item.text != null };
+}
+
+fn applyStudioRevealEdit(
+    history: *StudioHistory,
+    command: studio.ItemRevealCommand,
+    items: []const slides.SlideItem,
+    selection_ids: *StudioSelectionIds,
+) !void {
+    var all_have_ids = true;
+    for (command.targets.slice()) |target| {
+        const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+        if (item.id) |id| try selection_ids.appendCopy(id) else all_have_ids = false;
+    }
+    if (!all_have_ids) selection_ids.clear();
+    const patch = try studioRevealPatch(G.allocator, G.editor_memory[0..G.source_len], command, items) orelse return;
+    try recordStudioPatch(history, patch);
+}
+
+/// Pure source transformation for one reveal command: every target is
+/// resolved first (atomic refusal), then patched from the last directive
+/// backwards so earlier offsets stay valid. Returns null when nothing
+/// changes.
+fn studioRevealPatch(
+    allocator: std.mem.Allocator,
+    original: []const u8,
+    command: studio.ItemRevealCommand,
+    items: []const slides.SlideItem,
+) !?source_editor.PatchResult {
+    var resolved: [studio.max_selection_items]StudioRevealTarget = undefined;
+    for (command.targets.slice(), 0..) |target, index| {
+        resolved[index] = try studioRevealTarget(target, items);
+        for (resolved[0..index]) |previous| {
+            if (previous.offset == resolved[index].offset) return error.InvalidStudioPropertyBatch;
+        }
+    }
+    const count = command.targets.count;
+    // Apply from the last directive backwards so earlier offsets stay valid
+    // while decorator lines are inserted or removed.
+    var order: [studio.max_selection_items]usize = undefined;
+    for (0..count) |index| order[index] = index;
+    var sorted: usize = 1;
+    while (sorted < count) : (sorted += 1) {
+        var moving = sorted;
+        while (moving > 0 and resolved[order[moving]].offset > resolved[order[moving - 1]].offset) : (moving -= 1) {
+            std.mem.swap(usize, &order[moving], &order[moving - 1]);
+        }
+    }
+
+    var current: []u8 = try allocator.dupe(u8, original);
+    errdefer allocator.free(current);
+    var changed = false;
+    for (order[0..count]) |index| {
+        const target = resolved[index];
+        const result: ?source_editor.PatchResult = switch (command.action) {
+            .patch => patch: {
+                // Line/bullet grouping only means something for text; other
+                // kinds always reveal as one item.
+                var base = target.spec orelse command.template;
+                if (!target.text_item) base.by = .item;
+                var spec = studio.applyRevealPatch(base, command.patch);
+                if (!target.text_item) spec.by = .item;
+                break :patch try source_editor.setItemReveal(allocator, current, target.offset, spec);
+            },
+            .remove => source_editor.removeItemReveal(allocator, current, target.offset) catch |err| switch (err) {
+                error.NoLocalPropertyOverride => if (target.spec != null)
+                    try source_editor.setItemReveal(allocator, current, target.offset, .{ .effect = .none })
+                else
+                    null,
+                else => return err,
+            },
+            .reset => try source_editor.removeItemReveal(allocator, current, target.offset),
+        };
+        if (result) |patch| {
+            allocator.free(current);
+            current = patch.source;
+            changed = true;
+        }
+    }
+    if (!changed) {
+        allocator.free(current);
+        return null;
+    }
+    return .{
+        .source = current,
+        .byte_delta = @as(isize, @intCast(current.len)) - @as(isize, @intCast(original.len)),
+    };
+}
+
+test "Studio reveal commands patch every target from the last directive backwards and reparse cleanly" {
+    const allocator = std.testing.allocator;
+    const source =
+        "@push comp x=1 y=1 w=100 h=100 anim=fade\n" ++
+        "@slide\n" ++
+        "@box id=list x=100 y=100 w=400 h=300\n" ++
+        "- one\n" ++
+        "- two\n" ++
+        "@pop comp id=inherited\n" ++
+        "@box id=pic img=a.png x=1 y=1\n";
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const deck = try slides.SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, deck, arena.allocator());
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    const items = deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expect(items[1].animation != null); // inherited from @push
+
+    var command: studio.ItemRevealCommand = .{ .action = .patch, .patch = .{ .trigger = .auto }, .template = .{ .effect = .fade, .by = .bullet } };
+    for (items, 0..) |item, index| {
+        command.targets.targets[index] = .{ .item_identity = item.identity, .source = item.source, .edit_scope = .direct };
+    }
+    command.targets.count = 3;
+    const patched = (try studioRevealPatch(allocator, source, command, items)).?;
+    defer patched.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "@push comp x=1 y=1 w=100 h=100 anim=fade\n" ++
+            "@slide\n" ++
+            "@anim(fade) by=bullet delay=0.5 after=0.8\n" ++
+            "@box id=list x=100 y=100 w=400 h=300\n" ++
+            "- one\n" ++
+            "- two\n" ++
+            "@anim(fade) delay=0.5 after=0.8\n" ++
+            "@pop comp id=inherited\n" ++
+            "@anim(fade) delay=0.5 after=0.8\n" ++
+            "@box id=pic img=a.png x=1 y=1\n",
+        patched.source,
+    );
+    var after_arena = std.heap.ArenaAllocator.init(allocator);
+    defer after_arena.deinit();
+    const after_deck = try slides.SlideShow.new(after_arena.allocator());
+    const after_context = try parser.constructSlidesFromBuf(patched.source, after_deck, after_arena.allocator());
+    defer after_context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_context.parser_errors.items.len);
+    const after_items = after_deck.slides.items[0].items.?.items;
+    try std.testing.expectEqual(@as(?f32, 0.5), after_items[0].animation.?.delay);
+    try std.testing.expectEqual(animation.Grouping.bullet, after_items[0].animation.?.by);
+    try std.testing.expectEqual(@as(?f32, 0.8), after_items[1].animation.?.after);
+
+    // Remove on an inherited-only instance cancels with anim=none; on a
+    // direct item it deletes the decorator. Both in one transaction.
+    var remove: studio.ItemRevealCommand = .{ .action = .remove };
+    remove.targets.targets[0] = .{ .item_identity = items[1].identity, .source = items[1].source, .edit_scope = .direct };
+    remove.targets.targets[1] = .{ .item_identity = items[2].identity, .source = items[2].source, .edit_scope = .direct };
+    remove.targets.count = 2;
+    const removed = (try studioRevealPatch(allocator, source, remove, items)).?;
+    defer removed.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "@push comp x=1 y=1 w=100 h=100 anim=fade\n" ++
+            "@slide\n" ++
+            "@box id=list x=100 y=100 w=400 h=300\n" ++
+            "- one\n" ++
+            "- two\n" ++
+            "@anim(none)\n" ++
+            "@pop comp id=inherited\n" ++
+            "@box id=pic img=a.png x=1 y=1\n",
+        removed.source,
+    );
+
+    // Morph-born and shared-template items are refused atomically.
+    var born_items = [_]slides.SlideItem{items[0]};
+    born_items[0].creation_morph_state = 0;
+    var born: studio.ItemRevealCommand = .{ .action = .patch };
+    born.targets.targets[0] = .{ .item_identity = born_items[0].identity, .source = born_items[0].source };
+    born.targets.count = 1;
+    try std.testing.expectError(error.RevealMorphBorn, studioRevealPatch(allocator, source, born, &born_items));
+    var shared_items = [_]slides.SlideItem{items[0]};
+    shared_items[0].source.scope = .slide_template;
+    var shared: studio.ItemRevealCommand = .{ .action = .patch };
+    shared.targets.targets[0] = .{ .item_identity = shared_items[0].identity, .source = shared_items[0].source };
+    shared.targets.count = 1;
+    try std.testing.expectError(error.RevealSharedTemplate, studioRevealPatch(allocator, source, shared, &shared_items));
 }
 
 fn planStudioVisibilityEdits(
@@ -10509,6 +11208,7 @@ fn applyStudioSemanticEdit(
         .showtime_preflight,
         .create_portable_show,
         .edit_library_entry,
+        .motion_preview,
         => return error.NonSourceStudioCommand,
         .edit_speaker_notes => {
             const notes = prompted_text orelse return error.StudioPromptMissing;
@@ -11314,6 +12014,201 @@ fn applyStudioSemanticEdit(
             if (!all_have_ids) selection_ids.clear();
             try applyStudioLockEdit(history, lock, slide, morph_state, items);
         },
+        .set_morph_state_timing => |timing| {
+            if (timing.state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            const state = slide.morph_states.items[timing.state_index];
+            var changed = false;
+            if (timing.after) |after| changed = changed or !std.meta.eql(state.spec.after, after);
+            if (timing.duration) |duration| changed = changed or state.spec.duration != duration;
+            if (timing.easing) |easing| changed = changed or state.spec.easing != easing;
+            if (!changed) return .{ .source_changed = false, .morph_scene = .{ .active_state = timing.state_index }, .preserve_selection = true };
+            try recordStudioPatch(history, try source_editor.setMorphStateTiming(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+                state.source.line_offset,
+                .{ .after = timing.after, .duration = timing.duration, .easing = timing.easing },
+            ));
+            history.setLatestMorphScenes(morph_state, timing.state_index);
+            return .{ .morph_scene = .{ .active_state = timing.state_index }, .preserve_selection = true };
+        },
+        .clear_morph_state_label => |state_index| {
+            if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            const state = slide.morph_states.items[state_index];
+            if (state.spec.label == null) return .{ .source_changed = false, .morph_scene = .{ .active_state = state_index }, .preserve_selection = true };
+            const keys = [_][]const u8{"label"};
+            try recordStudioPatch(history, try source_editor.removeLiteralAttributes(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                state.source.line_offset,
+                &keys,
+            ));
+            history.setLatestMorphScenes(morph_state, state_index);
+            return .{ .morph_scene = .{ .active_state = state_index }, .preserve_selection = true };
+        },
+        .reset_morph_object => |target| {
+            const state_index = morph_state orelse return error.InvalidMorphState;
+            if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            const item = studioItemByIdentity(items, target.item_identity) orelse return error.StudioItemMissing;
+            const id = item.id orelse return error.MorphItemNeedsId;
+            if (item.id) |value| try selection_ids.appendCopy(value);
+            try recordStudioPatch(history, try source_editor.deleteMorphMutationsForItem(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                slide.pos_in_editor,
+                slide.morph_states.items[state_index].source.line_offset,
+                id,
+            ));
+            history.setLatestMorphScenes(morph_state, state_index);
+            return .{ .morph_scene = .{ .active_state = state_index }, .preserve_selection = true };
+        },
+        .exit_morph_object => |exit| {
+            const state_index = morph_state orelse return error.InvalidMorphState;
+            if (state_index >= slide.morph_states.items.len) return error.InvalidMorphState;
+            const item = studioItemByIdentity(items, exit.target.item_identity) orelse return error.StudioItemMissing;
+            if (item.locked) return error.StudioItemLocked;
+            const id = item.id orelse return error.MorphItemNeedsId;
+            try selection_ids.appendCopy(id);
+            const geometry = studio.itemGeometry(item.*, resolved_bounds);
+            const margin: f32 = 100;
+            var directive_buffer: [160]u8 = undefined;
+            const directive = switch (exit.direction) {
+                .left => try std.fmt.bufPrint(&directive_buffer, "@hide {s} x={d}", .{ id, -(geometry.size.x + margin) }),
+                .right => try std.fmt.bufPrint(&directive_buffer, "@hide {s} x={d}", .{ id, studio.default_logical_size.x + margin }),
+                .up => try std.fmt.bufPrint(&directive_buffer, "@hide {s} y={d}", .{ id, -(geometry.size.y + margin) }),
+                .down => try std.fmt.bufPrint(&directive_buffer, "@hide {s} y={d}", .{ id, studio.default_logical_size.y + margin }),
+            };
+            const state_offset = slide.morph_states.items[state_index].source.line_offset;
+            const insertion = try source_editor.morphStateEndOffset(G.editor_memory[0..G.source_len], state_offset);
+            try recordStudioPatch(history, try source_editor.insertDirectiveAt(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                insertion,
+                directive,
+            ));
+            history.setLatestMorphScenes(morph_state, state_index);
+            return .{ .morph_scene = .{ .active_state = state_index }, .preserve_selection = true };
+        },
+        .set_slide_transition => |change| {
+            const source = G.editor_memory[0..G.source_len];
+            const anchor_name = source_editor.directiveNameAt(source, slide.pos_in_editor) orelse return error.TransitionNeedsSlideDirective;
+            if (!(std.mem.eql(u8, anchor_name, "@slide") or std.mem.eql(u8, anchor_name, "@popslide"))) return error.TransitionNeedsSlideDirective;
+            var anchor_offset = slide.pos_in_editor;
+            if (change.shared) {
+                const template_name = source_editor.slideAnchorTemplateName(source, slide.pos_in_editor) orelse return error.TransitionSharedUnavailable;
+                const catalog = catalog_opt orelse return error.TransitionSharedUnavailable;
+                var found: ?usize = null;
+                for (catalog.entries, 0..) |entry, catalog_index| {
+                    if (entry.kind != .slide or !std.mem.eql(u8, entry.name, template_name)) continue;
+                    if (!catalog.isVisibleAt(catalog_index, slide.pos_in_editor)) continue;
+                    found = entry.directive_offset;
+                }
+                anchor_offset = found orelse return error.TransitionSharedUnavailable;
+            }
+            if (change.inherit) {
+                try recordStudioPatch(history, try source_editor.removeSlideTransition(G.allocator, source, anchor_offset));
+                return .{ .preserve_selection = true };
+            }
+            var transition = if (slide.transition_authored or G.slideshow.has_default_transition) slide.transition else animation.Transition{};
+            if (change.effect) |effect| {
+                transition.effect = effect;
+                if (transition.effect != .none and !slide.transition_authored and !G.slideshow.has_default_transition) {
+                    transition.duration = (animation.Transition{}).duration;
+                    transition.easing = .smooth;
+                }
+            }
+            if (change.duration) |duration| transition.duration = duration;
+            if (change.easing) |easing| transition.easing = easing;
+            if (!change.shared and std.meta.eql(transition, slide.transition) and
+                source_editor.directiveHasAttribute(source, anchor_offset, "transition"))
+            {
+                return .{ .source_changed = false, .preserve_selection = true };
+            }
+            try recordStudioPatch(history, try source_editor.setSlideTransition(G.allocator, source, anchor_offset, transition));
+            return .{ .preserve_selection = true };
+        },
+        .set_deck_transition => |defaults| {
+            try recordStudioPatch(history, try source_editor.setDeckTransitionDefaults(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                defaults,
+            ));
+            return .{ .preserve_selection = true };
+        },
+        .move_reveal_build => |move| {
+            if (morph_state != null) return error.RevealSceneRequired;
+            const builds = G.slide_renderer.revealBuilds(G.current_slide);
+            if (builds.len < 2) return .{ .source_changed = false, .preserve_selection = true };
+            var from: ?usize = null;
+            for (builds, 0..) |build, index| if (build.owner_identity == move.owner_identity) {
+                from = index;
+            };
+            const from_index = from orelse return error.StudioItemMissing;
+            const to_index: usize = switch (move.direction) {
+                .earlier => if (from_index == 0) return .{ .source_changed = false, .preserve_selection = true } else from_index - 1,
+                .later => if (from_index + 1 >= builds.len) return .{ .source_changed = false, .preserve_selection = true } else from_index + 1,
+            };
+            if (builds.len > studio.max_selection_items) return error.InvalidStudioPropertyBatch;
+
+            // Desired sequence: swap the two builds.
+            var sequence: [studio.max_selection_items]usize = undefined;
+            for (0..builds.len) |index| sequence[index] = index;
+            std.mem.swap(usize, &sequence[from_index], &sequence[to_index]);
+            var positions: [studio.max_selection_items]usize = undefined;
+            var owners: [studio.max_selection_items]*const slides.SlideItem = undefined;
+            for (sequence[0..builds.len], 0..) |build_index, slot| {
+                const item = studioItemByIdentity(items, builds[build_index].owner_identity) orelse return error.StudioItemMissing;
+                if (item.locked) return error.StudioItemLocked;
+                if (item.source.scope == .none or !item.source.patchable) return error.StudioItemHasNoPatchableSource;
+                if (item.source.scope == .slide_template or item.source.scope == .group_instance_member) return error.RevealSharedTemplate;
+                owners[slot] = item;
+                positions[slot] = item.source.line_offset;
+            }
+            var orders: [studio.max_selection_items]i32 = undefined;
+            revealOrderAssignments(positions[0..builds.len], orders[0..builds.len]);
+
+            // Apply from the last directive backwards so offsets stay valid.
+            var apply_order: [studio.max_selection_items]usize = undefined;
+            for (0..builds.len) |slot| apply_order[slot] = slot;
+            var sorted: usize = 1;
+            while (sorted < builds.len) : (sorted += 1) {
+                var moving = sorted;
+                while (moving > 0 and positions[apply_order[moving]] > positions[apply_order[moving - 1]]) : (moving -= 1) {
+                    std.mem.swap(usize, &apply_order[moving], &apply_order[moving - 1]);
+                }
+            }
+            const original = G.editor_memory[0..G.source_len];
+            var current: []u8 = try G.allocator.dupe(u8, original);
+            errdefer G.allocator.free(current);
+            var changed = false;
+            for (apply_order[0..builds.len]) |slot| {
+                const item = owners[slot];
+                const spec = item.animation orelse continue;
+                if (spec.order == orders[slot]) continue;
+                var updated = spec;
+                updated.order = orders[slot];
+                const patch = try source_editor.setItemReveal(G.allocator, current, item.source.line_offset, updated);
+                G.allocator.free(current);
+                current = patch.source;
+                changed = true;
+            }
+            if (!changed) {
+                G.allocator.free(current);
+                return .{ .source_changed = false, .preserve_selection = true };
+            }
+            try recordStudioPatch(history, .{
+                .source = current,
+                .byte_delta = @as(isize, @intCast(current.len)) - @as(isize, @intCast(original.len)),
+            });
+            return .{ .preserve_selection = true };
+        },
+        .set_item_reveal => |reveal| {
+            if (morph_state != null) return error.RevealSceneRequired;
+            if (reveal.targets.count == 0 or reveal.targets.count > studio.max_selection_items)
+                return error.InvalidStudioPropertyBatch;
+            try applyStudioRevealEdit(history, reveal, items, selection_ids);
+            return .{ .preserve_selection = true };
+        },
         .reset_local_override => |reset| {
             const item = studioItemByIdentity(items, reset.target.item_identity) orelse
                 return error.StudioItemMissing;
@@ -11804,6 +12699,71 @@ fn restoreStudioSlide(requested: i32) void {
     const last: i32 = @intCast(G.slideshow.slides.items.len - 1);
     G.current_slide = std.math.clamp(requested, 0, last);
     G.playback.enterSlide(null, 0, 0, .{}, 1, rl.getTime());
+}
+
+/// Attribute keys of one `@set/@show/@hide` line, comma-separated, for the
+/// State section. Truncated summaries end with an ellipsis.
+fn studioMutationKeys(source: []const u8, offset: usize, buffer: *[48]u8) u8 {
+    if (offset >= source.len or source[offset] != '@') return 0;
+    const line_end = std.mem.indexOfScalarPos(u8, source, offset, '\n') orelse source.len;
+    var tokens = std.mem.tokenizeAny(u8, source[offset..line_end], " \t\r");
+    _ = tokens.next(); // directive
+    _ = tokens.next(); // target id
+    var len: usize = 0;
+    while (tokens.next()) |token| {
+        const equals = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+        const key = token[0..equals];
+        const needed = key.len + @as(usize, if (len > 0) 2 else 0);
+        if (len + needed > buffer.len - 1) {
+            if (len + 1 <= buffer.len) {
+                buffer[len] = '~';
+                len += 1;
+            }
+            break;
+        }
+        if (len > 0) {
+            buffer[len] = ',';
+            buffer[len + 1] = ' ';
+            len += 2;
+        }
+        @memcpy(buffer[len .. len + key.len], key);
+        len += key.len;
+        if (std.mem.eql(u8, key, "text")) break;
+    }
+    return @intCast(len);
+}
+
+fn collectStudioStateChanges(
+    output: *std.ArrayList(studio.StateChangeSummary),
+    allocator: std.mem.Allocator,
+    slide: *const slides.Slide,
+    state_index: usize,
+    items: []const slides.SlideItem,
+) !void {
+    output.clearRetainingCapacity();
+    const source = G.editor_memory[0..G.source_len];
+    for (items) |item| {
+        if (item.kind == .background) continue;
+        const born = item.creation_morph_state != null and item.creation_morph_state.? == state_index;
+        const mutated = item.state_source_state != null and item.state_source_state.? == state_index;
+        if (!born and !mutated) continue;
+        var summary: studio.StateChangeSummary = .{
+            .identity = item.identity,
+            .label = studioItemLabel(item),
+            .kind = .changed,
+            .cross_fades = G.slide_renderer.morphOwnerCrossFades(G.current_slide, state_index, item.identity),
+        };
+        if (born) {
+            summary.kind = .born;
+        } else if (item.state_source) |mutation| {
+            summary.keys_len = studioMutationKeys(source, mutation.line_offset, &summary.keys);
+            const line_end = std.mem.indexOfScalarPos(u8, source, mutation.line_offset, '\n') orelse source.len;
+            const line = source[@min(mutation.line_offset, source.len)..line_end];
+            if (std.mem.startsWith(u8, line, "@hide")) summary.kind = .hidden else if (std.mem.startsWith(u8, line, "@show")) summary.kind = .shown;
+        }
+        try output.append(allocator, summary);
+    }
+    _ = slide;
 }
 
 fn collectStudioBounds(

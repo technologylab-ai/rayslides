@@ -7,6 +7,57 @@ not yet a release declaration: physical-phone venue rehearsal and a real
 projector pass remain open in
 [`ROADMAP.md`](ROADMAP.md).
 
+### Visual motion authoring in Studio
+
+- A third inspector tab, **Motion**, edits reveals, morph-state timing, and
+  slide transitions through the ordinary undoable source path. Its Reveal
+  section offers None/Click/Auto/Click>Auto triggers, effect, By
+  item/line/bullet, DELAY/AFTER/DUR, easing, **Build bullets**, and
+  Remove/Cancel/Reset; multi-selection patches every item in one step.
+- The State section edits LABEL/AFTER/DUR, Click/Auto, and easing of the
+  active morph state, lists the changes in that state, marks cross-fading
+  objects, and offers **Reset** and **Exit L/R/U/D** for the selected
+  object.
+- The Transition section chooses Inherit/None/Appear/Fade/Slide L/R/U/D,
+  duration, and easing for the slide's incoming transition, reports whether
+  the value comes from this slide, a template, or the deck default, and
+  writes or clears the deck default. Alt edits a `@pushslide` template
+  instead of the instance.
+- The bottom timeline shows the `IN` transition chip, BASE, one BUILD card
+  per reveal with step chips, and the STATE cards; `[`/`]` cycle through all
+  of them, and `<`/`>` on a BUILD card reorders builds without changing
+  paint order.
+- A live preview plays the slide's real reveal, morph, and transition timing
+  on the canvas from the selected scene: Play/Pause, Stop, Loop, a
+  scrubber, and a time readout in the timeline; Shift+Space and Esc on the
+  keyboard. Click-gated steps use a fixed 0.75 s preview gap.
+- The canvas shows numbered build badges in BASE and, in a state, dashed
+  ghosts of previous bounds, motion paths, and NEW/EXIT/SHOW chips (**Toggle
+  motion ghosts**). All of it is editor chrome and never reaches
+  presentation, export, or Presenter output.
+- New palette commands: Show Motion, Build bullets one by one, Remove
+  reveal, Play or pause preview, Stop preview, Loop preview, Toggle motion
+  ghosts, Reset object in this state, Edit slide transition. New launch
+  hooks: `--diagnostics-motion=ID`, `--diagnostics-timeline-step=N`,
+  `--diagnostics-slide=N`, `--diagnostics-motion-preview=SECONDS`,
+  `--diagnostics-motion-state=N`, `--diagnostics-motion-transition`.
+- Every Motion control carries delayed hover help, and Showtime adds three
+  motion findings: an automatic run longer than 30 s (info), a reveal on a
+  `visible=false` object (warning), and a morph state that changes nothing
+  (info).
+- Format additions: `delay=SECONDS|click`, `ease=`, and `order=N` on reveals;
+  `ease=` on slide boundaries; deck defaults `@transition=`,
+  `@transition_duration=`, and `@transition_ease=`.
+- Behavior change: `anim=none` / `@anim(none)` now means "no reveal" (it
+  used to create an instant click step), and unknown keys on `@anim` and
+  `@state(morph)` are parser errors instead of silently ignored tokens.
+
+Verification recorded 2026-08-25 for motion authoring: 585 tests pass in
+`zig build test` and `zig build release-confidence`; ten ReleaseSafe Studio
+baselines (compact/default/large, including six motion scenarios on
+`testslides/studio-motion-qa.sld`) match on macOS; Showtime reports the QA
+deck ready. A live projector run of the QA deck remains a manual step.
+
 ### First-class image and video authoring
 
 - Image and Video are source-native Studio tools with matching insertion,

@@ -20,7 +20,8 @@ With Rayslides, you can:
 - edit slides directly and reuse items;
 - author raster/SVG images, videos, rounded shapes, lines, arrows, aligned
   text, and rotated objects through source-backed Studio controls;
-- add reveals, transitions, and semantic morph states;
+- add reveals, transitions, and semantic morph states, authored visually in
+  Studio's Motion tab with a live preview;
 - read private notes and control a deck from a phone;
 - run Crowdplay polls on the local network;
 - preflight the exact deck and create a verified portable show folder;

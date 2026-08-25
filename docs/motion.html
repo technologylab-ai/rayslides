@@ -81,6 +81,24 @@
           </div>
           <p>Effects include <code>appear</code>, <code>fade</code>, and four slide directions.</p>
           <p>Add <code class="inline-code">after=0.8</code> to start a step after the previous motion ends.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Timing key</th><th>Result</th></tr></thead>
+              <tbody>
+                <tr><td><code>after=0.8</code></td><td>Each later step starts 0.8 seconds after the previous motion ends. Without it, every step waits for a click.</td></tr>
+                <tr><td><code>delay=0.5</code></td><td>The first step starts 0.5 seconds after the slide settles. Alone, it makes only the first step automatic.</td></tr>
+                <tr><td><code>delay=click</code></td><td>The first step waits for a click. Later steps follow <code>after=</code> automatically.</td></tr>
+                <tr><td><code>ease=spring</code></td><td>Use <code>linear</code>, <code>smooth</code> (default), or <code>spring</code> for the reveal.</td></tr>
+                <tr><td><code>order=1</code></td><td>Sort this build later than builds with a lower order. Ties keep source order.</td></tr>
+                <tr><td><code>anim=none</code></td><td>No reveal. On a <code>@pop</code> it cancels a reveal inherited from the <code>@push</code>.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <pre><code><span class="code-key">@anim(slide-left)</span> by=<span class="code-value">bullet</span> delay=<span class="code-value">0.5</span> after=<span class="code-value">0.8</span> duration=<span class="code-value">0.25</span> ease=<span class="code-value">spring</span>
+<span class="code-key">@box</span> x=140 y=250 w=900 h=500
+- Appears half a second after the slide settles
+- Then this one 0.8 seconds later</code></pre>
+          <p><code class="inline-code">@anim</code> accepts only its documented keys. An unknown key such as <code>name=</code> is a parser error.</p>
 
           <h2>Move between slides</h2>
           <p>Set a transition on a slide or a slide template.</p>
@@ -88,7 +106,11 @@
 
 <span class="code-key">@popslide</span> content transition=<span class="code-value">fade</span> duration=<span class="code-value">0.5</span></code></pre>
           <p>The transition moves the old and new slides together. Backward navigation reverses the direction.</p>
-          <p>Use <code class="inline-code">transition=none</code> to disable the inherited transition for one slide.</p>
+          <p>Use <code class="inline-code">transition=none</code> to disable the inherited transition for one slide. Add <code class="inline-code">ease=linear|smooth|spring</code> on the same line to choose the transition curve.</p>
+          <p>Set a deck-wide default once in the preamble. A slide or template that sets its own <code>transition=</code> keeps that value.</p>
+          <pre><code><span class="code-key">@transition</span>=<span class="code-value">fade</span>
+<span class="code-key">@transition_duration</span>=<span class="code-value">0.35</span>
+<span class="code-key">@transition_ease</span>=<span class="code-value">smooth</span></code></pre>
 
           <h2>Change one slide with morph states</h2>
           <p>A morph state changes named objects. Give each target a stable <code class="inline-code">id=</code>.</p>
@@ -131,7 +153,7 @@
             <img src="images/morph-studio.png" alt="Studio editing a morph deck with a selected title, exact Properties, and Base, Takeover, Explain, and Flow cards visible" width="2560" height="1440" loading="lazy">
             <figcaption><strong>The canvas shows the resolved state while Properties keeps exact values editable.</strong> The slide thumbnail and timeline remain tied to the same <code>.sld</code> source.</figcaption>
           </figure>
-          <p>The bottom timeline shows the base scene and each resolved state.</p>
+          <p>The bottom timeline shows the incoming transition chip, the base scene, one BUILD card per reveal, and each resolved state.</p>
           <figure class="shot">
             <img src="images/morph-timeline.png" alt="Morph timeline with Base, Takeover, Explain, and Flow cards plus six state controls" width="2560" height="136" loading="lazy">
             <figcaption><strong>The timeline keeps every control readable.</strong> The selected card has a cyan border.</figcaption>
@@ -140,11 +162,15 @@
             <table>
               <thead><tr><th>Control</th><th>Action</th></tr></thead>
               <tbody>
-                <tr><td>+</td><td>Append a cumulative morph state.</td></tr>
+                <tr><td>IN</td><td>Open the Transition section for this slide's incoming transition.</td></tr>
+                <tr><td>BASE</td><td>Show the fully revealed authored scene.</td></tr>
+                <tr><td>BUILD card</td><td>Show the slide through that reveal's last step and select its object. A step chip narrows to one step.</td></tr>
+                <tr><td>+</td><td>Append a cumulative morph state and open Motion for its timing.</td></tr>
                 <tr><td>Dup</td><td>Insert a new state from the selected snapshot.</td></tr>
                 <tr><td>Name</td><td>Give the selected state a source-backed label.</td></tr>
                 <tr><td>Del</td><td>Delete the complete selected state block.</td></tr>
-                <tr><td>&lt; · &gt;</td><td>Move the selected state earlier or later.</td></tr>
+                <tr><td>&lt; · &gt;</td><td>Move the selected state, or the selected BUILD, earlier or later.</td></tr>
+                <tr><td>Play · Stop · Loop</td><td>Preview the slide from the selected scene. Wider windows add a scrubber and a time readout.</td></tr>
               </tbody>
             </table>
           </div>
@@ -169,20 +195,73 @@
             <li><strong>Select a state card.</strong><p>Studio shows the objects after that state and every earlier state.</p></li>
             <li><strong>Select an object.</strong><p>The cyan outline identifies the object that will change.</p></li>
             <li><strong>Move it or change a property.</strong><p>Studio writes only the values that differ.</p></li>
-            <li><strong>Use <kbd>[</kbd> and <kbd>]</kbd>.</strong><p>These keys select the previous or next scene.</p></li>
+            <li><strong>Use <kbd>[</kbd> and <kbd>]</kbd>.</strong><p>These keys cycle BASE, each build, and each state.</p></li>
           </ol>
 
           <h3>Read the state values</h3>
           <p>A card shows the delay, duration, and easing from its <code>@state(morph)</code> line.</p>
-          <pre><code><span class="code-key">@state(morph)</span> name=<span class="code-value">flow</span> after=<span class="code-value">0.2</span> duration=<span class="code-value">0.9</span> ease=<span class="code-value">spring</span></code></pre>
+          <pre><code><span class="code-key">@state(morph)</span> label=<span class="code-value">flow</span> after=<span class="code-value">0.2</span> duration=<span class="code-value">0.9</span> ease=<span class="code-value">spring</span></code></pre>
           <ul>
             <li><code>after</code> delays the state after the previous motion.</li>
             <li><code>duration</code> sets the motion time in seconds.</li>
             <li><code>ease</code> sets the interpolation curve.</li>
             <li>The source order sets the playback order.</li>
           </ul>
-          <p>Edit these values in the <code>.sld</code> source. Studio reports them on the cards.</p>
+          <p>Edit these values in the <code>.sld</code> source or in the Motion tab's State section. Studio reports them on the cards.</p>
           <div class="callout"><p><strong>The BASE card is the authored root.</strong> You cannot rename, remove, or move it.</p></div>
+
+          <h2 id="author-motion-in-studio">Author motion in Studio</h2>
+          <p>The Motion tab sits beside Objects and Properties. It writes the same <code>@anim</code>, <code>@state(morph)</code>, and transition keys shown above, and every change is one undo step.</p>
+          <figure class="shot">
+            <img src="images/motion-inspector.png" alt="Studio with a bullet box selected and the Motion tab showing the Reveal section with trigger, effect, grouping, delay, and easing controls" width="2560" height="1440" loading="lazy">
+            <figcaption><strong>The Reveal section edits the selected object's build.</strong> Studio writes only the keys that differ from the defaults.</figcaption>
+          </figure>
+          <h3>Build bullets</h3>
+          <ol class="steps">
+            <li><strong>Select a text box.</strong><p>Open the Motion tab or choose <strong>Show Motion</strong> in Commands.</p></li>
+            <li><strong>Choose Build bullets.</strong><p>Studio writes <code>@anim(fade) by=bullet</code> before the box.</p></li>
+            <li><strong>Choose a trigger.</strong><p><strong>Click</strong> waits for a click at every step. <strong>Auto</strong> starts after DELAY and continues after AFTER. <strong>Click&gt;Auto</strong> waits once, then continues automatically.</p></li>
+            <li><strong>Refine it.</strong><p>Pick an effect, a grouping, a duration, and an easing. <strong>Remove</strong> deletes the reveal.</p></li>
+          </ol>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Section</th><th>Appears when</th><th>Edits</th></tr></thead>
+              <tbody>
+                <tr><td>Reveal</td><td>An object is selected in BASE or a build scene.</td><td>Trigger, effect, By item/line/bullet, DELAY, AFTER, DUR, easing, Build bullets, Remove.</td></tr>
+                <tr><td>State</td><td>A STATE card is active.</td><td>LABEL, AFTER, DUR, Click/Auto, easing, Reset, Exit L/R/U/D, and the list of changes in this state.</td></tr>
+                <tr><td>Transition</td><td>Nothing is selected in BASE, or the IN chip is clicked.</td><td>Inherit/None/effect, DUR, easing, Use for deck, Clear deck.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>The Transition section reports where the value comes from: this slide, a template, or the deck default. <strong>Use for deck</strong> writes the <code>@transition*=</code> preamble lines. On a template-backed slide, hold <kbd>Alt</kbd> to change the template instead of the instance.</p>
+
+          <h3>Read the timeline</h3>
+          <p>Every object with a reveal shows a numbered badge on the canvas and a BUILD card in the timeline.</p>
+          <figure class="shot">
+            <img src="images/timeline-build.png" alt="Studio timeline with the IN chip, BASE, a BUILD card expanded into step chips, and STATE cards" width="2560" height="1440" loading="lazy">
+            <figcaption><strong>A BUILD card shows the slide through its last step.</strong> Use &lt; and &gt; to move a build earlier or later without changing paint order.</figcaption>
+          </figure>
+
+          <h3>See where objects come from</h3>
+          <p>With a state selected, Studio draws a dashed ghost at each changed object's previous position and a path to its new center. Objects born, hidden, or shown in the state carry <code>NEW</code>, <code>EXIT</code>, or <code>SHOW</code> chips.</p>
+          <figure class="shot">
+            <img src="images/morph-ghosts.png" alt="Studio in a morph state with dashed ghosts, motion paths, and NEW and EXIT chips over the changed objects" width="2560" height="1440" loading="lazy">
+            <figcaption><strong>Ghosts are editor chrome.</strong> They never appear in the presentation or the PDF. Use <strong>Toggle motion ghosts</strong> in Commands to hide them.</figcaption>
+          </figure>
+          <p>With an object selected in a state, <strong>Reset</strong> removes every change to it in that state. <strong>Exit L/R/U/D</strong> hides it just beyond the chosen slide edge.</p>
+
+          <h3>Preview the timing</h3>
+          <p>Press <kbd>Shift</kbd> + <kbd>Space</kbd> or click <strong>Play</strong> in the timeline. Studio plays the real reveal, morph, and transition timing on the canvas from the selected scene.</p>
+          <figure class="shot">
+            <img src="images/motion-preview.png" alt="Studio mid-preview with the Pause, Stop, and Loop transport, a scrubber, and a time readout in the timeline" width="2560" height="1440" loading="lazy">
+            <figcaption><strong>The scrubber moves in both directions.</strong> Click-gated steps use a fixed 0.75-second gap so the whole slide plays through.</figcaption>
+          </figure>
+          <ul>
+            <li>The preview pauses on the last frame. <strong>Stop</strong> or <kbd>Esc</kbd> returns to the selected scene.</li>
+            <li><strong>Loop</strong> restarts the preview until you stop it.</li>
+            <li>Any source edit, undo, scene change, tool change, or canvas drag stops the preview.</li>
+            <li>Videos stay on their poster during a preview.</li>
+          </ul>
 
           <h2>See a rendered state</h2>
           <p>This showcase state moves and restyles the same named objects into a two-way relationship.</p>

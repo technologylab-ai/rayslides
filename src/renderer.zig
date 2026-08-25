@@ -119,10 +119,21 @@ const MorphPlan = struct {
     draws: std.ArrayList(MorphDraw),
 };
 
+/// One item's contiguous group of reveal steps in a slide's step timeline.
+/// Studio presents each build as a card and edits the shared `spec`.
+pub const RevealBuild = struct {
+    owner_identity: usize,
+    /// 1-based index of the first step in `RenderedSlide.steps`.
+    first_step: usize,
+    step_count: usize,
+    spec: animation.ItemSpec,
+};
+
 const RenderedSlide = struct {
     elements: std.ArrayList(RenderElement) = undefined,
     morph_scenes: std.ArrayList(RenderedScene) = undefined,
     steps: std.ArrayList(animation.Step) = undefined,
+    builds: std.ArrayList(RevealBuild) = undefined,
     /// Every heap-backed string referenced by base-scene RenderElements.
     /// Individual strings may be shared by several elements (bullet glyphs),
     /// so ownership lives here rather than on RenderElement itself.
@@ -137,6 +148,7 @@ const RenderedSlide = struct {
         self.elements = std.ArrayList(RenderElement).empty;
         self.morph_scenes = std.ArrayList(RenderedScene).empty;
         self.steps = std.ArrayList(animation.Step).empty;
+        self.builds = std.ArrayList(RevealBuild).empty;
         self.owned_text = std.ArrayList([:0]const u8).empty;
         self.owned_crowd_choices = std.ArrayList([]const []const u8).empty;
         return self;
@@ -147,6 +159,7 @@ const RenderedSlide = struct {
         for (self.morph_scenes.items) |*scene| scene.deinit(allocator);
         self.morph_scenes.deinit(allocator);
         self.steps.deinit(allocator);
+        self.builds.deinit(allocator);
         freeOwnedCrowdChoices(allocator, &self.owned_crowd_choices);
         freeOwnedText(allocator, &self.owned_text);
     }
@@ -551,6 +564,7 @@ pub const SlideshowRenderer = struct {
         if (slide.items) |items| {
             for (items.items) |item| try self.preRenderItem(render_slide, item, slide_number, slideshow_filp);
         }
+        try self.applyRevealOrder(render_slide);
         for (slide.morph_states.items, 0..) |state, state_index| {
             const state_render = try RenderedSlide.new(self.allocator);
             var state_render_owned = true;
@@ -691,6 +705,43 @@ pub const SlideshowRenderer = struct {
             count += 1;
         }
         return count;
+    }
+
+    /// True when the morph into `state` cannot interpolate `owner_identity`
+    /// and cross-fades it instead (changed text, media, wrapping, or fragment
+    /// structure). Studio reports this beside the object so authors know why
+    /// a state does not glide.
+    pub fn morphOwnerCrossFades(self: *const SlideshowRenderer, slide_number: i32, state: usize, owner_identity: usize) bool {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return false;
+        const slide = self.renderedSlides.items[@intCast(slide_number)];
+        if (state >= slide.morph_scenes.items.len) return false;
+        const scene = slide.morph_scenes.items[state];
+        const source_elements = if (state == 0) slide.elements.items else slide.morph_scenes.items[state - 1].elements.items;
+        for (scene.plan.draws.items) |draw| {
+            if (draw.kind == .interpolate) continue;
+            if (draw.target_index) |index| {
+                if (index < scene.elements.items.len and scene.elements.items[index].owner_identity == owner_identity and
+                    scene.elements.items[index].kind != .background) return true;
+            }
+            if (draw.source_index) |index| {
+                if (index < source_elements.len and source_elements[index].owner_identity == owner_identity and
+                    source_elements[index].kind != .background) return true;
+            }
+        }
+        return false;
+    }
+
+    /// The complete step timeline of one slide (reveal steps, then morph steps).
+    pub fn stepsForSlide(self: *const SlideshowRenderer, slide_number: i32) []const animation.Step {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return &.{};
+        return self.renderedSlides.items[@intCast(slide_number)].steps.items;
+    }
+
+    /// Every reveal build of one slide in step order. Steps of one owner are
+    /// contiguous, so `first_step .. first_step + step_count` addresses them.
+    pub fn revealBuilds(self: *const SlideshowRenderer, slide_number: i32) []const RevealBuild {
+        if (slide_number < 0 or slide_number >= self.renderedSlides.items.len) return &.{};
+        return self.renderedSlides.items[@intCast(slide_number)].builds.items;
     }
 
     pub fn setItemGeometryPreview(self: *SlideshowRenderer, preview: ?ItemGeometryPreview) void {
@@ -1018,13 +1069,103 @@ pub const SlideshowRenderer = struct {
         return result;
     }
 
-    fn appendStep(self: *SlideshowRenderer, renderSlide: *RenderedSlide, spec: animation.ItemSpec) !usize {
-        try renderSlide.steps.append(self.allocator, animation.Step.fromItem(spec));
-        return renderSlide.steps.items.len;
+    /// Reorder the base reveal steps by `(order, source position)`. Elements
+    /// keep pointing at their step through the remapped indices, and builds
+    /// are regrouped so each owner's steps stay contiguous.
+    fn applyRevealOrder(self: *SlideshowRenderer, render_slide: *RenderedSlide) !void {
+        const steps = render_slide.steps.items;
+        var needs_sort = false;
+        for (steps) |step| if (step.order != 0) {
+            needs_sort = true;
+            break;
+        };
+        if (!needs_sort or steps.len < 2) return;
+
+        const permutation = try self.allocator.alloc(usize, steps.len);
+        defer self.allocator.free(permutation);
+        for (permutation, 0..) |*slot, index| slot.* = index;
+        // Stable insertion sort keeps source order inside one order key.
+        var sorted: usize = 1;
+        while (sorted < permutation.len) : (sorted += 1) {
+            var moving = sorted;
+            while (moving > 0 and steps[permutation[moving]].order < steps[permutation[moving - 1]].order) : (moving -= 1) {
+                std.mem.swap(usize, &permutation[moving], &permutation[moving - 1]);
+            }
+        }
+        const new_index = try self.allocator.alloc(usize, steps.len);
+        defer self.allocator.free(new_index);
+        for (permutation, 0..) |old_index, position| new_index[old_index] = position + 1;
+
+        const reordered = try self.allocator.alloc(animation.Step, steps.len);
+        defer self.allocator.free(reordered);
+        for (permutation, 0..) |old_index, position| reordered[position] = steps[old_index];
+        @memcpy(steps, reordered);
+
+        for (render_slide.elements.items) |*element| {
+            if (element.reveal_step > 0 and element.reveal_step <= new_index.len) {
+                element.reveal_step = new_index[element.reveal_step - 1];
+            }
+        }
+
+        // Regroup builds from the reordered steps; specs are recovered from
+        // the previous build list by owner identity.
+        var previous_builds = render_slide.builds;
+        defer previous_builds.deinit(self.allocator);
+        render_slide.builds = std.ArrayList(RevealBuild).empty;
+        for (steps, 0..) |step, index| {
+            const step_number = index + 1;
+            if (render_slide.builds.items.len > 0) {
+                const last = &render_slide.builds.items[render_slide.builds.items.len - 1];
+                if (last.owner_identity == step.owner_identity and last.first_step + last.step_count == step_number) {
+                    last.step_count += 1;
+                    continue;
+                }
+            }
+            var spec: animation.ItemSpec = .{ .effect = step.effect, .after = step.after, .duration = step.duration, .easing = step.easing, .order = step.order };
+            for (previous_builds.items) |build| if (build.owner_identity == step.owner_identity) {
+                spec = build.spec;
+                break;
+            };
+            try render_slide.builds.append(self.allocator, .{
+                .owner_identity = step.owner_identity,
+                .first_step = step_number,
+                .step_count = 1,
+                .spec = spec,
+            });
+        }
+    }
+
+    /// Append one reveal step owned by `owner_identity`. Contiguous steps of
+    /// one owner form a build; only the build's first step honors `delay`.
+    fn appendStep(self: *SlideshowRenderer, renderSlide: *RenderedSlide, spec: animation.ItemSpec, owner_identity: usize) !usize {
+        const step_index_in_build: usize = blk: {
+            if (renderSlide.builds.items.len > 0) {
+                const last = &renderSlide.builds.items[renderSlide.builds.items.len - 1];
+                if (last.owner_identity == owner_identity and
+                    last.first_step + last.step_count == renderSlide.steps.items.len + 1)
+                {
+                    break :blk last.step_count;
+                }
+            }
+            break :blk 0;
+        };
+        try renderSlide.steps.append(self.allocator, animation.Step.fromItemStep(spec, step_index_in_build, owner_identity));
+        const step_number = renderSlide.steps.items.len;
+        if (step_index_in_build == 0) {
+            try renderSlide.builds.append(self.allocator, .{
+                .owner_identity = owner_identity,
+                .first_step = step_number,
+                .step_count = 1,
+                .spec = spec,
+            });
+        } else {
+            renderSlide.builds.items[renderSlide.builds.items.len - 1].step_count += 1;
+        }
+        return step_number;
     }
 
     fn wholeItemStep(self: *SlideshowRenderer, renderSlide: *RenderedSlide, item: slides.SlideItem) !usize {
-        if (item.animation) |spec| return try self.appendStep(renderSlide, spec);
+        if (item.animation) |spec| return try self.appendStep(renderSlide, spec, item.identity);
         return 0;
     }
 
@@ -1156,13 +1297,13 @@ pub const SlideshowRenderer = struct {
         var item_reveal_step: usize = 0;
         const text_element_start = renderSlide.elements.items.len;
         if (item.animation) |spec| {
-            if (spec.by == .item) item_reveal_step = try self.appendStep(renderSlide, spec);
+            if (spec.by == .item) item_reveal_step = try self.appendStep(renderSlide, spec, item.identity);
         }
 
         // box without text, but with color: render a colored box!
         if (item.text == null and item.color != null) {
             if (item_reveal_step == 0 and item.animation != null) {
-                item_reveal_step = try self.appendStep(renderSlide, item.animation.?);
+                item_reveal_step = try self.appendStep(renderSlide, item.animation.?, item.identity);
             }
             log.debug("preRenderTextBlock (color) creating RenderElement", .{});
             try renderSlide.elements.append(self.allocator, RenderElement{
@@ -1249,7 +1390,7 @@ pub const SlideshowRenderer = struct {
                 var line_reveal_step = item_reveal_step;
                 if (item.animation) |spec| {
                     const has_visible_content = std.mem.trim(u8, line, " \t").len > 0;
-                    if (has_visible_content and startsLineStep(spec.by, is_bulleted)) line_reveal_step = try self.appendStep(renderSlide, spec);
+                    if (has_visible_content and startsLineStep(spec.by, is_bulleted)) line_reveal_step = try self.appendStep(renderSlide, spec, item.identity);
                 }
                 const indent_level = bullet_indent_in_spaces / spaces_per_indent;
                 const indent_in_pixels = line_height_bullet_width.x * @as(f32, @floatFromInt(indent_level));
@@ -2180,7 +2321,7 @@ pub const SlideshowRenderer = struct {
     ) !void {
         if (self.renderedSlides.items.len == 0 or slide_number < 0 or slide_number >= self.renderedSlides.items.len) return;
 
-        const transition_progress = animation.eased(transition.progress);
+        const transition_progress = animation.applyEasing(transition.spec.easing, transition.progress);
         const transforms = slideTransitionTransforms(transition.spec.effect, transition_progress, transition.direction, size);
 
         if (transition.previous_slide) |previous_slide| {
@@ -2418,8 +2559,14 @@ pub const SlideshowRenderer = struct {
             }
             if (progress <= 0) continue;
 
-            const effect = if (element.reveal_step > 0) slide.steps.items[element.reveal_step - 1].effect else animation.Effect.none;
-            const item_transform = itemAnimationTransform(effect, animation.eased(progress), size, internal_render_size);
+            var effect = animation.Effect.none;
+            var eased_progress: f32 = progress;
+            if (element.reveal_step > 0) {
+                const step = slide.steps.items[element.reveal_step - 1];
+                effect = step.effect;
+                eased_progress = animation.applyEasing(step.easing, progress);
+            }
+            const item_transform = itemAnimationTransform(effect, eased_progress, size, internal_render_size);
             const transform = combineTransforms(slide_transform, item_transform);
             if (transform.opacity <= 0) continue;
 
@@ -3410,25 +3557,28 @@ fn itemAnimationTransform(effect: animation.Effect, progress: f32, slide_size: r
     var result = RenderTransform{};
     const travel_x = 90.0 * slide_size.x / internal_render_size.x;
     const travel_y = 90.0 * slide_size.y / internal_render_size.y;
+    // Eased progress may overshoot 1 (spring); geometry may travel past its
+    // destination briefly, but opacity is always clamped.
+    const opacity = animation.clampProgress(progress);
     switch (effect) {
         .none => {},
         .appear => result.opacity = if (progress >= 1.0) 1.0 else 0.0,
-        .fade => result.opacity = progress,
+        .fade => result.opacity = opacity,
         .slide_left => {
             result.offset.x = (1.0 - progress) * travel_x;
-            result.opacity = progress;
+            result.opacity = opacity;
         },
         .slide_right => {
             result.offset.x = -(1.0 - progress) * travel_x;
-            result.opacity = progress;
+            result.opacity = opacity;
         },
         .slide_up => {
             result.offset.y = (1.0 - progress) * travel_y;
-            result.opacity = progress;
+            result.opacity = opacity;
         },
         .slide_down => {
             result.offset.y = -(1.0 - progress) * travel_y;
-            result.opacity = progress;
+            result.opacity = opacity;
         },
     }
     return result;
@@ -4618,4 +4768,77 @@ fn renderBgColor(bgcol: rl.Color, slide_tl: rl.Vector2, slide_size: rl.Vector2, 
         .{ .x = slide_tl.x + transform.offset.x, .y = slide_tl.y + transform.offset.y, .width = slide_size.x, .height = slide_size.y },
         colorWithOpacity(bgcol, transform.opacity),
     );
+}
+
+test "reveal builds group contiguous steps per owner and honor first-step delay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var renderer: SlideshowRenderer = undefined;
+    renderer.allocator = allocator;
+    const slide = try RenderedSlide.new(allocator);
+
+    const bullets = animation.ItemSpec{ .effect = .slide_left, .by = .bullet, .delay = 0.5, .after = 0.8, .easing = .spring };
+    try std.testing.expectEqual(@as(usize, 1), try renderer.appendStep(slide, bullets, 3));
+    try std.testing.expectEqual(@as(usize, 2), try renderer.appendStep(slide, bullets, 3));
+    try std.testing.expectEqual(@as(usize, 3), try renderer.appendStep(slide, bullets, 3));
+    const image = animation.ItemSpec{ .effect = .fade, .delay = 0.2 };
+    try std.testing.expectEqual(@as(usize, 4), try renderer.appendStep(slide, image, 9));
+
+    try std.testing.expectEqual(@as(usize, 2), slide.builds.items.len);
+    try std.testing.expectEqual(@as(usize, 3), slide.builds.items[0].owner_identity);
+    try std.testing.expectEqual(@as(usize, 1), slide.builds.items[0].first_step);
+    try std.testing.expectEqual(@as(usize, 3), slide.builds.items[0].step_count);
+    try std.testing.expectEqual(animation.Grouping.bullet, slide.builds.items[0].spec.by);
+    try std.testing.expectEqual(@as(usize, 9), slide.builds.items[1].owner_identity);
+    try std.testing.expectEqual(@as(usize, 4), slide.builds.items[1].first_step);
+    try std.testing.expectEqual(@as(usize, 1), slide.builds.items[1].step_count);
+
+    try std.testing.expectEqual(@as(?f32, 0.5), slide.steps.items[0].after);
+    try std.testing.expectEqual(@as(?f32, 0.8), slide.steps.items[1].after);
+    try std.testing.expectEqual(@as(?f32, 0.8), slide.steps.items[2].after);
+    try std.testing.expectEqual(@as(?f32, 0.2), slide.steps.items[3].after);
+    try std.testing.expectEqual(animation.Easing.spring, slide.steps.items[0].easing);
+    try std.testing.expectEqual(@as(usize, 3), slide.steps.items[2].owner_identity);
+    try std.testing.expectEqual(@as(usize, 9), slide.steps.items[3].owner_identity);
+}
+
+test "reveal order sorts builds by order key while keeping element step links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var renderer: SlideshowRenderer = undefined;
+    renderer.allocator = allocator;
+    const slide = try RenderedSlide.new(allocator);
+    const bullets = animation.ItemSpec{ .effect = .fade, .by = .bullet, .order = 1 };
+    const image = animation.ItemSpec{ .effect = .slide_up };
+    const first = try renderer.appendStep(slide, bullets, 3);
+    const second = try renderer.appendStep(slide, bullets, 3);
+    const third = try renderer.appendStep(slide, image, 9);
+    try slide.elements.append(allocator, .{ .kind = .text, .owner_identity = 3, .reveal_step = first });
+    try slide.elements.append(allocator, .{ .kind = .text, .owner_identity = 3, .reveal_step = second });
+    try slide.elements.append(allocator, .{ .kind = .image, .owner_identity = 9, .reveal_step = third });
+    try renderer.applyRevealOrder(slide);
+    // The image (order 0) now comes first; bullets follow in source order.
+    try std.testing.expectEqual(@as(usize, 9), slide.steps.items[0].owner_identity);
+    try std.testing.expectEqual(@as(usize, 3), slide.steps.items[1].owner_identity);
+    try std.testing.expectEqual(@as(usize, 3), slide.steps.items[2].owner_identity);
+    try std.testing.expectEqual(@as(usize, 1), slide.elements.items[2].reveal_step);
+    try std.testing.expectEqual(@as(usize, 2), slide.elements.items[0].reveal_step);
+    try std.testing.expectEqual(@as(usize, 3), slide.elements.items[1].reveal_step);
+    try std.testing.expectEqual(@as(usize, 2), slide.builds.items.len);
+    try std.testing.expectEqual(@as(usize, 9), slide.builds.items[0].owner_identity);
+    try std.testing.expectEqual(@as(usize, 1), slide.builds.items[0].first_step);
+    try std.testing.expectEqual(@as(usize, 3), slide.builds.items[1].owner_identity);
+    try std.testing.expectEqual(@as(usize, 2), slide.builds.items[1].first_step);
+    try std.testing.expectEqual(@as(usize, 2), slide.builds.items[1].step_count);
+    try std.testing.expectEqual(animation.Grouping.bullet, slide.builds.items[1].spec.by);
+}
+
+test "reveal transforms clamp opacity for overshooting easings" {
+    const size: rl.Vector2 = .{ .x = 1920, .y = 1080 };
+    const overshoot = itemAnimationTransform(.slide_left, animation.applyEasing(.spring, 0.35), size, size);
+    try std.testing.expect(overshoot.opacity <= 1.0);
+    const done = itemAnimationTransform(.fade, 1.0, size, size);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), done.opacity, 0.0001);
 }
