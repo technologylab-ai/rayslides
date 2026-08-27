@@ -18,6 +18,7 @@ const presenter = @import("presenter.zig");
 const qrcode = @import("qrcode.zig");
 const source_editor = @import("source_editor.zig");
 const studio = @import("studio.zig");
+const goto_slide = @import("goto_slide.zig");
 const studio_catalog = @import("studio_catalog.zig");
 const studio_library_preview = @import("studio_library_preview.zig");
 const studio_new_deck = @import("studio_new_deck.zig");
@@ -54,6 +55,7 @@ const cli_help =
     \\Diagnostics and visual QA:
     \\  --diagnostics                    Show the diagnostics HUD
     \\  --diagnostics-command-palette    Open Studio with Commands visible
+    \\  --diagnostics-goto-slide         Open with the go-to-slide picker visible
     \\  --diagnostics-file-browser       Open Studio with the deck file chooser visible
     \\  --diagnostics-command-tooltip    Show deterministic command hover help
     \\  --diagnostics-precision-view     Show rulers, guides, and precision tools
@@ -3281,6 +3283,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var launch_studio = false;
     var diagnostics_enabled = false;
     var diagnostics_command_palette = false;
+    var diagnostics_goto_slide = false;
     var diagnostics_file_browser = false;
     var diagnostics_command_tooltip = false;
     var diagnostics_precision_view = false;
@@ -3367,6 +3370,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                 diagnostics_enabled = true;
                 diagnostics_command_palette = true;
                 launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-goto-slide")) {
+                diagnostics_enabled = true;
+                diagnostics_goto_slide = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-file-browser")) {
                 diagnostics_enabled = true;
                 diagnostics_file_browser = true;
@@ -3700,6 +3706,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var pending_save_as = false;
     var pending_portable_show = false;
     var showtime_overlay = ShowtimeOverlay{ .visible = diagnostics_showtime };
+    var goto_slide_picker: goto_slide.Picker = .{ .active = diagnostics_goto_slide };
     var showtime_report: ?showtime.Report = null;
     defer if (showtime_report) |*report| report.deinit();
     var showtime_cli_completed = false;
@@ -3817,7 +3824,15 @@ pub fn main(init: std.process.Init) anyerror!void {
         const inline_edit_active_at_frame_start = studio_mode.inlineEditActive();
         const command_palette_active_at_frame_start = studio_mode.commandPaletteActive();
         const library_picker_active_at_frame_start = studio_mode.libraryPickerActive();
-        const text_input_active_at_frame_start = property_prompt.active or studio_file_browser.active or studio_mode.textEntryActive();
+        const goto_slide_active_at_frame_start = goto_slide_picker.active;
+        const text_input_active_at_frame_start = goto_slide_active_at_frame_start or
+            property_prompt.active or studio_file_browser.active or studio_mode.textEntryActive();
+        const g_shortcut_action = goto_slide.classifyGShortcut(.{
+            .pressed = rl.isKeyPressed(.g),
+            .shortcut_modifier_down = shortcutModifierDown(),
+            .shift_down = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift),
+            .legacy_presentation_navigation = !studio_mode.capturesInput(),
+        });
         const presenter_network_now = rl.getTime();
         if (presenter_runtime.isRunning() and !presenter_network.explicit and
             presenter_network_now >= presenter_network_refresh_at)
@@ -3836,7 +3851,26 @@ pub fn main(init: std.process.Init) anyerror!void {
         const display_picker_visible_at_frame_start = display_picker.visible;
         const showtime_visible_at_frame_start = showtime_overlay.visible;
         var presenter_overlay_consumed_input = false;
-        if (showtime_visible_at_frame_start) {
+        if (goto_slide_active_at_frame_start) {
+            presenter_overlay_consumed_input = true;
+            switch (goto_slide_picker.updateFromRaylib(G.slideshow.slides.items.len)) {
+                .none => {},
+                .cancelled => window_close_seen = false,
+                .select => |slide_index| {
+                    if (studio_mode.capturesInput()) prepareStudioForSlideJump(&studio_mode, &studio_library_preview_cache);
+                    jumpToSlide(@intCast(slide_index), rl.getTime());
+                    window_close_seen = false;
+                },
+            }
+        } else if (!export_controller.running and !text_input_active_at_frame_start and
+            !showtime_visible_at_frame_start and !display_picker_visible_at_frame_start and
+            !presenter_pairing_visible_at_frame_start and g_shortcut_action == .open_picker)
+        {
+            goto_slide_picker.open();
+            if (studio_mode.capturesInput()) suspendStudioForSlidePicker(&studio_mode, &studio_library_preview_cache);
+            presenter_overlay_consumed_input = true;
+            window_close_seen = false;
+        } else if (showtime_visible_at_frame_start) {
             presenter_overlay_consumed_input = true;
             if (showtime_report) |*active_report| switch (updateShowtimeOverlay(&showtime_overlay, active_report, screenWidth, screenHeight)) {
                 .none => {},
@@ -4013,7 +4047,8 @@ pub fn main(init: std.process.Init) anyerror!void {
         const presenter_overlay_captures_input = presenter_pairing_visible_at_frame_start or
             presenter_pairing_visible or display_picker_visible_at_frame_start or
             display_picker.visible or showtime_visible_at_frame_start or
-            showtime_overlay.visible or presenter_overlay_consumed_input;
+            showtime_overlay.visible or goto_slide_active_at_frame_start or
+            goto_slide_picker.active or presenter_overlay_consumed_input;
         // A modal or inline property draft is not part of the persisted source
         // yet. Do not let the OS close button silently throw it away; after
         // submitting or cancelling, Q/Escape (or a fresh close request)
@@ -5730,6 +5765,12 @@ pub fn main(init: std.process.Init) anyerror!void {
             if (showtime_overlay.visible) {
                 if (showtime_report) |*report| drawShowtimeOverlay(&showtime_overlay, report, screenWidth, screenHeight);
             }
+            goto_slide_picker.draw(
+                studio_viewport,
+                G.studio_ui_font,
+                std.math.cast(usize, G.current_slide) orelse 0,
+                G.slideshow.slides.items.len,
+            );
         }
         if (screenshot_poster_render_pending) {
             screenshot_poster_render_pending = false;
@@ -6096,11 +6137,11 @@ pub fn main(init: std.process.Init) anyerror!void {
             jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime());
         }
 
-        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and G.slideshow.slides.items.len > 0 and rl.isKeyPressed(.g)) {
-            if (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)) {
-                jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime());
-            } else {
-                jumpToSlide(0, rl.getTime());
+        if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and G.slideshow.slides.items.len > 0) {
+            switch (g_shortcut_action) {
+                .first_slide => jumpToSlide(0, rl.getTime()),
+                .last_slide => jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime()),
+                .none, .open_picker => {},
             }
         }
 
@@ -10180,6 +10221,40 @@ fn captureStudioClipboard(
     clipboard.clear();
     for (captured.items) |item| clipboard.items.appendAssumeCapacity(item);
     captured.items.len = 0;
+}
+
+fn suspendStudioForSlidePicker(
+    studio_mode: *studio.Studio,
+    library_preview_cache: *StudioLibraryPreviewCache,
+) void {
+    const items = if (studio_mode.definitionModeActive())
+        library_preview_cache.items()
+    else
+        currentStudioSceneItemsMutable(studio_mode);
+    studio_mode.cancelActiveInteraction(items);
+}
+
+fn prepareStudioForSlideJump(
+    studio_mode: *studio.Studio,
+    library_preview_cache: *StudioLibraryPreviewCache,
+) void {
+    if (studio_mode.definitionModeActive()) {
+        studio_mode.leaveDefinitionMode(library_preview_cache.items());
+    }
+    studio_mode.clearSelection(currentStudioSceneItemsMutable(studio_mode));
+    studio_mode.active_morph_state = null;
+    studio_mode.dismissLibraryPreview();
+    studio_mode.setNotice(.none);
+}
+
+fn currentStudioSceneItemsMutable(studio_mode: *const studio.Studio) []slides.SlideItem {
+    if (G.current_slide < 0 or G.current_slide >= G.slideshow.slides.items.len) return &.{};
+    const slide = G.slideshow.slides.items[@intCast(G.current_slide)];
+    if (studio_mode.active_morph_state) |state_index| {
+        if (state_index >= slide.morph_states.items.len) return &.{};
+        return slide.morph_states.items[state_index].items.items;
+    }
+    return if (slide.items) |*items| items.items else &.{};
 }
 
 fn currentStudioSceneItems(studio_mode: *const studio.Studio) []const slides.SlideItem {

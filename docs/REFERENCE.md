@@ -105,6 +105,7 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>0</kbd> | Goto last slide |
 | <kbd>G</kbd> | Goto first slide |
 | <kbd>Shift</kbd> + <kbd>G</kbd> | Goto last slide |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd> | Open the numeric go-to-slide picker without leaving the current slide |
 | <kbd>M</kbd> | Play or pause videos on the current slide |
 | <kbd>Shift</kbd> + <kbd>M</kbd> | Stop videos on the current slide (rewind to poster frame) |
 | <kbd>O</kbd> | Open or lock the active Crowdplay poll |
@@ -115,6 +116,13 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | <kbd>E</kbd> | Enter or leave Studio visual editing mode |
 | <kbd>Cmd/Ctrl-O</kbd> | Browse for and open another `.sld` deck |
 | <kbd>F3</kbd> | Toggle frame/rebuild diagnostics |
+
+The go-to-slide picker is shared by presentation mode and Studio. It accepts
+digits only and does not preview or navigate while you type. <kbd>Enter</kbd>
+jumps only when the number is from 1 through the final slide; empty, zero, and
+out-of-range values leave the picker open with a bounds message. <kbd>Esc</kbd>
+or <kbd>Cmd/Ctrl-G</kbd> closes it without changing the current slide or playback
+state.
 
 **Beast Mode**: removes the 60 FPS limit
 
@@ -530,6 +538,8 @@ presentation plus a 60 Hz fallback; Beast Mode intentionally disables both
 limits.
 `--diagnostics-command-palette` opens Studio with the command palette visible,
 which makes compact/default/large screenshot regression checks deterministic.
+`--diagnostics-goto-slide` opens the shared numeric picker in either Studio or
+presentation mode for deterministic overlay and input QA.
 `--diagnostics-command-tooltip` similarly holds the Commands hover card open
 for deterministic typography and containment QA across macOS Spaces.
 `--diagnostics-confirm-display=N` validates the one-based active-monitor number
@@ -635,6 +645,7 @@ scoped, so a library item can only be placed after its definition.
 | Studio shortcut | Description |
 | --------------- | ----------- |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> | Open the searchable contextual command palette |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd> | Open the shared bounds-checked numeric picker; only a valid Enter changes slides |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>F</kbd> | Find and jump within Slides, Library, or Objects |
 | <kbd>1</kbd>–<kbd>4</kbd> on the new-deck chooser | Create Studio, Folio, Ember, or Signal |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> | Name an untitled deck, then atomically save changes to its `.sld` file |

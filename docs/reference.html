@@ -46,6 +46,7 @@
                 <tr><td><code>--presenter-port=PORT</code></td><td>Change the Presenter port. The default is 7332.</td></tr>
                 <tr><td><code>--showtime-report=JSON</code></td><td>Preflight the exact deck, write stable JSON, and exit nonzero on blockers.</td></tr>
                 <tr><td><code>--portable-show=DIR</code></td><td>Create an ordinary deck-and-assets folder, independently re-open it, preflight it, and write its report.</td></tr>
+                <tr><td><code>--diagnostics-goto-slide</code></td><td>Open with the shared go-to-slide picker visible for deterministic Studio or presentation QA.</td></tr>
                 <tr><td><code>-h, --help</code></td><td>Show the complete option list.</td></tr>
                 <tr><td><code>-v, --version</code></td><td>Show the version.</td></tr>
               </tbody>
@@ -62,6 +63,7 @@
                 <tr><td><kbd>Left</kbd>, <kbd>Page Up</kbd>, or <kbd>Backspace</kbd></td><td>Hide the current step or show the previous slide.</td></tr>
                 <tr><td><kbd>1</kbd> or <kbd>G</kbd></td><td>Show the first slide.</td></tr>
                 <tr><td><kbd>0</kbd> or <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Show the last slide.</td></tr>
+                <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd></td><td>Open the numeric go-to-slide picker without leaving the current slide.</td></tr>
                 <tr><td><kbd>F</kbd></td><td>Turn fullscreen on or off.</td></tr>
                 <tr><td><kbd>D</kbd></td><td>Identify and explicitly choose the presentation display.</td></tr>
                 <tr><td><kbd>L</kbd></td><td>Turn the laser pointer on or off.</td></tr>
@@ -77,6 +79,10 @@
               </tbody>
             </table>
           </div>
+
+          <h3 id="go-to-slide">Go directly to a slide</h3>
+          <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd> in either presentation mode or Studio. The centered picker accepts digits only and shows the current slide and the deck's slide count; it does not preview or navigate while you type.</p>
+          <p>Press <kbd>Enter</kbd> to jump when the number is from 1 through the final slide. An empty, zero, or out-of-range value leaves the picker open with a bounds message. Press <kbd>Esc</kbd> or <kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd> again to close it. Opening or cancelling preserves the current slide and playback state.</p>
 
           <h3>Save images and PDFs</h3>
           <div class="table-wrap">
@@ -138,6 +144,7 @@
               <thead><tr><th>Control</th><th>Action</th></tr></thead>
               <tbody>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd></td><td>Open the command palette.</td></tr>
+                <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd></td><td>Open the <a href="#go-to-slide">numeric go-to-slide picker</a> shared with presentation mode.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>F</kbd></td><td>Find a slide, library item, or object.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>O</kbd></td><td>Open an existing deck through the built-in file chooser; also available as <strong>Open existing deck…</strong> on the starter chooser.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd></td><td>Name an untitled deck or save the named deck.</td></tr>

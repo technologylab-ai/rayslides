@@ -332,6 +332,8 @@
             </div>
           </div>
           <p>Each slide action changes the <code>.sld</code> source in one undo step.</p>
+          <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd> to open the centered numeric go-to-slide picker. It accepts digits only and shares the same bounds-checked behavior as presentation mode.</p>
+          <div class="callout"><p><strong>Opening the picker does not navigate.</strong> The current slide stays selected while you type and after <kbd>Esc</kbd>. Only <kbd>Enter</kbd> on a number from 1 through the final slide changes the slide; invalid values leave the picker open with a bounds message.</p></div>
 
           <h2>Undo and redo</h2>
           <p>Studio records each successful visual or structural source change as one history step. Undo restores both the source and the slide you were working on.</p>
