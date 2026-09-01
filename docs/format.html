@@ -36,11 +36,12 @@
           </div>
 
           <h2 id="neovim-highlighting">Use Rayslides highlighting in Neovim</h2>
-          <p>The repository includes a <code class="inline-code">rayslides</code> filetype and syntax runtime. Try it from the repository root without changing your Neovim configuration:</p>
+          <div class="callout"><p><strong>Rayslides has its own <a href="studio.html#neovim-editor">embedded Neovim integration</a>.</strong> In a <a href="getting-started.html#neovim-build">Neovim-enabled build</a>, Rayslides loads this <code class="inline-code">.sld</code> runtime automatically; you do not need to change <code class="inline-code">init.lua</code>. The commands below are only for opening a deck directly in standalone Neovim.</p></div>
+          <p>The repository includes a <code class="inline-code">rayslides</code> filetype and syntax runtime. Try it in standalone Neovim from the repository root without changing your configuration:</p>
           <pre><code>nvim --cmd "set runtimepath^=$PWD/src/nvim/runtime" talk.sld</code></pre>
           <p>For a permanent setup, prepend the installed runtime's absolute path in <code class="inline-code">init.lua</code>. A Neovim-enabled build installs it beneath <code class="inline-code">zig-out/share/rayslides/nvim</code>.</p>
           <pre><code>vim.opt.runtimepath:prepend("/absolute/path/to/rayslides/zig-out/share/rayslides/nvim")</code></pre>
-          <p>Opening <code class="inline-code">*.sld</code> then reports <code class="inline-code">filetype=rayslides</code>. The bundled classic Vim syntax identifies directives, keys, values, comments, inline markup, and malformed constructs; your colorscheme supplies the colors. See <a href="studio.html#neovim-editor">the Studio guide</a> for the embedded editor.</p>
+          <p>Opening <code class="inline-code">*.sld</code> then reports <code class="inline-code">filetype=rayslides</code>. The bundled classic Vim syntax identifies directives, keys, values, comments, inline markup, and malformed constructs; your colorscheme supplies the colors.</p>
 
           <h2>Use the slide coordinate system</h2>
           <p>Rayslides renders each slide at 1920 × 1080. Use these coordinates for every display size.</p>
