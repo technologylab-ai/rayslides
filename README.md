@@ -39,6 +39,21 @@ zig build -Doptimize=ReleaseSafe
 zig-out/bin/rayslides
 ```
 
+On Linux, including [Omarchy](https://omarchy.org), an absolute symlink makes
+the development build available from any directory while keeping its installed
+resources discoverable:
+
+```sh
+mkdir -p ~/.local/bin
+ln -s "$PWD/zig-out/bin/rayslides" ~/.local/bin/rayslides
+```
+
+Keep the complete `zig-out` tree after building. Linux resolves the running
+executable through the symlink, so Rayslides still finds resources such as
+`zig-out/share/rayslides/nvim` when Neovim support is enabled. Rebuilds update
+the target in place and the symlink continues to work. Ensure `~/.local/bin`
+is on `PATH`.
+
 Run the program without a file to open Studio's new-deck chooser. Use
 `--studio` to edit an existing deck:
 

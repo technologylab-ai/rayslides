@@ -46,6 +46,12 @@ zig build -Doptimize=ReleaseSafe
 zig-out/bin/rayslides</code></pre>
           <p>The build places the executable at <code class="inline-code">zig-out/bin/rayslides</code>.</p>
 
+          <h3>Put the development build on PATH on Linux</h3>
+          <p>On Linux, including <a href="https://omarchy.org">Omarchy</a>, create an absolute symlink in your user bin directory to run Rayslides from any working directory:</p>
+          <pre><code>mkdir -p ~/.local/bin
+ln -s "$PWD/zig-out/bin/rayslides" ~/.local/bin/rayslides</code></pre>
+          <p>Keep the complete <code class="inline-code">zig-out</code> tree after building. Linux resolves the executable through the symlink, so Rayslides can still find adjacent installed resources such as <code class="inline-code">zig-out/share/rayslides/nvim</code> when Neovim support is enabled. Rebuilding updates the target while the symlink keeps working. Ensure <code class="inline-code">~/.local/bin</code> is on <code class="inline-code">PATH</code>.</p>
+
           <h2 id="neovim-build">Add the optional Neovim editor</h2>
           <p>On Linux or macOS, compile in the embedded Neovim overlay with <code class="inline-code">-Dneovim=true</code>. Neovim itself must be installed; Rayslides finds <code class="inline-code">nvim</code> on <code class="inline-code">PATH</code> and in common package-manager and user-local locations.</p>
           <pre><code><span class="code-comment"># Build Rayslides with Neovim support.</span>
