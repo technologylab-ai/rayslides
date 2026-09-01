@@ -8,6 +8,16 @@
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
+        .mpack = .{
+            .url = "git+https://github.com/ludocode/mpack?ref=v1.1.1#79d3fcd3e04338b06e82d01a62f4aa98c7bad5f7",
+            .hash = "N-V-__8AACBCDwC81hqRo6TrlzdJUALea5jN6zwtJ9Wq8oYx",
+            .lazy = true,
+        },
+        .jetbrains_mono = .{
+            .url = "git+https://github.com/JetBrains/JetBrainsMono?ref=v2.304#cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9",
+            .hash = "N-V-__8AAG_BSQEsc4_xZ_VZKt_VzgAN503PVJ4ludprf3hj",
+            .lazy = true,
+        },
         .raylib_zig = .{
             .url = "git+https://github.com/raylib-zig/raylib-zig?ref=devel#8758f4cd3a5ae0df6941c4715257223d34c5ad3e",
             .hash = "raylib_zig-6.0.0-KE8RECZ8BQDm-txuospkpZHbJ6DNpacUF7D88RWQ_qAe",

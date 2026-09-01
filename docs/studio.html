@@ -54,6 +54,27 @@
             <li><b>5</b><span><strong>Timeline</strong> selects the transition, the base scene, a reveal build, or a morph state, and plays the preview.</span></li>
           </ol>
 
+          <h2 id="neovim-editor">Edit source with Neovim</h2>
+          <p>A <a href="getting-started.html#neovim-build">Neovim-enabled Linux or macOS build</a> can open the complete deck as a controlled Neovim buffer inside Studio. Press <kbd>Cmd/Ctrl</kbd> + <kbd>E</kbd>, or open Commands and choose <strong>Edit source in Neovim</strong>.</p>
+          <figure class="shot">
+            <img src="images/studio-neovim-source-editor.png" alt="Rayslides Studio showing the embedded Neovim whole-document editor with highlighted .sld source, Normal mode, and the private Rayslides document URI" width="1280" height="720" loading="lazy">
+            <figcaption><strong>The full deck is a controlled Neovim buffer.</strong> This screenshot shows whole-source editing; eligible text, bullet, and speaker-note <code>...</code> fields use the same overlay and guarded apply path.</figcaption>
+          </figure>
+          <p>This is Neovim's external UI protocol, not a terminal widget: Neovim owns modes, editing, selection, syntax highlights, and the cursor while raylib renders its grid with the bundled JetBrains Mono font. Your Neovim configuration and colorscheme still apply, so the exact colors and status line can differ.</p>
+          <div class="callout"><p><strong>Neovim owns all keyboard and mouse input while the overlay is open.</strong> Rayslides shortcuts—including <kbd>F</kbd> for fullscreen and <kbd>D</kbd> for display selection—remain suspended until Neovim exits.</p></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Neovim command</th><th>Result in Studio</th></tr></thead>
+              <tbody>
+                <tr><td><code>:w</code></td><td>Validate and apply the buffer to the in-memory Studio document. This does not write the <code>.sld</code> file; use Studio Save for that.</td></tr>
+                <tr><td><code>:wq</code>, <code>:x</code>, or <code>ZZ</code></td><td>Apply the buffer and close the overlay.</td></tr>
+                <tr><td><code>:q</code></td><td>Close a clean buffer. Neovim refuses the command when the buffer has unapplied changes.</td></tr>
+                <tr><td><code>:q!</code> or <code>ZQ</code></td><td>Discard changes since the last accepted write and close the overlay.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>If Rayslides rejects changed source, the overlay stays open and shows the diagnostic so you can fix it. If a plugin or configuration prevents Neovim from starting, launch Studio with <code class="inline-code">--neovim-clean</code>. Eligible <code>...</code> fields retain their built-in editor when Neovim support is not compiled in or Neovim cannot start.</p>
+
           <h2>Create an object</h2>
           <p>Choose a creation tool, then click the canvas. Studio returns to Select after one placement.</p>
           <figure class="shot shot-toolbar">

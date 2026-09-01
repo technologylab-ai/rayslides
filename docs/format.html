@@ -35,6 +35,13 @@
             <a class="button button-primary" href="#live-camera">Jump to live camera setup</a>
           </div>
 
+          <h2 id="neovim-highlighting">Use Rayslides highlighting in Neovim</h2>
+          <p>The repository includes a <code class="inline-code">rayslides</code> filetype and syntax runtime. Try it from the repository root without changing your Neovim configuration:</p>
+          <pre><code>nvim --cmd "set runtimepath^=$PWD/src/nvim/runtime" talk.sld</code></pre>
+          <p>For a permanent setup, prepend the installed runtime's absolute path in <code class="inline-code">init.lua</code>. A Neovim-enabled build installs it beneath <code class="inline-code">zig-out/share/rayslides/nvim</code>.</p>
+          <pre><code>vim.opt.runtimepath:prepend("/absolute/path/to/rayslides/zig-out/share/rayslides/nvim")</code></pre>
+          <p>Opening <code class="inline-code">*.sld</code> then reports <code class="inline-code">filetype=rayslides</code>. The bundled classic Vim syntax identifies directives, keys, values, comments, inline markup, and malformed constructs; your colorscheme supplies the colors. See <a href="studio.html#neovim-editor">the Studio guide</a> for the embedded editor.</p>
+
           <h2>Use the slide coordinate system</h2>
           <p>Rayslides renders each slide at 1920 × 1080. Use these coordinates for every display size.</p>
           <p>The <code class="inline-code">x</code> and <code class="inline-code">y</code> values set the top-left corner. The <code class="inline-code">w</code> and <code class="inline-code">h</code> values set the size.</p>

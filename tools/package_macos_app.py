@@ -82,7 +82,7 @@ def make_icon(source: Path, destination: Path) -> None:
         )
 
 
-def verify_bundle(bundle: Path, version: str) -> None:
+def verify_bundle(bundle: Path, version: str, includes_neovim: bool) -> None:
     plist_path = bundle / "Contents" / "Info.plist"
     binary = bundle / "Contents" / "MacOS" / "rayslides"
     icon = bundle / "Contents" / "Resources" / "Rayslides.icns"
@@ -101,6 +101,19 @@ def verify_bundle(bundle: Path, version: str) -> None:
         raise RuntimeError("bundle executable is missing or not executable")
     if not icon.is_file() or icon.stat().st_size == 0:
         raise RuntimeError("bundle icon is missing")
+    if includes_neovim:
+        runtime = bundle / "Contents" / "Resources" / "nvim"
+        font = bundle / "Contents" / "Resources" / "fonts" / "JetBrainsMono-Regular.ttf"
+        license_file = bundle / "Contents" / "Resources" / "fonts" / "JetBrainsMono-OFL.txt"
+        mpack_license = bundle / "Contents" / "Resources" / "licenses" / "MPack-LICENSE.txt"
+        if not (runtime / "ftdetect" / "rayslides.vim").is_file():
+            raise RuntimeError("bundle Neovim runtime is missing")
+        if not font.is_file() or font.stat().st_size == 0:
+            raise RuntimeError("bundle JetBrains Mono font is missing")
+        if not license_file.is_file() or license_file.stat().st_size == 0:
+            raise RuntimeError("bundle JetBrains Mono license is missing")
+        if not mpack_license.is_file() or mpack_license.stat().st_size == 0:
+            raise RuntimeError("bundle MPack license is missing")
 
 
 def seal_adhoc(bundle: Path) -> None:
@@ -121,7 +134,16 @@ def seal_adhoc(bundle: Path) -> None:
     )
 
 
-def package(binary: Path, output: Path, version: str, icon_source: Path) -> None:
+def package(
+    binary: Path,
+    output: Path,
+    version: str,
+    icon_source: Path,
+    neovim_runtime: Path | None,
+    neovim_font: Path | None,
+    neovim_font_license: Path | None,
+    neovim_mpack_license: Path | None,
+) -> None:
     if output.exists():
         shutil.rmtree(output)
     macos = output / "Contents" / "MacOS"
@@ -136,7 +158,19 @@ def package(binary: Path, output: Path, version: str, icon_source: Path) -> None
         plistlib.dump(info_plist(version), file, fmt=plistlib.FMT_XML, sort_keys=True)
     (output / "Contents" / "PkgInfo").write_bytes(b"APPL????")
     make_icon(icon_source, resources / "Rayslides.icns")
-    verify_bundle(output, version)
+    includes_neovim = neovim_runtime is not None
+    if includes_neovim:
+        if neovim_font is None or neovim_font_license is None or neovim_mpack_license is None:
+            raise RuntimeError("Neovim app resources require the JetBrains Mono and MPack licenses")
+        shutil.copytree(neovim_runtime, resources / "nvim")
+        fonts = resources / "fonts"
+        fonts.mkdir()
+        shutil.copy2(neovim_font, fonts / "JetBrainsMono-Regular.ttf")
+        shutil.copy2(neovim_font_license, fonts / "JetBrainsMono-OFL.txt")
+        licenses = resources / "licenses"
+        licenses.mkdir()
+        shutil.copy2(neovim_mpack_license, licenses / "MPack-LICENSE.txt")
+    verify_bundle(output, version, includes_neovim)
     seal_adhoc(output)
 
 
@@ -146,12 +180,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--icon", type=Path, required=True)
+    parser.add_argument("--neovim-runtime", type=Path)
+    parser.add_argument("--neovim-font", type=Path)
+    parser.add_argument("--neovim-font-license", type=Path)
+    parser.add_argument("--neovim-mpack-license", type=Path)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    package(args.binary.resolve(), args.output.resolve(), args.version, args.icon.resolve())
+    package(
+        args.binary.resolve(),
+        args.output.resolve(),
+        args.version,
+        args.icon.resolve(),
+        args.neovim_runtime.resolve() if args.neovim_runtime else None,
+        args.neovim_font.resolve() if args.neovim_font else None,
+        args.neovim_font_license.resolve() if args.neovim_font_license else None,
+        args.neovim_mpack_license.resolve() if args.neovim_mpack_license else None,
+    )
     print(f"Packaged locally ad-hoc-signed, non-notarized app: {args.output}")
     return 0
 

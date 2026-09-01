@@ -609,6 +609,12 @@ PNG and JSON references live in `tests/studio_baselines`. The harness requires
 Python Pillow. See [the baseline notes](../tests/studio_baselines/README.md) for
 tolerances and individual-scenario commands.
 
+Build with `-Dneovim=true` to expose the separate `neovim-baselines` and
+`neovim-baselines-update` steps. Those run clean embedded sessions at compact,
+default, and large sizes; regular Studio baselines remain independent of the
+optional editor. On Hyprland the harness verifies the exact launched window is
+floating before opening its capture gate.
+
 For release work, `zig build release-confidence` runs the headless resilience
 gate. The repeatable [macOS release checklist](MACOS_RELEASE_QA.md) adds
 verified Aerospace placement, focus, multi-monitor/resize/fullscreen, reload,

@@ -82,6 +82,15 @@ This file tracks the documentation work that remains after the first site draft.
   - Show the voting screen.
   - Show the result view.
 
+## Embedded Neovim editor
+
+- [x] Explain the optional Linux and macOS build flag and runtime dependency.
+- [x] Show the whole-document editor with real interface evidence.
+- [x] Connect the whole-document editor to eligible `...` field editors.
+- [x] Document input ownership, apply/write behavior, and every supported quit path.
+- [x] Explain clean-mode recovery and the built-in-editor fallback.
+- [x] Explain standalone `.sld` filetype and syntax setup.
+
 ## Current-capabilities illustration refresh
 
 - [x] Replace the one-slide Studio fixture with a complete source-native showcase.

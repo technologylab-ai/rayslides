@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import platform
 import shutil
 import subprocess
@@ -132,6 +133,30 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
 )
 
+NEOVIM_SCENARIOS: tuple[Scenario, ...] = (
+    Scenario(
+        "neovim-compact",
+        900,
+        506,
+        24,
+        ("--diagnostics-neovim-editor",),
+    ),
+    Scenario(
+        "neovim-default",
+        1600,
+        900,
+        24,
+        ("--diagnostics-neovim-editor",),
+    ),
+    Scenario(
+        "neovim-large",
+        2560,
+        1440,
+        24,
+        ("--diagnostics-neovim-editor",),
+    ),
+)
+
 
 @dataclass(frozen=True)
 class ImageComparison:
@@ -155,13 +180,25 @@ class AerospaceWindow:
     layout: str
 
 
+@dataclass(frozen=True)
+class HyprlandWindow:
+    address: str
+    window_class: str
+    title: str
+    floating: bool
+
+
 def scenario_map() -> dict[str, Scenario]:
-    return {scenario.name: scenario for scenario in SCENARIOS}
+    return {scenario.name: scenario for scenario in (*SCENARIOS, *NEOVIM_SCENARIOS)}
 
 
-def selected_scenarios(names: list[str] | None) -> list[Scenario]:
+def selected_scenarios(names: list[str] | None, suite: str) -> list[Scenario]:
     if not names:
-        return list(SCENARIOS)
+        if suite == "studio":
+            return list(SCENARIOS)
+        if suite == "neovim":
+            return list(NEOVIM_SCENARIOS)
+        return [*SCENARIOS, *NEOVIM_SCENARIOS]
     available = scenario_map()
     return [available[name] for name in names]
 
@@ -307,6 +344,72 @@ def place_and_verify_window(pid: int, workspace: str, deadline: float) -> Aerosp
     return None
 
 
+def hyprland_windows_for_pid(pid: int) -> list[HyprlandWindow]:
+    hyprctl = shutil.which("hyprctl")
+    if hyprctl is None:
+        return []
+    completed = subprocess.run(
+        [hyprctl, "clients", "-j"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return []
+    try:
+        clients = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return []
+    return [
+        HyprlandWindow(
+            address=client.get("address", ""),
+            window_class=client.get("class", ""),
+            title=client.get("title", ""),
+            floating=bool(client.get("floating", False)),
+        )
+        for client in clients
+        if client.get("pid") == pid and client.get("address")
+    ]
+
+
+def float_and_verify_hyprland_window(pid: int, deadline: float) -> HyprlandWindow | None:
+    hyprctl = shutil.which("hyprctl")
+    if hyprctl is None:
+        return None
+    target_address: str | None = None
+    float_requested = False
+    while time.monotonic() < deadline:
+        windows = [
+            window
+            for window in hyprland_windows_for_pid(pid)
+            if window.window_class.casefold() == "rayslides"
+        ]
+        if target_address is None and len(windows) == 1:
+            target_address = windows[0].address
+        matching = [window for window in windows if window.address == target_address]
+        if matching and matching[0].floating:
+            return matching[0]
+        if matching and not float_requested:
+            subprocess.run(
+                [
+                    hyprctl,
+                    "dispatch",
+                    f"hl.dsp.window.float{{window='address:{target_address}'}}",
+                ],
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            # `float` toggles, so request it at most once for this exact window
+            # and use queried state—not the dispatch acknowledgement—as proof.
+            float_requested = True
+        time.sleep(0.05)
+    return None
+
+
 def terminate_process(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -409,6 +512,25 @@ def capture_scenario(
                 f"{placed.workspace} ({placed.layout})",
                 flush=True,
             )
+        if platform.system() == "Linux" and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            floated = float_and_verify_hyprland_window(
+                process.pid,
+                min(deadline, time.monotonic() + 12.0),
+            )
+            if floated is None:
+                observed = ", ".join(
+                    f"{window.address}/{window.window_class}/floating={window.floating}"
+                    for window in hyprland_windows_for_pid(process.pid)
+                ) or "none"
+                terminate_process(process)
+                raise RuntimeError(
+                    f"{scenario.name}: could not verify a floating Rayslides window under "
+                    f"Hyprland; observed windows: {observed}; capture aborted"
+                )
+            print(
+                f"[{scenario.name}] verified floating Hyprland window {floated.address}",
+                flush=True,
+            )
         gate_path.touch()
         try:
             return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
@@ -429,7 +551,7 @@ def run_capture(args: argparse.Namespace, update: bool) -> int:
         raise SystemExit(f"Rayslides binary not found: {binary}; build it first")
     artifact_dir = Path(args.artifacts).resolve()
     failures: list[str] = []
-    for scenario in selected_scenarios(args.scenario):
+    for scenario in selected_scenarios(args.scenario, args.suite):
         print(f"[{scenario.name}] capturing {scenario.width}x{scenario.height} …", flush=True)
         actual_image, actual_report_path = capture_scenario(
             scenario,
@@ -539,6 +661,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         subparser.add_argument("--binary", default=str(ROOT / "zig-out" / "bin" / "rayslides"))
         subparser.add_argument("--artifacts", default=str(DEFAULT_ARTIFACT_DIR))
         subparser.add_argument("--scenario", action="append", choices=sorted(scenario_map()))
+        subparser.add_argument(
+            "--suite",
+            choices=("studio", "neovim", "all"),
+            default="studio",
+            help="capture the regular Studio suite, the optional Neovim overlay suite, or both",
+        )
         subparser.add_argument("--settle-frames", type=int, default=120)
         subparser.add_argument("--timeout", type=float, default=45.0)
         subparser.add_argument("--workspace", help="Aerospace workspace used while each macOS window is open")

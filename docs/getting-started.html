@@ -46,6 +46,17 @@ zig build -Doptimize=ReleaseSafe
 zig-out/bin/rayslides</code></pre>
           <p>The build places the executable at <code class="inline-code">zig-out/bin/rayslides</code>.</p>
 
+          <h2 id="neovim-build">Add the optional Neovim editor</h2>
+          <p>On Linux or macOS, compile in the embedded Neovim overlay with <code class="inline-code">-Dneovim=true</code>. Neovim itself must be installed; Rayslides finds <code class="inline-code">nvim</code> on <code class="inline-code">PATH</code> and in common package-manager and user-local locations.</p>
+          <pre><code><span class="code-comment"># Build Rayslides with Neovim support.</span>
+zig build -Dneovim=true -Doptimize=ReleaseSafe
+
+<span class="code-comment"># Open a deck in Studio.</span>
+zig-out/bin/rayslides --studio talk.sld</code></pre>
+          <p>The enabled build includes the Rayslides syntax runtime and JetBrains Mono for the rendered editor grid. It does not bundle the Neovim executable. The default <code class="inline-code">-Dneovim=false</code> build keeps the built-in field editors and has no Neovim runtime requirement.</p>
+          <p>For the macOS app, pass the same option to the app build: <code class="inline-code">zig build -Dneovim=true -Doptimize=ReleaseSafe macos-app</code>.</p>
+          <p><a href="studio.html#neovim-editor">Learn how to open, apply, and close the embedded editor.</a></p>
+
           <h2>Build the macOS app</h2>
           <p>On macOS, build the Rayslides app with the <code class="inline-code">macos-app</code> step.</p>
           <pre><code><span class="code-comment"># Build the app bundle.</span>

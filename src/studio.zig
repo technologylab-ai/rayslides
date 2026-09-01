@@ -1283,6 +1283,8 @@ pub const Notice = enum {
     morph_state_required,
     morph_structure_locked,
     camera_start_failed,
+    neovim_unavailable,
+    neovim_start_failed,
 };
 
 /// The active canvas tool. Creation tools are deliberately one-shot: after a
@@ -2110,6 +2112,7 @@ pub const SemanticCommand = union(enum) {
     save_document_copy: void,
     undo: void,
     redo: void,
+    edit_source_neovim: void,
     edit_speaker_notes: void,
     pair_presenter_phone: void,
     choose_presentation_display: void,
@@ -3761,6 +3764,7 @@ pub const CommandId = enum {
     save_copy,
     undo,
     redo,
+    edit_source_neovim,
     tool_select,
     tool_text,
     tool_bullets,
@@ -3831,6 +3835,7 @@ const command_specs = [_]CommandSpec{
     .{ .id = .save_copy, .category = "FILE", .title = "Save a copy", .description = "Write a new .edited.sld copy", .keywords = "duplicate export backup file", .shortcut = "Shift Cmd/Ctrl S" },
     .{ .id = .undo, .category = "HISTORY", .title = "Undo", .description = "Restore the previous source transaction", .keywords = "back history revert", .shortcut = "Cmd/Ctrl Z" },
     .{ .id = .redo, .category = "HISTORY", .title = "Redo", .description = "Reapply the next source transaction", .keywords = "forward history repeat", .shortcut = "Shift Cmd/Ctrl Z" },
+    .{ .id = .edit_source_neovim, .category = "FILE", .title = "Edit source in Neovim", .description = "Open the complete in-memory .sld in the embedded modal editor", .keywords = "source code syntax vim nvim text whole document", .shortcut = "Cmd/Ctrl E" },
     .{ .id = .tool_select, .category = "TOOLS", .title = "Select tool", .description = "Select, move, resize, and marquee objects", .keywords = "pointer move resize marquee", .shortcut = "V" },
     .{ .id = .tool_text, .category = "TOOLS", .title = "Add text", .description = "Place a new source-backed text box", .keywords = "textbox type label", .shortcut = "T" },
     .{ .id = .tool_bullets, .category = "TOOLS", .title = "Add bullet list", .description = "Place a new bulleted text box", .keywords = "list bullets", .shortcut = "B" },
@@ -5595,6 +5600,7 @@ pub const Studio = struct {
             .open,
             .save,
             .save_copy,
+            .edit_source_neovim,
             .tool_select,
             .tool_text,
             .tool_bullets,
@@ -6157,6 +6163,7 @@ pub const Studio = struct {
             .save_copy => self.pending_semantic_command = .{ .save_document_copy = {} },
             .undo => self.pending_semantic_command = .{ .undo = {} },
             .redo => self.pending_semantic_command = .{ .redo = {} },
+            .edit_source_neovim => self.pending_semantic_command = .{ .edit_source_neovim = {} },
             .tool_select => self.setTool(.select, items),
             .tool_text => self.setTool(.add_text, items),
             .tool_bullets => self.setTool(.add_bullets, items),
@@ -16629,6 +16636,8 @@ pub const Studio = struct {
             .morph_state_required => "Select a state card first; BASE cannot be renamed, deleted, or reordered",
             .morph_structure_locked => "That state move would break cumulative source ownership; no change was made",
             .camera_start_failed => "Camera could not start - check the device, permissions, video_size, and cam_format",
+            .neovim_unavailable => "Embedded Neovim is unavailable; build with -Dneovim=true and install nvim",
+            .neovim_start_failed => "Neovim could not start - the built-in editors remain available",
         };
     }
 

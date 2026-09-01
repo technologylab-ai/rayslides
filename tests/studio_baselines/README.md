@@ -1,8 +1,9 @@
 # Studio visual and performance baselines
 
-These references exercise ten deterministic ReleaseSafe Studio scenarios. The
-first four use the generated stress deck; the Motion scenarios open the
-fixture deck `testslides/studio-motion-qa.sld` (4 slides) instead:
+These references exercise ten deterministic ReleaseSafe Studio scenarios plus
+three opt-in embedded-Neovim overlay scenarios. The first four use the
+generated stress deck; the Motion scenarios open the fixture deck
+`testslides/studio-motion-qa.sld` (4 slides) instead:
 
 - `compact-properties` — 900×506 docked Properties and selected object;
 - `default-command-palette` — 1600×900 searchable command discovery;
@@ -20,6 +21,12 @@ fixture deck `testslides/studio-motion-qa.sld` (4 slides) instead:
   selected: State section, change list, and morph ghosts/paths on the canvas;
 - `compact-transition` — 900×506 slide 2 Transition section via the timeline
   `IN` chip.
+
+An enabled build also provides `neovim-compact`, `neovim-default`, and
+`neovim-large` at 900×506, 1600×900, and 2560×1440. They start Neovim with
+`--clean`, wait for a real external-UI grid snapshot, and verify the overlay's
+clipping, cell geometry, private URI, syntax colors, and bundled JetBrains Mono
+font without depending on the capture machine's `init.lua`.
 
 Each PNG is normalized to the requested logical client size. Its JSON partner
 records render mode/count/timing, frame sampling, Studio cache activity, deck
@@ -43,11 +50,22 @@ gate. Failure to prove all three aborts the scenario without a screenshot.
 Every successful scenario exits by itself. Omit `--workspace` on systems that
 do not use Aerospace.
 
+Under Hyprland the harness identifies the exact launched Rayslides PID,
+switches that window to floating once, verifies `floating=true`, and only then
+opens the capture gate. This keeps Linux captures non-tiling without changing
+the user's window rules.
+
 Run one scenario with, for example:
 
 ```sh
 zig build -Doptimize=ReleaseSafe studio-baselines -- \
   --workspace 12 --scenario compact-properties
+```
+
+Run the separate Neovim suite only from an enabled build:
+
+```sh
+zig build -Dneovim=true -Doptimize=ReleaseSafe neovim-baselines
 ```
 
 Actual PNGs/JSON, process logs, and amplified failure diffs are written to
@@ -65,6 +83,9 @@ confirming that a performance increase is intentional:
 ```sh
 zig build -Doptimize=ReleaseSafe studio-baselines-update -- --workspace 12
 ```
+
+The corresponding opt-in editor update step is
+`zig build -Dneovim=true -Doptimize=ReleaseSafe neovim-baselines-update`.
 
 An update first validates exact image dimensions, scenario/deck identity,
 rebuild mode, slide counts, and incremental full/partial event counts. Invalid

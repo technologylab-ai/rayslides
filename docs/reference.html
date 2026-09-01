@@ -39,6 +39,7 @@
               <thead><tr><th>Option</th><th>Action</th></tr></thead>
               <tbody>
                 <tr><td><code>--studio</code></td><td>Open the deck in Studio.</td></tr>
+                <tr><td><code>--neovim-clean</code></td><td>Start an enabled embedded Neovim editor without user configuration or plugins.</td></tr>
                 <tr><td><code>--no-crowd</code></td><td>Disable the Crowdplay server.</td></tr>
                 <tr><td><code>--crowd-host=HOST</code></td><td>Bind Crowdplay to the given host.</td></tr>
                 <tr><td><code>--crowd-port=PORT</code></td><td>Change the Crowdplay port. The default is 7331.</td></tr>
@@ -144,6 +145,7 @@
               <thead><tr><th>Control</th><th>Action</th></tr></thead>
               <tbody>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd></td><td>Open the command palette.</td></tr>
+                <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>E</kbd></td><td>Open the complete deck in the <a href="studio.html#neovim-editor">optional embedded Neovim editor</a>.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd></td><td>Open the <a href="#go-to-slide">numeric go-to-slide picker</a> shared with presentation mode.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>F</kbd></td><td>Find a slide, library item, or object.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl</kbd> + <kbd>O</kbd></td><td>Open an existing deck through the built-in file chooser; also available as <strong>Open existing deck…</strong> on the starter chooser.</td></tr>
@@ -172,6 +174,7 @@
               </tbody>
             </table>
           </div>
+          <p>While the Neovim overlay is open, it owns keyboard and mouse input. Studio and presentation shortcuts do not run until Neovim exits.</p>
 
           <h3>Move around the canvas</h3>
           <div class="table-wrap">

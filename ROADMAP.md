@@ -373,6 +373,12 @@ capability of the `.sld` format visually authorable and previewable. It is
 sequenced in the [Motion Studio roadmap](MOTION_STUDIO_ROADMAP.md) and
 follows the same completion rules as the topics above.
 
+An independent active track adds an optional raylib-rendered Neovim source and
+expanded-field editor without changing the `.sld` source, Studio history, or
+save boundaries. Its accepted protocol, write/quit contract, build opt-out,
+delivery tranches, and platform gates are recorded in the
+[Neovim editor roadmap](NEOVIM_EDITOR_ROADMAP.md).
+
 ## Final release gate
 
 - [x] Run the complete unit and round-trip suite in ReleaseSafe.

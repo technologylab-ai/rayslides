@@ -137,7 +137,32 @@ sleep/wake, Android, latency, or real-projector checklist item.
 - [ ] Cancel or finish export, return to the original slide/step, then edit and
       Undo/Redo once to verify GPU/parser ownership is still sound.
 
-## 6. Shutdown hygiene
+## 6. Embedded Neovim (enabled build)
+
+- [ ] Build `zig build -Dneovim=true -Doptimize=ReleaseSafe macos-app`, copy
+      the app outside the checkout, and verify its Resources contain the
+      `nvim` runtime plus `fonts/JetBrainsMono-Regular.ttf` and the OFL text.
+      `licenses/MPack-LICENSE.txt` must also be present. The bundle must not
+      contain or require a bundled Neovim executable.
+- [ ] From a Finder launch, open whole-source and eligible expanded text,
+      bullet, and speaker-note editors with Neovim installed through Homebrew
+      on Apple Silicon/Intel, MacPorts, and one user-local/shim location as
+      available. Repeat once with no discoverable executable and require the
+      built-in field editor fallback.
+- [ ] Run `--neovim-clean`, then normal configuration. Verify Command and
+      Option mappings, composed Unicode, clipboard paste, mouse selection and
+      wheel input, focus switching, Retina scaling, and resizing at compact,
+      default, and large window sizes.
+- [ ] Exercise every write/quit row in `NEOVIM_EDITOR_ROADMAP.md`. Confirm
+      rejected writes retain the overlay, ordinary Rayslides shortcuts remain
+      suspended while it is open, close restores Studio input once, and app
+      quit reaps only the exact child without a recovery copy for unapplied
+      Neovim changes.
+- [ ] Run `zig build -Dneovim=true -Doptimize=ReleaseSafe neovim-baselines --
+      --workspace 12` from the copied-bundle QA environment and review all
+      three overlay captures.
+
+## 7. Shutdown hygiene
 
 - [x] Quit every Rayslides process after the checks.
 - [x] `aerospace list-windows --all ... | rg -i rayslides` returns nothing.

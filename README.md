@@ -60,6 +60,63 @@ During development, use `zig build run -- talk.sld`. On macOS,
 `zig build -Doptimize=ReleaseSafe macos-app` also creates
 `zig-out/Rayslides.app`.
 
+### Optional embedded Neovim editor
+
+Linux and macOS builds can include the embedded Neovim overlay:
+
+```sh
+zig build -Dneovim=true
+zig-out/bin/rayslides --studio talk.sld
+```
+
+Rayslides looks for `nvim` on `PATH`, in common Linux, Homebrew, and MacPorts
+locations, and in common user-local, mise, and asdf locations. Open the whole
+document with <kbd>Ctrl/Cmd-E</kbd> or **Edit source in Neovim** in Studio's
+Commands palette. Eligible expanded `...` editors for item text, multiline
+bullets, and speaker notes use the same overlay. If support is disabled or
+Neovim cannot start, those fields retain the built-in editor.
+
+The overlay is a native Neovim external UI rendered by raylib with the bundled
+JetBrains Mono font. Normal modes, the user's configuration and colorscheme,
+syntax colors, committed Unicode/AltGr text, paste, mouse input, and Vim quit
+rules apply. While it is open, it owns input: Rayslides shortcuts such as `f`
+for fullscreen and `D` for display selection are suspended. If a plugin or
+configuration prevents startup, use the recovery mode:
+
+```sh
+zig-out/bin/rayslides --neovim-clean --studio talk.sld
+```
+
+Inside this controlled buffer, `:w` validates and applies the source to the
+in-memory Studio document; it does not write the `.sld` file. Use Studio Save
+for that. `:wq`, `:x`, and `ZZ` apply and close, while a rejected edit keeps
+the overlay open. A clean `:q` closes, a dirty `:q` is refused by Neovim, and
+`:q!` or `ZQ` discards changes since the last accepted write and closes.
+
+The feature remains compile-time opt-in. Builds without it retain the
+dependency-free stub and built-in editors; use the default or pass
+`-Dneovim=false` explicitly. Enabled macOS application bundles include the
+private syntax runtime and font, but not the Neovim executable itself.
+
+To use Rayslides highlighting in standalone Neovim from the repository root,
+prepend the private runtime before opening a deck:
+
+```sh
+nvim --cmd "set runtimepath^=$PWD/src/nvim/runtime" talk.sld
+```
+
+For a permanent setup, prepend the absolute runtime path in `init.lua` (the
+installed build places it under `zig-out/share/rayslides/nvim`):
+
+```lua
+vim.opt.runtimepath:prepend("/absolute/path/to/rayslides/zig-out/share/rayslides/nvim")
+```
+
+Opening `*.sld` then reports `filetype=rayslides` and uses the bundled classic
+Vim syntax. Neovim's colorscheme supplies the actual colors.
+
+### Live camera items
+
 Live camera items use the video renderer and therefore support fitting,
 cropping, rotation, opacity, morphs, posters, and the existing playback pill:
 

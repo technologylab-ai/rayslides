@@ -28,6 +28,7 @@ const studio_roundtrip_test = @import("studio_roundtrip_test.zig");
 const motion_schedule = @import("motion_schedule.zig");
 const videoplayer = @import("videoplayer.zig");
 const showtime = @import("showtime.zig");
+const nvim_editor = @import("nvim_editor.zig");
 const SlideShow = slides.SlideShow;
 const studio_ui_font_data = @embedFile("assets/Calibri Regular.ttf");
 const presenter_ui_font_data = @embedFile("assets/Calibri Light.ttf");
@@ -42,6 +43,7 @@ const cli_help =
     \\
     \\Core options:
     \\  --studio                         Start with Studio authoring open
+    \\  --neovim-clean                  Start embedded Neovim without user config
     \\  --no-crowd                       Disable the Crowdplay server
     \\  --crowd-host=HOST                Bind Crowdplay to HOST
     \\  --crowd-port=PORT                Bind Crowdplay to PORT (default 7331)
@@ -55,6 +57,7 @@ const cli_help =
     \\Diagnostics and visual QA:
     \\  --diagnostics                    Show the diagnostics HUD
     \\  --diagnostics-command-palette    Open Studio with Commands visible
+    \\  --diagnostics-neovim-editor      Open Studio's embedded source editor
     \\  --diagnostics-goto-slide         Open with the go-to-slide picker visible
     \\  --diagnostics-file-browser       Open Studio with the deck file chooser visible
     \\  --diagnostics-command-tooltip    Show deterministic command hover help
@@ -3281,8 +3284,10 @@ pub fn main(init: std.process.Init) anyerror!void {
     var presenter_host_buffer: [256]u8 = undefined;
     presenter_options.host = defaultCrowdHost(&presenter_host_buffer);
     var launch_studio = false;
+    var neovim_clean = false;
     var diagnostics_enabled = false;
     var diagnostics_command_palette = false;
+    var diagnostics_neovim_editor = false;
     var diagnostics_goto_slide = false;
     var diagnostics_file_browser = false;
     var diagnostics_command_tooltip = false;
@@ -3364,11 +3369,17 @@ pub fn main(init: std.process.Init) anyerror!void {
                 presenter_options.port = std.fmt.parseInt(u16, arg["--presenter-port=".len..], 10) catch std.process.fatal("Invalid --presenter-port value", .{});
             } else if (!positional_only and std.mem.eql(u8, arg, "--studio")) {
                 launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--neovim-clean")) {
+                neovim_clean = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics")) {
                 diagnostics_enabled = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
                 diagnostics_enabled = true;
                 diagnostics_command_palette = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-neovim-editor")) {
+                diagnostics_enabled = true;
+                diagnostics_neovim_editor = true;
                 launch_studio = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-goto-slide")) {
                 diagnostics_enabled = true;
@@ -3673,6 +3684,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_library_preview_pending = diagnostics_library_preview_name;
     var diagnostics_library_definition_pending = diagnostics_library_definition_name;
     var diagnostics_command_palette_pending = diagnostics_command_palette;
+    var diagnostics_neovim_editor_pending = diagnostics_neovim_editor;
     var diagnostics_file_browser_pending = diagnostics_file_browser;
     var diagnostics_precision_view_pending = diagnostics_precision_view;
     var diagnostics_grid_settings_pending = diagnostics_grid_settings;
@@ -3701,8 +3713,11 @@ pub fn main(init: std.process.Init) anyerror!void {
         .dirty = slideshow_to_load == null,
         .ui_font = G.studio_ui_font,
     };
+    var embedded_editor = nvim_editor.Controller.init(gpa, io, neovim_clean);
+    defer embedded_editor.deinit();
     var property_prompt: studio_prompt.Prompt = .{};
     var pending_semantic_command: ?studio.SemanticCommand = null;
+    var pending_neovim_semantic_command: ?studio.SemanticCommand = null;
     var pending_save_as = false;
     var pending_portable_show = false;
     var showtime_overlay = ShowtimeOverlay{ .visible = diagnostics_showtime };
@@ -3804,6 +3819,73 @@ pub fn main(init: std.process.Init) anyerror!void {
     while (true) {
         frame_diagnostics.observeFrame(rl.getTime());
         syncWindowTitle(studio_mode.dirty);
+        var neovim_source_changed_this_frame = false;
+        var neovim_field_apply: ?nvim_editor.Apply = null;
+        var neovim_apply_message_buffer: [512]u8 = undefined;
+        const neovim_outer = nvim_editor.overlayRect(screenWidth, screenHeight);
+        const neovim_closed_this_frame = embedded_editor.update(neovim_outer);
+        if (neovim_closed_this_frame) pending_neovim_semantic_command = null;
+        if (embedded_editor.takeApply()) |apply| {
+            switch (apply.kind) {
+                .field => neovim_field_apply = apply,
+                .source => {
+                    if (apply.accepted_revision != G.source_revision) {
+                        embedded_editor.rejectApply("Rayslides changed since this editor opened; close and reopen Neovim");
+                    } else if (std.mem.eql(u8, apply.source, G.editor_memory[0..G.source_len])) {
+                        embedded_editor.acceptApply(G.source_revision);
+                    } else if (neovimSourceDiagnostic(
+                        gpa,
+                        apply.source,
+                        G.editor_memory.len - 1,
+                        &neovim_apply_message_buffer,
+                    )) |diagnostic_opt| {
+                        if (diagnostic_opt) |diagnostic| {
+                            embedded_editor.rejectApply(diagnostic);
+                            log.warn("Neovim source apply rejected: {s}", .{diagnostic});
+                        } else {
+                            const owned = gpa.dupe(u8, apply.source) catch null;
+                            if (owned) |replacement| {
+                                const old_len = std.math.cast(isize, G.source_len) orelse 0;
+                                const new_len = std.math.cast(isize, replacement.len) orelse 0;
+                                if (recordStudioPatch(&studio_history, .{
+                                    .source = replacement,
+                                    .byte_delta = new_len - old_len,
+                                })) |_| {
+                                    studio_mode.markSourceChanged();
+                                    studio_mode.dirty = editorSourceDirty();
+                                    is_pre_rendered = false;
+                                    neovim_source_changed_this_frame = true;
+                                    embedded_editor.acceptApply(G.source_revision);
+                                } else |err| {
+                                    const message = std.fmt.bufPrint(
+                                        &neovim_apply_message_buffer,
+                                        "Rayslides rejected this write: {s}",
+                                        .{@errorName(err)},
+                                    ) catch "Rayslides rejected this write; the last valid slideshow is unchanged";
+                                    embedded_editor.rejectApply(message);
+                                    log.warn("Neovim source apply rejected after validation: {any}", .{err});
+                                }
+                            } else {
+                                embedded_editor.rejectApply("Rayslides could not allocate this source update");
+                            }
+                        }
+                    } else |err| {
+                        const message = std.fmt.bufPrint(
+                            &neovim_apply_message_buffer,
+                            "Rayslides could not validate this write: {s}",
+                            .{@errorName(err)},
+                        ) catch "Rayslides could not validate this write";
+                        embedded_editor.rejectApply(message);
+                        log.warn("Neovim source validation failed: {any}", .{err});
+                    }
+                },
+            }
+        }
+        if (diagnostics_neovim_editor_pending and G.source_len > 0 and !embedded_editor.active()) {
+            diagnostics_neovim_editor_pending = false;
+            if (embedded_editor.beginSourceClean(G.editor_memory[0..G.source_len], G.source_revision) != .started)
+                return error.DiagnosticNeovimEditorUnavailable;
+        }
         // Window managers may tile a just-launched diagnostic process while
         // moving it to the requested QA workspace. Baseline capture is the
         // one mode where the CLI dimensions are a strict test contract, so
@@ -3827,8 +3909,26 @@ pub fn main(init: std.process.Init) anyerror!void {
         const goto_slide_active_at_frame_start = goto_slide_picker.active;
         const text_input_active_at_frame_start = goto_slide_active_at_frame_start or
             property_prompt.active or studio_file_browser.active or studio_mode.textEntryActive();
+        const neovim_shortcut_requested = !embedded_editor.active() and studio_mode.capturesInput() and
+            !text_input_active_at_frame_start and !display_picker.visible and !showtime_overlay.visible and
+            !presenter_pairing_visible and shortcutModifierDown() and rl.isKeyPressed(.e);
+        if (neovim_shortcut_requested) {
+            switch (embedded_editor.beginSource(G.editor_memory[0..G.source_len], G.source_revision)) {
+                .started => studio_mode.setNotice(.none),
+                .support_disabled, .executable_missing => studio_mode.setNotice(.neovim_unavailable),
+                .start_failed => studio_mode.setNotice(.neovim_start_failed),
+            }
+        }
+        // Once the embedded UI exists it owns the complete input frame. Raylib
+        // key queries are non-consuming, so merely forwarding a key to Neovim
+        // does not stop later Rayslides shortcut checks from seeing it too.
+        const neovim_captures_input = neovimOwnsInput(
+            embedded_editor.active(),
+            neovim_shortcut_requested,
+            neovim_closed_this_frame,
+        );
         const g_shortcut_action = goto_slide.classifyGShortcut(.{
-            .pressed = rl.isKeyPressed(.g),
+            .pressed = !neovim_captures_input and rl.isKeyPressed(.g),
             .shortcut_modifier_down = shortcutModifierDown(),
             .shift_down = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift),
             .legacy_presentation_navigation = !studio_mode.capturesInput(),
@@ -3851,7 +3951,9 @@ pub fn main(init: std.process.Init) anyerror!void {
         const display_picker_visible_at_frame_start = display_picker.visible;
         const showtime_visible_at_frame_start = showtime_overlay.visible;
         var presenter_overlay_consumed_input = false;
-        if (goto_slide_active_at_frame_start) {
+        if (neovim_captures_input) {
+            presenter_overlay_consumed_input = true;
+        } else if (goto_slide_active_at_frame_start) {
             presenter_overlay_consumed_input = true;
             switch (goto_slide_picker.updateFromRaylib(G.slideshow.slides.items.len)) {
                 .none => {},
@@ -4048,7 +4150,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             presenter_pairing_visible or display_picker_visible_at_frame_start or
             display_picker.visible or showtime_visible_at_frame_start or
             showtime_overlay.visible or goto_slide_active_at_frame_start or
-            goto_slide_picker.active or presenter_overlay_consumed_input;
+            goto_slide_picker.active or presenter_overlay_consumed_input or neovim_captures_input;
         // A modal or inline property draft is not part of the persisted source
         // yet. Do not let the OS close button silently throw it away; after
         // submitting or cancelling, Q/Escape (or a fresh close request)
@@ -4110,11 +4212,13 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         // Cmd/Ctrl-O works in Studio and in presentation alike, exactly like
         // dropping a deck onto the window; the same open guards apply.
-        if (!text_input_active_at_frame_start and !export_controller.running and shortcutModifierDown() and rl.isKeyPressed(.o)) {
+        if (!presenter_overlay_captures_input and !text_input_active_at_frame_start and
+            !export_controller.running and shortcutModifierDown() and rl.isKeyPressed(.o))
+        {
             beginStudioFileBrowse(.deck);
         }
 
-        if (!text_input_active_at_frame_start and rl.isKeyPressed(.s)) {
+        if (!presenter_overlay_captures_input and !text_input_active_at_frame_start and rl.isKeyPressed(.s)) {
             if (studio_mode.capturesInput() or (editorSourceDirty() and shortcutModifierDown())) {
                 if (shortcutModifierDown()) {
                     if (G.slideshow_filp == null) {
@@ -4158,7 +4262,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!text_input_active_at_frame_start and rl.isKeyPressed(.f3)) {
+        if (!presenter_overlay_captures_input and !text_input_active_at_frame_start and rl.isKeyPressed(.f3)) {
             frame_diagnostics.enabled = !frame_diagnostics.enabled;
             log.info("frame diagnostics {s}", .{if (frame_diagnostics.enabled) "enabled" else "disabled"});
         }
@@ -4832,6 +4936,7 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         var semantic_to_apply: ?studio.SemanticCommand = null;
         var semantic_text: ?[]const u8 = null;
+        var semantic_from_neovim_field = false;
         var dropped_media_source_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var inline_field_to_finish: ?studio.InlineField = null;
         var inline_commit_completed = false;
@@ -4840,7 +4945,27 @@ pub fn main(init: std.process.Init) anyerror!void {
         // as their keyboard equivalents.
         var history_command_requested: ?bool = null;
         var studio_slide_to_select: ?usize = null;
-        var source_graph_reparsed_this_frame = false;
+        var source_graph_reparsed_this_frame = neovim_source_changed_this_frame;
+        if (neovim_field_apply) |apply| {
+            if (apply.accepted_revision != G.source_revision) {
+                embedded_editor.rejectApply("Rayslides changed since this field editor opened; discard and reopen Neovim");
+            } else if (pending_neovim_semantic_command == null) {
+                embedded_editor.rejectApply("Rayslides no longer has an edit target for this field");
+            } else if (apply.source.len > studio_prompt.max_input_bytes) {
+                const message = std.fmt.bufPrint(
+                    &neovim_apply_message_buffer,
+                    "Field is {d} bytes; Rayslides supports at most {d}",
+                    .{ apply.source.len, studio_prompt.max_input_bytes },
+                ) catch "The field is too large for Rayslides";
+                embedded_editor.rejectApply(message);
+            } else if (!std.unicode.utf8ValidateSlice(apply.source)) {
+                embedded_editor.rejectApply("The field is not valid UTF-8");
+            } else {
+                semantic_to_apply = pending_neovim_semantic_command;
+                semantic_text = apply.source;
+                semantic_from_neovim_field = true;
+            }
+        }
         const browser_was_active = studio_file_browser.active;
         const prompt_was_active = property_prompt.active;
         // The file chooser stacks above a media prompt: while it is open the
@@ -5003,12 +5128,29 @@ pub fn main(init: std.process.Init) anyerror!void {
                     },
                     .undo => history_command_requested = false,
                     .redo => history_command_requested = true,
+                    .edit_source_neovim => {
+                        switch (embedded_editor.beginSource(G.editor_memory[0..G.source_len], G.source_revision)) {
+                            .started => studio_mode.setNotice(.none),
+                            .support_disabled, .executable_missing => studio_mode.setNotice(.neovim_unavailable),
+                            .start_failed => studio_mode.setNotice(.neovim_start_failed),
+                        }
+                    },
                     .edit_speaker_notes => {
-                        pending_semantic_command = command;
-                        property_prompt.begin(
+                        const initial_notes = if (current_slide) |slide| slide.speaker_notes orelse "" else "";
+                        if (embedded_editor.beginField(
                             .speaker_notes,
-                            if (current_slide) |slide| slide.speaker_notes orelse "" else "",
-                        );
+                            initial_notes,
+                            G.source_revision,
+                        ) == .started) {
+                            pending_neovim_semantic_command = command;
+                            studio_mode.setNotice(.none);
+                        } else {
+                            // A disabled build, missing executable, broken user
+                            // config, or startup failure must retain the proven
+                            // allocation-free field editor as a full fallback.
+                            pending_semantic_command = command;
+                            property_prompt.begin(.speaker_notes, initial_notes);
+                        }
                     },
                     .pair_presenter_phone => {
                         if (ensurePresenterCompanionRunning(&presenter_runtime, presenter_options, &presenter_network)) {
@@ -5085,12 +5227,17 @@ pub fn main(init: std.process.Init) anyerror!void {
                                 item.text orelse ""
                         else
                             "";
-                        pending_semantic_command = command;
-                        property_prompt.begin(
-                            if (target.edit_scope == .shared_template) .shared_text else .text,
-                            initial_text,
-                        );
-                        // Prompt.begin copied any live inline draft, so the
+                        if (embedded_editor.beginField(.text, initial_text, G.source_revision) == .started) {
+                            pending_neovim_semantic_command = command;
+                            studio_mode.setNotice(.none);
+                        } else {
+                            pending_semantic_command = command;
+                            property_prompt.begin(
+                                if (target.edit_scope == .shared_template) .shared_text else .text,
+                                initial_text,
+                            );
+                        }
+                        // Either editor copied any live inline draft, so the
                         // narrow editor can now be dismissed without losing it.
                         studio_mode.dismissInlineTextForModal();
                     },
@@ -5771,6 +5918,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 std.math.cast(usize, G.current_slide) orelse 0,
                 G.slideshow.slides.items.len,
             );
+            embedded_editor.draw(neovim_outer);
         }
         if (screenshot_poster_render_pending) {
             screenshot_poster_render_pending = false;
@@ -5865,23 +6013,75 @@ pub fn main(init: std.process.Init) anyerror!void {
                 }
                 if (inline_field_to_finish) |field| studio_mode.acceptInlineCommit(field);
                 studio_mode.setNotice(if (customized_shared_property) .shared_template_customized else .none);
+                if (semantic_from_neovim_field) embedded_editor.acceptApply(G.source_revision);
             } else |err| {
-                const invalid_prompt_value = switch (err) {
-                    error.InvalidStudioNumber,
-                    error.InvalidStudioDimension,
-                    error.InvalidStudioColor,
-                    error.InvalidStudioFontSize,
-                    error.InvalidStudioOpacity,
-                    error.InvalidStudioUnitInterval,
-                    error.InvalidStudioVideoPoster,
-                    error.InvalidStudioMediaPath,
-                    => true,
-                    else => false,
-                };
-                if (inline_field_to_finish) |field| {
-                    const reason = inlineErrorForSemanticFailure(field, err);
-                    studio_mode.rejectInlineCommit(field, reason);
-                    if (reason == .source_edit_failed) {
+                if (semantic_from_neovim_field) {
+                    const message = std.fmt.bufPrint(
+                        &neovim_apply_message_buffer,
+                        "Rayslides rejected this field: {s}",
+                        .{@errorName(err)},
+                    ) catch "Rayslides rejected this field edit";
+                    embedded_editor.rejectApply(message);
+                    studio_mode.setNotice(.none);
+                    log.warn("Neovim field apply rejected: {any}", .{err});
+                } else {
+                    const invalid_prompt_value = switch (err) {
+                        error.InvalidStudioNumber,
+                        error.InvalidStudioDimension,
+                        error.InvalidStudioColor,
+                        error.InvalidStudioFontSize,
+                        error.InvalidStudioOpacity,
+                        error.InvalidStudioUnitInterval,
+                        error.InvalidStudioVideoPoster,
+                        error.InvalidStudioMediaPath,
+                        => true,
+                        else => false,
+                    };
+                    if (inline_field_to_finish) |field| {
+                        const reason = inlineErrorForSemanticFailure(field, err);
+                        studio_mode.rejectInlineCommit(field, reason);
+                        if (reason == .source_edit_failed) {
+                            semantic_source_changed = true;
+                            studio_mode.setNotice(switch (err) {
+                                error.AmbiguousSlideTemplateLayout,
+                                error.AmbiguousSlideTemplateDependency,
+                                error.UnsafeSlideGlobalDirective,
+                                error.UnsupportedSlideTemplateOverride,
+                                error.UnsupportedSharedTemplateDeletion,
+                                error.UnsupportedItemDuplication,
+                                error.TemplateInstanceDuplicationUnsupported,
+                                error.MorphItemDuplicationUnsupported,
+                                error.AmbiguousItemLayer,
+                                error.InvalidItemScene,
+                                error.UnsupportedItemLayerMove,
+                                error.UnsupportedClipboardItem,
+                                error.UnsupportedBatchDeletion,
+                                error.UnsupportedGroupPromotion,
+                                error.UnsupportedGroupInstance,
+                                error.UnsupportedGroupDetach,
+                                => .structural_source_locked,
+                                error.UnsupportedDefinitionStructure => .definition_structure_unsupported,
+                                error.StudioClipboardEmpty => .clipboard_empty,
+                                error.RevealMorphBorn => .reveal_morph_born,
+                                error.RevealSceneRequired => .reveal_scene_required,
+                                error.RevealSharedTemplate => .reveal_shared_template,
+                                error.TransitionNeedsSlideDirective => .transition_needs_slide_directive,
+                                error.TransitionSharedUnavailable => .structural_source_locked,
+                                error.LockedLayerBarrier,
+                                error.StudioItemLocked,
+                                => .locked_item,
+                                else => .edit_failed,
+                            });
+                            log.err("Studio inline edit failed: {any}", .{err});
+                            reparseEditorSource() catch {};
+                        } else {
+                            studio_mode.setNotice(.none);
+                        }
+                    } else if (invalid_prompt_value) {
+                        property_prompt.rejectValue();
+                        pending_semantic_command = command;
+                        studio_mode.setNotice(.none);
+                    } else {
                         semantic_source_changed = true;
                         studio_mode.setNotice(switch (err) {
                             error.AmbiguousSlideTemplateLayout,
@@ -5899,9 +6099,14 @@ pub fn main(init: std.process.Init) anyerror!void {
                             error.UnsupportedBatchDeletion,
                             error.UnsupportedGroupPromotion,
                             error.UnsupportedGroupInstance,
-                            error.UnsupportedGroupDetach,
                             => .structural_source_locked,
                             error.UnsupportedDefinitionStructure => .definition_structure_unsupported,
+                            error.InvalidMorphStateOffset,
+                            error.NoAdjacentMorphState,
+                            => .morph_structure_locked,
+                            error.InvalidMorphState,
+                            error.StudioSourcePatchInvalid,
+                            => if (semanticCommandIsMorphTimeline(command)) .morph_structure_locked else .edit_failed,
                             error.StudioClipboardEmpty => .clipboard_empty,
                             error.RevealMorphBorn => .reveal_morph_born,
                             error.RevealSceneRequired => .reveal_scene_required,
@@ -5911,71 +6116,26 @@ pub fn main(init: std.process.Init) anyerror!void {
                             error.LockedLayerBarrier,
                             error.StudioItemLocked,
                             => .locked_item,
+                            error.NoLocalPropertyOverride => .override_reset_unsupported,
+                            error.UnsupportedComponentDetach,
+                            error.UnsupportedGroupDetach,
+                            error.ComponentDefinitionMismatch,
+                            error.DetachedItemIdMismatch,
+                            => .detach_instance_unsupported,
+                            error.NameCollision => .library_name_conflict,
+                            error.GroupNameCollision => .library_name_conflict,
+                            error.SlideTemplateNameCollision => .library_name_conflict,
+                            error.LiveUses => .library_entry_in_use,
+                            error.UnsafeSlideTemplateDelete => .library_delete_unsupported,
+                            error.UnsafeGroupDelete => .library_delete_unsupported,
+                            error.NoCleanupCandidates => .library_cleanup_empty,
+                            error.DynamicContextName => .structural_source_locked,
+                            error.UnsupportedSlidePromotion => .slide_template_promotion_locked,
                             else => .edit_failed,
                         });
-                        log.err("Studio inline edit failed: {any}", .{err});
+                        log.err("Studio property edit failed: {any}", .{err});
                         reparseEditorSource() catch {};
-                    } else {
-                        studio_mode.setNotice(.none);
                     }
-                } else if (invalid_prompt_value) {
-                    property_prompt.rejectValue();
-                    pending_semantic_command = command;
-                    studio_mode.setNotice(.none);
-                } else {
-                    semantic_source_changed = true;
-                    studio_mode.setNotice(switch (err) {
-                        error.AmbiguousSlideTemplateLayout,
-                        error.AmbiguousSlideTemplateDependency,
-                        error.UnsafeSlideGlobalDirective,
-                        error.UnsupportedSlideTemplateOverride,
-                        error.UnsupportedSharedTemplateDeletion,
-                        error.UnsupportedItemDuplication,
-                        error.TemplateInstanceDuplicationUnsupported,
-                        error.MorphItemDuplicationUnsupported,
-                        error.AmbiguousItemLayer,
-                        error.InvalidItemScene,
-                        error.UnsupportedItemLayerMove,
-                        error.UnsupportedClipboardItem,
-                        error.UnsupportedBatchDeletion,
-                        error.UnsupportedGroupPromotion,
-                        error.UnsupportedGroupInstance,
-                        => .structural_source_locked,
-                        error.UnsupportedDefinitionStructure => .definition_structure_unsupported,
-                        error.InvalidMorphStateOffset,
-                        error.NoAdjacentMorphState,
-                        => .morph_structure_locked,
-                        error.InvalidMorphState,
-                        error.StudioSourcePatchInvalid,
-                        => if (semanticCommandIsMorphTimeline(command)) .morph_structure_locked else .edit_failed,
-                        error.StudioClipboardEmpty => .clipboard_empty,
-                        error.RevealMorphBorn => .reveal_morph_born,
-                        error.RevealSceneRequired => .reveal_scene_required,
-                        error.RevealSharedTemplate => .reveal_shared_template,
-                        error.TransitionNeedsSlideDirective => .transition_needs_slide_directive,
-                        error.TransitionSharedUnavailable => .structural_source_locked,
-                        error.LockedLayerBarrier,
-                        error.StudioItemLocked,
-                        => .locked_item,
-                        error.NoLocalPropertyOverride => .override_reset_unsupported,
-                        error.UnsupportedComponentDetach,
-                        error.UnsupportedGroupDetach,
-                        error.ComponentDefinitionMismatch,
-                        error.DetachedItemIdMismatch,
-                        => .detach_instance_unsupported,
-                        error.NameCollision => .library_name_conflict,
-                        error.GroupNameCollision => .library_name_conflict,
-                        error.SlideTemplateNameCollision => .library_name_conflict,
-                        error.LiveUses => .library_entry_in_use,
-                        error.UnsafeSlideTemplateDelete => .library_delete_unsupported,
-                        error.UnsafeGroupDelete => .library_delete_unsupported,
-                        error.NoCleanupCandidates => .library_cleanup_empty,
-                        error.DynamicContextName => .structural_source_locked,
-                        error.UnsupportedSlidePromotion => .slide_template_promotion_locked,
-                        else => .edit_failed,
-                    });
-                    log.err("Studio property edit failed: {any}", .{err});
-                    reparseEditorSource() catch {};
                 }
             }
             if (semantic_source_changed) {
@@ -6006,6 +6166,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 const capture_ready = is_pre_rendered and
                     diagnosticCaptureGateIsOpen(io, diagnostics_capture_gate_path) and
                     diagnostics_incremental_edit_pending == null and
+                    (!diagnostics_neovim_editor or embedded_editor.readyForCapture()) and
                     frame_diagnostics.pre_render_count >= expected_rebuild_events and
                     !source_graph_reparsed_this_frame;
                 if (capture_ready) {
@@ -6337,6 +6498,81 @@ test "external document filtering preserves CLI and desktop file semantics" {
     try std.testing.expect(isSlideshowDocumentPath("/tmp/DECK.SLD"));
     try std.testing.expect(!isSlideshowDocumentPath("deck.txt"));
     try std.testing.expect(!isSlideshowDocumentPath("sld"));
+}
+
+fn neovimOwnsInput(active: bool, opened_this_frame: bool, closed_this_frame: bool) bool {
+    return active or opened_this_frame or closed_this_frame;
+}
+
+test "Neovim retains exclusive input ownership across open and close frames" {
+    try std.testing.expect(neovimOwnsInput(true, false, false));
+    try std.testing.expect(neovimOwnsInput(false, true, false));
+    try std.testing.expect(neovimOwnsInput(false, false, true));
+    try std.testing.expect(!neovimOwnsInput(false, false, false));
+}
+
+fn neovimSourceDiagnostic(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    max_bytes: usize,
+    message_buffer: []u8,
+) !?[]const u8 {
+    if (source.len > max_bytes) {
+        return std.fmt.bufPrint(
+            message_buffer,
+            "source exceeds Rayslides' {d}-byte limit",
+            .{max_bytes},
+        ) catch "source exceeds Rayslides' document limit";
+    }
+    if (!std.unicode.utf8ValidateSlice(source)) return "source is not valid UTF-8";
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slideshow = try SlideShow.new(arena.allocator());
+    const context = try parser.constructSlidesFromBuf(source, slideshow, arena.allocator());
+    defer context.deinit();
+    const first = if (context.parser_errors.items.len > 0)
+        context.parser_errors.items[0]
+    else
+        return null;
+    return if (first.message) |detail|
+        std.fmt.bufPrint(
+            message_buffer,
+            "line {d}: {s} ({s})",
+            .{ first.line_number, @errorName(first.parser_error), detail },
+        ) catch "Rayslides parser rejected this write"
+    else
+        std.fmt.bufPrint(
+            message_buffer,
+            "line {d}: {s}",
+            .{ first.line_number, @errorName(first.parser_error) },
+        ) catch "Rayslides parser rejected this write";
+}
+
+test "Neovim source validation reports precise parser and encoding failures" {
+    var message: [256]u8 = undefined;
+    try std.testing.expect((try neovimSourceDiagnostic(
+        std.testing.allocator,
+        "@slide\n@box text=valid\n",
+        1024,
+        &message,
+    )) == null);
+    const parser_message = (try neovimSourceDiagnostic(
+        std.testing.allocator,
+        "@slide\n@box opacity=2\n",
+        1024,
+        &message,
+    )).?;
+    try std.testing.expect(std.mem.startsWith(u8, parser_message, "line 2:"));
+    try std.testing.expectEqualStrings(
+        "source is not valid UTF-8",
+        (try neovimSourceDiagnostic(std.testing.allocator, "\xff", 1024, &message)).?,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        (try neovimSourceDiagnostic(std.testing.allocator, "@slide\n", 2, &message)).?,
+        "2-byte limit",
+    ) != null);
 }
 
 /// A parser graph built beside the live application state. Its arena lives at
@@ -11271,6 +11507,7 @@ fn applyStudioSemanticEdit(
         .save_document_copy,
         .undo,
         .redo,
+        .edit_source_neovim,
         .pair_presenter_phone,
         .open_document,
         .choose_presentation_display,
