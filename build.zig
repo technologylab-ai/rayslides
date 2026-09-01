@@ -243,6 +243,9 @@ pub fn build(b: *std.Build) void {
 
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
+        // The test binary links the same raylib archive as the application;
+        // keep its native Linux linker choice consistent with `exe` above.
+        .use_lld = if (native_linux) false else null,
     });
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);

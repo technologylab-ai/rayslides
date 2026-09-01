@@ -8,6 +8,21 @@ const support = @import("neovim");
 const log = std.log.scoped(.neovim_editor);
 const startup_timeout_seconds = 8.0;
 
+pub const default_font_size: f32 = 20;
+pub const minimum_font_size: f32 = 10;
+pub const maximum_font_size: f32 = 48;
+
+pub const Options = struct {
+    clean: bool = false,
+    executable_path: ?[]const u8 = null,
+    font_path: ?[]const u8 = null,
+    font_size: f32 = default_font_size,
+};
+
+pub fn validFontSize(value: f32) bool {
+    return std.math.isFinite(value) and value >= minimum_font_size and value <= maximum_font_size;
+}
+
 pub const compiled = support.compiled;
 
 pub const BeginResult = enum {
@@ -36,7 +51,7 @@ pub const Apply = struct {
 pub const Controller = if (compiled) EnabledController else DisabledController;
 
 const DisabledController = struct {
-    pub fn init(_: std.mem.Allocator, _: std.Io, _: bool) DisabledController {
+    pub fn init(_: std.mem.Allocator, _: std.Io, _: Options) DisabledController {
         return .{};
     }
     pub fn deinit(_: *DisabledController) void {}
@@ -74,7 +89,9 @@ const EnabledController = struct {
     snapshot_value: ?support.session.Snapshot = null,
     font: rl.Font,
     owns_font: bool = false,
-    font_size: f32 = 20,
+    emoji_font: rl.Font,
+    owns_emoji_font: bool = false,
+    font_size: f32 = default_font_size,
     cell_width: f32 = 12,
     cell_height: f32 = 24,
     configured: bool = false,
@@ -90,16 +107,28 @@ const EnabledController = struct {
     field_kind: FieldKind = .text,
     clean_mode: bool = false,
     default_clean: bool,
+    executable_path: [std.fs.max_path_bytes]u8 = undefined,
+    executable_path_len: usize = 0,
     startup_started_at: f64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, default_clean: bool) EnabledController {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) EnabledController {
         var executable_dir: [std.fs.max_path_bytes]u8 = undefined;
         const executable_dir_len = std.process.executableDirPath(io, &executable_dir) catch 0;
         var editor_fontchars_storage: [768]i32 = undefined;
         const editor_fontchars = editorFontCharacters(&editor_fontchars_storage);
+        const font_size = if (validFontSize(options.font_size)) options.font_size else default_font_size;
+        const font_load_size: i32 = @max(24, @as(i32, @intFromFloat(@ceil(font_size * 1.2))));
         var font = rl.getFontDefault() catch unreachable;
         var owns_font = false;
-        if (executable_dir_len > 0) {
+        if (options.font_path) |candidate| {
+            if (loadEditorFont(candidate, editor_fontchars, font_load_size)) |loaded| {
+                font = loaded;
+                owns_font = true;
+            } else {
+                log.warn("could not load configured Neovim font at {s}; using fallback discovery", .{candidate});
+            }
+        }
+        if (!owns_font and executable_dir_len > 0) {
             var candidate_buffer: [std.fs.max_path_bytes:0]u8 = @splat(0);
             for ([_][]const u8{
                 "../share/rayslides/fonts/JetBrainsMono-Regular.ttf",
@@ -110,7 +139,7 @@ const EnabledController = struct {
                     "{s}/{s}",
                     .{ executable_dir[0..executable_dir_len], relative },
                 ) catch continue;
-                if (loadEditorFont(candidate, editor_fontchars)) |loaded| {
+                if (loadEditorFont(candidate, editor_fontchars, font_load_size)) |loaded| {
                     font = loaded;
                     owns_font = true;
                     break;
@@ -118,7 +147,7 @@ const EnabledController = struct {
             }
         }
         if (!owns_font and build_options.neovim_font_development_path.len > 0) {
-            if (loadEditorFont(build_options.neovim_font_development_path, editor_fontchars)) |loaded| {
+            if (loadEditorFont(build_options.neovim_font_development_path, editor_fontchars, font_load_size)) |loaded| {
                 font = loaded;
                 owns_font = true;
             }
@@ -134,7 +163,7 @@ const EnabledController = struct {
                 "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
             };
             for (candidates) |candidate| {
-                if (loadEditorFont(candidate, editor_fontchars)) |loaded| {
+                if (loadEditorFont(candidate, editor_fontchars, font_load_size)) |loaded| {
                     font = loaded;
                     owns_font = true;
                     break;
@@ -142,16 +171,34 @@ const EnabledController = struct {
             }
         }
         if (owns_font) rl.setTextureFilter(font.texture, .bilinear);
-        const measured = rl.measureTextEx(font, "M", 20, 0);
+        var emoji_font = font;
+        var owns_emoji_font = false;
+        if (fonts.loadBitmapEmojiFont(font_load_size)) |loaded| {
+            emoji_font = loaded;
+            owns_emoji_font = true;
+            rl.setTextureFilter(emoji_font.texture, .bilinear);
+        } else |err| {
+            log.warn("could not load the embedded Rayslides emoji font: {any}", .{err});
+        }
+        const measured = rl.measureTextEx(font, "M", font_size, 0);
         var result: EnabledController = .{
             .allocator = allocator,
             .io = io,
             .font = font,
             .owns_font = owns_font,
+            .emoji_font = emoji_font,
+            .owns_emoji_font = owns_emoji_font,
+            .font_size = font_size,
             .cell_width = @max(8, measured.x),
-            .cell_height = 24,
-            .default_clean = default_clean,
+            .cell_height = @ceil(font_size * 1.2),
+            .default_clean = options.clean,
         };
+        if (options.executable_path) |path| {
+            if (path.len <= result.executable_path.len) {
+                @memcpy(result.executable_path[0..path.len], path);
+                result.executable_path_len = path.len;
+            }
+        }
         if (executable_dir_len > 0) {
             for ([_][]const u8{
                 "../share/rayslides/nvim",
@@ -178,6 +225,7 @@ const EnabledController = struct {
 
     pub fn deinit(self: *EnabledController) void {
         self.closeSession();
+        if (self.owns_emoji_font) rl.unloadFont(self.emoji_font);
         if (self.owns_font) rl.unloadFont(self.font);
     }
 
@@ -219,8 +267,12 @@ const EnabledController = struct {
             return .start_failed;
         };
 
-        var candidates: [9][]const u8 = undefined;
+        var candidates: [10][]const u8 = undefined;
         var candidate_count: usize = 0;
+        if (self.executable_path_len > 0) {
+            candidates[candidate_count] = self.executable_path[0..self.executable_path_len];
+            candidate_count += 1;
+        }
         for ([_][]const u8{
             "nvim",
             "/opt/homebrew/bin/nvim",
@@ -466,12 +518,15 @@ const EnabledController = struct {
                 }
                 if (paint.cell.text().len > 0 and !std.mem.eql(u8, paint.cell.text(), " ")) {
                     var text_buffer: [support.grid.max_cell_text_bytes + 1:0]u8 = @splat(0);
-                    @memcpy(text_buffer[0..paint.cell.text().len], paint.cell.text());
-                    const text: [:0]const u8 = text_buffer[0..paint.cell.text().len :0];
+                    const text = editorCellText(paint.cell.text(), &text_buffer);
+                    const cell_font = switch (editorCellFontChoice(text)) {
+                        .primary => self.font,
+                        .emoji => self.emoji_font,
+                    };
                     const color = rayColor(foreground);
-                    rl.drawTextEx(self.font, text, .{ .x = x, .y = y + 1 }, self.font_size, 0, color);
+                    rl.drawTextEx(cell_font, text, .{ .x = x, .y = y + 1 }, self.font_size, 0, color);
                     if (paint.highlight.bold)
-                        rl.drawTextEx(self.font, text, .{ .x = x + 0.65, .y = y + 1 }, self.font_size, 0, color);
+                        rl.drawTextEx(cell_font, text, .{ .x = x + 0.65, .y = y + 1 }, self.font_size, 0, color);
                 }
                 const decoration = rayColor(paint.highlight.special orelse foreground);
                 if (paint.highlight.underline or paint.highlight.undercurl or paint.highlight.underdouble or
@@ -763,6 +818,58 @@ fn rayColor(color: support.grid.Color) rl.Color {
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = 255 };
 }
 
+const EditorCellFontChoice = enum {
+    primary,
+    emoji,
+};
+
+fn editorCellFontChoice(text: []const u8) EditorCellFontChoice {
+    var byte_index: usize = 0;
+    while (byte_index < text.len) {
+        const codepoint = nextCodepoint(text, &byte_index);
+        if (fonts.codepointFontChoice(codepoint) == .emoji) return .emoji;
+    }
+    return .primary;
+}
+
+/// Neovim may include emoji variation selectors or a joiner in a grid-cell
+/// grapheme. Rayslides deliberately renders its portable emoji repertoire as
+/// individual monochrome codepoints, so omit those shaping controls instead
+/// of letting raylib replace them with tofu.
+fn editorCellText(text: []const u8, storage: *[support.grid.max_cell_text_bytes + 1:0]u8) [:0]const u8 {
+    var source_index: usize = 0;
+    var output_len: usize = 0;
+    while (source_index < text.len) {
+        const codepoint_start = source_index;
+        const codepoint = nextCodepoint(text, &source_index);
+        if (fonts.codepointFontChoice(codepoint) == .ignore) continue;
+        const codepoint_bytes = text[codepoint_start..source_index];
+        if (output_len + codepoint_bytes.len > support.grid.max_cell_text_bytes) break;
+        @memcpy(storage[output_len..][0..codepoint_bytes.len], codepoint_bytes);
+        output_len += codepoint_bytes.len;
+    }
+    storage[output_len] = 0;
+    return storage[0..output_len :0];
+}
+
+fn nextCodepoint(text: []const u8, byte_index: *usize) u21 {
+    const sequence_len = std.unicode.utf8ByteSequenceLength(text[byte_index.*]) catch {
+        byte_index.* += 1;
+        return '?';
+    };
+    const end = byte_index.* + sequence_len;
+    if (end > text.len) {
+        byte_index.* += 1;
+        return '?';
+    }
+    const codepoint = std.unicode.utf8Decode(text[byte_index.*..end]) catch {
+        byte_index.* += 1;
+        return '?';
+    };
+    byte_index.* = end;
+    return codepoint;
+}
+
 fn editorFontCharacters(storage: []i32) []const i32 {
     var len: usize = 0;
     for (fonts.default_fontchars) |codepoint| {
@@ -785,11 +892,11 @@ fn editorFontCharacters(storage: []i32) []const i32 {
     return storage[0..len];
 }
 
-fn loadEditorFont(path: []const u8, font_chars: []const i32) ?rl.Font {
+fn loadEditorFont(path: []const u8, font_chars: []const i32, pixel_size: i32) ?rl.Font {
     var path_buffer: [std.fs.max_path_bytes:0]u8 = @splat(0);
     if (path.len >= path_buffer.len) return null;
     @memcpy(path_buffer[0..path.len], path);
-    return rl.loadFontEx(path_buffer[0..path.len :0], 24, font_chars) catch null;
+    return rl.loadFontEx(path_buffer[0..path.len :0], pixel_size, font_chars) catch null;
 }
 
 fn directoryExistsAbsolute(io: std.Io, path: []const u8) bool {
@@ -802,6 +909,28 @@ test "overlay geometry keeps a usable inset" {
     const rect = overlayRect(1280, 720);
     try std.testing.expect(rect.x >= 22 and rect.y >= 22);
     try std.testing.expect(rect.width > 1100 and rect.height > 600);
+}
+
+test "editor font size accepts a bounded finite range" {
+    try std.testing.expect(validFontSize(default_font_size));
+    try std.testing.expect(validFontSize(minimum_font_size));
+    try std.testing.expect(validFontSize(maximum_font_size));
+    try std.testing.expect(!validFontSize(minimum_font_size - 0.1));
+    try std.testing.expect(!validFontSize(maximum_font_size + 0.1));
+    try std.testing.expect(!validFontSize(std.math.nan(f32)));
+}
+
+test "editor cells use the Rayslides emoji repertoire and omit shaping controls" {
+    for (fonts.emoji_fontchars) |raw_codepoint| {
+        const codepoint: u21 = @intCast(raw_codepoint);
+        var encoded: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(codepoint, &encoded);
+        try std.testing.expectEqual(EditorCellFontChoice.emoji, editorCellFontChoice(encoded[0..len]));
+    }
+    try std.testing.expectEqual(EditorCellFontChoice.primary, editorCellFontChoice("A→"));
+
+    var text_storage: [support.grid.max_cell_text_bytes + 1:0]u8 = @splat(0);
+    try std.testing.expectEqualStrings("❤", editorCellText("❤️", &text_storage));
 }
 
 test "mouse modifiers preserve every simultaneous modifier" {

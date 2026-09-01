@@ -7,6 +7,24 @@ not yet a release declaration: physical-phone venue rehearsal and a real
 projector pass remain open in
 [`ROADMAP.md`](ROADMAP.md).
 
+### Optional embedded Neovim editor
+
+- Linux and macOS builds can opt in with `-Dneovim=true` to edit the complete
+  deck or expanded text, bullet, and speaker-note fields in a native Neovim
+  external UI rendered inside Rayslides.
+- `:w` validates and applies to the in-memory Studio document without closing;
+  normal Vim write/quit/forced-quit rules apply, invalid source stays open with
+  a diagnostic, and Studio remains the only disk-save boundary.
+- The overlay owns keyboard and mouse input while open, uses the private `.sld`
+  syntax runtime, and supports normal user configuration and plugins. Clean
+  recovery is available with `--neovim-clean`.
+- `--neovim-path`, `--neovim-font`, and `--neovim-font-size` configure runtime
+  discovery and grid rendering. JetBrains Mono is the bundled primary face;
+  the exact curated Rayslides emoji set uses its bundled monochrome Noto Emoji
+  fallback even with a custom primary font.
+- Builds without the feature retain the dependency-free built-in editors, and
+  enabled app bundles include the syntax/font resources but not Neovim itself.
+
 ### Visual motion authoring in Studio
 
 - A third inspector tab, **Motion**, edits reveals, morph-state timing, and

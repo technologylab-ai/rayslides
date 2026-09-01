@@ -153,6 +153,10 @@ sleep/wake, Android, latency, or real-projector checklist item.
       Option mappings, composed Unicode, clipboard paste, mouse selection and
       wheel input, focus switching, Retina scaling, and resizing at compact,
       default, and large window sizes.
+- [ ] Launch once each with `--neovim-path`, `--neovim-font`, and
+      `--neovim-font-size`. Verify the configured primary face remains
+      monospaced and the complete supported monochrome emoji set renders with
+      the bundled fallback.
 - [ ] Exercise every write/quit row in `NEOVIM_EDITOR_ROADMAP.md`. Confirm
       rejected writes retain the overlay, ordinary Rayslides shortcuts remain
       suspended while it is open, close restores Studio input once, and app

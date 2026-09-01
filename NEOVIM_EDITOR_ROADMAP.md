@@ -1,8 +1,8 @@
 # Rayslides Neovim editor roadmap
 
-Status: Linux initial feature complete, including whole-document and expanded
-field editors; macOS packaging seams are implemented and native macOS QA
-remains, 2026-09-01.
+Status: Linux feature complete, including whole-document and expanded field
+editors. The native macOS ReleaseSafe build/protocol/package matrix passes;
+interactive WindowServer QA remains, 2026-09-01.
 
 This roadmap records the product contract, architecture, delivery order, and
 completion gates for rendering an embedded Neovim editor inside Rayslides. It
@@ -49,8 +49,9 @@ cell grid in its existing window.
 - Initial rendering uses one composed line grid. External multigrid, cmdline,
   messages, popup-menu, and tabline surfaces are deferred until evidence shows
   that the composed grid is insufficient.
-- Initial source updates are explicit writes/applies. Debounced live preview
-  from `nvim_buf_attach` events is a later enhancement, not an MVP dependency.
+- Source updates remain explicit writes/applies. Rayslides deliberately does
+  not parse or publish an automatically debounced mid-edit buffer; `:w` is the
+  clear validation and Studio-history boundary.
 
 ## Write, quit, and process-lifecycle contract
 
@@ -67,9 +68,10 @@ Rayslides-only close gesture.
 | `:q!` or `ZQ` | Discard changes since the last successful apply and close the overlay. |
 | `:qa` | Follow the same clean/modified rule as `:q` for the controlled buffer. |
 | `:qa!` | Discard changes since the last successful apply and close the overlay. |
-| Rayslides **Apply and close** | Invoke the same guarded behavior as `:wq`; it is not a parallel commit path. |
-| Rayslides **Discard** | Invoke the same behavior as `:q!`. |
 | Child EOF, crash, or forced child termination | Close the overlay immediately. Keep only edits from writes that Rayslides already acknowledged; discard every unapplied buffer change. |
+
+There are no parallel Rayslides Apply/Discard overlay buttons: ordinary
+Neovim write and quit commands are the complete lifecycle surface.
 
 If Neovim is reused between overlays, closing an editor window may leave a
 private parking window/process alive. That is an implementation detail:
@@ -168,11 +170,13 @@ the main thread touches raylib textures, fonts, and drawing calls.
   and notify Neovim of focus transitions when the negotiated API supports it.
 - While active, the overlay owns keyboard/mouse input and suppresses Studio
   shortcuts except an explicit fail-safe host escape that cannot be confused
-  with normal Neovim Escape.
+  with normal Neovim Escape. The fail-safe is `Ctrl-Alt-Shift-F12`.
 - Render a dedicated monospaced font and calculate the grid strictly from its
   cell metrics. The initial bundled font must cover ordinary source text and
-  common editor symbols; missing glyphs degrade visibly rather than corrupting
-  cell positions.
+  common editor symbols. The same bounded monochrome Noto Emoji atlas used by
+  slide text covers every emoji Rayslides supports, independently of the
+  selected primary editor font; other missing glyphs degrade visibly rather
+  than corrupting cell positions.
 
 ### Controlled buffers and source transactions
 
@@ -240,6 +244,8 @@ the child without touching Studio.
   cursor, status feedback, and no GPU work off the main thread.
 - [x] Bundle a redistribution-safe monospace font instead of relying on the
   current platform font search and raylib fallback.
+- [x] Render the exact curated Rayslides emoji repertoire through its bundled
+  monochrome fallback while preserving Neovim's fixed-width grid cells.
 - [x] Add a deterministic diagnostic launch mode for the editor overlay.
 - [x] Add compact/default/large visual baselines for the exact overlay geometry.
 
@@ -265,7 +271,7 @@ window resize on Linux.
 - [x] Verify every overlay-close path restores Studio focus/input exactly once.
 
 Exit gate: every row in the lifecycle table behaves identically through Vim
-commands, equivalent key sequences, and Rayslides overlay controls.
+commands and their equivalent key sequences.
 
 ### 3. Whole-document source editor
 
@@ -329,23 +335,32 @@ Exit gate: enabled support is safe as the Linux default, while
   Unicode input, resize, process teardown, and app quit.
 - [x] Package the private syntax runtime and monospace font into the app bundle
   without bundling Neovim itself.
-- [ ] Run the enabled/disabled build matrix and a copied-bundle visual/editor/
-  write/quit QA pass outside the checkout.
+- [x] Run the native enabled/disabled ReleaseSafe build/test matrix, live
+  Neovim protocol/lifecycle probes, syntax sweep, enabled app build, and copied
+  bundle structure/signature checks outside the ordinary checkout.
+- [ ] Run the copied-bundle visual/editor/write/quit pass from an active macOS
+  WindowServer session.
 
 Exit gate: the same deck and lifecycle matrix passes from the packaged macOS
 application, and a missing Neovim installation falls back cleanly.
 
-### 7. Optional follow-ups after the vertical feature ships
+### 7. Resolved follow-ups after the vertical feature shipped
 
-- [ ] Debounced live slideshow preview that only publishes valid intermediate
-  parses and retains the last valid graph during syntax errors.
-- [ ] User-configurable editor executable, arguments, font, size, and clean
-  mode through a stable Rayslides configuration surface.
-- [ ] Richer parser diagnostics, buffer-local completion, help lookup, and
-  source-navigation commands implemented without requiring a global plugin.
-- [ ] Evaluate multigrid, IME pre-edit support, dynamic font fallback, and
-  Tree-sitter only against reproduced limitations in the shipped one-grid
-  implementation.
+- [x] Keep slideshow updates behind explicit Neovim writes. Do not add a
+  debounced mid-edit preview unless a future workflow explicitly reopens that
+  product decision.
+- [x] Expose clean mode plus a preferred Neovim executable, primary grid font,
+  and 10–48 pixel size through stable CLI options. Do not forward arbitrary
+  child arguments: that would weaken the controlled-buffer/runtime contract.
+- [x] Let ordinary Neovim configuration and plugins provide completion, help,
+  and richer source navigation. The shipped `.sld` filetype and syntax are the
+  self-contained baseline; add built-in language features only for a concrete
+  parser-aware gap that plugins cannot reasonably cover.
+- [x] Retain the composed one-grid UI, committed-text Unicode path, and classic
+  Vim syntax because the shipped experience—including Telescope—works. IME
+  pre-edit, multigrid, and Tree-sitter remain evidence-driven future work, not
+  incomplete roadmap items. The only required font fallback is the now-shipped
+  static Rayslides emoji repertoire.
 
 ## Explicitly out of scope for the initial feature
 
@@ -414,6 +429,24 @@ evidence here so build/runtime behavior cannot drift from this contract.
 - 2026-09-01: macOS build/runtime seams are ready for native validation. Finder
   launches can discover PATH, Apple Silicon/Intel Homebrew, MacPorts,
   user-local, mise, and asdf Neovim paths; enabled app bundles copy the private
-  runtime, JetBrains Mono, and its license without bundling Neovim. Native
-  Command/Option/Retina/focus/clipboard QA and a copied-bundle enabled/disabled
-  matrix remain explicitly unchecked because they require a macOS host.
+  runtime, JetBrains Mono, and its license without bundling Neovim. Interactive
+  Command/Option/Retina/focus/clipboard QA remains an explicit native gate.
+- 2026-09-01: Post-vertical-slice configuration and glyph fidelity landed.
+  CLI options now select a preferred Neovim executable, primary grid font, and
+  bounded 10–48 pixel size. The editor loads the same 50-codepoint monochrome
+  Noto Emoji subset as slide text, ignores emoji shaping controls consistently,
+  and keeps that fallback when the primary font changes. Unit coverage checks
+  every supported emoji; a live floating/non-fullscreen Linux overlay rendered
+  the representative set, and compact/default/large baselines remained exact.
+  Explicit `:w` applies, ordinary plugin-provided completion/help/navigation,
+  and the shipped one-grid/committed-text/classic-syntax architecture are now
+  recorded as deliberate final decisions rather than open follow-ups.
+- 2026-09-01: A fresh disposable checkout on the Apple Silicon `maxross` host
+  passed enabled and disabled ReleaseSafe tests, the live embed and complete
+  session lifecycle probes against Neovim 0.12.5, the 26-deck syntax sweep, and
+  enabled app packaging. A copied app outside the checkout passed its ad-hoc
+  signature and resource checks and exposed all configuration flags without
+  bundling a Neovim executable. SSH had no active WindowServer display
+  (`screencapture` could not create an image), so Command/Option, Retina,
+  clipboard, focus, and visual/editor lifecycle checks remain the single
+  interactive macOS gate.

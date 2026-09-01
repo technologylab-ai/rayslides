@@ -60,8 +60,8 @@
             <img src="images/studio-neovim-source-editor.png" alt="Rayslides Studio showing the embedded Neovim whole-document editor with highlighted .sld source, Normal mode, and the private Rayslides document URI" width="2216" height="1343" loading="lazy">
             <figcaption><strong>The full deck is a controlled Neovim buffer.</strong> This screenshot shows whole-source editing; eligible text, bullet, and speaker-note <code>...</code> fields use the same overlay and guarded apply path.</figcaption>
           </figure>
-          <p>This is Neovim's external UI protocol, not a terminal widget: Neovim owns modes, editing, selection, syntax highlights, and the cursor while raylib renders its grid with the bundled JetBrains Mono font. Your Neovim configuration and colorscheme still apply, so the exact colors and status line can differ.</p>
-          <div class="callout"><p><strong>Neovim owns all keyboard and mouse input while the overlay is open.</strong> Rayslides shortcuts—including <kbd>F</kbd> for fullscreen and <kbd>D</kbd> for display selection—remain suspended until Neovim exits.</p></div>
+          <p>This is Neovim's external UI protocol, not a terminal widget: Neovim owns modes, editing, selection, syntax highlights, and the cursor while raylib renders its grid with bundled JetBrains Mono. The <a href="format.html#symbols-emoji">curated emoji supported by Rayslides</a> use the same monochrome Noto Emoji fallback as slide text. Your Neovim configuration and colorscheme still apply, so the exact colors and status line can differ.</p>
+          <div class="callout"><p><strong>Neovim owns all keyboard and mouse input while the overlay is open.</strong> Rayslides shortcuts—including <kbd>F</kbd> for fullscreen and <kbd>D</kbd> for display selection—remain suspended until Neovim exits. If a broken session cannot be closed from Neovim, <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F12</kbd> force-closes only the overlay.</p></div>
           <div class="table-wrap">
             <table>
               <thead><tr><th>Neovim command</th><th>Result in Studio</th></tr></thead>
@@ -73,7 +73,8 @@
               </tbody>
             </table>
           </div>
-          <p>If Rayslides rejects changed source, the overlay stays open and shows the diagnostic so you can fix it. If a plugin or configuration prevents Neovim from starting, launch Studio with <code class="inline-code">--neovim-clean</code>. Eligible <code>...</code> fields retain their built-in editor when Neovim support is not compiled in or Neovim cannot start.</p>
+          <p>If Rayslides rejects changed source, the overlay stays open and shows the diagnostic so you can fix it. Studio never applies a mid-edit buffer automatically; an explicit Neovim write is the update boundary. If a plugin or configuration prevents Neovim from starting, launch Studio with <code class="inline-code">--neovim-clean</code>. Eligible <code>...</code> fields retain their built-in editor when Neovim support is not compiled in or Neovim cannot start.</p>
+          <p>Use <code class="inline-code">--neovim-path=PATH</code> to try a specific executable first, <code class="inline-code">--neovim-font=PATH</code> to replace the primary grid face, and <code class="inline-code">--neovim-font-size=PIXELS</code> to choose a size from 10 through 48. A custom primary font does not replace the bounded Rayslides emoji fallback.</p>
 
           <h2>Create an object</h2>
           <p>Choose a creation tool, then click the canvas. Studio returns to Select after one placement.</p>

@@ -53,7 +53,8 @@ zig build -Dneovim=true -Doptimize=ReleaseSafe
 
 <span class="code-comment"># Open a deck in Studio.</span>
 zig-out/bin/rayslides --studio talk.sld</code></pre>
-          <p>The enabled build includes the Rayslides syntax runtime and JetBrains Mono for the rendered editor grid. It does not bundle the Neovim executable. The default <code class="inline-code">-Dneovim=false</code> build keeps the built-in field editors and has no Neovim runtime requirement.</p>
+          <p>The enabled build includes the Rayslides syntax runtime and JetBrains Mono for the rendered editor grid. Supported emoji use the same bundled monochrome Noto Emoji fallback as slide text. It does not bundle the Neovim executable. The default <code class="inline-code">-Dneovim=false</code> build keeps the built-in field editors and has no Neovim runtime requirement.</p>
+          <p>At launch, <code class="inline-code">--neovim-path=PATH</code> tries a specific executable first, <code class="inline-code">--neovim-font=PATH</code> selects the primary grid font, and <code class="inline-code">--neovim-font-size=PIXELS</code> accepts sizes from 10 through 48. Use <code class="inline-code">--neovim-clean</code> when a user configuration or plugin prevents startup.</p>
           <p>For the macOS app, pass the same option to the app build: <code class="inline-code">zig build -Dneovim=true -Doptimize=ReleaseSafe macos-app</code>.</p>
           <p><a href="studio.html#neovim-editor">Learn how to open, apply, and close the embedded editor.</a></p>
 

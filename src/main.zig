@@ -44,6 +44,9 @@ const cli_help =
     \\Core options:
     \\  --studio                         Start with Studio authoring open
     \\  --neovim-clean                  Start embedded Neovim without user config
+    \\  --neovim-path=PATH              Try this Neovim executable first
+    \\  --neovim-font=PATH              Render the editor with this font
+    \\  --neovim-font-size=PIXELS       Set editor text size from 10 through 48
     \\  --no-crowd                       Disable the Crowdplay server
     \\  --crowd-host=HOST                Bind Crowdplay to HOST
     \\  --crowd-port=PORT                Bind Crowdplay to PORT (default 7331)
@@ -3285,6 +3288,11 @@ pub fn main(init: std.process.Init) anyerror!void {
     presenter_options.host = defaultCrowdHost(&presenter_host_buffer);
     var launch_studio = false;
     var neovim_clean = false;
+    var neovim_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var neovim_path: ?[]const u8 = null;
+    var neovim_font_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var neovim_font_path: ?[]const u8 = null;
+    var neovim_font_size = nvim_editor.default_font_size;
     var diagnostics_enabled = false;
     var diagnostics_command_palette = false;
     var diagnostics_neovim_editor = false;
@@ -3371,6 +3379,22 @@ pub fn main(init: std.process.Init) anyerror!void {
                 launch_studio = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--neovim-clean")) {
                 neovim_clean = true;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--neovim-path=")) {
+                const value = arg["--neovim-path=".len..];
+                if (value.len == 0) std.process.fatal("--neovim-path requires a non-empty path", .{});
+                neovim_path = std.fmt.bufPrint(&neovim_path_buffer, "{s}", .{value}) catch
+                    std.process.fatal("Neovim executable path is too long", .{});
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--neovim-font=")) {
+                const value = arg["--neovim-font=".len..];
+                if (value.len == 0) std.process.fatal("--neovim-font requires a non-empty path", .{});
+                neovim_font_path = std.fmt.bufPrint(&neovim_font_buffer, "{s}", .{value}) catch
+                    std.process.fatal("Neovim font path is too long", .{});
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--neovim-font-size=")) {
+                const value = std.fmt.parseFloat(f32, arg["--neovim-font-size=".len..]) catch
+                    std.process.fatal("Invalid --neovim-font-size value; use a number from 10 through 48", .{});
+                if (!nvim_editor.validFontSize(value))
+                    std.process.fatal("Invalid --neovim-font-size value; use a number from 10 through 48", .{});
+                neovim_font_size = value;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics")) {
                 diagnostics_enabled = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
@@ -3713,7 +3737,12 @@ pub fn main(init: std.process.Init) anyerror!void {
         .dirty = slideshow_to_load == null,
         .ui_font = G.studio_ui_font,
     };
-    var embedded_editor = nvim_editor.Controller.init(gpa, io, neovim_clean);
+    var embedded_editor = nvim_editor.Controller.init(gpa, io, .{
+        .clean = neovim_clean,
+        .executable_path = neovim_path,
+        .font_path = neovim_font_path,
+        .font_size = neovim_font_size,
+    });
     defer embedded_editor.deinit();
     var property_prompt: studio_prompt.Prompt = .{};
     var pending_semantic_command: ?studio.SemanticCommand = null;

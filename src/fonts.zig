@@ -170,6 +170,19 @@ const fontdata_bolditalic = @embedFile("assets/Calibri Italic.ttf"); // Calibri 
 const fontdata_zig = @embedFile("assets/press-start-2p.ttf");
 const fontdata_emoji = @embedFile("assets/NotoEmoji.ttf");
 
+/// Load the same bounded monochrome emoji atlas used by presentation text as
+/// an ordinary bitmap font. UI surfaces such as the embedded Neovim grid do
+/// not run inside the presentation SDF shader, but should still render the
+/// exact emoji repertoire Rayslides promises.
+pub fn loadBitmapEmojiFont(requested_size: i32) !rl.Font {
+    return rl.loadFontFromMemory(
+        ".ttf",
+        fontdata_emoji,
+        requested_size,
+        emoji_fontchars[0..],
+    );
+}
+
 // SDF reconstruction, unlike a bitmap atlas, remains scale-independent; a
 // 32-pixel source keeps startup and custom-font replacement responsive while
 // the derivative-aware shader supplies crisp edges at every output scale.
@@ -447,7 +460,7 @@ test "presentation font atlases use a derivative-aware SDF floor" {
     try std.testing.expect(std.mem.indexOf(u8, sdf_fragment_shader, "fwidth(distance)") != null);
 }
 
-const CodepointFontChoice = enum {
+pub const CodepointFontChoice = enum {
     primary,
     symbol,
     emoji,
@@ -461,7 +474,7 @@ fn codepointIn(chars: []const i32, codepoint: u21) bool {
     return false;
 }
 
-fn codepointFontChoice(codepoint: u21) CodepointFontChoice {
+pub fn codepointFontChoice(codepoint: u21) CodepointFontChoice {
     // Variation selectors and joiners affect emoji shaping. Rayslides draws a
     // portable monochrome codepoint fallback, so they must not become tofu.
     if (codepoint == 0x200d or codepoint == 0xfe0e or codepoint == 0xfe0f) return .ignore;

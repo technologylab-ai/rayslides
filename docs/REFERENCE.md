@@ -782,7 +782,9 @@ controls (`▶ ◀ ⏩ ⏪ ⏸ ⏹ ⏺`), status marks (`✅ ✔ ❌ ⚠ ℹ ❓
 visual accents such as `✨ ⭐ ❤ 🎉 🎯 🏆 👍 👀 👏 💡 📈 📉 📌 🔥 🚀 🛠 🤖 🧠`.
 Emoji variation selectors are accepted and ignored safely. Complex joined
 emoji sequences are rendered as their supported individual glyphs rather than
-as a single color ligature.
+as a single color ligature. A Neovim-enabled Studio build uses this same emoji
+fallback in its editor grid, even when `--neovim-font` selects another primary
+monospaced face.
 
 ### Text shadows
 

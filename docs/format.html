@@ -102,7 +102,10 @@ This body can continue on later lines.
               </tbody>
             </table>
           </div>
-          <p>Rayslides also provides monochrome fallbacks for common arrows, marks, and symbols.</p>
+          <h3 id="symbols-emoji">Use supported symbols and emoji</h3>
+          <p>Rayslides provides portable monochrome fallbacks even when a custom primary font lacks them. The supported set is:</p>
+          <p><code>← ↑ → ↓ ↔ ↕ ↖ ↗ ↘ ↙</code><br><code>ℹ ↩ ↪ ⏩ ⏪ ⏭ ⏮ ⏰ ⏸ ⏹ ⏺ ▶ ◀ ☀ ☁ ☂ ☃ ☎ ☑ ☕ ♻ ⚙ ⚠ ⚡ ✅ ✔ ✖ ✨ ❌ ❓ ❗ ❤ ➡ ⭐ 🎉 🎯 🏆 👀 👍 👎 👏 💡 📈 📉 📌 🔥 🚀 🛠 🤖 🧠</code></p>
+          <p>The glyphs inherit surrounding color, opacity, shadow, and animation. Variation selectors are accepted and ignored safely; complex joined sequences render as their supported individual glyphs rather than one color ligature. The <a href="studio.html#neovim-editor">embedded Neovim grid</a> uses the same emoji repertoire.</p>
 
           <h3>Add a text shadow</h3>
           <p>Set the shadow color and offset on the text item.</p>

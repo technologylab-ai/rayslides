@@ -18,6 +18,8 @@ plain-text `.sld` source. Both views stay in sync.
 With Rayslides, you can:
 
 - edit slides directly and reuse items;
+- optionally open the whole deck and expanded text, bullet, and speaker-note
+  fields in an embedded Neovim on Linux and macOS;
 - author raster/SVG images, videos, rounded shapes, lines, arrows, aligned
   text, and rotated objects through source-backed Studio controls;
 - add reveals, transitions, and semantic morph states, authored visually in
@@ -76,22 +78,31 @@ Commands palette. Eligible expanded `...` editors for item text, multiline
 bullets, and speaker notes use the same overlay. If support is disabled or
 Neovim cannot start, those fields retain the built-in editor.
 
-The overlay is a native Neovim external UI rendered by raylib with the bundled
-JetBrains Mono font. Normal modes, the user's configuration and colorscheme,
-syntax colors, committed Unicode/AltGr text, paste, mouse input, and Vim quit
-rules apply. While it is open, it owns input: Rayslides shortcuts such as `f`
-for fullscreen and `D` for display selection are suspended. If a plugin or
+The overlay is a native Neovim external UI rendered by raylib with bundled
+JetBrains Mono plus the same curated monochrome Noto Emoji fallback used by
+slide text. Normal modes, the user's configuration and colorscheme, syntax
+colors, committed Unicode/AltGr text, paste, mouse input, and Vim quit rules
+apply. While it is open, it owns input: Rayslides shortcuts such as `f` for
+fullscreen and `D` for display selection are suspended. `Ctrl-Alt-Shift-F12`
+force-closes a broken overlay as a last-resort host escape. If a plugin or
 configuration prevents startup, use the recovery mode:
 
 ```sh
 zig-out/bin/rayslides --neovim-clean --studio talk.sld
 ```
 
+Use `--neovim-path=PATH` to try a specific executable first,
+`--neovim-font=PATH` to replace the primary grid face, and
+`--neovim-font-size=PIXELS` to choose a size from 10 through 48. The emoji
+fallback remains the Rayslides-supported set even with a custom primary font.
+
 Inside this controlled buffer, `:w` validates and applies the source to the
 in-memory Studio document; it does not write the `.sld` file. Use Studio Save
 for that. `:wq`, `:x`, and `ZZ` apply and close, while a rejected edit keeps
 the overlay open. A clean `:q` closes, a dirty `:q` is refused by Neovim, and
 `:q!` or `ZQ` discards changes since the last accepted write and closes.
+There is no automatic mid-edit apply: Studio changes only after an explicit
+Neovim write.
 
 The feature remains compile-time opt-in. Builds without it retain the
 dependency-free stub and built-in editors; use the default or pass
