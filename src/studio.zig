@@ -3835,7 +3835,7 @@ const command_specs = [_]CommandSpec{
     .{ .id = .save_copy, .category = "FILE", .title = "Save a copy", .description = "Write a new .edited.sld copy", .keywords = "duplicate export backup file", .shortcut = "Shift Cmd/Ctrl S" },
     .{ .id = .undo, .category = "HISTORY", .title = "Undo", .description = "Restore the previous source transaction", .keywords = "back history revert", .shortcut = "Cmd/Ctrl Z" },
     .{ .id = .redo, .category = "HISTORY", .title = "Redo", .description = "Reapply the next source transaction", .keywords = "forward history repeat", .shortcut = "Shift Cmd/Ctrl Z" },
-    .{ .id = .edit_source_neovim, .category = "FILE", .title = "Edit source in Neovim", .description = "Open the complete in-memory .sld in the embedded modal editor", .keywords = "source code syntax vim nvim text whole document", .shortcut = "Cmd/Ctrl E" },
+    .{ .id = .edit_source_neovim, .category = "FILE", .title = "Edit source in Neovim", .description = "Open the complete in-memory .sld at the current rendered slide", .keywords = "source code syntax vim nvim text whole document", .shortcut = "Cmd/Ctrl E" },
     .{ .id = .tool_select, .category = "TOOLS", .title = "Select tool", .description = "Select, move, resize, and marquee objects", .keywords = "pointer move resize marquee", .shortcut = "V" },
     .{ .id = .tool_text, .category = "TOOLS", .title = "Add text", .description = "Place a new source-backed text box", .keywords = "textbox type label", .shortcut = "T" },
     .{ .id = .tool_bullets, .category = "TOOLS", .title = "Add bullet list", .description = "Place a new bulleted text box", .keywords = "list bullets", .shortcut = "B" },

@@ -11,7 +11,8 @@ projector pass remain open in
 
 - Linux and macOS builds can opt in with `-Dneovim=true` to edit the complete
   deck or expanded text, bullet, and speaker-note fields in a native Neovim
-  external UI rendered inside Rayslides.
+  external UI rendered inside Rayslides. Whole-deck editing opens at the
+  currently rendered slide's `@slide` or `@popslide` source line.
 - `:w` validates and applies to the in-memory Studio document without closing;
   normal Vim write/quit/forced-quit rules apply, invalid source stays open with
   a diagnostic, and Studio remains the only disk-save boundary.

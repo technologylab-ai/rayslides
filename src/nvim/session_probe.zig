@@ -8,6 +8,7 @@ const wait_interval = std.Io.Duration.fromMilliseconds(10);
 pub const Result = struct {
     ready: bool = false,
     rendered: bool = false,
+    initial_cursor_line: bool = false,
     write_round_trip: bool = false,
     quit_closed_overlay: bool = false,
     rejected_wq_stayed_open: bool = false,
@@ -54,7 +55,7 @@ fn runBasicProbe(
     executable: []const u8,
     result: *Result,
 ) !void {
-    const embedded = try openProbe(io, allocator, executable, "@slide\n@text hello\n", 73, 52, 14);
+    const embedded = try openProbeAtLine(io, allocator, executable, "@slide\n@text hello\n", 73, 52, 14, 2);
     defer embedded.deinit();
     result.ready = true;
 
@@ -64,12 +65,14 @@ fn runBasicProbe(
             var snapshot = snapshot_value;
             snapshot_revision = snapshot.flush_revision;
             result.rendered = snapshot.width == 52 and snapshot.height == 14;
+            result.initial_cursor_line = snapshot.cursor_row == 1;
             snapshot.deinit();
-            if (result.rendered) break;
+            if (result.rendered and result.initial_cursor_line) break;
         }
         try io.sleep(wait_interval, .awake);
     }
     if (!result.rendered) return error.SessionDidNotRender;
+    if (!result.initial_cursor_line) return error.SessionDidNotPositionCursor;
 
     try embedded.input("Go@text changed<Esc>");
     try embedded.command("write");
@@ -93,10 +96,23 @@ fn openProbe(
     width: usize,
     height: usize,
 ) !*session.Session {
+    return openProbeAtLine(io, allocator, executable, source, revision, width, height, 1);
+}
+
+fn openProbeAtLine(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+    source: []const u8,
+    revision: usize,
+    width: usize,
+    height: usize,
+    initial_line: usize,
+) !*session.Session {
     const embedded = try session.Session.start(io, allocator, executable, true, width, height, revision);
     errdefer embedded.deinit();
     try waitForState(io, embedded, .ready);
-    if (!try embedded.openSourceBuffer(source, "src/nvim/runtime"))
+    if (!try embedded.openBufferAtLine(source, "src/nvim/runtime", .source, initial_line))
         return error.SessionDidNotOpenBuffer;
     try io.sleep(.fromMilliseconds(50), .awake);
     return embedded;

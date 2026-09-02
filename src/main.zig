@@ -3942,7 +3942,11 @@ pub fn main(init: std.process.Init) anyerror!void {
             !text_input_active_at_frame_start and !display_picker.visible and !showtime_overlay.visible and
             !presenter_pairing_visible and shortcutModifierDown() and rl.isKeyPressed(.e);
         if (neovim_shortcut_requested) {
-            switch (embedded_editor.beginSource(G.editor_memory[0..G.source_len], G.source_revision)) {
+            switch (embedded_editor.beginSource(
+                G.editor_memory[0..G.source_len],
+                G.source_revision,
+                renderedSlideEditorLine(G.slideshow, G.current_slide),
+            )) {
                 .started => studio_mode.setNotice(.none),
                 .support_disabled, .executable_missing => studio_mode.setNotice(.neovim_unavailable),
                 .start_failed => studio_mode.setNotice(.neovim_start_failed),
@@ -5158,7 +5162,11 @@ pub fn main(init: std.process.Init) anyerror!void {
                     .undo => history_command_requested = false,
                     .redo => history_command_requested = true,
                     .edit_source_neovim => {
-                        switch (embedded_editor.beginSource(G.editor_memory[0..G.source_len], G.source_revision)) {
+                        switch (embedded_editor.beginSource(
+                            G.editor_memory[0..G.source_len],
+                            G.source_revision,
+                            renderedSlideEditorLine(G.slideshow, G.current_slide),
+                        )) {
                             .started => studio_mode.setNotice(.none),
                             .support_disabled, .executable_missing => studio_mode.setNotice(.neovim_unavailable),
                             .start_failed => studio_mode.setNotice(.neovim_start_failed),
@@ -6533,11 +6541,39 @@ fn neovimOwnsInput(active: bool, opened_this_frame: bool, closed_this_frame: boo
     return active or opened_this_frame or closed_this_frame;
 }
 
+fn renderedSlideEditorLine(slideshow: *const SlideShow, current_slide: i32) usize {
+    if (current_slide < 0) return 1;
+    const slide_index: usize = @intCast(current_slide);
+    if (slide_index >= slideshow.slides.items.len) return 1;
+    return @max(1, slideshow.slides.items[slide_index].line_in_editor);
+}
+
 test "Neovim retains exclusive input ownership across open and close frames" {
     try std.testing.expect(neovimOwnsInput(true, false, false));
     try std.testing.expect(neovimOwnsInput(false, true, false));
     try std.testing.expect(neovimOwnsInput(false, false, true));
     try std.testing.expect(!neovimOwnsInput(false, false, false));
+}
+
+test "global Neovim editor targets the rendered slide source line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try SlideShow.new(allocator);
+    const source =
+        "@pushslide layout\n" ++
+        "@box id=shared text=Shared\n" ++
+        "@popslide layout\n" ++
+        "@slide\n";
+    const context = try parser.constructSlidesFromBuf(source, slideshow, allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slideshow.slides.items.len);
+    try std.testing.expectEqual(@as(usize, 3), renderedSlideEditorLine(slideshow, 0));
+    try std.testing.expectEqual(@as(usize, 4), renderedSlideEditorLine(slideshow, 1));
+    try std.testing.expectEqual(@as(usize, 1), renderedSlideEditorLine(slideshow, -1));
+    try std.testing.expectEqual(@as(usize, 1), renderedSlideEditorLine(slideshow, 2));
 }
 
 fn neovimSourceDiagnostic(

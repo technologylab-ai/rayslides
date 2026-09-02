@@ -19,13 +19,14 @@ pub fn main(init: std.process.Init) !void {
     const session_result = try neovim.session_probe.run(init.io, init.gpa, "nvim");
     try stdout_writer.interface.print(
         "Neovim session probe passed:\n" ++
-            "  basic: ready={}, rendered={}, write={}, clean_q_closed={}\n" ++
+            "  basic: ready={}, rendered={}, initial_cursor_line={}, write={}, clean_q_closed={}\n" ++
             "  quit/apply: rejected_wq_open={}, dirty_q_open={}, q!_closed={}, wq={}, x={}, ZZ={}, ZQ={}\n" ++
             "  lifecycle: clean_qa={}, dirty_qa_open={}, qa!={}, buffer_close={}, child_failure={}, host_reaped={}\n" ++
             "  fidelity: repeated_write_discard={}, exact_source={}, focus={}, field_buffer={}\n",
         .{
             session_result.ready,
             session_result.rendered,
+            session_result.initial_cursor_line,
             session_result.write_round_trip,
             session_result.quit_closed_overlay,
             session_result.rejected_wq_stayed_open,

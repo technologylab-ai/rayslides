@@ -254,6 +254,19 @@ pub const Session = struct {
         runtime_path: []const u8,
         kind: BufferKind,
     ) !bool {
+        return self.openBufferAtLine(source, runtime_path, kind, 1);
+    }
+
+    /// Configures a private buffer and places the cursor on a one-based source
+    /// line. Neovim clamps the requested line to the buffer so stale host-side
+    /// anchors remain harmless.
+    pub fn openBufferAtLine(
+        self: *Session,
+        source: []const u8,
+        runtime_path: []const u8,
+        kind: BufferKind,
+        initial_line: usize,
+    ) !bool {
         var format = try source_format.Format.init(self.allocator, source);
         var format_owned = true;
         defer if (format_owned) format.deinit();
@@ -283,12 +296,13 @@ pub const Session = struct {
         const request_id = self.claimRequestId();
         try encoder.beginRequest(request_id, "nvim_exec_lua", 2);
         try encoder.writeString(open_buffer_lua);
-        try encoder.writeArrayHeader(5);
+        try encoder.writeArrayHeader(6);
         try encoder.writeUint(channel_id);
         try encoder.writeString(runtime_path);
         try encoder.writeString(kind.name());
         try encoder.writeString("rayslides");
         try writeSourceLines(&encoder, self.source_format_value.?.editorSource());
+        try encoder.writeUint(@max(1, initial_line));
         try self.send(encoder.bytes());
         return true;
     }
@@ -749,7 +763,7 @@ fn terminateChildProcess(child: *std.process.Child) void {
 }
 
 const open_buffer_lua =
-    \\local channel, runtime, name, filetype, source = ...
+    \\local channel, runtime, name, filetype, source, initial_line = ...
     \\vim.opt.runtimepath:prepend(runtime)
     \\local diagnostic_ns = vim.api.nvim_create_namespace('rayslides-embedded-editor')
     \\local lines, final_eol = source[1], source[2]
@@ -768,6 +782,8 @@ const open_buffer_lua =
     \\vim.api.nvim_buf_set_lines(buf, 0, -1, true, lines)
     \\vim.bo[buf].endofline = final_eol
     \\vim.bo[buf].modified = false
+    \\vim.api.nvim_win_set_cursor(0, { math.min(#lines, math.max(1, initial_line)), 0 })
+    \\vim.cmd('normal! zz')
     \\vim.api.nvim_create_autocmd('BufWriteCmd', { buffer = buf, callback = function()
     \\  vim.diagnostic.reset(diagnostic_ns, buf)
     \\  local current = vim.api.nvim_buf_get_lines(buf, 0, -1, true)

@@ -651,6 +651,7 @@ scoped, so a library item can only be placed after its definition.
 | Studio shortcut | Description |
 | --------------- | ----------- |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> | Open the searchable contextual command palette |
+| <kbd>Cmd/Ctrl</kbd> + <kbd>E</kbd> | Open the complete deck in optional embedded Neovim at the current slide's `@slide` or `@popslide` line |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd> | Open the shared bounds-checked numeric picker; only a valid Enter changes slides |
 | <kbd>Cmd/Ctrl</kbd> + <kbd>F</kbd> | Find and jump within Slides, Library, or Objects |
 | <kbd>1</kbd>–<kbd>4</kbd> on the new-deck chooser | Create Studio, Folio, Ember, or Signal |

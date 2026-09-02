@@ -89,7 +89,8 @@ zig-out/bin/rayslides --studio talk.sld
 Rayslides looks for `nvim` on `PATH`, in common Linux, Homebrew, and MacPorts
 locations, and in common user-local, mise, and asdf locations. Open the whole
 document with <kbd>Ctrl/Cmd-E</kbd> or **Edit source in Neovim** in Studio's
-Commands palette. Eligible expanded `...` editors for item text, multiline
+Commands palette; the cursor starts on the current slide's `@slide` or
+`@popslide` line. Eligible expanded `...` editors for item text, multiline
 bullets, and speaker notes use the same overlay. If support is disabled or
 Neovim cannot start, those fields retain the built-in editor.
 

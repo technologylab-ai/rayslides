@@ -58,7 +58,7 @@ const DisabledController = struct {
     pub fn active(_: *const DisabledController) bool {
         return false;
     }
-    pub fn beginSource(_: *DisabledController, _: []const u8, _: usize) BeginResult {
+    pub fn beginSource(_: *DisabledController, _: []const u8, _: usize, _: usize) BeginResult {
         return .support_disabled;
     }
     pub fn beginSourceClean(_: *DisabledController, _: []const u8, _: usize) BeginResult {
@@ -109,6 +109,7 @@ const EnabledController = struct {
     default_clean: bool,
     executable_path: [std.fs.max_path_bytes]u8 = undefined,
     executable_path_len: usize = 0,
+    initial_line: usize = 1,
     startup_started_at: f64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) EnabledController {
@@ -233,15 +234,15 @@ const EnabledController = struct {
         return self.embedded != null;
     }
 
-    pub fn beginSource(self: *EnabledController, source: []const u8, revision: usize) BeginResult {
-        return self.beginBuffer(.source, .text, source, revision, self.default_clean);
+    pub fn beginSource(self: *EnabledController, source: []const u8, revision: usize, initial_line: usize) BeginResult {
+        return self.beginBuffer(.source, .text, source, revision, self.default_clean, initial_line);
     }
 
     /// Starts a reproducible recovery/diagnostic session without user config.
     /// Interactive editor entry points deliberately keep the user's normal
     /// Neovim configuration.
     pub fn beginSourceClean(self: *EnabledController, source: []const u8, revision: usize) BeginResult {
-        return self.beginBuffer(.source, .text, source, revision, true);
+        return self.beginBuffer(.source, .text, source, revision, true, 1);
     }
 
     pub fn beginField(
@@ -250,7 +251,7 @@ const EnabledController = struct {
         source: []const u8,
         revision: usize,
     ) BeginResult {
-        return self.beginBuffer(.field, field_kind, source, revision, self.default_clean);
+        return self.beginBuffer(.field, field_kind, source, revision, self.default_clean, 1);
     }
 
     fn beginBuffer(
@@ -260,6 +261,7 @@ const EnabledController = struct {
         source: []const u8,
         revision: usize,
         clean_mode: bool,
+        initial_line: usize,
     ) BeginResult {
         self.closeSession();
         self.initial_source = self.allocator.dupe(u8, source) catch {
@@ -326,6 +328,7 @@ const EnabledController = struct {
             self.buffer_kind = buffer_kind;
             self.field_kind = field_kind;
             self.clean_mode = clean_mode;
+            self.initial_line = @max(1, initial_line);
             self.startup_started_at = rl.getTime();
             self.setStatus("Starting Neovim…");
             return .started;
@@ -365,7 +368,7 @@ const EnabledController = struct {
 
         if (!self.configured and embedded.state() == .ready) {
             const source = self.initial_source orelse "";
-            if (embedded.openBuffer(
+            if (embedded.openBufferAtLine(
                 source,
                 self.runtime_path[0..self.runtime_path_len],
                 switch (self.buffer_kind) {
@@ -375,6 +378,7 @@ const EnabledController = struct {
                         .speaker_notes => .speaker_notes,
                     },
                 },
+                self.initial_line,
             )) |opened| {
                 if (opened) {
                     self.configured = true;
@@ -706,6 +710,7 @@ const EnabledController = struct {
         self.mouse_capture = @splat(false);
         self.buffer_kind = .source;
         self.field_kind = .text;
+        self.initial_line = 1;
         self.startup_started_at = 0;
     }
 
