@@ -9,7 +9,8 @@ rayslides is a minimalistic slideshow presentation tool written in Zig, using ra
 ## Build Commands
 
 ```bash
-# Build the project
+# Build the project (add -Dneovim=true on Linux/macOS to compile the embedded
+# Neovim editor; use the same flag for `zig build test`)
 zig build
 
 # Run with a slideshow file
@@ -54,6 +55,8 @@ zig build -Doptimize=ReleaseSafe studio-baselines-update -- --workspace 12
 - **studio.zig** - Studio's interaction and overlay logic: selection, live geometry gestures, semantic property controls, creation tools, base/build/morph scene navigation, the Objects/Properties/Motion inspector (Reveal, State, and Transition sections), the step timeline with its preview transport, and the canvas build badges and morph ghosts. It never rewrites `.sld` text itself; it emits `GeometryCommand`/`SemanticCommand` intentions that the integration layer applies.
 
 - **source_editor.zig** - Guarded, byte-preserving `.sld` rewriting for every Studio command: item/geometry patches, layer moves, duplication, morph-state blocks, and the motion primitives (`setItemReveal`/`removeItemReveal`, `setMorphStateTiming`, `setSlideTransition`/`removeSlideTransition`, `setDeckTransitionDefaults`). Writes minimal source and leaves unedited lines untouched.
+
+- **studio_motion.zig** - Studio chrome motion: per-rectangle hover/press/active glow registry (buttons register themselves while drawing, so `self: Studio`-by-value draw code needs no state), the comet that runs around a hovered button, eased open/close reveals for floating instruments (command palette, reusable picker, grid popover, go-to-slide, prompt, file browser, embedded Neovim, toast, inspector tab wipe), a nesting-safe scissor stack (`pushClip`/`popClip`; Studio never calls `rl.beginScissorMode` directly), and pure fold/slide geometry with unit tests. `main.zig` ticks it once per frame before drawing. Diagnostics captures set `enabled = false`, which snaps every reveal and silences glows so pixel baselines stay deterministic. `RAYSLIDES_MOTION_SLOW=N` stretches every timer N× for reviewing animations.
 
 - **file_browser.zig** - Self-drawn modal file chooser used on every platform for Open deck (Cmd/Ctrl-O, Commands, the welcome chooser) and the image/video Browse… buttons. Allocation-free directory model (listing, extension/hidden/type-ahead filtering, navigation, per-purpose remembered folder) that is unit-tested against a temporary tree, plus raylib input/drawing. `--diagnostics-file-browser` opens it for visual QA captures.
 

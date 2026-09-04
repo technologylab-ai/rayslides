@@ -17,6 +17,7 @@ const animation = @import("animation.zig");
 const slides = @import("slides.zig");
 const studio_new_deck = @import("studio_new_deck.zig");
 const theme = @import("studio_theme.zig");
+const chrome_motion = @import("studio_motion.zig");
 
 pub const NewDeckPreset = studio_new_deck.Preset;
 
@@ -2114,6 +2115,9 @@ pub const SemanticCommand = union(enum) {
     redo: void,
     edit_source_neovim: void,
     edit_speaker_notes: void,
+    /// Open the numeric go-to-slide picker (owned by the integration, shared
+    /// with presentation mode).
+    go_to_slide: void,
     pair_presenter_phone: void,
     choose_presentation_display: void,
     showtime_preflight: void,
@@ -2796,13 +2800,8 @@ fn starterPreviewFont(slide: rl.Rectangle, logical_size: f32) i32 {
 
 fn drawStarterPreview(studio: Studio, rect: rl.Rectangle, preset: NewDeckPreset, colors: StarterPalette) void {
     if (rect.width <= 0 or rect.height <= 0) return;
-    rl.beginScissorMode(
-        @intFromFloat(@floor(rect.x)),
-        @intFromFloat(@floor(rect.y)),
-        @intFromFloat(@ceil(rect.width)),
-        @intFromFloat(@ceil(rect.height)),
-    );
-    defer rl.endScissorMode();
+    chrome_motion.pushClip(rect);
+    defer chrome_motion.popClip();
     rl.drawRectangleRounded(rect, 0.035, 8, colors.background);
     switch (preset) {
         .studio => {
@@ -3777,6 +3776,7 @@ pub const CommandId = enum {
     new_slide,
     previous_slide,
     next_slide,
+    go_to_slide,
     duplicate_slide,
     delete_slide,
     toggle_grid,
@@ -3848,6 +3848,7 @@ const command_specs = [_]CommandSpec{
     .{ .id = .new_slide, .category = "SLIDES", .title = "New slide", .description = "Append a blank authored slide", .keywords = "add page deck", .shortcut = "Cmd/Ctrl N" },
     .{ .id = .previous_slide, .category = "SLIDES", .title = "Previous slide", .description = "Select the previous slide in the deck", .keywords = "page back navigate", .shortcut = "Page Up" },
     .{ .id = .next_slide, .category = "SLIDES", .title = "Next slide", .description = "Select the next slide in the deck", .keywords = "page forward navigate", .shortcut = "Page Down" },
+    .{ .id = .go_to_slide, .category = "SLIDES", .title = "Go to slide…", .description = "Jump to a slide by number", .keywords = "goto jump number navigate page", .shortcut = "Cmd/Ctrl G" },
     .{ .id = .duplicate_slide, .category = "SLIDES", .title = "Duplicate slide", .description = "Duplicate the current complete slide", .keywords = "copy page deck", .shortcut = "Cmd/Ctrl D" },
     .{ .id = .delete_slide, .category = "SLIDES", .title = "Delete slide", .description = "Remove the current slide atomically", .keywords = "remove page deck", .shortcut = "Cmd/Ctrl Backspace" },
     .{ .id = .toggle_grid, .category = "VIEW", .title = "Toggle grid", .description = "Show or hide the snapping grid", .keywords = "guides snap view", .shortcut = "G" },
@@ -4117,7 +4118,9 @@ pub fn statusRevealLayout(viewport: Viewport) StatusRevealLayout {
 
 /// Where the drawer actually sits this frame, given how far it has glided.
 pub fn statusRevealPanelAt(layout: StatusRevealLayout, reveal: f32) rl.Rectangle {
-    const hidden = 1 - std.math.clamp(reveal, 0, 1);
+    // The glide value is linear in time; the drawer itself decelerates into
+    // place so it lands instead of stopping dead.
+    const hidden = 1 - chrome_motion.easeOut(std.math.clamp(reveal, 0, 1));
     return .{
         .x = layout.panel.x,
         .y = layout.panel.y + layout.panel.height * hidden,
@@ -4539,6 +4542,8 @@ const InlineEditor = struct {
 pub const max_command_query_bytes: usize = 128;
 pub const max_panel_search_bytes: usize = 128;
 pub const tooltip_delay_seconds: f32 = 0.55;
+/// Fade/settle time of the hover card once its delay has elapsed.
+pub const tooltip_fade_seconds: f32 = 0.12;
 pub const tooltip_pointer_tolerance: f32 = 5;
 
 /// Hover intent before the status drawer peeks open, and the glide it uses.
@@ -5106,7 +5111,9 @@ pub const Studio = struct {
                 .shortcut = "Cmd/Ctrl K",
             },
             .pointer_origin = .{ .x = anchor.x + anchor.width / 2, .y = anchor.y + anchor.height / 2 },
-            .elapsed = tooltip_delay_seconds,
+            // Past the delay and the fade, so the card is fully present on
+            // the first frame it is drawn.
+            .elapsed = tooltip_delay_seconds + tooltip_fade_seconds,
         };
     }
 
@@ -5626,6 +5633,7 @@ pub const Studio = struct {
             => .{ .enabled = true },
             .edit_speaker_notes,
             .pair_presenter_phone,
+            .go_to_slide,
             => if (workspace.slides.len > 0)
                 .{ .enabled = true }
             else
@@ -6208,6 +6216,7 @@ pub const Studio = struct {
             },
             .edit_speaker_notes => self.pending_semantic_command = .{ .edit_speaker_notes = {} },
             .pair_presenter_phone => self.pending_semantic_command = .{ .pair_presenter_phone = {} },
+            .go_to_slide => self.pending_semantic_command = .{ .go_to_slide = {} },
             .choose_presentation_display => self.pending_semantic_command = .{ .choose_presentation_display = {} },
             .showtime_preflight => self.pending_semantic_command = .{ .showtime_preflight = {} },
             .create_portable_show => self.pending_semantic_command = .{ .create_portable_show = {} },
@@ -7860,9 +7869,19 @@ pub const Studio = struct {
     }
 
     pub fn timelineSceneAt(self: Studio, index: usize) TimelineScene {
+        return timelineSceneFor(self.build_count, index);
+    }
+
+    /// Scene at `index` of a timeline with `build_count` build cards. The
+    /// draw path passes the workspace's own build count: Studio's cached
+    /// `build_count` is only refreshed by its update, which a modal (the
+    /// go-to-slide picker) skips, so on the frame a jump lands the cache can
+    /// still describe the previous slide and would mislabel a build card as
+    /// a morph state that the new slide does not have.
+    pub fn timelineSceneFor(build_count: usize, index: usize) TimelineScene {
         if (index == 0) return .base;
-        if (index - 1 < self.build_count) return .{ .build = index - 1 };
-        return .{ .state = index - 1 - self.build_count };
+        if (index - 1 < build_count) return .{ .build = index - 1 };
+        return .{ .state = index - 1 - build_count };
     }
 
     /// The card that represents what the canvas currently shows.
@@ -10515,7 +10534,7 @@ pub const Studio = struct {
             if (!pointInRectangle(pointer, card)) continue;
             const scene_index = self.morph_first_visible + visible_slot;
             if (scene_index >= 1 + workspace.builds.len + workspace.morph_states.len) return true;
-            switch (self.timelineSceneAt(scene_index)) {
+            switch (timelineSceneFor(workspace.builds.len, scene_index)) {
                 .build => |build_index| {
                     const build = workspace.builds[build_index];
                     const chip_count = @min(build.step_count, max_timeline_step_chips);
@@ -12601,15 +12620,11 @@ pub const Studio = struct {
     /// visible as a subdued outline and the live geometry gets the accent.
     pub fn draw(self: Studio, items: []const slides.SlideItem, resolved_bounds: []const ResolvedBounds, viewport: Viewport) void {
         if (!self.enabled) return;
+        chrome_motion.setOverlayShadingChrome(self.overlayShadesChrome());
 
         const canvas = viewport.canvasBounds();
         const clip_canvas = canvas.width > 0 and canvas.height > 0;
-        if (clip_canvas) rl.beginScissorMode(
-            @intFromFloat(@floor(canvas.x)),
-            @intFromFloat(@floor(canvas.y)),
-            @intFromFloat(@ceil(canvas.width)),
-            @intFromFloat(@ceil(canvas.height)),
-        );
+        if (clip_canvas) chrome_motion.pushClip(canvas);
 
         if (self.grid_snapping) self.drawLogicalGrid(viewport);
         if (self.safe_areas_visible) self.drawSafeAreas(viewport);
@@ -12728,7 +12743,7 @@ pub const Studio = struct {
         if (self.active_morph_state == null and self.definition_mode == null) self.drawBuildBadges(items, resolved_bounds, viewport);
         if (self.active_morph_state != null and self.motion_ghosts_visible and self.definition_mode == null) self.drawMorphGhosts(items, resolved_bounds, viewport);
 
-        if (clip_canvas) rl.endScissorMode();
+        if (clip_canvas) chrome_motion.popClip();
         if (self.rulers_visible and !self.focus_canvas) self.drawRulers(viewport);
 
         const chrome_visible = if (viewport.chrome) |chrome| chrome.visible else true;
@@ -12901,6 +12916,8 @@ pub const Studio = struct {
         if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
         drawStudioPanel(layout.panel);
         self.drawInspectorTabs(viewport);
+        const body_fold = beginInspectorBody(layout.panel, viewport);
+        defer endInspectorBody(layout.panel, body_fold);
         const compact_font = scaledUiFont(layout.scale, UiTypography.compact);
         const body_font = scaledUiFont(layout.scale, UiTypography.body);
         const text_origin: rl.Vector2 = .{ .x = layout.context.x, .y = layout.context.y };
@@ -13769,7 +13786,9 @@ pub const Studio = struct {
             const preview = self.visibleSlidePreview(viewport, workspace, visible_slot) orelse break;
             const card = slideCardRect(layout, visible_slot) orelse break;
             const active = preview.slide_index == workspace.current_slide;
-            rl.drawRectangleRec(card, if (active) theme.accent_soft else theme.row);
+            const hover = chrome_motion.smooth(chrome_motion.touchRow(card).hover);
+            const rest: rl.Color = if (active) theme.accent_soft else theme.row;
+            rl.drawRectangleRec(card, chrome_motion.mixColor(rest, theme.control_hover, hover * 0.8));
             rl.drawRectangleRec(slidePreviewRect(card), theme.sunken);
         }
         for (0..libraryRowCapacity(layout)) |visible_slot| {
@@ -13777,12 +13796,14 @@ pub const Studio = struct {
             const row = libraryRowRect(layout, visible_slot) orelse break;
             const entry = workspace.library[entry_index];
             const selected = self.selected_library_index != null and self.selected_library_index.? == entry_index;
-            rl.drawRectangleRec(row, if (selected)
+            const hover = chrome_motion.smooth(chrome_motion.touchRow(row).hover);
+            const rest: rl.Color = if (selected)
                 theme.accent_soft
             else if (entry.available)
                 theme.row
             else
-                theme.control_disabled);
+                theme.control_disabled;
+            rl.drawRectangleRec(row, chrome_motion.mixColor(rest, theme.control_hover, hover * 0.8));
         }
     }
 
@@ -13908,12 +13929,7 @@ pub const Studio = struct {
             .x = inner.x + (inner.width - content_width) / 2 - summary.content_bounds.x * scale,
             .y = inner.y + (inner.height - content_height) / 2 - summary.content_bounds.y * scale,
         };
-        rl.beginScissorMode(
-            @intFromFloat(@floor(visual_rect.x)),
-            @intFromFloat(@floor(visual_rect.y)),
-            @intFromFloat(@ceil(visual_rect.width)),
-            @intFromFloat(@ceil(visual_rect.height)),
-        );
+        chrome_motion.pushClip(visual_rect);
         for (summary.items[0..summary.item_count]) |item| {
             const rect: rl.Rectangle = .{
                 .x = origin.x + item.bounds.x * scale,
@@ -13965,7 +13981,7 @@ pub const Studio = struct {
                 },
             }
         }
-        rl.endScissorMode();
+        chrome_motion.popClip();
     }
 
     pub fn drawWorkspaceOverlay(self: Studio, viewport: Viewport, workspace: Workspace) void {
@@ -14019,7 +14035,8 @@ pub const Studio = struct {
             const summary = workspace.slides[summary_index];
             const card = slideCardRect(layout, visible_slot) orelse break;
             const active = summary.index == workspace.current_slide;
-            const border: rl.Color = if (active) theme.accent else theme.border;
+            const hover = chrome_motion.smooth(chrome_motion.touchRow(card).hover);
+            const border: rl.Color = if (active) theme.accent else chrome_motion.mixColor(theme.border, theme.accent, hover * 0.7);
             rl.drawRectangleLinesEx(card, if (active) 2 else 1, border);
             if (self.active_search == .slides and result_index == self.slide_search.selected_result)
                 rl.drawRectangleLinesEx(.{ .x = card.x + 3, .y = card.y + 3, .width = card.width - 6, .height = card.height - 6 }, 1, theme.accent_bright);
@@ -14029,12 +14046,12 @@ pub const Studio = struct {
             const text_x = preview.x + preview.width + 9 * font_scale;
             const text_width = @max(0, card.x + card.width - text_x - 7 * font_scale);
             if (text_width <= 0) continue;
-            rl.beginScissorMode(
-                @intFromFloat(@floor(text_x)),
-                @intFromFloat(@floor(card.y + 2 * font_scale)),
-                @intFromFloat(@ceil(text_width)),
-                @intFromFloat(@ceil(card.height - 4 * font_scale)),
-            );
+            chrome_motion.pushClip(.{
+                .x = text_x,
+                .y = card.y + 2 * font_scale,
+                .width = text_width,
+                .height = card.height - 4 * font_scale,
+            });
             var line_buffer: [96]u8 = undefined;
             const slide_number = std.fmt.bufPrintZ(&line_buffer, "SLIDE {d}", .{summary.index + 1}) catch "SLIDE";
             self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 6 * font_scale }, compact_font, if (active) theme.accent_bright else theme.text_muted);
@@ -14057,7 +14074,7 @@ pub const Studio = struct {
             var fitted_metadata_buffer: [96]u8 = undefined;
             const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
             self.drawUiText(fitted_metadata, .{ .x = text_x, .y = card.y + 45 * font_scale }, compact_font, theme.text_muted);
-            rl.endScissorMode();
+            chrome_motion.popClip();
         }
 
         self.drawUiText("LIBRARY", .{ .x = layout.library.x + 12 * font_scale, .y = layout.library.y + 9 * font_scale }, heading_font, theme.text_heading);
@@ -14109,12 +14126,13 @@ pub const Studio = struct {
             const entry = workspace.library[entry_index];
             const row = libraryRowRect(layout, visible_slot) orelse break;
             const selected = self.selected_library_index != null and self.selected_library_index.? == entry_index;
+            const hover = chrome_motion.smooth(chrome_motion.touchRow(row).hover);
             const border: rl.Color = if (selected)
                 theme.accent
             else if (!entry.available)
                 theme.border_subtle
             else
-                theme.border;
+                chrome_motion.mixColor(theme.border, theme.accent, hover * 0.7);
             rl.drawRectangleLinesEx(row, if (selected) 2 else 1, border);
             if (self.active_search == .library and result_index == self.library_search.selected_result)
                 rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 1, theme.accent_bright);
@@ -14149,12 +14167,12 @@ pub const Studio = struct {
             const text_x = visual_rect.x + visual_rect.width + 8 * font_scale;
             const text_width = @max(0, row.x + row.width - text_x - 7 * font_scale);
             if (text_width <= 0) continue;
-            rl.beginScissorMode(
-                @intFromFloat(@floor(text_x)),
-                @intFromFloat(@floor(row.y + 2 * font_scale)),
-                @intFromFloat(@ceil(text_width)),
-                @intFromFloat(@ceil(row.height - 4 * font_scale)),
-            );
+            chrome_motion.pushClip(.{
+                .x = text_x,
+                .y = row.y + 2 * font_scale,
+                .width = text_width,
+                .height = row.height - 4 * font_scale,
+            });
             var name_buffer: [128]u8 = undefined;
             const name = self.fitUiText(&name_buffer, entry.name, body_font, text_width);
             self.drawUiText(name, .{ .x = text_x, .y = row.y + 5 * font_scale }, body_font, if (entry.available)
@@ -14170,7 +14188,7 @@ pub const Studio = struct {
                 .x = text_x,
                 .y = row.y + row.height - @as(f32, @floatFromInt(compact_font)) - 5 * font_scale,
             }, compact_font, if (entry.deletable) theme.success else theme.text_muted);
-            rl.endScissorMode();
+            chrome_motion.popClip();
         }
         if (workspace.new_deck) self.drawNewDeckChooser(viewport);
     }
@@ -14362,15 +14380,50 @@ pub const Studio = struct {
         if (!self.enabled) return;
         self.drawNoticeToast(viewport);
         self.drawStatusReveal(items, resolved_bounds, viewport);
-        if (self.grid_settings_active) {
+
+        // Each floating instrument keeps drawing while its reveal folds shut,
+        // so a palette that just launched the reusable picker leaves as the
+        // picker arrives instead of vanishing on the frame the flag flips.
+        const palette_reveal = chrome_motion.reveal(.command_palette);
+        const picker_reveal = chrome_motion.reveal(.reusable_picker);
+        const grid_reveal = chrome_motion.reveal(.grid_settings);
+        palette_reveal.setOpen(self.command_palette.active);
+        picker_reveal.setOpen(self.library_picker_active);
+        grid_reveal.setOpen(self.grid_settings_active);
+        if (self.command_palette.active) palette_afterimage = self.command_palette;
+
+        chrome_motion.setOverlayLayer(true);
+        defer chrome_motion.setOverlayLayer(false);
+        var any_overlay = false;
+        if (grid_reveal.visible()) {
+            any_overlay = true;
             self.drawGridSettings(viewport);
-        } else if (self.command_palette.active) {
-            self.drawCommandPalette(items, viewport, workspace);
-        } else if (self.library_picker_active) {
+        }
+        if (palette_reveal.visible()) {
+            any_overlay = true;
+            if (self.command_palette.active) {
+                self.drawCommandPalette(items, viewport, workspace);
+            } else {
+                // The live state was wiped on close; fold the last frame out.
+                var parting = self;
+                parting.command_palette = palette_afterimage;
+                parting.command_palette.active = true;
+                parting.drawCommandPalette(items, viewport, workspace);
+            }
+        }
+        if (picker_reveal.visible()) {
+            any_overlay = true;
             self.drawReusablePicker(viewport, workspace);
-        } else if (self.tooltip.visible()) {
+        }
+        if (!any_overlay and self.tooltip.visible()) {
             self.drawTooltip(viewport);
         }
+    }
+
+    /// True while a floating instrument shades the docks, which makes chrome
+    /// underneath ignore the pointer for hover motion.
+    fn overlayShadesChrome(self: Studio) bool {
+        return self.command_palette.active or self.library_picker_active or self.grid_settings_active;
     }
 
     /// The handle is always drawn; the drawer only when it has glided out.
@@ -14388,12 +14441,7 @@ pub const Studio = struct {
 
         if (active) {
             const panel = statusRevealPanelAt(layout, self.status_reveal.reveal);
-            rl.beginScissorMode(
-                @intFromFloat(@floor(layout.clip.x)),
-                @intFromFloat(@floor(layout.clip.y)),
-                @intFromFloat(@ceil(layout.clip.width)),
-                @intFromFloat(@ceil(layout.clip.height)),
-            );
+            chrome_motion.pushClip(layout.clip);
             // Semi-transparent so the deck stays legible underneath: this is a
             // reference surface, not a modal.
             rl.drawRectangleRec(.{
@@ -14459,7 +14507,7 @@ pub const Studio = struct {
                 .x = panel.x + panel.width - hint_width - 14 * scale,
                 .y = panel.y + 13 * scale,
             }, compact_font, theme.text_disabled);
-            rl.endScissorMode();
+            chrome_motion.popClip();
         }
 
         // Handle: a quiet pill with a chevron that flips once the drawer is out.
@@ -14488,6 +14536,23 @@ pub const Studio = struct {
     /// behind a hover: a failure the user never saw is a failure they never
     /// fixed. The toast floats above the band and needs no seeking.
     pub fn drawNoticeToast(self: Studio, viewport: Viewport) void {
+        // Rise-and-fade in, sink-and-fade out. The notice is cleared on the
+        // next interaction, so the last one drawn is remembered for the exit.
+        const reveal = chrome_motion.reveal(.toast);
+        if (self.notice != .none) {
+            if (toast_afterimage != self.notice and reveal.visible()) chrome_motion.replay(.toast);
+            toast_afterimage = self.notice;
+            reveal.setOpen(true);
+        } else {
+            reveal.setOpen(false);
+        }
+        if (!reveal.visible()) return;
+        var shown = self;
+        shown.notice = toast_afterimage;
+        shown.drawNoticeToastAt(viewport, reveal.presence());
+    }
+
+    fn drawNoticeToastAt(self: Studio, viewport: Viewport, presence: f32) void {
         var message_buffer: [256]u8 = undefined;
         const message = self.noticeMessage(&message_buffer) orelse return;
         const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
@@ -14512,31 +14577,39 @@ pub const Studio = struct {
         const toast_height = 32 * scale;
         const band = statusPanel(viewport);
         const band_top = if (band.height > 0) band.y else bounds.y + bounds.height;
+        const rise = (1 - presence) * 10 * scale;
         const toast: rl.Rectangle = .{
             .x = bounds.x + (bounds.width - toast_width) / 2,
-            .y = band_top - toast_height - 10 * scale,
+            .y = band_top - toast_height - 10 * scale + rise,
             .width = toast_width,
             .height = toast_height,
         };
         if (toast.y < bounds.y) return;
+        const faded = struct {
+            k: f32,
+            fn of(this: @This(), color: rl.Color) rl.Color {
+                const a: f32 = @floatFromInt(color.a);
+                return theme.alpha(color, @intFromFloat(@round(a * this.k)));
+            }
+        }{ .k = presence };
         rl.drawRectangleRounded(.{
             .x = toast.x + 1 * scale,
             .y = toast.y + 3 * scale,
             .width = toast.width,
             .height = toast.height,
-        }, 0.3, 8, theme.alpha(theme.shadow, 90));
-        rl.drawRectangleRounded(toast, 0.3, 8, theme.overlay);
-        rl.drawRectangleRoundedLinesEx(toast, 0.3, 8, @max(1, scale), theme.border_strong);
+        }, 0.3, 8, faded.of(theme.alpha(theme.shadow, 90)));
+        rl.drawRectangleRounded(toast, 0.3, 8, faded.of(theme.overlay));
+        rl.drawRectangleRoundedLinesEx(toast, 0.3, 8, @max(1, scale), faded.of(theme.border_strong));
         rl.drawRectangleRec(.{
             .x = toast.x + 1 * scale,
             .y = toast.y + 7 * scale,
             .width = @max(2, 3 * scale),
             .height = @max(0, toast.height - 14 * scale),
-        }, accent);
+        }, faded.of(accent));
         self.drawUiText(fitted, .{
             .x = toast.x + padding_x,
             .y = toast.y + (toast.height - @as(f32, @floatFromInt(font))) / 2,
-        }, font, theme.text);
+        }, font, faded.of(theme.text));
     }
 
     fn drawGridSettings(self: Studio, viewport: Viewport) void {
@@ -14548,6 +14621,17 @@ pub const Studio = struct {
         const muted: rl.Color = theme.text_muted;
         const accent: rl.Color = theme.accent;
 
+        // A popover, not a modal: no scrim, but it still unfolds from under
+        // the toolbar button that opened it.
+        const fold = chrome_motion.wipeFromTop(
+            chrome_motion.inflateRect(layout.panel, 12 * scale),
+            chrome_motion.reveal(.grid_settings).presence(),
+        );
+        chrome_motion.pushClip(fold.clip);
+        defer {
+            chrome_motion.popClip();
+            chrome_motion.drawFoldEdge(fold, layout.panel.x, layout.panel.width);
+        }
         rl.drawRectangleRounded(.{
             .x = layout.panel.x + 5 * scale,
             .y = layout.panel.y + 7 * scale,
@@ -14665,30 +14749,32 @@ pub const Studio = struct {
     }
 
     fn drawReusablePicker(self: Studio, viewport: Viewport, workspace: Workspace) void {
-        const layout = commandPaletteLayout(viewport);
-        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        const settled_layout = commandPaletteLayout(viewport);
+        if (settled_layout.panel.width <= 0 or settled_layout.panel.height <= 0) return;
         const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
             .x = viewport.slide_top_left.x,
             .y = viewport.slide_top_left.y,
             .width = viewport.slide_size.x,
             .height = viewport.slide_size.y,
         };
-        const scale = layout.scale;
+        const scale = settled_layout.scale;
         const body_font = scaledUiFont(scale, UiTypography.body);
         const compact_font = scaledUiFont(scale, UiTypography.compact);
 
-        drawOverlayPanel(bounds, layout.panel, scale);
+        const fold = chrome_motion.foldFromTop(
+            settled_layout.panel,
+            chrome_motion.reveal(.reusable_picker).presence(),
+            scale,
+        );
+        const layout = shiftCommandPaletteLayout(settled_layout, fold.offset_y);
+        drawOverlayPanel(bounds, layout.panel, scale, fold);
+        defer finishOverlayPanel(layout.panel, fold);
         const query: [:0]const u8 = self.library_search.query[0..self.library_search.len :0];
         self.drawOverlaySearch(layout, query, "Choose a reusable, group, or slide template…");
 
         const count = librarySearchResultCount(workspace.library, self.library_search.text());
         const capacity = commandPaletteRowCapacity(layout);
-        rl.beginScissorMode(
-            @intFromFloat(@floor(layout.rows_clip.x)),
-            @intFromFloat(@floor(layout.rows_clip.y)),
-            @intFromFloat(@ceil(layout.rows_clip.width)),
-            @intFromFloat(@ceil(layout.rows_clip.height)),
-        );
+        chrome_motion.pushClip(layout.rows_clip);
         for (0..capacity) |slot| {
             const result_index = self.library_search.first_visible + slot;
             if (result_index >= count) break;
@@ -14782,7 +14868,7 @@ pub const Studio = struct {
                 .y = action_rect.y + (action_rect.height - @as(f32, @floatFromInt(compact_font))) / 2,
             }, compact_font, if (entry.available) theme.text_secondary else theme.text_disabled);
         }
-        rl.endScissorMode();
+        chrome_motion.popClip();
 
         if (count == 0) self.drawUiText("No matching reusable definitions", .{
             .x = layout.rows_clip.x + 12 * scale,
@@ -14803,30 +14889,32 @@ pub const Studio = struct {
         viewport: Viewport,
         workspace: Workspace,
     ) void {
-        const layout = commandPaletteLayout(viewport);
-        if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
+        const settled_layout = commandPaletteLayout(viewport);
+        if (settled_layout.panel.width <= 0 or settled_layout.panel.height <= 0) return;
         const bounds: rl.Rectangle = if (viewport.chrome) |chrome| chrome.content else .{
             .x = viewport.slide_top_left.x,
             .y = viewport.slide_top_left.y,
             .width = viewport.slide_size.x,
             .height = viewport.slide_size.y,
         };
-        const scale = layout.scale;
+        const scale = settled_layout.scale;
         const body_font = scaledUiFont(scale, UiTypography.body);
         const compact_font = scaledUiFont(scale, UiTypography.compact);
 
-        drawOverlayPanel(bounds, layout.panel, scale);
+        const fold = chrome_motion.foldFromTop(
+            settled_layout.panel,
+            chrome_motion.reveal(.command_palette).presence(),
+            scale,
+        );
+        const layout = shiftCommandPaletteLayout(settled_layout, fold.offset_y);
+        drawOverlayPanel(bounds, layout.panel, scale, fold);
+        defer finishOverlayPanel(layout.panel, fold);
         const query: [:0]const u8 = self.command_palette.query[0..self.command_palette.len :0];
         self.drawOverlaySearch(layout, query, "Search commands…");
 
         const count = self.commandResultCount();
         const capacity = commandPaletteRowCapacity(layout);
-        rl.beginScissorMode(
-            @intFromFloat(@floor(layout.rows_clip.x)),
-            @intFromFloat(@floor(layout.rows_clip.y)),
-            @intFromFloat(@ceil(layout.rows_clip.width)),
-            @intFromFloat(@ceil(layout.rows_clip.height)),
-        );
+        chrome_motion.pushClip(layout.rows_clip);
         for (0..capacity) |slot| {
             const result_index = self.command_palette.first_visible + slot;
             if (result_index >= count) break;
@@ -14905,7 +14993,7 @@ pub const Studio = struct {
                 }, compact_font, if (availability.enabled) theme.text_secondary else theme.text_disabled);
             }
         }
-        rl.endScissorMode();
+        chrome_motion.popClip();
 
         if (count == 0) {
             self.drawUiText("No matching commands", .{
@@ -14961,16 +15049,32 @@ pub const Studio = struct {
             below
         else
             @max(bounds.y + margin, above);
-        const panel: rl.Rectangle = .{ .x = x, .y = y, .width = panel_width, .height = panel_height };
+        // Fade and settle: the card starts a few pixels closer to its anchor
+        // and drifts into place while its alpha ramps, so hover help arrives
+        // instead of popping.
+        const fade_in: f32 = if (chrome_motion.enabled)
+            chrome_motion.smooth((self.tooltip.elapsed - tooltip_delay_seconds) / tooltip_fade_seconds)
+        else
+            1;
+        const settle = (1 - fade_in) * 4 * scale;
+        const y_settled = if (y >= below) y - settle else y + settle;
+        const panel: rl.Rectangle = .{ .x = x, .y = y_settled, .width = panel_width, .height = panel_height };
+        const faded = struct {
+            k: f32,
+            fn of(this: @This(), color: rl.Color) rl.Color {
+                const a: f32 = @floatFromInt(color.a);
+                return theme.alpha(color, @intFromFloat(@round(a * this.k)));
+            }
+        }{ .k = fade_in };
 
         rl.drawRectangleRounded(.{
             .x = panel.x + 1 * scale,
             .y = panel.y + 3 * scale,
             .width = panel.width,
             .height = panel.height,
-        }, 0.14, 8, theme.alpha(theme.shadow, 90));
-        rl.drawRectangleRounded(panel, 0.14, 8, theme.overlay);
-        rl.drawRectangleRoundedLinesEx(panel, 0.14, 8, scale, theme.border_strong);
+        }, 0.14, 8, faded.of(theme.alpha(theme.shadow, 90)));
+        rl.drawRectangleRounded(panel, 0.14, 8, faded.of(theme.overlay));
+        rl.drawRectangleRoundedLinesEx(panel, 0.14, 8, scale, faded.of(theme.border_strong));
 
         const text_right = panel.x + panel.width - padding_x;
         var title_buffer: [160]u8 = undefined;
@@ -14980,7 +15084,7 @@ pub const Studio = struct {
             title_font,
             @max(0, panel.width - padding_x * 2 - shortcut_gap - shortcut_width),
         );
-        self.drawUiText(title, .{ .x = panel.x + padding_x, .y = panel.y + padding_y }, title_font, theme.text);
+        self.drawUiText(title, .{ .x = panel.x + padding_x, .y = panel.y + padding_y }, title_font, faded.of(theme.text));
         if (target.shortcut.len > 0) {
             const shortcut: rl.Rectangle = .{
                 .x = text_right - shortcut_width,
@@ -14988,11 +15092,11 @@ pub const Studio = struct {
                 .width = shortcut_width,
                 .height = title_line + 4 * scale,
             };
-            rl.drawRectangleRounded(shortcut, 0.3, 6, theme.control);
+            rl.drawRectangleRounded(shortcut, 0.3, 6, faded.of(theme.control));
             self.drawUiText(target.shortcut, .{
                 .x = shortcut.x + 7 * scale,
                 .y = shortcut.y + (shortcut.height - @as(f32, @floatFromInt(detail_font))) / 2,
-            }, detail_font, theme.text_secondary);
+            }, detail_font, faded.of(theme.text_secondary));
         }
         if (has_detail) {
             var detail_buffer: [256]u8 = undefined;
@@ -15005,7 +15109,7 @@ pub const Studio = struct {
             self.drawUiText(detail, .{
                 .x = panel.x + padding_x,
                 .y = panel.y + padding_y + title_line + line_gap,
-            }, detail_font, theme.text_muted);
+            }, detail_font, faded.of(theme.text_muted));
         }
     }
 
@@ -15017,18 +15121,13 @@ pub const Studio = struct {
         const meta_font = scaledUiFont(layout.scale, UiTypography.compact);
         const scene_count = 1 + workspace.builds.len + workspace.morph_states.len;
 
-        rl.beginScissorMode(
-            @intFromFloat(@floor(layout.cards_clip.x)),
-            @intFromFloat(@floor(layout.cards_clip.y)),
-            @intFromFloat(@ceil(layout.cards_clip.width)),
-            @intFromFloat(@ceil(layout.cards_clip.height)),
-        );
+        chrome_motion.pushClip(layout.cards_clip);
         for (0..morphTimelineCardCapacity(layout)) |visible_slot| {
             const scene_index = self.morph_first_visible + visible_slot;
             if (scene_index >= scene_count) break;
             const card = morphTimelineCardRect(layout, visible_slot) orelse break;
             const active = scene_index == active_scene;
-            const scene = self.timelineSceneAt(scene_index);
+            const scene = timelineSceneFor(workspace.builds.len, scene_index);
             const fill: rl.Color = if (active) theme.accent_soft else theme.control;
             const border: rl.Color = if (active) theme.accent else theme.border_strong;
             rl.drawRectangleRec(card, fill);
@@ -15116,7 +15215,7 @@ pub const Studio = struct {
                 );
             }
         }
-        rl.endScissorMode();
+        chrome_motion.popClip();
 
         self.drawTransport(layout);
         self.drawTransitionChip(layout);
@@ -15309,6 +15408,37 @@ pub const Studio = struct {
         drawToggleButton(self, layout.objects_tab, "Objects", self.inspector_panel == .objects);
         drawToggleButton(self, layout.properties_tab, "Properties", self.inspector_panel == .properties);
         drawToggleButton(self, layout.motion_tab, "Motion", self.inspector_panel == .motion);
+        // The accent bar glides from the previous tab to the new one and the
+        // body wipes in beneath it, so a switch reads as one panel changing
+        // pages rather than three buttons swapping fills.
+        const active_tab = switch (self.inspector_panel) {
+            .objects => layout.objects_tab,
+            .properties => layout.properties_tab,
+            .motion => layout.motion_tab,
+        };
+        const glide = chrome_motion.glide(.inspector_tab, active_tab);
+        if (glide.retargeted) chrome_motion.replay(.inspector_body);
+        chrome_motion.drawTabIndicator(glide.rect);
+    }
+
+    /// Clip the inspector body to its tab-switch wipe. Pair with
+    /// `endInspectorBody` (usually via `defer`).
+    fn beginInspectorBody(panel: rl.Rectangle, viewport: Viewport) chrome_motion.Fold {
+        const tabs = objectsLayout(viewport).objects_tab;
+        const body: rl.Rectangle = .{
+            .x = panel.x,
+            .y = tabs.y + tabs.height + 2,
+            .width = panel.width,
+            .height = @max(0, panel.y + panel.height - (tabs.y + tabs.height + 2)),
+        };
+        const fold = chrome_motion.wipeFromTop(body, chrome_motion.reveal(.inspector_body).presence());
+        chrome_motion.pushClip(fold.clip);
+        return fold;
+    }
+
+    fn endInspectorBody(panel: rl.Rectangle, fold: chrome_motion.Fold) void {
+        chrome_motion.popClip();
+        chrome_motion.drawFoldEdge(fold, panel.x + 1, panel.width - 2);
     }
 
     fn drawObjects(self: Studio, items: []const slides.SlideItem, viewport: Viewport) void {
@@ -15316,6 +15446,8 @@ pub const Studio = struct {
         if (layout.panel.width <= 0 or layout.panel.height <= 0) return;
         drawStudioPanel(layout.panel);
         self.drawInspectorTabs(viewport);
+        const body_fold = beginInspectorBody(layout.panel, viewport);
+        defer endInspectorBody(layout.panel, body_fold);
         const layer_labels = [_][:0]const u8{ "Back", "Down", "Up", "Front" };
         for (layout.layer_actions, layer_labels) |button, label| drawCompactButton(self, button, label);
         drawCompactButton(self, layout.page_previous, "Prev");
@@ -15342,14 +15474,19 @@ pub const Studio = struct {
             const item = items[item_index];
             const row = objectRowRect(layout, visible_slot) orelse break;
             const selected = item.kind != .background and self.isIdentitySelected(item.identity);
-            const row_color: rl.Color = if (selected)
+            const row_rest: rl.Color = if (selected)
                 theme.accent_soft
             else if (item.kind == .background or !item.visible or item.opacity <= 0)
                 theme.control_disabled
             else
                 theme.row;
-            rl.drawRectangleRec(row, row_color);
-            rl.drawRectangleLinesEx(row, if (selected) 2 else 1, if (selected) theme.accent else theme.border);
+            const row_hover = chrome_motion.smooth(chrome_motion.touchRow(row).hover);
+            rl.drawRectangleRec(row, chrome_motion.mixColor(row_rest, theme.control_hover, row_hover * 0.8));
+            rl.drawRectangleLinesEx(
+                row,
+                if (selected) 2 else 1,
+                if (selected) theme.accent else chrome_motion.mixColor(theme.border, theme.accent, row_hover * 0.7),
+            );
             if (self.active_search == .objects and paint_offset == self.objects_search.selected_result)
                 rl.drawRectangleLinesEx(.{ .x = row.x + 2, .y = row.y + 2, .width = row.width - 4, .height = row.height - 4 }, 1, theme.accent_bright);
 
@@ -15367,12 +15504,12 @@ pub const Studio = struct {
             const text_right = lock.x - 7 * scale;
             const text_width = @max(0, text_right - text_x);
             if (text_width <= 0) continue;
-            rl.beginScissorMode(
-                @intFromFloat(@floor(text_x)),
-                @intFromFloat(@floor(row.y + 2 * scale)),
-                @intFromFloat(@ceil(text_width)),
-                @intFromFloat(@ceil(row.height - 4 * scale)),
-            );
+            chrome_motion.pushClip(.{
+                .x = text_x,
+                .y = row.y + 2 * scale,
+                .width = text_width,
+                .height = row.height - 4 * scale,
+            });
             var generated_name: [192]u8 = undefined;
             const raw_name = objectDisplayName(item, &generated_name);
             var fitted_name_buffer: [192]u8 = undefined;
@@ -15443,7 +15580,7 @@ pub const Studio = struct {
             var fitted_metadata_buffer: [192]u8 = undefined;
             const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
             self.drawUiText(fitted_metadata, .{ .x = text_x, .y = row.y + 24 * scale }, compact_font, theme.text_muted);
-            rl.endScissorMode();
+            chrome_motion.popClip();
         }
 
         var page_buffer: [64]u8 = undefined;
@@ -15668,12 +15805,12 @@ pub const Studio = struct {
                 .horizontal_offset = 0,
             };
         self.drawUiText(label, .{ .x = rect.x + InlineFieldPadding.left, .y = rect.y + if (multiline) 3 else (rect.height - @as(f32, @floatFromInt(label_font))) / 2 }, label_font, theme.text_muted);
-        rl.beginScissorMode(
-            @intFromFloat(@floor(value_x)),
-            @intFromFloat(@floor(value_y)),
-            @intFromFloat(@ceil(@max(0, rect.x + rect.width - reserved_right - value_x - InlineFieldPadding.right))),
-            @intFromFloat(@ceil(@max(0, rect.y + rect.height - value_y - 4))),
-        );
+        chrome_motion.pushClip(.{
+            .x = value_x,
+            .y = value_y,
+            .width = @max(0, rect.x + rect.width - reserved_right - value_x - InlineFieldPadding.right),
+            .height = @max(0, rect.y + rect.height - value_y - 4),
+        });
         var display_buffer: [max_inline_input_bytes + 1]u8 = undefined;
         const bounded_len = @min(value.len, max_inline_input_bytes);
         const display_start = @min(draw_window.display_start, bounded_len);
@@ -15697,7 +15834,7 @@ pub const Studio = struct {
                 .height = cursor_height,
             }, border);
         }
-        rl.endScissorMode();
+        chrome_motion.popClip();
         if (expandable) {
             rl.drawRectangleRec(expand_rect, theme.control);
             rl.drawRectangleLinesEx(expand_rect, 1, theme.border_strong);
@@ -16443,6 +16580,8 @@ pub const Studio = struct {
         drawStudioPanel(layout.properties);
         if (viewport.chrome != null) {
             self.drawInspectorTabs(viewport);
+            const body_fold = beginInspectorBody(layout.properties, viewport);
+            defer endInspectorBody(layout.properties, body_fold);
             self.drawInlineProperties(items, resolved_bounds, viewport, selected_locked);
             return;
         } else {
@@ -16813,8 +16952,13 @@ fn drawStudioPanel(rect: rl.Rectangle) void {
 /// reusable picker. They used to be two independent copies of the same drawing
 /// code, which is how one of them ended up with a "LIB" badge and the other
 /// with "CMD K". Both now share the panel, the search line, and the row.
-fn drawOverlayPanel(bounds: rl.Rectangle, panel: rl.Rectangle, scale: f32) void {
-    rl.drawRectangleRec(bounds, theme.scrim);
+fn drawOverlayPanel(bounds: rl.Rectangle, panel: rl.Rectangle, scale: f32, fold: chrome_motion.Fold) void {
+    const scrim_alpha: f32 = @floatFromInt(theme.scrim.a);
+    rl.drawRectangleRec(bounds, theme.alpha(theme.scrim, @intFromFloat(@round(scrim_alpha * fold.scrim))));
+    // Everything from here until `finishOverlayPanel` is exposed from the top
+    // edge down as the reveal unfolds. The clip carries the shadow margin so
+    // the shadow does not get sliced off while the panel is only half open.
+    chrome_motion.pushClip(fold.clip);
     rl.drawRectangleRounded(.{
         .x = panel.x + 4 * scale,
         .y = panel.y + 10 * scale,
@@ -16831,10 +16975,38 @@ fn drawOverlayPanel(bounds: rl.Rectangle, panel: rl.Rectangle, scale: f32) void 
     rl.drawRectangleRoundedLinesEx(panel, 0.05, 12, scale, theme.border_strong);
 }
 
+/// Release the fold clip opened by `drawOverlayPanel` and paint the scan line
+/// that travels with the fold edge while the panel is moving.
+fn finishOverlayPanel(panel: rl.Rectangle, fold: chrome_motion.Fold) void {
+    chrome_motion.popClip();
+    chrome_motion.drawFoldEdge(fold, panel.x, panel.width);
+}
+
+/// Translate every rectangle of a palette layout by the fold drift so the
+/// search line, rows, and footer travel with the panel.
+fn shiftCommandPaletteLayout(layout: CommandPaletteLayout, dy: f32) CommandPaletteLayout {
+    var shifted = layout;
+    shifted.panel = chrome_motion.shiftRect(layout.panel, 0, dy);
+    shifted.search = chrome_motion.shiftRect(layout.search, 0, dy);
+    shifted.rows_clip = chrome_motion.shiftRect(layout.rows_clip, 0, dy);
+    shifted.footer = chrome_motion.shiftRect(layout.footer, 0, dy);
+    return shifted;
+}
+
+/// The command palette state as it was last drawn open, kept so the panel can
+/// fold shut showing what the user just saw rather than an empty query.
+var palette_afterimage: CommandPaletteState = .{};
+/// The notice last shown, kept while its toast sinks away.
+var toast_afterimage: Notice = .none;
+
 /// Only the selected row is painted. Leaving the rest unfilled is what stops a
 /// long list from reading as a stack of boxes.
 fn drawOverlayRow(row: rl.Rectangle, selected: bool, scale: f32) void {
-    if (!selected) return;
+    const hover = chrome_motion.smooth(chrome_motion.touchRow(row).hover);
+    if (!selected) {
+        if (hover > 0.01) rl.drawRectangleRounded(row, 0.16, 6, chrome_motion.mixColor(theme.alpha(theme.row, 0), theme.row, hover));
+        return;
+    }
     rl.drawRectangleRounded(row, 0.16, 6, theme.accent_soft);
     rl.drawRectangleRec(.{
         .x = row.x,
@@ -16871,8 +17043,14 @@ fn drawButtonLabel(studio: Studio, rect: rl.Rectangle, label: []const u8, font_s
 /// with a quiet 1 px edge. Only the active state spends the accent, so a glance
 /// at any dock immediately answers "what is switched on here?".
 fn drawButtonSurface(rect: rl.Rectangle, active: bool) void {
-    rl.drawRectangleRec(rect, if (active) theme.accent_fill else theme.control);
-    rl.drawRectangleLinesEx(rect, 1, if (active) theme.accent else theme.border_strong);
+    // Motion never changes what a button *means*; it only lets the fill and
+    // edge approach the accent while the pointer rests on it, crossfades a
+    // toggle that just switched, and runs the comet around the hovered edge.
+    const glow = chrome_motion.touch(rect, active);
+    const colors = chrome_motion.controlColors(glow);
+    rl.drawRectangleRec(rect, colors.fill);
+    rl.drawRectangleLinesEx(rect, 1, colors.border);
+    chrome_motion.drawControlMotion(rect, glow);
 }
 
 fn drawActionButton(studio: Studio, rect: rl.Rectangle, label: [:0]const u8) void {
@@ -23367,6 +23545,29 @@ test "command palette emits application save and history intentions" {
         .undo => {},
         else => return error.UnexpectedSemanticCommand,
     }
+}
+
+test "timeline scenes resolve against the workspace being drawn, not a stale build count" {
+    // A slide with two builds was open; the go-to-slide picker (a modal that
+    // skips Studio's update) jumped to a slide with one build and no morph
+    // states. The workspace already describes the new slide while the cached
+    // count still says two, which used to turn the last card into a morph
+    // state index that does not exist.
+    const stale: Studio = .{ .enabled = true, .build_count = 2 };
+    const workspace_builds: usize = 1;
+    const workspace_states: usize = 0;
+    const scene_count = 1 + workspace_builds + workspace_states;
+    var index: usize = 0;
+    while (index < scene_count) : (index += 1) {
+        switch (Studio.timelineSceneFor(workspace_builds, index)) {
+            .base => try std.testing.expectEqual(@as(usize, 0), index),
+            .build => |build| try std.testing.expect(build < workspace_builds),
+            .state => |state| try std.testing.expect(state < workspace_states),
+        }
+    }
+    // The cached resolver still answers for its own frame's counts.
+    try std.testing.expectEqual(Studio.TimelineScene{ .build = 1 }, stale.timelineSceneAt(2));
+    try std.testing.expectEqual(Studio.TimelineScene{ .state = 0 }, stale.timelineSceneAt(3));
 }
 
 test "status drawer opens on hover intent and glides shut when the pointer leaves" {
