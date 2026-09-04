@@ -29,6 +29,7 @@ const motion_schedule = @import("motion_schedule.zig");
 const videoplayer = @import("videoplayer.zig");
 const showtime = @import("showtime.zig");
 const nvim_editor = @import("nvim_editor.zig");
+const studio_motion = @import("studio_motion.zig");
 const SlideShow = slides.SlideShow;
 const studio_ui_font_data = @embedFile("assets/Calibri Regular.ttf");
 const presenter_ui_font_data = @embedFile("assets/Calibri Light.ttf");
@@ -471,6 +472,7 @@ test {
     std.testing.refAllDecls(file_browser);
     std.testing.refAllDecls(studio_roundtrip_test);
     std.testing.refAllDecls(motion_schedule);
+    std.testing.refAllDecls(studio_motion);
 }
 
 const CrowdOptions = struct {
@@ -3694,6 +3696,13 @@ pub fn main(init: std.process.Init) anyerror!void {
     }
 
     rl.setTargetFPS(60);
+    // Headless captures compare pixels; chrome motion snaps to its end state
+    // there so a glow or a half-open palette can never leak into a baseline.
+    studio_motion.enabled = diagnostics_capture_path == null;
+    if (std.c.getenv("RAYSLIDES_MOTION_SLOW")) |raw_slow| {
+        const slow = std.fmt.parseFloat(f32, std.mem.span(raw_slow)) catch 1;
+        if (slow >= 1 and slow <= 100) studio_motion.time_scale = slow;
+    }
     var beast_mode: bool = false;
     var frame_diagnostics = FrameDiagnostics{ .enabled = diagnostics_enabled and !diagnostics_hide_hud };
     var diagnostics_selection_pending = diagnostics_select_id;
@@ -5189,6 +5198,13 @@ pub fn main(init: std.process.Init) anyerror!void {
                             property_prompt.begin(.speaker_notes, initial_notes);
                         }
                     },
+                    .go_to_slide => {
+                        // Same entry as Cmd/Ctrl G: the picker takes the frame
+                        // over from Studio until it closes.
+                        goto_slide_picker.open();
+                        suspendStudioForSlidePicker(&studio_mode, &studio_library_preview_cache);
+                        studio_mode.setNotice(.none);
+                    },
                     .pair_presenter_phone => {
                         if (ensurePresenterCompanionRunning(&presenter_runtime, presenter_options, &presenter_network)) {
                             presenter_pairing_visible = true;
@@ -5790,6 +5806,16 @@ pub fn main(init: std.process.Init) anyerror!void {
         // redraw flash on macOS.
         var video_overlay_consumed_click = false;
         {
+            // Chrome motion ticks once per frame regardless of which surface
+            // owns input, so a closing palette keeps folding while a prompt
+            // opens on top of it. The pointer is only offered to Studio chrome
+            // when nothing floats above the docks.
+            const chrome_pointer_free = !export_controller.running and
+                !property_prompt.active and !studio_file_browser.active and
+                !presenter_pairing_visible and !display_picker.visible and !showtime_overlay.visible and
+                !goto_slide_picker.active and !embedded_editor.active();
+            studio_motion.beginFrameFromRaylib(chrome_pointer_free);
+
             rl.beginDrawing();
             defer rl.endDrawing();
             rl.clearBackground(.blank);
@@ -5955,7 +5981,19 @@ pub fn main(init: std.process.Init) anyerror!void {
                 std.math.cast(usize, G.current_slide) orelse 0,
                 G.slideshow.slides.items.len,
             );
-            embedded_editor.draw(neovim_outer);
+            // The editor pane slides in from the right edge and leaves the
+            // same way, with the backdrop scrim following its presence.
+            // `update` keeps receiving the settled rect so Neovim's grid is
+            // sized once, not on every frame of the glide.
+            const neovim_reveal = studio_motion.reveal(.neovim);
+            neovim_reveal.setOpen(embedded_editor.active());
+            if (neovim_reveal.visible()) {
+                const presence = neovim_reveal.presence();
+                const pane = studio_motion.slideFromRight(neovim_outer, presence, @floatFromInt(screenWidth));
+                embedded_editor.draw(pane, presence);
+            } else if (embedded_editor.hasAfterimage()) {
+                embedded_editor.releaseAfterimage();
+            }
         }
         if (screenshot_poster_render_pending) {
             screenshot_poster_render_pending = false;
@@ -11573,6 +11611,7 @@ fn applyStudioSemanticEdit(
         .undo,
         .redo,
         .edit_source_neovim,
+        .go_to_slide,
         .pair_presenter_phone,
         .open_document,
         .choose_presentation_display,

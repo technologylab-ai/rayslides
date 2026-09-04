@@ -9,6 +9,7 @@ const std = @import("std");
 const rl = @import("raylib");
 const studio = @import("studio.zig");
 const theme = @import("studio_theme.zig");
+const motion = @import("studio_motion.zig");
 
 pub const max_digits: usize = 20;
 
@@ -55,6 +56,9 @@ pub const Layout = struct {
     input: rl.Rectangle,
     footer: rl.Rectangle,
 };
+
+/// Snapshot of the picker as last drawn open, used while it folds shut.
+var afterimage: Picker = .{};
 
 pub const Picker = struct {
     active: bool = false,
@@ -137,17 +141,34 @@ pub const Picker = struct {
         current_slide: usize,
         slide_count: usize,
     ) void {
-        if (!self.active) return;
-        const placement = pickerLayout(viewport);
-        if (placement.panel.width <= 0 or placement.panel.height <= 0) return;
-        const scale = placement.scale;
+        // The picker folds open and shut like the command palette; while it
+        // folds shut the last typed digits stay visible through the afterimage.
+        const reveal = motion.reveal(.goto_slide);
+        reveal.setOpen(self.active);
+        if (self.active) afterimage = self;
+        if (!reveal.visible()) return;
+        const shown: Picker = if (self.active) self else afterimage;
+        const settled = pickerLayout(viewport);
+        if (settled.panel.width <= 0 or settled.panel.height <= 0) return;
+        const scale = settled.scale;
+        const fold = motion.foldFromTop(settled.panel, reveal.presence(), scale);
+        var placement = settled;
+        placement.panel = motion.shiftRect(settled.panel, 0, fold.offset_y);
+        placement.input = motion.shiftRect(settled.input, 0, fold.offset_y);
+        placement.footer = motion.shiftRect(settled.footer, 0, fold.offset_y);
         const heading_size = @as(f32, @floatFromInt(scaledFont(scale, studio.UiTypography.heading)));
         const value_size = @as(f32, @floatFromInt(scaledFont(scale, 30)));
         const compact_size = @as(f32, @floatFromInt(scaledFont(scale, studio.UiTypography.compact)));
 
         // Same elevation stack as Studio's command palette, scoped to the
         // visible slide so editor docks remain readable and usable context.
-        rl.drawRectangleRec(placement.bounds, theme.scrim);
+        const scrim_alpha: f32 = @floatFromInt(theme.scrim.a);
+        rl.drawRectangleRec(placement.bounds, theme.alpha(theme.scrim, @intFromFloat(@round(scrim_alpha * fold.scrim))));
+        motion.pushClip(fold.clip);
+        defer {
+            motion.popClip();
+            motion.drawFoldEdge(fold, placement.panel.x, placement.panel.width);
+        }
         rl.drawRectangleRounded(.{
             .x = placement.panel.x + 4 * scale,
             .y = placement.panel.y + 10 * scale,
@@ -168,11 +189,11 @@ pub const Picker = struct {
             .y = placement.panel.y + 15 * scale,
         }, heading_size, theme.text_heading);
 
-        const value: [:0]const u8 = if (self.len > 0) self.text() else "Slide number";
+        const value: [:0]const u8 = if (shown.len > 0) shown.text() else "Slide number";
         drawText(font, value, .{
             .x = placement.input.x,
             .y = placement.input.y + (placement.input.height - value_size) / 2,
-        }, value_size, if (self.len > 0) theme.text else theme.text_muted);
+        }, value_size, if (shown.len > 0) theme.text else theme.text_muted);
 
         var count_buffer: [48]u8 = undefined;
         const count_text = std.fmt.bufPrintZ(&count_buffer, "/ {d}", .{slide_count}) catch "/ ?";
@@ -182,7 +203,7 @@ pub const Picker = struct {
             .y = placement.input.y + (placement.input.height - heading_size) / 2,
         }, heading_size, theme.text_muted);
 
-        const line_color = if (self.failure == .none) theme.border else theme.danger;
+        const line_color = if (shown.failure == .none) theme.border else theme.danger;
         rl.drawRectangleRec(.{
             .x = placement.input.x,
             .y = placement.input.y + placement.input.height,
@@ -190,12 +211,12 @@ pub const Picker = struct {
             .height = @max(1, scale),
         }, line_color);
 
-        const caret_x = if (self.len == 0)
+        const caret_x = if (shown.len == 0)
             placement.input.x
         else
             @min(
                 placement.input.x + placement.input.width - count_width - 14 * scale,
-                placement.input.x + measureText(font, self.text(), value_size) + 3 * scale,
+                placement.input.x + measureText(font, shown.text(), value_size) + 3 * scale,
             );
         rl.drawRectangleRec(.{
             .x = caret_x,
@@ -205,7 +226,7 @@ pub const Picker = struct {
         }, theme.accent_bright);
 
         var status_buffer: [96]u8 = undefined;
-        const status: [:0]const u8 = switch (self.failure) {
+        const status: [:0]const u8 = switch (shown.failure) {
             .none => std.fmt.bufPrintZ(&status_buffer, "Current slide {d}", .{current_slide + 1}) catch "Current slide",
             .empty => "Enter a slide number",
             .out_of_bounds => std.fmt.bufPrintZ(&status_buffer, "Choose a slide from 1 to {d}", .{slide_count}) catch "Slide is out of range",
@@ -213,7 +234,7 @@ pub const Picker = struct {
         drawText(font, status, .{
             .x = placement.footer.x,
             .y = placement.footer.y + (placement.footer.height - compact_size) / 2,
-        }, compact_size, if (self.failure == .none) theme.text_muted else theme.danger);
+        }, compact_size, if (shown.failure == .none) theme.text_muted else theme.danger);
 
         const help: [:0]const u8 = "enter go   esc close";
         const help_width = measureText(font, help, compact_size);

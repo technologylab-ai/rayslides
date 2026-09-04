@@ -70,7 +70,11 @@ const DisabledController = struct {
     pub fn update(_: *DisabledController, _: rl.Rectangle) bool {
         return false;
     }
-    pub fn draw(_: *const DisabledController, _: rl.Rectangle) void {}
+    pub fn draw(_: *const DisabledController, _: rl.Rectangle, _: f32) void {}
+    pub fn hasAfterimage(_: *const DisabledController) bool {
+        return false;
+    }
+    pub fn releaseAfterimage(_: *DisabledController) void {}
     pub fn takeApply(_: *DisabledController) ?Apply {
         return null;
     }
@@ -87,6 +91,12 @@ const EnabledController = struct {
     embedded: ?*support.session.Session = null,
     initial_source: ?[]u8 = null,
     snapshot_value: ?support.session.Snapshot = null,
+    /// The last grid of a closed session, kept only long enough for the pane
+    /// to slide out showing what the user just saw. Released by the caller
+    /// through `releaseAfterimage` once the motion settles.
+    afterimage: ?support.session.Snapshot = null,
+    afterimage_kind: BufferKind = .source,
+    afterimage_field: FieldKind = .text,
     font: rl.Font,
     owns_font: bool = false,
     emoji_font: rl.Font,
@@ -226,6 +236,7 @@ const EnabledController = struct {
 
     pub fn deinit(self: *EnabledController) void {
         self.closeSession();
+        self.releaseAfterimage();
         if (self.owns_emoji_font) rl.unloadFont(self.emoji_font);
         if (self.owns_font) rl.unloadFont(self.font);
     }
@@ -459,22 +470,39 @@ const EnabledController = struct {
         return self.configured and self.snapshot_value != null;
     }
 
-    pub fn draw(self: *const EnabledController, outer: rl.Rectangle) void {
-        if (self.embedded == null) return;
+    pub fn hasAfterimage(self: *const EnabledController) bool {
+        return self.afterimage != null;
+    }
+
+    pub fn releaseAfterimage(self: *EnabledController) void {
+        if (self.afterimage) |*snapshot| snapshot.deinit();
+        self.afterimage = null;
+    }
+
+    /// Draw the pane at `outer`, which the caller may animate; `presence`
+    /// (0..1) fades the backdrop scrim so the deck shows through while the
+    /// pane is still travelling. A closed session keeps drawing from its
+    /// afterimage until the caller releases it.
+    pub fn draw(self: *const EnabledController, outer: rl.Rectangle, presence: f32) void {
+        const live = self.embedded != null;
+        if (!live and self.afterimage == null) return;
+        const scrim_alpha: f32 = 220 * std.math.clamp(presence, 0, 1);
         rl.drawRectangleRec(.{
             .x = 0,
             .y = 0,
             .width = @floatFromInt(rl.getScreenWidth()),
             .height = @floatFromInt(rl.getScreenHeight()),
-        }, .{ .r = 4, .g = 7, .b = 12, .a = 220 });
+        }, .{ .r = 4, .g = 7, .b = 12, .a = @intFromFloat(@round(scrim_alpha)) });
         rl.drawRectangleRec(outer, .{ .r = 15, .g = 18, .b = 25, .a = 255 });
         rl.drawRectangleLinesEx(outer, 1, .{ .r = 88, .g = 98, .b = 120, .a = 255 });
 
         const header = headerRect(outer);
         rl.drawRectangleRec(header, .{ .r = 24, .g = 29, .b = 40, .a = 255 });
-        const label: [:0]const u8 = switch (self.buffer_kind) {
+        const buffer_kind = if (live) self.buffer_kind else self.afterimage_kind;
+        const field_kind = if (live) self.field_kind else self.afterimage_field;
+        const label: [:0]const u8 = switch (buffer_kind) {
             .source => "EDIT SOURCE · NEOVIM",
-            .field => switch (self.field_kind) {
+            .field => switch (field_kind) {
                 .text => "EDIT TEXT · NEOVIM",
                 .speaker_notes => "EDIT SPEAKER NOTES · NEOVIM",
             },
@@ -492,10 +520,13 @@ const EnabledController = struct {
         );
 
         const content = contentRect(outer);
-        const snapshot = if (self.snapshot_value) |*value| value else {
-            rl.drawTextEx(self.font, "Waiting for Neovim redraw…", .{ .x = content.x + 12, .y = content.y + 12 }, 18, 0, .{ .r = 190, .g = 198, .b = 210, .a = 255 });
-            return;
-        };
+        const snapshot = if (live)
+            (if (self.snapshot_value) |*value| value else {
+                rl.drawTextEx(self.font, "Waiting for Neovim redraw…", .{ .x = content.x + 12, .y = content.y + 12 }, 18, 0, .{ .r = 190, .g = 198, .b = 210, .a = 255 });
+                return;
+            })
+        else
+            (if (self.afterimage) |*value| value else return);
         const default_fg = snapshot.default_foreground orelse support.grid.Color{ .r = 220, .g = 223, .b = 228 };
         const default_bg = snapshot.default_background orelse support.grid.Color{ .r = 18, .g = 20, .b = 26 };
         rl.beginScissorMode(
@@ -702,7 +733,12 @@ const EnabledController = struct {
         self.embedded = null;
         if (self.initial_source) |source| self.allocator.free(source);
         self.initial_source = null;
-        if (self.snapshot_value) |*snapshot| snapshot.deinit();
+        // Hand the final grid to the afterimage so the pane can leave with
+        // its contents intact instead of blanking on the close frame.
+        self.releaseAfterimage();
+        self.afterimage = self.snapshot_value;
+        self.afterimage_kind = self.buffer_kind;
+        self.afterimage_field = self.field_kind;
         self.snapshot_value = null;
         self.configured = false;
         self.last_cols = 0;

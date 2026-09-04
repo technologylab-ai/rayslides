@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rl = @import("raylib");
 const theme = @import("studio_theme.zig");
+const motion = @import("studio_motion.zig");
 
 pub const image_extensions = [_][]const u8{ ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tga", ".qoi", ".svg" };
 pub const video_extensions = [_][]const u8{ ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpg", ".mpeg" };
@@ -687,10 +688,19 @@ pub const Browser = struct {
     }
 
     pub fn draw(self: *const Browser, screen_size: rl.Vector2, ui_font: rl.Font) void {
-        if (!self.active) return;
-        rl.drawRectangle(0, 0, @intFromFloat(screen_size.x), @intFromFloat(screen_size.y), theme.scrim);
+        const reveal = motion.reveal(.file_browser);
+        reveal.setOpen(self.active);
+        if (!reveal.visible()) return;
+        const presence = reveal.presence();
+        rl.drawRectangle(0, 0, @intFromFloat(screen_size.x), @intFromFloat(screen_size.y), motion.scrimAt(presence));
         const layout = browserLayout(screen_size);
         const panel = layout.panel;
+        const fold = motion.wipeFromTop(motion.inflateRect(panel, 6), presence);
+        motion.pushClip(fold.clip);
+        defer {
+            motion.popClip();
+            motion.drawFoldEdge(fold, panel.x, panel.width);
+        }
         rl.drawRectangleRounded(panel, 0.035, 12, theme.raised);
         rl.drawRectangleRoundedLinesEx(panel, 0.035, 12, 1, theme.border_strong);
 
@@ -725,7 +735,7 @@ pub const Browser = struct {
         rl.drawRectangleRec(field, theme.field);
         rl.drawRectangleLinesEx(field, 1, if (focused) theme.accent else theme.border_strong);
         const inner = fieldInner(field);
-        rl.beginScissorMode(@intFromFloat(inner.x), @intFromFloat(inner.y), @intFromFloat(inner.width), @intFromFloat(inner.height));
+        motion.pushClip(inner);
         const value = self.path_field.textZ();
         // Keep the caret in view for long paths: the field scrolls so the
         // caret (or the path tail while unfocused) is always visible.
@@ -738,15 +748,15 @@ pub const Browser = struct {
         if (focused) {
             rl.drawRectangleRec(.{ .x = origin.x + caret_x, .y = origin.y, .width = 2, .height = row_font_size + 2 }, theme.accent_bright);
         }
-        rl.endScissorMode();
+        motion.popClip();
     }
 
     fn drawList(self: *const Browser, layout: Layout, ui_font: rl.Font) void {
         const list = layout.list;
         rl.drawRectangleRec(list, theme.sunken);
         rl.drawRectangleLinesEx(list, 1, if (self.focus == .list) theme.accent else theme.border);
-        rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
-        defer rl.endScissorMode();
+        motion.pushClip(list);
+        defer motion.popClip();
 
         if (self.visible_count == 0) {
             const empty: [:0]const u8 = if (self.filter.len > 0)
@@ -899,18 +909,13 @@ fn drawEntryIcon(origin: rl.Vector2, kind: EntryKind, broken: bool) void {
 }
 
 fn drawButton(ui_font: rl.Font, rect: rl.Rectangle, label: [:0]const u8, enabled: bool, emphasized: bool) void {
-    const hovered = enabled and pointInRectangle(rl.getMousePosition(), rect);
-    const fill: rl.Color = if (!enabled)
-        theme.control_disabled
-    else if (emphasized)
-        if (hovered) theme.accent else theme.accent_fill
-    else if (hovered)
-        theme.control_hover
-    else
-        theme.control;
-    const border: rl.Color = if (!enabled) theme.border else if (emphasized) theme.accent else theme.border_strong;
+    const glow = motion.touchAt(rect, emphasized, if (enabled) rl.getMousePosition() else null);
+    const colors = motion.controlColors(glow);
+    const fill: rl.Color = if (!enabled) theme.control_disabled else colors.fill;
+    const border: rl.Color = if (!enabled) theme.border else colors.border;
     rl.drawRectangleRec(rect, fill);
     rl.drawRectangleLinesEx(rect, 1, border);
+    if (enabled) motion.drawControlMotion(rect, glow);
     const label_width = rl.measureTextEx(ui_font, label, row_font_size, 0).x;
     rl.drawTextEx(
         ui_font,

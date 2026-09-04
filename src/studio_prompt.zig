@@ -1,6 +1,7 @@
 const std = @import("std");
 const rl = @import("raylib");
 const theme = @import("studio_theme.zig");
+const motion = @import("studio_motion.zig");
 
 pub const max_input_bytes = 8192;
 const editor_font_size: f32 = 21;
@@ -288,11 +289,22 @@ pub const Prompt = struct {
         ui_font: rl.Font,
         media_browse_available: bool,
     ) void {
-        if (!self.active) return;
-        rl.drawRectangle(0, 0, @intFromFloat(screen_size.x), @intFromFloat(screen_size.y), theme.scrim);
+        // The dialog wipes open from its top edge over a scrim that fades
+        // with it, and wipes shut the same way once it is dismissed.
+        const reveal = motion.reveal(.prompt);
+        reveal.setOpen(self.active);
+        if (!reveal.visible()) return;
+        const presence = reveal.presence();
+        rl.drawRectangle(0, 0, @intFromFloat(screen_size.x), @intFromFloat(screen_size.y), motion.scrimAt(presence));
 
         const layout = promptLayout(screen_size);
         const panel = layout.panel;
+        const fold = motion.wipeFromTop(motion.inflateRect(panel, 6), presence);
+        motion.pushClip(fold.clip);
+        defer {
+            motion.popClip();
+            motion.drawFoldEdge(fold, panel.x, panel.width);
+        }
         rl.drawRectangleRounded(panel, 0.035, 12, theme.raised);
         rl.drawRectangleRoundedLinesEx(panel, 0.035, 12, 1, theme.border_strong);
 
@@ -313,12 +325,7 @@ pub const Prompt = struct {
         if (!self.notice.blocksEditing() and self.select_all)
             rl.drawRectangleRec(inner, theme.selection);
 
-        rl.beginScissorMode(
-            @intFromFloat(inner.x),
-            @intFromFloat(inner.y),
-            @intFromFloat(inner.width),
-            @intFromFloat(inner.height),
-        );
+        motion.pushClip(inner);
         const visible: [:0]const u8 = if (self.notice.blocksEditing()) "" else self.buffer[0..self.len :0];
         const content_origin: rl.Vector2 = .{
             .x = inner.x - self.scroll_x,
@@ -335,7 +342,7 @@ pub const Prompt = struct {
                 .height = editor_font_size + 2,
             }, theme.accent_bright);
         }
-        rl.endScissorMode();
+        motion.popClip();
         if (!self.notice.blocksEditing())
             drawEditorScrollbars(self.*, editor, ui_font);
 
@@ -767,26 +774,16 @@ fn drawPromptButton(
     enabled: bool,
     emphasized: bool,
 ) void {
-    const hovered = enabled and pointInRectangle(rl.getMousePosition(), rect);
+    const glow = motion.touchAt(rect, emphasized, if (enabled) rl.getMousePosition() else null);
     // The confirming action is the only filled button; everything else stays
     // neutral so the dialog has a single obvious default.
-    const fill: rl.Color = if (!enabled)
-        theme.control_disabled
-    else if (emphasized)
-        if (hovered) theme.accent else theme.accent_fill
-    else if (hovered)
-        theme.control_hover
-    else
-        theme.control;
-    const border: rl.Color = if (!enabled)
-        theme.border
-    else if (emphasized)
-        theme.accent
-    else
-        theme.border_strong;
+    const colors = motion.controlColors(glow);
+    const fill: rl.Color = if (!enabled) theme.control_disabled else colors.fill;
+    const border: rl.Color = if (!enabled) theme.border else colors.border;
     const text_color: rl.Color = if (enabled) theme.text else theme.text_disabled;
     rl.drawRectangleRec(rect, fill);
     rl.drawRectangleLinesEx(rect, 1, border);
+    if (enabled) motion.drawControlMotion(rect, glow);
     const font_size: f32 = 16;
     const label_width = rl.measureTextEx(ui_font, label, font_size, 0).x;
     rl.drawTextEx(
