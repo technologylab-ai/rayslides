@@ -1169,6 +1169,7 @@ fn defaultCrowdHost(buffer: *[256]u8) []const u8 {
 
 fn slideshowHasCrowd(slideshow: *const SlideShow) bool {
     for (slideshow.slides.items) |slide| {
+        if (slide.hidden) continue;
         if (slide.items) |items| for (items.items) |item| if (item.crowd != null) return true;
     }
     return false;
@@ -1606,13 +1607,16 @@ fn publishPresenterState(
     drawing_enabled: bool,
 ) void {
     if (!runtime.isRunning()) return;
-    const slide_count = G.slideshow.slides.items.len;
-    const valid_slide = G.current_slide >= 0 and G.current_slide < slide_count;
-    const current_slide: usize = if (valid_slide) @intCast(G.current_slide) else 0;
+    const slide_count = visibleSlideCount(G.slideshow);
+    const valid_slide = G.current_slide >= 0 and G.current_slide < G.slideshow.slides.items.len and
+        !slideIsHidden(G.slideshow, G.current_slide);
+    const current_slide: usize = if (valid_slide) visibleSlideOrdinal(G.slideshow, G.current_slide) else 0;
     const step_count = if (valid_slide) G.slide_renderer.stepCount(G.current_slide) else 0;
-    const has_previous = valid_slide and (G.playback.visible_step > 0 or G.current_slide > 0);
+    const previous_slide = if (valid_slide) visibleSlideInDirection(G.slideshow, G.current_slide, -1) else null;
+    const next_slide = if (valid_slide) visibleSlideInDirection(G.slideshow, G.current_slide, 1) else null;
+    const has_previous = valid_slide and (G.playback.visible_step > 0 or previous_slide != null);
     const has_next = valid_slide and
-        (G.playback.visible_step < step_count or current_slide + 1 < slide_count);
+        (G.playback.visible_step < step_count or next_slide != null);
     const reversing = G.playback.active_step != null and G.playback.active_reverse;
     const advancing = G.playback.active_step != null and !G.playback.active_reverse;
     _ = runtime.publish(.{
@@ -1621,7 +1625,7 @@ fn publishPresenterState(
         .visible_step = @intCast(@min(G.playback.visible_step, std.math.maxInt(u32))),
         .step_count = @intCast(@min(step_count, std.math.maxInt(u32))),
         .notes = notesForSlide(G.slideshow, G.current_slide),
-        .next_notes = notesForSlide(G.slideshow, G.current_slide + 1),
+        .next_notes = notesForSlide(G.slideshow, next_slide orelse -1),
         .can_previous = controls_enabled and has_previous and !reversing,
         .can_next = controls_enabled and has_next and !advancing,
         .pointer_enabled = pointer_enabled,
@@ -2269,7 +2273,6 @@ const ExportController = struct {
     return_to_slide_number: i32,
     return_to_step_number: usize,
     current_slide_number: i32,
-    num_slides: usize,
     export_dir: []const u8,
 
     ready_toggle: bool = false,
@@ -2289,7 +2292,6 @@ const ExportController = struct {
             .return_to_slide_number = 0,
             .return_to_step_number = 0,
             .current_slide_number = 0,
-            .num_slides = 0,
         };
     }
 
@@ -2312,24 +2314,24 @@ const ExportController = struct {
         self.exported_imgs = null;
     }
 
-    pub fn start(self: *ExportController, current_slide_number: i32, current_step_number: usize, num_slides: usize) void {
-        self.running = true;
+    pub fn start(self: *ExportController, current_slide_number: i32, current_step_number: usize, slideshow: *const SlideShow) void {
+        const first = firstVisibleSlide(slideshow);
+        self.running = first != null;
         self.return_to_slide_number = current_slide_number;
         self.return_to_step_number = current_step_number;
-        self.current_slide_number = 0;
-        self.num_slides = num_slides;
-        self.exported_imgs = std.ArrayListUnmanaged([]const u8).empty;
+        self.current_slide_number = first orelse 0;
+        self.exported_imgs = if (first != null) std.ArrayListUnmanaged([]const u8).empty else null;
         self.ready_toggle = false;
     }
 
     /// signals if it's done
-    pub fn advance(self: *ExportController) bool {
-        self.current_slide_number += 1;
-        if (self.current_slide_number >= self.num_slides) {
-            self.running = false;
-            return true;
+    pub fn advance(self: *ExportController, slideshow: *const SlideShow) bool {
+        if (visibleSlideInDirection(slideshow, self.current_slide_number, 1)) |next| {
+            self.current_slide_number = next;
+            return false;
         }
-        return false;
+        self.running = false;
+        return true;
     }
 
     pub fn ready(self: *ExportController) bool {
@@ -4002,7 +4004,12 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .cancelled => window_close_seen = false,
                 .select => |slide_index| {
                     if (studio_mode.capturesInput()) prepareStudioForSlideJump(&studio_mode, &studio_library_preview_cache);
-                    jumpToSlide(@intCast(slide_index), rl.getTime());
+                    const requested: i32 = @intCast(slide_index);
+                    if (studio_mode.capturesInput()) {
+                        jumpToSlide(requested, rl.getTime());
+                    } else if (nearestVisibleSlide(G.slideshow, requested)) |target| {
+                        jumpToSlide(target, rl.getTime());
+                    }
                     window_close_seen = false;
                 },
             }
@@ -4234,7 +4241,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         if (export_controller.running) {
             if (export_controller.ready()) {
                 if (export_controller.snapshot()) |_| {
-                    if (export_controller.advance()) {
+                    if (export_controller.advance(G.slideshow)) {
                         if (G.slideshow_filp) |slideshow_name| {
                             try export_controller.to_pdf(slideshow_name);
                         } else {
@@ -4294,8 +4301,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                     // Stopped videos show their poster frame, which keeps the
                     // exported pages deterministic.
                     G.slide_renderer.stopAllVideos();
-                    export_controller.start(G.current_slide, G.playback.visible_step, G.slideshow.slides.items.len);
-                    G.current_slide = 0;
+                    export_controller.start(G.current_slide, G.playback.visible_step, G.slideshow);
+                    G.current_slide = export_controller.current_slide_number;
                 }
             } else {
                 if (export_controller.running == false) {
@@ -4446,6 +4453,9 @@ pub fn main(init: std.process.Init) anyerror!void {
                     }
                     if (G.slideshow.slides.items.len > 0) {
                         if (G.current_slide < 0 or G.current_slide >= G.slideshow.slides.items.len) G.current_slide = 0;
+                        if (!studio_mode.capturesInput() and slideIsHidden(G.slideshow, G.current_slide)) {
+                            G.current_slide = nearestVisibleSlide(G.slideshow, G.current_slide) orelse G.current_slide;
+                        }
                         const now = rl.getTime();
                         G.playback.enterSlide(null, 0, 0, G.slide_renderer.transitionForSlide(G.current_slide), 1, now);
                         if (!export_controller.running and !studio_mode.capturesInput()) {
@@ -5115,6 +5125,13 @@ pub fn main(init: std.process.Init) anyerror!void {
             studio_mode.updateWithWorkspaceFromRaylib(studio_items, studio_bounds.items, studio_viewport, studio_workspace)
         else
             null;
+        if (studio_active_at_frame_start and !studio_mode.capturesInput() and
+            slideIsHidden(G.slideshow, G.current_slide))
+        {
+            if (nearestVisibleSlide(G.slideshow, G.current_slide)) |target| {
+                jumpToSlide(target, now);
+            }
+        }
         if (definition_preview_entry != null and !studio_mode.definitionModeActive()) {
             // Back or deck navigation can leave Definition mode during the
             // update. Stop borrowing its parser arena before the preview
@@ -5874,6 +5891,22 @@ pub fn main(init: std.process.Init) anyerror!void {
                     !presenter_overlay_captures_input and !laser_pointer.show,
             );
             if (!export_controller.running) {
+                if (studio_mode.capturesInput() and slideIsHidden(G.slideshow, G.current_slide)) {
+                    const canvas = studio_viewport.canvasBounds();
+                    rl.beginScissorMode(
+                        @intFromFloat(@floor(canvas.x)),
+                        @intFromFloat(@floor(canvas.y)),
+                        @intFromFloat(@ceil(canvas.width)),
+                        @intFromFloat(@ceil(canvas.height)),
+                    );
+                    rl.drawRectangleRec(.{
+                        .x = studio_viewport.slide_top_left.x,
+                        .y = studio_viewport.slide_top_left.y,
+                        .width = studio_viewport.slide_size.x,
+                        .height = studio_viewport.slide_size.y,
+                    }, .{ .r = 112, .g = 116, .b = 124, .a = 118 });
+                    rl.endScissorMode();
+                }
                 if (definition_preview_entry != null) {
                     const canvas = studio_viewport.canvasBounds();
                     rl.beginScissorMode(
@@ -6366,17 +6399,17 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
 
         if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and rl.isKeyPressed(.one)) {
-            jumpToSlide(0, rl.getTime());
+            if (firstVisibleSlide(G.slideshow)) |target| jumpToSlide(target, rl.getTime());
         }
 
         if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and G.slideshow.slides.items.len > 0 and rl.isKeyPressed(.zero)) {
-            jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime());
+            if (lastVisibleSlide(G.slideshow)) |target| jumpToSlide(target, rl.getTime());
         }
 
         if (!presenter_overlay_captures_input and !export_controller.running and !studio_mode.capturesInput() and G.slideshow.slides.items.len > 0) {
             switch (g_shortcut_action) {
-                .first_slide => jumpToSlide(0, rl.getTime()),
-                .last_slide => jumpToSlide(@intCast(G.slideshow.slides.items.len - 1), rl.getTime()),
+                .first_slide => if (firstVisibleSlide(G.slideshow)) |target| jumpToSlide(target, rl.getTime()),
+                .last_slide => if (lastVisibleSlide(G.slideshow)) |target| jumpToSlide(target, rl.getTime()),
                 .none, .open_picker => {},
             }
         }
@@ -6444,6 +6477,75 @@ fn shortcutModifierDown() bool {
         rl.isKeyDown(.left_super) or rl.isKeyDown(.right_super);
 }
 
+fn slideIsHidden(slideshow: *const SlideShow, slide_index: i32) bool {
+    if (slide_index < 0 or slide_index >= slideshow.slides.items.len) return false;
+    return slideshow.slides.items[@intCast(slide_index)].hidden;
+}
+
+fn visibleSlideInDirection(slideshow: *const SlideShow, from: i32, direction: i8) ?i32 {
+    if (direction == 0) return null;
+    var candidate = from + direction;
+    while (candidate >= 0 and candidate < slideshow.slides.items.len) : (candidate += direction) {
+        if (!slideIsHidden(slideshow, candidate)) return candidate;
+    }
+    return null;
+}
+
+fn firstVisibleSlide(slideshow: *const SlideShow) ?i32 {
+    return visibleSlideInDirection(slideshow, -1, 1);
+}
+
+fn lastVisibleSlide(slideshow: *const SlideShow) ?i32 {
+    const after_last: i32 = @intCast(slideshow.slides.items.len);
+    return visibleSlideInDirection(slideshow, after_last, -1);
+}
+
+fn nearestVisibleSlide(slideshow: *const SlideShow, slide_index: i32) ?i32 {
+    if (slide_index >= 0 and slide_index < slideshow.slides.items.len and
+        !slideIsHidden(slideshow, slide_index)) return slide_index;
+    return visibleSlideInDirection(slideshow, slide_index, 1) orelse
+        visibleSlideInDirection(slideshow, slide_index, -1);
+}
+
+fn visibleSlideCount(slideshow: *const SlideShow) usize {
+    var count: usize = 0;
+    for (slideshow.slides.items) |slide| if (!slide.hidden) {
+        count += 1;
+    };
+    return count;
+}
+
+fn visibleSlideOrdinal(slideshow: *const SlideShow, slide_index: i32) usize {
+    if (slide_index < 0) return 0;
+    var ordinal: usize = 0;
+    for (slideshow.slides.items, 0..) |slide, index| {
+        if (index == @as(usize, @intCast(slide_index))) return ordinal;
+        if (!slide.hidden) ordinal += 1;
+    }
+    return 0;
+}
+
+test "presentation slide navigation omits hidden slides in both directions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try SlideShow.new(allocator);
+    for (0..5) |index| {
+        const slide = try slides.Slide.new(allocator);
+        slide.hidden = index == 0 or index == 2 or index == 4;
+        try slideshow.slides.append(allocator, slide);
+    }
+
+    try std.testing.expectEqual(@as(?i32, 1), firstVisibleSlide(slideshow));
+    try std.testing.expectEqual(@as(?i32, 3), lastVisibleSlide(slideshow));
+    try std.testing.expectEqual(@as(?i32, 3), visibleSlideInDirection(slideshow, 1, 1));
+    try std.testing.expectEqual(@as(?i32, 1), visibleSlideInDirection(slideshow, 3, -1));
+    try std.testing.expectEqual(@as(?i32, 3), nearestVisibleSlide(slideshow, 2));
+    try std.testing.expectEqual(@as(usize, 2), visibleSlideCount(slideshow));
+    try std.testing.expectEqual(@as(usize, 0), visibleSlideOrdinal(slideshow, 1));
+    try std.testing.expectEqual(@as(usize, 1), visibleSlideOrdinal(slideshow, 3));
+}
+
 fn advancePresentation(now: f64) void {
     G.playback.settle(now);
     // A repeated forward action must not skip over a step that is still
@@ -6456,8 +6558,7 @@ fn advancePresentation(now: f64) void {
         return;
     }
 
-    const next_slide = G.current_slide + 1;
-    if (next_slide < G.slideshow.slides.items.len) {
+    if (visibleSlideInDirection(G.slideshow, G.current_slide, 1)) |next_slide| {
         moveToSlide(next_slide, 1, 0, now);
     }
 }
@@ -6475,8 +6576,7 @@ fn reversePresentation(now: f64) void {
         return;
     }
 
-    const previous_slide = G.current_slide - 1;
-    if (previous_slide >= 0) {
+    if (visibleSlideInDirection(G.slideshow, G.current_slide, -1)) |previous_slide| {
         moveToSlide(previous_slide, -1, G.slide_renderer.stepCount(previous_slide), now);
     }
 }
@@ -10073,6 +10173,7 @@ fn collectStudioSlideSummaries(
             .item_count = if (slide.items) |items| items.items.len else 0,
             .morph_count = slide.morph_states.items.len,
             .transition_effect = slide.transition.effect,
+            .hidden = slide.hidden,
         });
     }
 }
@@ -13023,6 +13124,17 @@ fn applyStudioSemanticEdit(
             };
             history.setLatestMorphScenes(morph_state, next_state);
             return .{ .morph_scene = .{ .active_state = next_state } };
+        },
+        .set_slide_hidden => |change| {
+            if (change.slide_index >= G.slideshow.slides.items.len) return error.NoStudioSlide;
+            const target = G.slideshow.slides.items[change.slide_index];
+            try recordStudioPatch(history, try source_editor.setSlideHidden(
+                G.allocator,
+                G.editor_memory[0..G.source_len],
+                target.pos_in_editor,
+                change.hidden,
+            ));
+            return .{ .slide_index = change.slide_index };
         },
         .new_slide => {
             try recordStudioPatch(history, try source_editor.insertBlankSlideAfter(

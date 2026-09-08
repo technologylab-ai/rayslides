@@ -2034,6 +2034,7 @@ pub const SlideSummary = struct {
     item_count: usize = 0,
     morph_count: usize = 0,
     transition_effect: animation.Effect = .none,
+    hidden: bool = false,
 };
 
 pub const LibraryEntryKind = enum {
@@ -2196,6 +2197,10 @@ pub const SemanticCommand = union(enum) {
     duplicate_slide: usize,
     delete_slide: usize,
     move_slide: SlideMoveCommand,
+    set_slide_hidden: struct {
+        slide_index: usize,
+        hidden: bool,
+    },
     /// Promotes the indexed authored slide to a reusable `@pushslide`
     /// definition. The integration layer chooses and validates its name.
     promote_slide_to_template: usize,
@@ -2592,6 +2597,20 @@ pub fn slidePreviewRect(card: rl.Rectangle) rl.Rectangle {
     const height = @min(card.height - inset * 2, (card.width * 0.54) * 9 / 16);
     const width = height * 16 / 9;
     return .{ .x = card.x + inset, .y = card.y + (card.height - height) / 2, .width = width, .height = height };
+}
+
+/// Eye toggle shown over the organizer thumbnail. Keeping this geometry
+/// public makes the draw and hit-test contract independently testable.
+pub fn slideVisibilityRect(card: rl.Rectangle) rl.Rectangle {
+    const preview = slidePreviewRect(card);
+    const size = @min(preview.height * 0.42, card.height * 0.34);
+    const inset = @max(@as(f32, 2), size * 0.16);
+    return .{
+        .x = preview.x + preview.width - size - inset,
+        .y = preview.y + inset,
+        .width = size,
+        .height = size,
+    };
 }
 
 pub fn libraryRowRect(layout: WorkspaceLayout, visible_slot: usize) ?rl.Rectangle {
@@ -10390,7 +10409,16 @@ pub const Studio = struct {
                 else
                     null;
                 if (summary_index) |index| {
-                    self.emitSlideSelection(items, workspace.slides[index].index);
+                    const summary = workspace.slides[index];
+                    if (pointInRectangle(pointer, slideVisibilityRect(card))) {
+                        self.prepareDeckCommand(items);
+                        self.pending_semantic_command = .{ .set_slide_hidden = .{
+                            .slide_index = summary.index,
+                            .hidden = !summary.hidden,
+                        } };
+                    } else {
+                        self.emitSlideSelection(items, summary.index);
+                    }
                 }
                 return true;
             }
@@ -13807,6 +13835,34 @@ pub const Studio = struct {
         }
     }
 
+    fn drawSlideVisibilityIcon(self: Studio, rect: rl.Rectangle, hidden: bool) void {
+        _ = self;
+        const color = if (hidden) theme.danger else theme.text;
+        const background = if (hidden) theme.danger_soft else theme.overlay;
+        rl.drawRectangleRounded(rect, 0.3, 6, theme.alpha(background, 242));
+        rl.drawRectangleRoundedLinesEx(rect, 0.3, 6, 1, theme.alpha(color, 210));
+
+        const center: rl.Vector2 = .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 };
+        const left: rl.Vector2 = .{ .x = rect.x + rect.width * 0.20, .y = center.y };
+        const right: rl.Vector2 = .{ .x = rect.x + rect.width * 0.80, .y = center.y };
+        const top: rl.Vector2 = .{ .x = center.x, .y = rect.y + rect.height * 0.29 };
+        const bottom: rl.Vector2 = .{ .x = center.x, .y = rect.y + rect.height * 0.71 };
+        const line_width = @max(@as(f32, 1), rect.width * 0.07);
+        rl.drawLineEx(left, top, line_width, color);
+        rl.drawLineEx(top, right, line_width, color);
+        rl.drawLineEx(right, bottom, line_width, color);
+        rl.drawLineEx(bottom, left, line_width, color);
+        rl.drawCircleV(center, @max(@as(f32, 1.5), rect.width * 0.10), color);
+        if (hidden) {
+            rl.drawLineEx(
+                .{ .x = rect.x + rect.width * 0.18, .y = rect.y + rect.height * 0.16 },
+                .{ .x = rect.x + rect.width * 0.82, .y = rect.y + rect.height * 0.84 },
+                @max(@as(f32, 2), rect.width * 0.11),
+                theme.danger,
+            );
+        }
+    }
+
     fn drawPanelSearchField(
         self: Studio,
         rect: rl.Rectangle,
@@ -14037,12 +14093,20 @@ pub const Studio = struct {
             const active = summary.index == workspace.current_slide;
             const hover = chrome_motion.smooth(chrome_motion.touchRow(card).hover);
             const border: rl.Color = if (active) theme.accent else chrome_motion.mixColor(theme.border, theme.accent, hover * 0.7);
+            const preview = slidePreviewRect(card);
+            if (summary.hidden) {
+                rl.drawRectangleRec(card, .{ .r = 112, .g = 116, .b = 124, .a = 104 });
+            }
             rl.drawRectangleLinesEx(card, if (active) 2 else 1, border);
             if (self.active_search == .slides and result_index == self.slide_search.selected_result)
                 rl.drawRectangleLinesEx(.{ .x = card.x + 3, .y = card.y + 3, .width = card.width - 6, .height = card.height - 6 }, 1, theme.accent_bright);
-            rl.drawRectangleLinesEx(slidePreviewRect(card), 1, theme.border);
+            rl.drawRectangleLinesEx(preview, 1, theme.border);
 
-            const preview = slidePreviewRect(card);
+            const visibility = slideVisibilityRect(card);
+            if (summary.hidden or pointInRectangle(rl.getMousePosition(), preview)) {
+                self.drawSlideVisibilityIcon(visibility, summary.hidden);
+            }
+
             const text_x = preview.x + preview.width + 9 * font_scale;
             const text_width = @max(0, card.x + card.width - text_x - 7 * font_scale);
             if (text_width <= 0) continue;
@@ -14054,10 +14118,10 @@ pub const Studio = struct {
             });
             var line_buffer: [96]u8 = undefined;
             const slide_number = std.fmt.bufPrintZ(&line_buffer, "SLIDE {d}", .{summary.index + 1}) catch "SLIDE";
-            self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 6 * font_scale }, compact_font, if (active) theme.accent_bright else theme.text_muted);
+            self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 6 * font_scale }, compact_font, if (summary.hidden) theme.text_disabled else if (active) theme.accent_bright else theme.text_muted);
             var title_buffer: [96]u8 = undefined;
             const title = self.fitUiText(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title, body_font, text_width);
-            self.drawUiText(title, .{ .x = text_x, .y = card.y + 23 * font_scale }, body_font, theme.text);
+            self.drawUiText(title, .{ .x = text_x, .y = card.y + 23 * font_scale }, body_font, if (summary.hidden) theme.text_muted else theme.text);
             var metadata_buffer: [96]u8 = undefined;
             const metadata = if (summary.transition_effect != .none)
                 std.fmt.bufPrintZ(
@@ -20077,6 +20141,32 @@ test "workspace layout exposes bounded slide thumbnail slots" {
     const short_workspace: Workspace = .{ .visible = true, .slides = &summaries };
     const short_studio: Studio = .{ .enabled = true };
     try std.testing.expect(short_studio.visibleSlidePreview(short_viewport, short_workspace, 0) == null);
+}
+
+test "slide thumbnail eye toggles hidden state without selecting the card" {
+    var items: [0]slides.SlideItem = .{};
+    const summaries = [_]SlideSummary{
+        .{ .index = 0, .title = "Visible" },
+        .{ .index = 1, .title = "Hidden", .hidden = true },
+    };
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0 };
+    const viewport: Viewport = .{ .slide_top_left = .zero(), .slide_size = default_logical_size };
+    const card = slideCardRect(workspaceLayout(viewport), 1).?;
+    const eye = slideVisibilityRect(card);
+    try std.testing.expect(pointInRectangle(rectangleCenter(eye), slidePreviewRect(card)));
+
+    var editor: Studio = .{ .enabled = true, .last_workspace_slide = 0 };
+    _ = editor.updateWithWorkspace(&items, &.{}, viewport, workspace, .{
+        .pointer_screen = rectangleCenter(eye),
+        .pointer_pressed = true,
+    });
+    switch (editor.takeSemanticCommand().?) {
+        .set_slide_hidden => |change| {
+            try std.testing.expectEqual(@as(usize, 1), change.slide_index);
+            try std.testing.expect(!change.hidden);
+        },
+        else => return error.UnexpectedSemanticCommand,
+    }
 }
 
 test "organizer card selects a slide and shields the canvas beneath it" {

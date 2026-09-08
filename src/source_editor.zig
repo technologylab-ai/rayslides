@@ -2325,6 +2325,35 @@ pub fn removeSlideTransition(
     return removeLiteralAttributes(allocator, source, slide_directive_offset, &transition_attribute_keys);
 }
 
+/// Set the presentation visibility of one rendered slide without touching
+/// any other boundary attributes. Both values are explicit so a `@popslide`
+/// instance can override a hidden slide-template definition.
+pub fn setSlideHidden(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    slide_directive_offset: usize,
+    hidden: bool,
+) (std.mem.Allocator.Error || PatchError)!PatchResult {
+    const range = try logicalSlideRange(source, slide_directive_offset);
+    if (!range.explicit_anchor) {
+        if (!hidden) return .{ .source = try allocator.dupe(u8, source), .byte_delta = 0 };
+        const layout = try inspectSlideLayout(source);
+        if (layout.has_component_definition or layout.has_slide_template_definition) {
+            return error.AmbiguousSlideTemplateLayout;
+        }
+        return insertDirectiveAt(allocator, source, deckPreambleEnd(source), "@slide hidden=true");
+    }
+    const line = try directiveLine(source, range.anchor_offset);
+    if (hasPotentialLetExpansion(source[line.start..line.content_end])) return error.InvalidSlideOffset;
+    const name = directiveName(source[line.start..line.content_end]);
+    if (!isRenderedSlideAnchor(name)) return error.InvalidSlideOffset;
+    const patches = [_]LiteralAttributePatch{.{
+        .key = "hidden",
+        .value = if (hidden) "true" else "false",
+    }};
+    return patchLiteralAttributes(allocator, source, range.anchor_offset, &patches);
+}
+
 const deck_transition_directives = [_][]const u8{ "@transition=", "@transition_duration=", "@transition_ease=" };
 
 fn findGlobalDirectiveLine(source: []const u8, prefix: []const u8) ?DirectiveLine {
@@ -7960,6 +7989,36 @@ test "logical slide range rejects non-anchor offsets" {
     const item = std.mem.indexOf(u8, source, "@box").?;
     try std.testing.expectError(error.InvalidSlideOffset, logicalSlideRange(source, item));
     try std.testing.expectError(error.InvalidSlideOffset, logicalSlideRange(source, source.len));
+}
+
+test "slide hidden patch preserves boundary attributes and supports an implicit deck" {
+    const source =
+        "@slide transition=fade\r\n" ++
+        "@box text=One\r\n" ++
+        "@slide hidden\r\n" ++
+        "@box text=Two\r\n";
+    const second = std.mem.indexOf(u8, source, "@slide hidden").?;
+    const shown = try setSlideHidden(std.testing.allocator, source, second, false);
+    defer shown.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@slide transition=fade\r\n@box text=One\r\n@slide hidden=false\r\n@box text=Two\r\n",
+        shown.source,
+    );
+
+    const hidden = try setSlideHidden(std.testing.allocator, shown.source, second, true);
+    defer hidden.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@slide transition=fade\r\n@box text=One\r\n@slide hidden=true\r\n@box text=Two\r\n",
+        hidden.source,
+    );
+
+    const implicit = "@fontsize=48\n@box text=Only\n";
+    const made_explicit = try setSlideHidden(std.testing.allocator, implicit, 0, true);
+    defer made_explicit.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "@fontsize=48\n@slide hidden=true\n@box text=Only\n",
+        made_explicit.source,
+    );
 }
 
 test "promote explicit slide moves its base to the library and preserves morph instance" {

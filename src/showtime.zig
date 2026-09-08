@@ -360,8 +360,10 @@ pub fn analyze(
 ) !Report {
     var report = Report.init(allocator);
     errdefer report.deinit();
-    report.summary.slides = slideshow.slides.items.len;
-    if (slideshow.slides.items.len == 0) {
+    for (slideshow.slides.items) |slide| if (!slide.hidden) {
+        report.summary.slides += 1;
+    };
+    if (report.summary.slides == 0) {
         try report.add(.error_, .deck, .empty_deck, null, null, null, null, "The deck has no slides", "Add at least one authored slide before presenting.");
     }
 
@@ -375,6 +377,7 @@ pub fn analyze(
     var observations = std.ArrayList(renderer.SlideshowRenderer.ShowtimeRenderItem).empty;
     defer observations.deinit(allocator);
     for (slideshow.slides.items, 0..) |slide, slide_index| {
+        if (slide.hidden) continue;
         report.summary.reveal_endpoints += render.stepCount(@intCast(slide_index)) + 1;
         const scene_count = slide.morph_states.items.len + 1;
         report.summary.scenes += scene_count;

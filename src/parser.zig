@@ -1340,6 +1340,21 @@ fn parseItemAttributes(line: []const u8, context: *ParserContext) !slides.ItemCo
                         }
                     }
                 }
+                if (std.mem.eql(u8, attrname, "hidden")) {
+                    if (attr_it.next()) |hidden_str| {
+                        if (std.mem.eql(u8, hidden_str, "true")) {
+                            item_context.slide_hidden = true;
+                        } else if (std.mem.eql(u8, hidden_str, "false")) {
+                            item_context.slide_hidden = false;
+                        } else {
+                            reportErrorInContext(ParserError.Syntax, context, "hidden= must be true or false");
+                        }
+                    } else {
+                        // The concise `@slide hidden` spelling is equivalent
+                        // to `hidden=true`; Studio writes the explicit form.
+                        item_context.slide_hidden = true;
+                    }
+                }
                 if (std.mem.eql(u8, attrname, "locked")) {
                     if (attr_it.next()) |locked_str| {
                         if (std.mem.eql(u8, locked_str, "true")) {
@@ -2253,6 +2268,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
             try validateCurrentMorphIds(context, parsing_item_context);
             var previous_slide_context = parsing_item_context.*;
             previous_slide_context.transition = null;
+            previous_slide_context.slide_hidden = null;
             context.current_slide.applyContext(&previous_slide_context); // ignore the new slide's transition
             context.current_slide.applyDefaultTransition(context.slideshow);
             try context.slideshow.slides.append(context.allocator, context.current_slide);
@@ -2279,6 +2295,9 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
                         context.current_slide.transition = transition;
                         context.current_slide.transition_authored = true;
                     }
+                    if (parsing_item_context.slide_hidden) |hidden| {
+                        context.current_slide.hidden = hidden;
+                    }
                     context.template_instance_base_open = true;
                 }
             } else {
@@ -2302,6 +2321,7 @@ fn commitParsingContext(parsing_item_context: *slides.ItemContext, context: *Par
             try validateCurrentMorphIds(context, parsing_item_context);
             var previous_slide_context = parsing_item_context.*;
             previous_slide_context.transition = null;
+            previous_slide_context.slide_hidden = null;
             context.current_slide.applyContext(&previous_slide_context); // ignore the new slide's transition
             context.current_slide.applyDefaultTransition(context.slideshow);
             try context.slideshow.slides.append(context.allocator, context.current_slide);
@@ -4268,6 +4288,27 @@ test "deck transition defaults apply to unauthored slides only" {
     // The final slide is emitted at EOF and still receives the deck default.
     try std.testing.expectEqual(animation.Effect.fade, s[4].transition.effect);
     try std.testing.expectEqual(animation.Easing.spring, s[4].transition.easing);
+}
+
+test "slide hidden attribute supports shorthand, explicit values, and template overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const slideshow = try slides.SlideShow.new(allocator);
+    const input =
+        "@box id=template_item text=Template\n" ++
+        "@pushslide optional hidden=true\n" ++
+        "@popslide optional\n" ++
+        "@popslide optional hidden=false\n" ++
+        "@slide hidden\n" ++
+        "@box text=Hidden\n";
+    const context = try constructSlidesFromBuf(input, slideshow, allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.parser_errors.items.len);
+    try std.testing.expectEqual(@as(usize, 3), slideshow.slides.items.len);
+    try std.testing.expect(slideshow.slides.items[0].hidden);
+    try std.testing.expect(!slideshow.slides.items[1].hidden);
+    try std.testing.expect(slideshow.slides.items[2].hidden);
 }
 
 test "a component reveal does not leak into later items through the popped context" {

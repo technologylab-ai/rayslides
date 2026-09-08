@@ -49,6 +49,10 @@
           <pre><code><span class="code-key">@slide</span>
 <span class="code-key">@bg</span> color=<span class="code-value">#07111fff</span>
 <span class="code-key">@box</span> x=<span class="code-value">120</span> y=<span class="code-value">160</span> w=<span class="code-value">1680</span> h=<span class="code-value">140</span> fontsize=<span class="code-value">72</span> text=<span class="code-string">A clear title</span></code></pre>
+          <p>Add <code class="inline-code">hidden</code> or <code class="inline-code">hidden=true</code> to a slide boundary to keep the slide in the deck while excluding it from presentation navigation, Presenter Companion, Showtime, Crowdplay readiness, and PDF export. Studio keeps hidden slides editable and marks their canvas and organizer card with a grey tint and a red crossed-out eye. Use <code class="inline-code">hidden=false</code> to override a hidden <code class="inline-code">@pushslide</code> template.</p>
+          <pre><code><span class="code-comment"># Kept for later, but skipped during the show.</span>
+<span class="code-key">@slide</span> hidden=true
+<span class="code-key">@box</span> x=120 y=160 w=1680 h=140 text=<span class="code-string">Optional poll</span></code></pre>
           <figure class="diagram coordinate-figure">
             <div class="diagram-frame coordinate-frame">
               <div class="coordinate-stage" role="img" aria-label="A box at x 120 and y 160 on a 1920 by 1080 slide">

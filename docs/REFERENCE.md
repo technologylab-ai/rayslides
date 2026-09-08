@@ -474,6 +474,16 @@ recognizable. Cards reflow through compact, default, and large densities
 without changing their hit targets. Selecting an available ITEM, GROUP, or
 SLIDE shows a full, read-only, source-order-resolved preview on the canvas
 without editing the deck; click the canvas or press <kbd>Esc</kbd> to return.
+
+Hover a slide thumbnail to reveal its eye control. Clicking the eye writes
+`hidden=true` on that slide boundary; the crossed-out eye stays visible in red
+while the slide is hidden, and clicking it writes `hidden=false`. Hidden slides
+remain editable and saved in the deck, with a grey tint on both the Studio
+canvas and organizer card, but presentation navigation, Presenter Companion,
+Showtime, Crowdplay readiness, and PDF export skip them. Source authors may
+also use the shorthand `@slide hidden`; `hidden=false` can make one
+`@popslide` instance visible when its template is hidden.
+
 Choose **Use** to place the selected element or group at its authored size, or
 to create the next slide from a selected template.
 Choose **Edit**, double-click the row, or choose the right-side **Properties**

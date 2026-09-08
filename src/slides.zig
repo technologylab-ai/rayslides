@@ -44,6 +44,9 @@ pub const Slide = struct {
     allocator: std.mem.Allocator,
     pos_in_editor: usize = 0,
     line_in_editor: usize = 0,
+    /// Hidden slides remain part of the authored deck and Studio organizer,
+    /// but presentation navigation and export skip them.
+    hidden: bool = false,
     /// Private presenter text attached to this logical slide. Notes are never
     /// renderer input and therefore cannot affect presentation/export pixels.
     speaker_notes: ?[]const u8 = null,
@@ -83,6 +86,7 @@ pub const Slide = struct {
     }
 
     pub fn applyContext(self: *Slide, ctx: *ItemContext) void {
+        if (ctx.slide_hidden) |hidden| self.hidden = hidden;
         if (ctx.fontSize) |fs| self.fontsize = fs;
         if (ctx.color) |col| self.text_color = col;
         if (ctx.bullet_color) |bul| self.bullet_color = bul;
@@ -107,6 +111,7 @@ pub const Slide = struct {
         // reuse visual structure, but its notes must not silently leak into
         // every @popslide instance.
         n.fontsize = orig.fontsize;
+        n.hidden = orig.hidden;
         n.text_color = orig.text_color;
         n.bullet_color = orig.bullet_color;
         n.bullet_symbol = orig.bullet_symbol;
@@ -850,6 +855,9 @@ pub const ItemContext = struct {
     /// from a reusable definition and none is generated.
     animation_disabled: bool = false,
     transition: ?animation.Transition = null,
+    /// Boundary-only state parsed from `@slide`, `@popslide`, or
+    /// `@pushslide`. It is intentionally not inherited by item contexts.
+    slide_hidden: ?bool = null,
     text_shadow: ?TextShadow = null,
     crowd: ?CrowdSpec = null,
     has_shadow_enabled: bool = false,
