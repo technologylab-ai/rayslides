@@ -3857,6 +3857,10 @@ pub fn main(init: std.process.Init) anyerror!void {
     }
 
     while (true) {
+        // Set by the command palette's Quit entry. Rayslides deliberately has
+        // no bare quit keystroke: a stray Q or Escape during a talk must be
+        // harmless.
+        var quit_requested = false;
         frame_diagnostics.observeFrame(rl.getTime());
         syncWindowTitle(studio_mode.dirty);
         var neovim_source_changed_this_frame = false;
@@ -4202,8 +4206,8 @@ pub fn main(init: std.process.Init) anyerror!void {
             goto_slide_picker.active or presenter_overlay_consumed_input or neovim_captures_input;
         // A modal or inline property draft is not part of the persisted source
         // yet. Do not let the OS close button silently throw it away; after
-        // submitting or cancelling, Q/Escape (or a fresh close request)
-        // follows the normal source-recovery path below.
+        // submitting or cancelling, the palette's Quit command (or a fresh
+        // close request) follows the normal source-recovery path below.
         if (window_close_requested and !text_input_active_at_frame_start and readyToQuitPreservingEdits(&studio_mode)) break;
 
         const studio_active_at_frame_start = studio_mode.capturesInput();
@@ -5260,6 +5264,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                             log.err("Showtime preflight failed: {any}", .{err});
                         }
                     },
+                    .quit_application => quit_requested = true,
                     .create_portable_show => {
                         pending_portable_show = true;
                         var folder_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -6392,9 +6397,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             }
         }
 
-        if (!presenter_overlay_captures_input and !property_prompt.active and !studio_file_browser.active and !studio_mode.textEntryActive() and (rl.isKeyPressed(.q) or
-            (rl.isKeyPressed(.escape) and !studio_active_at_frame_start and !presenter_pairing_visible_at_frame_start)))
-        {
+        if (quit_requested) {
             if (readyToQuitPreservingEdits(&studio_mode)) break;
         }
 
@@ -11718,6 +11721,7 @@ fn applyStudioSemanticEdit(
         .choose_presentation_display,
         .showtime_preflight,
         .create_portable_show,
+        .quit_application,
         .edit_library_entry,
         .motion_preview,
         => return error.NonSourceStudioCommand,

@@ -2123,6 +2123,10 @@ pub const SemanticCommand = union(enum) {
     choose_presentation_display: void,
     showtime_preflight: void,
     create_portable_show: void,
+    /// Leave the application. Rayslides has no destructive quit keystroke;
+    /// this intention comes from the command palette (or the window manager's
+    /// own close request) and still runs the unsaved-source recovery path.
+    quit_application: void,
     /// Replaces the pristine untitled placeholder with an ordinary starter
     /// `.sld` source in one undoable edit.
     create_starter_deck: NewDeckPreset,
@@ -3814,6 +3818,7 @@ pub const CommandId = enum {
     choose_presentation_display,
     showtime_preflight,
     create_portable_show,
+    quit_application,
     find_slides,
     find_library,
     find_objects,
@@ -3855,6 +3860,7 @@ const command_specs = [_]CommandSpec{
     .{ .id = .undo, .category = "HISTORY", .title = "Undo", .description = "Restore the previous source transaction", .keywords = "back history revert", .shortcut = "Cmd/Ctrl Z" },
     .{ .id = .redo, .category = "HISTORY", .title = "Redo", .description = "Reapply the next source transaction", .keywords = "forward history repeat", .shortcut = "Shift Cmd/Ctrl Z" },
     .{ .id = .edit_source_neovim, .category = "FILE", .title = "Edit source in Neovim", .description = "Open the complete in-memory .sld at the current rendered slide", .keywords = "source code syntax vim nvim text whole document", .shortcut = "Cmd/Ctrl E" },
+    .{ .id = .quit_application, .category = "FILE", .title = "Quit Rayslides", .description = "Close the app; unsaved Studio work is recovered to a copy first", .keywords = "exit close leave application shut down terminate" },
     .{ .id = .tool_select, .category = "TOOLS", .title = "Select tool", .description = "Select, move, resize, and marquee objects", .keywords = "pointer move resize marquee", .shortcut = "V" },
     .{ .id = .tool_text, .category = "TOOLS", .title = "Add text", .description = "Place a new source-backed text box", .keywords = "textbox type label", .shortcut = "T" },
     .{ .id = .tool_bullets, .category = "TOOLS", .title = "Add bullet list", .description = "Place a new bulleted text box", .keywords = "list bullets", .shortcut = "B" },
@@ -5649,6 +5655,7 @@ pub const Studio = struct {
             .choose_presentation_display,
             .showtime_preflight,
             .create_portable_show,
+            .quit_application,
             => .{ .enabled = true },
             .edit_speaker_notes,
             .pair_presenter_phone,
@@ -6239,6 +6246,7 @@ pub const Studio = struct {
             .choose_presentation_display => self.pending_semantic_command = .{ .choose_presentation_display = {} },
             .showtime_preflight => self.pending_semantic_command = .{ .showtime_preflight = {} },
             .create_portable_show => self.pending_semantic_command = .{ .create_portable_show = {} },
+            .quit_application => self.pending_semantic_command = .{ .quit_application = {} },
             .find_slides => self.activatePanelSearch(.slides),
             .find_library => self.activatePanelSearch(.library),
             .find_objects => self.activatePanelSearch(.objects),

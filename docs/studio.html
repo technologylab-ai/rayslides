@@ -369,6 +369,7 @@
           <h2>Find a command</h2>
           <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> to open the command list.</p>
           <p>Type an action, tool, category, or shortcut. Disabled commands stay visible and explain why they cannot run.</p>
+          <p>The <strong>File</strong> commands end with <strong>Quit Rayslides</strong>. No keystroke closes the app&mdash;<kbd>Q</kbd> and <kbd>Esc</kbd> are harmless during a talk&mdash;so this command and your window manager are the two ways out. See <a href="reference.html#quitting">Quit Rayslides</a>.</p>
           <p>The <strong>Present</strong> commands include speaker notes, private Presenter Companion pairing, <strong>Choose presentation display</strong>, <strong>Showtime preflight</strong>, and <strong>Create portable show</strong>. The display picker names and identifies active screens before you explicitly choose one; it never assumes an external monitor is the projector. Showtime checks the exact parser, renderer, assets, reusable definitions, display, and local services without changing the deck or playback. Portable show writes an ordinary copied <code>.sld</code> and assets, then independently re-opens and preflights the copy.</p>
           <figure class="shot">
             <img src="images/command-palette.png" alt="Studio command list showing save, history, authoring, presentation, and tool commands" width="2560" height="1440" loading="lazy">
@@ -457,7 +458,7 @@
             <li>Press <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> to save the current file.</li>
             <li>Press <kbd>Shift</kbd> + <kbd>Cmd/Ctrl</kbd> + <kbd>S</kbd> to save a copy.</li>
           </ul>
-          <p>Rayslides writes a recovery copy when you quit with unsaved work.</p>
+          <p>Rayslides writes a recovery copy when you quit with unsaved work. That protection runs whether you quit through <strong>Quit Rayslides</strong> in the command list or through your window manager; if the copy cannot be written, the quit is cancelled and the deck stays open.</p>
 
           <a class="next-guide" href="motion.html"><span><span>Next guide</span><strong>Animate a deck</strong></span><b aria-hidden="true">→</b></a>
         </main>

@@ -136,6 +136,10 @@ sleep/wake, Android, latency, or real-projector checklist item.
       margins, diagnostics HUD, cursor, laser drawing, or geometry preview.
 - [ ] Cancel or finish export, return to the original slide/step, then edit and
       Undo/Redo once to verify GPU/parser ownership is still sound.
+- [ ] Press <kbd>Q</kbd> and <kbd>Esc</kbd> repeatedly in windowed, borderless,
+      and exclusive fullscreen presentation. Neither key ends the app. Quit
+      through the palette's **Quit Rayslides** and through the window's close
+      button; both run the recovery-copy path above.
 
 ## 6. Embedded Neovim (enabled build)
 

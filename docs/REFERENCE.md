@@ -84,8 +84,6 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 
 | Shortcut | Description |
 | -------- | ----------- |
-| <kbd>Q</kbd> | Quit |
-| <kbd>ESC</kbd> | Quit |
 | <kbd>S</kbd> | Screen-Shot current slide  to PNG |
 | <kbd>SHIFT</kbd> + <kbd>S</kbd> | Screen-Shot and export slideshow to PDF |
 | <kbd>F</kbd> | Toggle fullscreen |
@@ -125,6 +123,23 @@ or <kbd>Cmd/Ctrl-G</kbd> closes it without changing the current slide or playbac
 state.
 
 **Beast Mode**: removes the 60 FPS limit
+
+## Quitting
+
+Rayslides has no quit keystroke. <kbd>Q</kbd> and <kbd>Esc</kbd> are harmless in
+presentation mode: a stray keypress in front of an audience must never end the
+show. Two paths close the app:
+
+- Run **Quit Rayslides** from the command palette. Press <kbd>E</kbd> to enter
+  Studio if you are presenting, then <kbd>Cmd/Ctrl-K</kbd> (or click
+  **Commands**) and choose **Quit Rayslides**.
+- Use your operating system or window manager: the window's close button,
+  <kbd>Cmd-Q</kbd> on macOS, or whatever your desktop binds to closing a
+  window.
+
+Both paths run the same protection. Unsaved Studio edits are written to a
+unique `*.edited.sld` recovery copy first, and if that copy cannot be written
+the quit is cancelled and the deck stays open.
 
 ## Studio visual editing
 
@@ -437,6 +452,7 @@ to the back, or to the front while preserving the group's internal paint
 order. A layer change is also one atomic source edit.
 <kbd>Cmd/Ctrl-N</kbd> or **+ Slide** inserts a new slide immediately after the
 current one. <kbd>Esc</kbd> cancels an active drag or tool, then leaves Studio.
+It never closes the app; see [Quitting](#quitting).
 
 <kbd>Cmd/Ctrl-C</kbd> copies selected authored objects to Studio's internal
 clipboard; <kbd>Cmd/Ctrl-V</kbd> pastes fresh objects into the current base or
