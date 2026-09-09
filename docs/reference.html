@@ -79,10 +79,18 @@
                 <tr><td><kbd>E</kbd></td><td>Enter or leave Studio.</td></tr>
                 <tr><td><kbd>Cmd/Ctrl-O</kbd></td><td>Browse for and open another <code class="inline-code">.sld</code> deck.</td></tr>
                 <tr><td><kbd>F3</kbd></td><td>Show or hide the diagnostics display.</td></tr>
-                <tr><td><kbd>Q</kbd> or <kbd>Esc</kbd></td><td>Quit.</td></tr>
               </tbody>
             </table>
           </div>
+          <div class="callout"><p><strong>No keystroke quits Rayslides.</strong> <kbd>Q</kbd> and <kbd>Esc</kbd> are harmless during a presentation. See <a href="#quitting">Quit Rayslides</a>.</p></div>
+
+          <h3 id="quitting">Quit Rayslides</h3>
+          <p>A stray keypress in front of an audience must never end the show, so Rayslides has no quit key. Close the app either way:</p>
+          <ul>
+            <li>Run <strong>Quit Rayslides</strong> from the command palette. Press <kbd>E</kbd> to enter Studio if you are presenting, then press <kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd> (or click <strong>Commands</strong>) and choose <strong>Quit Rayslides</strong>.</li>
+            <li>Use your operating system or window manager: the window's close button, <kbd>Cmd</kbd> + <kbd>Q</kbd> on macOS, or whatever your desktop binds to closing a window.</li>
+          </ul>
+          <p>Both paths run the same protection. Unsaved Studio edits are written to a unique <code class="inline-code">*.edited.sld</code> recovery copy first, and if that copy cannot be written the quit is cancelled and the deck stays open.</p>
 
           <h3 id="go-to-slide">Go directly to a slide</h3>
           <p>Press <kbd>Cmd/Ctrl</kbd> + <kbd>G</kbd> in either presentation mode or Studio. The centered picker accepts digits only and shows the current slide and the deck's slide count; it does not preview or navigate while you type.</p>

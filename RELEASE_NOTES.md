@@ -7,6 +7,15 @@ not yet a release declaration: physical-phone venue rehearsal and a real
 projector pass remain open in
 [`ROADMAP.md`](ROADMAP.md).
 
+### Quitting is deliberate
+
+- <kbd>Q</kbd> and <kbd>Esc</kbd> no longer quit Rayslides. A stray keypress in
+  front of an audience is now harmless.
+- The Studio command palette gained **Quit Rayslides** under FILE. Your
+  operating system or window manager closing the window still works.
+- Both paths run the existing unsaved-source recovery: a unique
+  `*.edited.sld` copy is written first, and a failed recovery cancels the quit.
+
 ### Optional embedded Neovim editor
 
 - Linux and macOS builds can opt in with `-Dneovim=true` to edit the complete
