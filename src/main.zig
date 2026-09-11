@@ -47,7 +47,7 @@ const cli_help =
     \\  --neovim-clean                  Start embedded Neovim without user config
     \\  --neovim-path=PATH              Try this Neovim executable first
     \\  --neovim-font=PATH              Render the editor with this font
-    \\  --neovim-font-size=PIXELS       Set editor text size from 10 through 48
+    \\  --neovim-font-size=PIXELS       Set base editor text size (10–48, follows UI scale)
     \\  --no-crowd                       Disable the Crowdplay server
     \\  --crowd-host=HOST                Bind Crowdplay to HOST
     \\  --crowd-port=PORT                Bind Crowdplay to PORT (default 7331)

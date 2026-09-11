@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const rl = @import("raylib");
 const build_options = @import("build_options");
 const fonts = @import("fonts.zig");
+const studio = @import("studio.zig");
 const support = @import("neovim");
 
 const log = std.log.scoped(.neovim_editor);
@@ -102,6 +103,8 @@ const EnabledController = struct {
     emoji_font: rl.Font,
     owns_emoji_font: bool = false,
     font_size: f32 = default_font_size,
+    base_font_size: f32 = default_font_size,
+    ui_scale: f32 = 1,
     cell_width: f32 = 12,
     cell_height: f32 = 24,
     configured: bool = false,
@@ -128,7 +131,8 @@ const EnabledController = struct {
         var editor_fontchars_storage: [768]i32 = undefined;
         const editor_fontchars = editorFontCharacters(&editor_fontchars_storage);
         const font_size = if (validFontSize(options.font_size)) options.font_size else default_font_size;
-        const font_load_size: i32 = @max(24, @as(i32, @intFromFloat(@ceil(font_size * 1.2))));
+        // Rasterize for the maximum Studio scale so resizing stays sharp.
+        const font_load_size: i32 = @max(24, @as(i32, @intFromFloat(@ceil(font_size * 2 * 1.2))));
         var font = rl.getFontDefault() catch unreachable;
         var owns_font = false;
         if (options.font_path) |candidate| {
@@ -200,6 +204,7 @@ const EnabledController = struct {
             .emoji_font = emoji_font,
             .owns_emoji_font = owns_emoji_font,
             .font_size = font_size,
+            .base_font_size = font_size,
             .cell_width = @max(8, measured.x),
             .cell_height = @ceil(font_size * 1.2),
             .default_clean = options.clean,
@@ -357,6 +362,15 @@ const EnabledController = struct {
     /// Updates transport and input. Returns true exactly on an overlay-close
     /// transition, including :q/:q!, BufWinLeave, EOF, and child failure.
     pub fn update(self: *EnabledController, outer: rl.Rectangle) bool {
+        self.ui_scale = studio.chromeScale(.{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(rl.getScreenWidth()),
+            .height = @floatFromInt(rl.getScreenHeight()),
+        });
+        self.font_size = self.base_font_size * self.ui_scale;
+        self.cell_width = @max(8 * self.ui_scale, rl.measureTextEx(self.font, "M", self.font_size, 0).x);
+        self.cell_height = @ceil(self.font_size * 1.2);
         const embedded = self.embedded orelse return false;
         if (embedded.shouldClose()) {
             self.closeSession();
@@ -409,7 +423,7 @@ const EnabledController = struct {
             }
         }
 
-        const content = contentRect(outer);
+        const content = contentRect(outer, self.ui_scale);
         const cols: usize = @max(10, @as(usize, @intFromFloat(@floor(content.width / self.cell_width))));
         const rows: usize = @max(4, @as(usize, @intFromFloat(@floor(content.height / self.cell_height))));
         if (self.configured and (cols != self.last_cols or rows != self.last_rows)) {
@@ -496,7 +510,8 @@ const EnabledController = struct {
         rl.drawRectangleRec(outer, .{ .r = 15, .g = 18, .b = 25, .a = 255 });
         rl.drawRectangleLinesEx(outer, 1, .{ .r = 88, .g = 98, .b = 120, .a = 255 });
 
-        const header = headerRect(outer);
+        const scale = self.ui_scale;
+        const header = headerRect(outer, self.ui_scale);
         rl.drawRectangleRec(header, .{ .r = 24, .g = 29, .b = 40, .a = 255 });
         const buffer_kind = if (live) self.buffer_kind else self.afterimage_kind;
         const field_kind = if (live) self.field_kind else self.afterimage_field;
@@ -507,22 +522,22 @@ const EnabledController = struct {
                 .speaker_notes => "EDIT SPEAKER NOTES · NEOVIM",
             },
         };
-        rl.drawTextEx(self.font, label, .{ .x = header.x + 14, .y = header.y + 9 }, 17, 0, .{ .r = 226, .g = 232, .b = 240, .a = 255 });
+        rl.drawTextEx(self.font, label, .{ .x = header.x + 14 * scale, .y = header.y + 9 * scale }, 17 * scale, 0, .{ .r = 226, .g = 232, .b = 240, .a = 255 });
         const status_text: [:0]const u8 = self.status[0..self.status_len :0];
-        const status_size = rl.measureTextEx(self.font, status_text, 14, 0);
+        const status_size = rl.measureTextEx(self.font, status_text, 14 * scale, 0);
         rl.drawTextEx(
             self.font,
             status_text,
-            .{ .x = header.x + header.width - status_size.x - 14, .y = header.y + 11 },
-            14,
+            .{ .x = header.x + header.width - status_size.x - 14 * scale, .y = header.y + 11 * scale },
+            14 * scale,
             0,
             .{ .r = 151, .g = 163, .b = 184, .a = 255 },
         );
 
-        const content = contentRect(outer);
+        const content = contentRect(outer, self.ui_scale);
         const snapshot = if (live)
             (if (self.snapshot_value) |*value| value else {
-                rl.drawTextEx(self.font, "Waiting for Neovim redraw…", .{ .x = content.x + 12, .y = content.y + 12 }, 18, 0, .{ .r = 190, .g = 198, .b = 210, .a = 255 });
+                rl.drawTextEx(self.font, "Waiting for Neovim redraw…", .{ .x = content.x + 12 * scale, .y = content.y + 12 * scale }, 18 * scale, 0, .{ .r = 190, .g = 198, .b = 210, .a = 255 });
                 return;
             })
         else
@@ -559,9 +574,9 @@ const EnabledController = struct {
                         .emoji => self.emoji_font,
                     };
                     const color = rayColor(foreground);
-                    rl.drawTextEx(cell_font, text, .{ .x = x, .y = y + 1 }, self.font_size, 0, color);
+                    rl.drawTextEx(cell_font, text, .{ .x = x, .y = y + scale }, self.font_size, 0, color);
                     if (paint.highlight.bold)
-                        rl.drawTextEx(cell_font, text, .{ .x = x + 0.65, .y = y + 1 }, self.font_size, 0, color);
+                        rl.drawTextEx(cell_font, text, .{ .x = x + 0.65 * scale, .y = y + scale }, self.font_size, 0, color);
                 }
                 const decoration = rayColor(paint.highlight.special orelse foreground);
                 if (paint.highlight.underline or paint.highlight.undercurl or paint.highlight.underdouble or
@@ -767,12 +782,12 @@ pub fn overlayRect(screen_width: i32, screen_height: i32) rl.Rectangle {
     };
 }
 
-fn headerRect(outer: rl.Rectangle) rl.Rectangle {
-    return .{ .x = outer.x, .y = outer.y, .width = outer.width, .height = 38 };
+fn headerRect(outer: rl.Rectangle, scale: f32) rl.Rectangle {
+    return .{ .x = outer.x, .y = outer.y, .width = outer.width, .height = 38 * scale };
 }
 
-fn contentRect(outer: rl.Rectangle) rl.Rectangle {
-    return .{ .x = outer.x + 1, .y = outer.y + 39, .width = outer.width - 2, .height = outer.height - 40 };
+fn contentRect(outer: rl.Rectangle, scale: f32) rl.Rectangle {
+    return .{ .x = outer.x + scale, .y = outer.y + 39 * scale, .width = outer.width - 2 * scale, .height = outer.height - 40 * scale };
 }
 
 fn keyTriggered(key: rl.KeyboardKey) bool {

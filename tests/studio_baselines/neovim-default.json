@@ -6,9 +6,9 @@
   "render": {
     "events": 1, "last_mode": "full", "last_rebuilt": 24, "total_slides": 24,
     "full_count": 1, "partial_count": 0, "unchanged_count": 0,
-    "last_full_ms": 25.767, "last_partial_ms": 0.000, "last_unchanged_ms": 0.000
+    "last_full_ms": 0.699, "last_partial_ms": 0.000, "last_unchanged_ms": 0.000
   },
-  "studio": { "prepare_ms": 0.089, "document_cache_builds": 1, "scene_cache_builds": 1, "composition_cache_builds": 1, "gallery_cache_builds": 1, "gallery_projected": 24, "gallery_placeholders": 0 },
-  "frame": { "latest_ms": 16.667, "sampled_peak_ms": 56.320, "sampled_slow_frames": 1 },
-  "parser_arena_bytes": 532518
+  "studio": { "prepare_ms": 0.012, "document_cache_builds": 1, "scene_cache_builds": 1, "composition_cache_builds": 1, "gallery_cache_builds": 1, "gallery_projected": 24, "gallery_placeholders": 0 },
+  "frame": { "latest_ms": 16.677, "sampled_peak_ms": 16.692, "sampled_slow_frames": 0 },
+  "parser_arena_bytes": 815784
 }
