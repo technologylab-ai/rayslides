@@ -299,6 +299,7 @@ pub const ChromeLayout = struct {
     left_dock: rl.Rectangle = empty_frame_rectangle,
     right_dock: rl.Rectangle = empty_frame_rectangle,
     status: rl.Rectangle = empty_frame_rectangle,
+    field_editor: rl.Rectangle = empty_frame_rectangle,
     left_visible: bool = false,
     right_visible: bool = false,
     visible: bool = false,
@@ -2086,6 +2087,8 @@ pub const Workspace = struct {
     new_deck: bool = false,
     slides: []const SlideSummary = &.{},
     current_slide: usize = 0,
+    /// Borrowed current-slide notes for preview layout and input routing.
+    speaker_notes: []const u8 = "",
     library: []const LibraryEntry = &.{},
     /// Aligned one-for-one with `library`; a missing/short slice draws a
     /// deterministic placeholder without changing Library hit targets.
@@ -2255,6 +2258,7 @@ pub const UiLayout = struct {
     properties_dock_toggle: rl.Rectangle = empty_ui_rectangle,
     command_palette: rl.Rectangle = empty_ui_rectangle,
     focus_canvas: rl.Rectangle = empty_ui_rectangle,
+    notes_toggle: rl.Rectangle = empty_ui_rectangle,
     properties: rl.Rectangle,
     edit_text: rl.Rectangle,
     duplicate_item: rl.Rectangle,
@@ -3227,7 +3231,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
     }
     const margin: f32 = 12 * scale;
     const docked = if (viewport.chrome) |chrome| chrome.visible else false;
-    const compact_toolbar = if (viewport.chrome) |chrome| chrome.content.width < 1100 else false;
+    const compact_toolbar = if (viewport.chrome) |chrome| chrome.content.width / chrome.scale < 1200 else false;
     const gap: f32 = @as(f32, if (compact_toolbar) 3 else 5) * scale;
     // Tool buttons carry 3-4 character text labels, so they are sized as a
     // segmented control: wide enough for "RECT", only as tall as the band.
@@ -3306,9 +3310,15 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .width = focus_width,
         .height = tool_size,
     } else empty_ui_rectangle;
+    const notes_toggle: rl.Rectangle = if (docked) .{
+        .x = focus_canvas.x - dock_button_gap - focus_width,
+        .y = tool_row_y,
+        .width = focus_width,
+        .height = tool_size,
+    } else empty_ui_rectangle;
     const show_dock_toggles = docked and !(viewport.chrome.?.left_visible and viewport.chrome.?.right_visible);
     const properties_dock_toggle: rl.Rectangle = if (show_dock_toggles) .{
-        .x = focus_canvas.x - dock_button_gap - properties_toggle_width,
+        .x = notes_toggle.x - dock_button_gap - properties_toggle_width,
         .y = focus_canvas.y,
         .width = properties_toggle_width,
         .height = tool_size,
@@ -3320,7 +3330,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .height = tool_size,
     } else empty_ui_rectangle;
     const command_width: f32 = @as(f32, if (compact_toolbar) 84 else 98) * scale;
-    const command_anchor_x = if (slides_dock_toggle.width > 0) slides_dock_toggle.x else focus_canvas.x;
+    const command_anchor_x = if (slides_dock_toggle.width > 0) slides_dock_toggle.x else notes_toggle.x;
     const command_palette: rl.Rectangle = if (docked) .{
         .x = command_anchor_x - dock_button_gap - command_width,
         .y = focus_canvas.y,
@@ -3495,6 +3505,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
             .slides_dock_toggle = slides_dock_toggle,
             .properties_dock_toggle = properties_dock_toggle,
             .command_palette = command_palette,
+            .notes_toggle = notes_toggle,
             .focus_canvas = focus_canvas,
             .properties = properties,
             .edit_text = edit_text,
@@ -3665,6 +3676,7 @@ pub fn uiLayout(viewport: Viewport) UiLayout {
         .slides_dock_toggle = slides_dock_toggle,
         .properties_dock_toggle = properties_dock_toggle,
         .command_palette = command_palette,
+        .notes_toggle = notes_toggle,
         .focus_canvas = focus_canvas,
         .properties = properties,
         .edit_text = edit_text,
@@ -3813,6 +3825,7 @@ pub const CommandId = enum {
     show_slides,
     show_objects,
     show_properties,
+    toggle_notes,
     edit_speaker_notes,
     pair_presenter_phone,
     choose_presentation_display,
@@ -3887,6 +3900,7 @@ const command_specs = [_]CommandSpec{
     .{ .id = .show_slides, .category = "VIEW", .title = "Show Slides and Library", .description = "Open the deck organizer dock", .keywords = "left dock organizer reusable" },
     .{ .id = .show_objects, .category = "VIEW", .title = "Show Objects", .description = "Open the source-aware object stack", .keywords = "layers inspector right dock" },
     .{ .id = .show_properties, .category = "VIEW", .title = "Show Properties", .description = "Open precise inline object properties", .keywords = "inspector right dock values" },
+    .{ .id = .toggle_notes, .category = "VIEW", .title = "Toggle speaker notes", .description = "Show or hide private notes below the slide", .keywords = "presenter notes pane dock" },
     .{ .id = .edit_speaker_notes, .category = "PRESENT", .title = "Edit speaker notes", .description = "Edit private notes for the current slide", .keywords = "presenter companion phone notes cue" },
     .{ .id = .pair_presenter_phone, .category = "PRESENT", .title = "Pair presenter phone", .description = "Show the private Presenter Companion QR", .keywords = "mobile remote companion qr connect" },
     .{ .id = .choose_presentation_display, .category = "PRESENT", .title = "Choose presentation display", .description = "Identify and explicitly select the projector display", .keywords = "monitor screen beamer projector output venue", .shortcut = "D" },
@@ -4711,6 +4725,12 @@ pub const Studio = struct {
     /// Focus Canvas keeps editing/selection live while hiding all permanent
     /// chrome. The next frame should be obtained through layoutFrame().
     focus_canvas: bool = false,
+    notes_visible: bool = false,
+    notes_scroll: f32 = 0,
+    notes_scroll_slide: ?usize = null,
+    notes_drag_offset: ?f32 = null,
+    /// Set by the integration while a field editor (including its exit motion) is visible.
+    field_editor_visible: bool = false,
     /// Below the wide breakpoint only this dock is reserved beside the slide.
     active_dock: DockPanel = .slides,
     /// Wide windows always reserve the right dock; this chooses its content.
@@ -4828,7 +4848,28 @@ pub const Studio = struct {
             fitted.canvas_area = result.canvas_area;
             result.viewport = fitted;
         }
-        result.viewport = applyCanvasCamera(result.viewport, self.canvas_zoom, self.canvas_center);
+        if (self.field_editor_visible or (self.notes_visible and !self.focus_canvas)) {
+            const outer = result.canvas_area;
+            const gap = 8 * result.chrome.scale;
+            const minimum_height = @min(@max(outer.height * 0.22, 180 * result.chrome.scale), outer.height * 0.42);
+            const height = @max(minimum_height, outer.height - outer.width * default_logical_size.y / default_logical_size.x - gap);
+            result.chrome.field_editor = .{
+                .x = outer.x,
+                .y = outer.y + outer.height - height,
+                .width = outer.width,
+                .height = height,
+            };
+            result.canvas_area.height = @max(0, outer.height - height - gap);
+            var fitted = fitSlideViewport(result.canvas_area);
+            fitted.slide_top_left.y = result.canvas_area.y;
+            result.canvas_area.height = fitted.slide_size.y;
+            fitted.chrome = result.chrome;
+            fitted.canvas_area = result.canvas_area;
+            result.viewport = fitted;
+        }
+        // Field editing temporarily fits the whole slide; the author's camera
+        // is retained and restored when the editor closes.
+        if (!self.field_editor_visible) result.viewport = applyCanvasCamera(result.viewport, self.canvas_zoom, self.canvas_center);
         return result;
     }
 
@@ -5373,6 +5414,7 @@ pub const Studio = struct {
             .{ .key = 25, .anchor = layout.slides_dock_toggle, .title = "Slides and Library", .detail = "Open the deck organizer and reusable Library" },
             .{ .key = 26, .anchor = layout.properties_dock_toggle, .title = "Inspector", .detail = "Open Objects or precise Properties" },
             .{ .key = 27, .anchor = layout.command_palette, .title = "Command palette", .detail = "Search every contextual Studio action", .shortcut = "Cmd/Ctrl K" },
+            .{ .key = 30, .anchor = layout.notes_toggle, .title = "Speaker notes", .detail = "Show private notes below the slide; Edit opens the field editor", .shortcut = "" },
             .{ .key = 28, .anchor = layout.focus_canvas, .title = "Focus Canvas", .detail = "Hide Studio chrome while keeping editing live", .shortcut = "Tab" },
         };
         for (chrome_targets) |target| {
@@ -5652,6 +5694,7 @@ pub const Studio = struct {
             .show_slides,
             .show_objects,
             .show_properties,
+            .toggle_notes,
             .choose_presentation_display,
             .showtime_preflight,
             .create_portable_show,
@@ -6240,7 +6283,15 @@ pub const Studio = struct {
                 self.active_dock = .properties;
                 self.inspector_panel = .properties;
             },
-            .edit_speaker_notes => self.pending_semantic_command = .{ .edit_speaker_notes = {} },
+            .toggle_notes => {
+                self.notes_visible = !self.notes_visible;
+                if (self.notes_visible) self.focus_canvas = false;
+            },
+            .edit_speaker_notes => {
+                self.notes_visible = true;
+                self.focus_canvas = false;
+                self.pending_semantic_command = .{ .edit_speaker_notes = {} };
+            },
             .pair_presenter_phone => self.pending_semantic_command = .{ .pair_presenter_phone = {} },
             .go_to_slide => self.pending_semantic_command = .{ .go_to_slide = {} },
             .choose_presentation_display => self.pending_semantic_command = .{ .choose_presentation_display = {} },
@@ -8553,6 +8604,7 @@ pub const Studio = struct {
             }
         }
 
+        if (self.handleNotesPreview(viewport, workspace, input)) return null;
         if (self.handleViewNavigation(items, viewport, input)) return null;
         if (input.pointer_pressed and self.precisionChromeContainsPoint(viewport, input.pointer_screen)) return null;
 
@@ -10804,6 +10856,14 @@ pub const Studio = struct {
     ) bool {
         const layout = uiLayout(viewport);
         const inspector = objectsLayout(viewport);
+        if (viewport.chrome) |chrome| {
+            if (pointInRectangle(pointer, chrome.field_editor)) {
+                if (!self.field_editor_visible and self.definition_mode == null and workspace.slides.len > 0 and
+                    pointInRectangle(pointer, notesEditButton(chrome.field_editor, uiScale(viewport))))
+                    self.pending_semantic_command = .{ .edit_speaker_notes = {} };
+                return true;
+            }
+        }
         const in_status = pointInRectangle(pointer, statusPanel(viewport));
         const in_toolbar = pointInRectangle(pointer, layout.toolbar);
         const in_inspector = pointInRectangle(pointer, inspector.panel);
@@ -10829,6 +10889,10 @@ pub const Studio = struct {
                     .objects
                 else
                     .properties;
+                return true;
+            }
+            if (pointInRectangle(pointer, layout.notes_toggle)) {
+                self.notes_visible = !self.notes_visible;
                 return true;
             }
             if (pointInRectangle(pointer, layout.focus_canvas)) {
@@ -15670,6 +15734,148 @@ pub const Studio = struct {
         );
     }
 
+    const NotesPreviewLayout = struct {
+        body: rl.Rectangle,
+        track: rl.Rectangle,
+        thumb: rl.Rectangle,
+        line_height: f32,
+        max_scroll: f32,
+        scroll: f32,
+    };
+
+    fn notesFontAdvances(self: Studio, font: i32) [128]f32 {
+        var advances: [128]f32 = undefined;
+        for (&advances, 0..) |*advance, codepoint| {
+            const glyph = [_:0]u8{@intCast(codepoint)};
+            advance.* = self.measureUiText(&glyph, font);
+        }
+        return advances;
+    }
+
+    /// Shared wrapping keeps scroll extents and rendered lines identical.
+    /// Cache ASCII advances once per pass instead of measuring every growing
+    /// prefix: long notes must not make the Studio frame quadratic in line length.
+    fn nextNotesLine(self: Studio, notes: []const u8, start: *usize, buffer: []u8, font: i32, advances: *const [128]f32, width: f32) ?[:0]const u8 {
+        if (start.* >= notes.len) return null;
+        const begin = start.*;
+        var end = begin;
+        var word_end = begin;
+        var line_width: f32 = 0;
+        while (end < notes.len and notes[end] != '\n') {
+            const len = std.unicode.utf8ByteSequenceLength(notes[end]) catch 1;
+            const next = @min(notes.len, end + len);
+            if (next - begin >= buffer.len) break;
+            var glyph: [5:0]u8 = @splat(0);
+            @memcpy(glyph[0 .. next - end], notes[end..next]);
+            const advance = if (notes[end] < 128) advances[notes[end]] else self.measureUiText(glyph[0 .. next - end :0], font);
+            if (end > begin and line_width + advance > width) break;
+            line_width += advance;
+            if (notes[end] == ' ') word_end = end;
+            end = next;
+        }
+        if (end < notes.len and notes[end] != '\n' and word_end > begin) end = word_end;
+        @memcpy(buffer[0 .. end - begin], notes[begin..end]);
+        buffer[end - begin] = 0;
+        start.* = if (end < notes.len and (notes[end] == '\n' or notes[end] == ' ')) end + 1 else end;
+        return buffer[0 .. end - begin :0];
+    }
+
+    fn notesPreviewLayout(self: Studio, viewport: Viewport, notes: []const u8, slide_index: usize) NotesPreviewLayout {
+        const panel = if (viewport.chrome) |chrome| chrome.field_editor else empty_frame_rectangle;
+        const scale = uiScale(viewport);
+        const font = scaledUiFont(scale, UiTypography.body);
+        const line_height = @as(f32, @floatFromInt(font)) * 1.4;
+        const body = rl.Rectangle{ .x = panel.x + 12 * scale, .y = panel.y + 46 * scale, .width = @max(0, panel.width - 42 * scale), .height = @max(0, panel.height - 54 * scale) };
+        const track = rl.Rectangle{ .x = panel.x + panel.width - 22 * scale, .y = body.y, .width = 14 * scale, .height = body.height };
+        var start: usize = 0;
+        var lines: usize = 0;
+        var buffer: [2048]u8 = undefined;
+        const advances = self.notesFontAdvances(font);
+        while (self.nextNotesLine(notes, &start, &buffer, font, &advances, body.width) != null) lines += 1;
+        const content_height = @as(f32, @floatFromInt(lines)) * line_height;
+        const max_scroll = @max(0, content_height - body.height);
+        const scroll = if (self.notes_scroll_slide == slide_index) std.math.clamp(self.notes_scroll, 0, max_scroll) else 0;
+        const thumb_height = if (max_scroll > 0) @min(track.height, @max(24 * scale, track.height * body.height / content_height)) else track.height;
+        const thumb = rl.Rectangle{
+            .x = track.x,
+            .y = track.y + if (max_scroll > 0) scroll / max_scroll * (track.height - thumb_height) else 0,
+            .width = track.width,
+            .height = thumb_height,
+        };
+        return .{ .body = body, .track = track, .thumb = thumb, .line_height = line_height, .max_scroll = max_scroll, .scroll = scroll };
+    }
+
+    fn handleNotesPreview(self: *Studio, viewport: Viewport, workspace: Workspace, input: FrameInput) bool {
+        if (self.notes_scroll_slide != workspace.current_slide) {
+            self.notes_scroll_slide = workspace.current_slide;
+            self.notes_scroll = 0;
+            self.notes_drag_offset = null;
+        }
+        if (!self.notes_visible or self.field_editor_visible or self.focus_canvas) {
+            self.notes_drag_offset = null;
+            return false;
+        }
+        const chrome = viewport.chrome orelse return false;
+        const layout = self.notesPreviewLayout(viewport, workspace.speaker_notes, workspace.current_slide);
+        self.notes_scroll = layout.scroll;
+        if (self.notes_drag_offset) |offset| {
+            if (input.pointer_down and layout.max_scroll > 0) {
+                const travel = layout.track.height - layout.thumb.height;
+                if (travel > 0) self.notes_scroll = std.math.clamp((input.pointer_screen.y - layout.track.y - offset) / travel, 0, 1) * layout.max_scroll;
+            } else self.notes_drag_offset = null;
+            return true;
+        }
+        if (input.workspace_scroll != 0 and pointInRectangle(input.pointer_screen, chrome.field_editor)) {
+            self.notes_scroll = std.math.clamp(self.notes_scroll - input.workspace_scroll * layout.line_height * 3, 0, layout.max_scroll);
+            return true;
+        }
+        if (input.pointer_pressed and layout.max_scroll > 0 and pointInRectangle(input.pointer_screen, layout.track)) {
+            if (pointInRectangle(input.pointer_screen, layout.thumb)) {
+                self.notes_drag_offset = input.pointer_screen.y - layout.thumb.y;
+            } else {
+                const direction: f32 = if (input.pointer_screen.y < layout.thumb.y) -1 else 1;
+                self.notes_scroll = std.math.clamp(self.notes_scroll + direction * layout.body.height, 0, layout.max_scroll);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    pub fn drawNotesPane(self: Studio, viewport: Viewport, notes: []const u8, slide_number: usize) void {
+        if (!self.enabled or !self.notes_visible or self.field_editor_visible or self.focus_canvas) return;
+        const chrome = viewport.chrome orelse return;
+        const panel = chrome.field_editor;
+        if (panel.width <= 0 or panel.height <= 0) return;
+        const scale = uiScale(viewport);
+        const font = scaledUiFont(scale, UiTypography.body);
+        const layout = self.notesPreviewLayout(viewport, notes, slide_number -| 1);
+        drawStudioPanel(panel);
+        const edit = notesEditButton(panel, scale);
+        var heading: [96]u8 = undefined;
+        const title = std.fmt.bufPrintZ(&heading, "SPEAKER NOTES · SLIDE {d}", .{slide_number}) catch "SPEAKER NOTES";
+        self.drawUiText(title, .{ .x = panel.x + 12 * scale, .y = panel.y + 12 * scale }, scaledUiFont(scale, UiTypography.compact), theme.text_heading);
+        if (self.definition_mode == null) drawActionButton(self, edit, "Edit") else drawDisabledBadge(self, edit, "Edit");
+        if (layout.max_scroll > 0) {
+            rl.drawRectangleRounded(layout.track, 0.6, 6, theme.sunken);
+            rl.drawRectangleRounded(layout.thumb, 0.6, 6, if (self.notes_drag_offset != null) theme.text_secondary else theme.border_strong);
+        }
+        chrome_motion.pushClip(layout.body);
+        defer chrome_motion.popClip();
+        if (notes.len == 0) {
+            self.drawUiText("Add private speaker notes with Edit.", .{ .x = layout.body.x, .y = layout.body.y }, font, theme.text_secondary);
+            return;
+        }
+        var start: usize = 0;
+        var y = layout.body.y - layout.scroll;
+        var line: [2048]u8 = undefined;
+        const advances = self.notesFontAdvances(font);
+        while (y < layout.body.y + layout.body.height) : (y += layout.line_height) {
+            const text = self.nextNotesLine(notes, &start, &line, font, &advances, layout.body.width) orelse break;
+            if (y + layout.line_height > layout.body.y)
+                self.drawUiText(text, .{ .x = layout.body.x, .y = y }, font, theme.text);
+        }
+    }
+
     fn drawToolbar(self: Studio, viewport: Viewport) void {
         const layout = uiLayout(viewport);
         const compact_toolbar = if (viewport.chrome) |chrome| chrome.content.width < 1100 else false;
@@ -15707,6 +15913,7 @@ pub const Studio = struct {
             self.active_dock == .objects or self.active_dock == .properties,
         );
         drawActionButton(self, layout.command_palette, "Commands");
+        drawToggleButton(self, layout.notes_toggle, "Notes", self.notes_visible);
         drawActionButton(self, layout.focus_canvas, "Focus");
     }
 
@@ -17013,6 +17220,10 @@ fn inlineErrorMessage(reason: InlineError) [:0]const u8 {
         .invalid_state_label => "Labels start with a letter or _ and use letters, digits, _ or - (empty removes it)",
         .source_edit_failed => "Source changed; Esc cancels this guarded draft",
     };
+}
+
+pub fn notesEditButton(panel: rl.Rectangle, scale: f32) rl.Rectangle {
+    return .{ .x = panel.x + panel.width - 72 * scale, .y = panel.y + 8 * scale, .width = 60 * scale, .height = 28 * scale };
 }
 
 fn drawStudioPanel(rect: rl.Rectangle) void {
@@ -24591,4 +24802,144 @@ test "timeline arrows reorder the active build without changing paint order" {
     });
     try std.testing.expect(studio.takeSemanticCommand() == null);
     try std.testing.expect(!studio.dirty);
+}
+
+test "notes and field editors reserve space below the slide at every Studio size" {
+    for ([_]rl.Vector2{ .{ .x = 900, .y = 506 }, .{ .x = 1100, .y = 700 }, .{ .x = 1199, .y = 700 }, .{ .x = 1200, .y = 800 }, .{ .x = 1600, .y = 900 }, .{ .x = 2000, .y = 1250 }, .{ .x = 3840, .y = 2160 } }) |size| {
+        const content = rl.Rectangle{ .x = 0, .y = 0, .width = size.x, .height = size.y };
+        var editor: Studio = .{ .enabled = true, .notes_visible = true };
+        const frame = editor.layoutFrame(content);
+        try std.testing.expect(frame.viewport.valid());
+        try expectRectangleContained(content, frame.chrome.field_editor);
+        try expectRectangleContained(content, frame.canvas_area);
+        try std.testing.expect(!rectanglesOverlap(frame.canvas_area, frame.chrome.field_editor));
+        try std.testing.expect(frame.viewport.slide_top_left.y + frame.viewport.slide_size.y < frame.chrome.field_editor.y);
+        const controls = uiLayout(frame.viewport);
+        try expectRectangleContained(controls.toolbar, controls.notes_toggle);
+        try std.testing.expect(!rectanglesOverlap(controls.notes_toggle, controls.focus_canvas));
+        try std.testing.expect(!rectanglesOverlap(controls.notes_toggle, controls.command_palette));
+        try std.testing.expect(!rectanglesOverlap(controls.scene_next, controls.command_palette));
+        editor.notes_visible = false;
+        editor.field_editor_visible = true;
+        const field = editor.layoutFrame(content);
+        try std.testing.expectEqualDeep(frame.chrome.field_editor, field.chrome.field_editor);
+        editor.canvas_zoom = 2;
+        try std.testing.expectEqualDeep(field.viewport, editor.layoutFrame(content).viewport);
+        editor.field_editor_visible = false;
+        try std.testing.expectEqual(@as(f32, 2), editor.canvas_zoom);
+        try std.testing.expectEqual(@as(f32, 0), editor.layoutFrame(content).chrome.field_editor.height);
+        editor.notes_visible = true;
+        editor.focus_canvas = true;
+        try std.testing.expectEqual(@as(f32, 0), editor.layoutFrame(content).chrome.field_editor.height);
+        editor.field_editor_visible = true;
+        const focus_field = editor.layoutFrame(content);
+        try std.testing.expect(!rectanglesOverlap(focus_field.canvas_area, focus_field.chrome.field_editor));
+    }
+}
+
+test "Notes toolbar and palette toggle the pane and Edit emits current-slide notes intent" {
+    var editor: Studio = .{ .enabled = true };
+    var items = [_]slides.SlideItem{};
+    const summaries = [_]SlideSummary{.{ .index = 0 }};
+    const workspace: Workspace = .{ .visible = true, .slides = &summaries, .current_slide = 0 };
+    const content = rl.Rectangle{ .x = 0, .y = 0, .width = 1600, .height = 900 };
+    var frame = editor.layoutFrame(content);
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = rectangleCenter(uiLayout(frame.viewport).notes_toggle),
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(editor.notes_visible);
+    frame = editor.layoutFrame(content);
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = rectangleCenter(notesEditButton(frame.chrome.field_editor, frame.chrome.scale)),
+        .pointer_pressed = true,
+    });
+    try std.testing.expectEqual(SemanticCommand.edit_speaker_notes, std.meta.activeTag(editor.takeSemanticCommand().?));
+    editor.executeCommand(&items, &.{}, frame.viewport, workspace, .toggle_notes);
+    try std.testing.expect(!editor.notes_visible);
+    editor.focus_canvas = true;
+    editor.executeCommand(&items, &.{}, frame.viewport, workspace, .edit_speaker_notes);
+    try std.testing.expect(editor.notes_visible);
+    try std.testing.expect(!editor.focus_canvas);
+    try std.testing.expectEqual(SemanticCommand.edit_speaker_notes, std.meta.activeTag(editor.takeSemanticCommand().?));
+}
+
+test "notes preview wheel, paging, and scrollbar drag stay inside the notes pane" {
+    var editor: Studio = .{ .enabled = true, .notes_visible = true };
+    var items = [_]slides.SlideItem{};
+    const summaries = [_]SlideSummary{ .{ .index = 0 }, .{ .index = 1 } };
+    var workspace: Workspace = .{ .visible = true, .slides = &summaries, .speaker_notes = "A line of speaker notes.\n" ** 40 };
+    const frame = editor.layoutFrame(.{ .x = 0, .y = 0, .width = 1600, .height = 900 });
+    var layout = editor.notesPreviewLayout(frame.viewport, workspace.speaker_notes, 0);
+    try std.testing.expect(layout.max_scroll > 0);
+    try expectRectangleContained(frame.chrome.field_editor, layout.track);
+    try expectRectangleContained(layout.track, layout.thumb);
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.body),
+        .workspace_scroll = -2,
+    });
+    try std.testing.expect(editor.notes_scroll > 0);
+    try std.testing.expectEqual(@as(f32, 1), editor.canvas_zoom);
+    try std.testing.expect(editor.takeSemanticCommand() == null);
+    layout = editor.notesPreviewLayout(frame.viewport, workspace.speaker_notes, 0);
+    try std.testing.expect(layout.thumb.y > layout.track.y);
+    const before_page = editor.notes_scroll;
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = .{ .x = layout.track.x + 2, .y = layout.track.y + layout.track.height - 1 },
+        .pointer_pressed = true,
+    });
+    try std.testing.expect(editor.notes_scroll > before_page);
+    layout = editor.notesPreviewLayout(frame.viewport, workspace.speaker_notes, 0);
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.thumb),
+        .pointer_pressed = true,
+        .pointer_down = true,
+    });
+    try std.testing.expect(editor.notes_drag_offset != null);
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = .{ .x = 0, .y = layout.track.y + layout.track.height + 100 },
+        .pointer_down = true,
+    });
+    try std.testing.expectEqual(layout.max_scroll, editor.notes_scroll);
+    layout = editor.notesPreviewLayout(frame.viewport, workspace.speaker_notes, 0);
+    try std.testing.expectApproxEqAbs(layout.track.y + layout.track.height, layout.thumb.y + layout.thumb.height, 0.01);
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{});
+    try std.testing.expect(editor.notes_drag_offset == null);
+    workspace.current_slide = 1;
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{});
+    try std.testing.expectEqual(@as(f32, 0), editor.notes_scroll);
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{
+        .pointer_screen = rectangleCenter(layout.body),
+        .workspace_scroll = -1000,
+    });
+    try std.testing.expect(editor.notes_scroll > 0);
+    const before_resize = editor.notes_scroll;
+    const taller = editor.layoutFrame(.{ .x = 0, .y = 0, .width = 1600, .height = 1400 });
+    _ = editor.updateWithWorkspace(&items, &.{}, taller.viewport, workspace, .{});
+    try std.testing.expect(editor.notes_scroll < before_resize);
+    try std.testing.expectEqual(editor.notesPreviewLayout(taller.viewport, workspace.speaker_notes, 1).max_scroll, editor.notes_scroll);
+    workspace.speaker_notes = "Shortened notes";
+    _ = editor.updateWithWorkspace(&items, &.{}, frame.viewport, workspace, .{});
+    try std.testing.expectEqual(@as(f32, 0), editor.notes_scroll);
+    try std.testing.expectEqual(@as(f32, 0), editor.notesPreviewLayout(frame.viewport, workspace.speaker_notes, 1).max_scroll);
+}
+
+test "notes wrapping preserves blank lines and long UTF-8 words for scrolling" {
+    const editor: Studio = .{};
+    var buffer: [2048]u8 = undefined;
+    var start: usize = 0;
+    const unicode = "αβγδεζηθ";
+    const advances = editor.notesFontAdvances(16);
+    var bytes: usize = 0;
+    while (editor.nextNotesLine(unicode, &start, &buffer, 16, &advances, 1)) |line| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+        try std.testing.expect(line.len > 0);
+        bytes += line.len;
+    }
+    try std.testing.expectEqual(unicode.len, bytes);
+    start = 0;
+    for ([_][]const u8{ "first", "", "last" }) |expected| {
+        try std.testing.expectEqualStrings(expected, editor.nextNotesLine("first\n\nlast", &start, &buffer, 16, &advances, 1000).?);
+    }
+    try std.testing.expect(editor.nextNotesLine("first\n\nlast", &start, &buffer, 16, &advances, 1000) == null);
 }

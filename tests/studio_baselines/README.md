@@ -96,3 +96,10 @@ absolute channel error ≤2.5, RGB RMS ≤10, and at most 3% of pixels may diffe
 by more than 12 in any channel. Performance fails above the larger of 2× the
 full baseline or +5 ms; the partial threshold is 2.5× or +2 ms. This suite is
 opt-in because those timings and rasterized glyphs remain machine-sensitive.
+
+For a capture that never shows a window or takes desktop focus, invoke the
+application with `--diagnostics-hidden`, `--diagnostics-capture=PATH`, and
+`--diagnostics-exit-after-capture`. `--diagnostics-notes-pane` shows the current
+slide's notes preview; `--diagnostics-neovim-notes --neovim-clean` captures the
+embedded notes editor below the slide. These modes can be combined with
+`--diagnostics-window=900x506` (or another size) for responsive layout checks.

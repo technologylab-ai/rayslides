@@ -779,6 +779,10 @@ const open_buffer_lua =
     \\vim.bo[buf].swapfile = false
     \\vim.bo[buf].filetype = filetype
     \\vim.bo[buf].syntax = filetype
+    \\if name:match('^rayslides://field/') then
+    \\  vim.wo.wrap = true
+    \\  vim.wo.linebreak = true
+    \\end
     \\vim.api.nvim_buf_set_lines(buf, 0, -1, true, lines)
     \\vim.bo[buf].endofline = final_eol
     \\vim.bo[buf].modified = false

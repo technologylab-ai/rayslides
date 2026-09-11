@@ -91,8 +91,13 @@ locations, and in common user-local, mise, and asdf locations. Open the whole
 document with <kbd>Ctrl/Cmd-E</kbd> or **Edit source in Neovim** in Studio's
 Commands palette; the cursor starts on the current slide's `@slide` or
 `@popslide` line. Eligible expanded `...` editors for item text, multiline
-bullets, and speaker notes use the same overlay. If support is disabled or
-Neovim cannot start, those fields retain the built-in editor.
+bullets, and speaker notes open below the slide, which moves up and scales to
+keep the full slide visible. **Notes**, beside **Focus**, toggles a private notes
+pane that follows the current slide; choose **Edit** to write notes. Scroll longer
+notes with the mouse wheel, drag the vertical scrollbar, or click its track to
+page up and down. The palette also offers **Toggle speaker notes** and
+**Edit speaker notes**. If support is disabled or Neovim cannot start, those
+fields retain the built-in editor.
 
 The overlay is a native Neovim external UI rendered by raylib with bundled
 JetBrains Mono plus the same curated monochrome Noto Emoji fallback used by

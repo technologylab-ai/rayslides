@@ -335,8 +335,16 @@ fn runFieldBufferProbe(io: std.Io, allocator: std.mem.Allocator, executable: []c
     if (!try embedded.openBuffer("First line", "src/nvim/runtime", .speaker_notes))
         return error.SessionDidNotOpenBuffer;
     try io.sleep(.fromMilliseconds(50), .awake);
+    try embedded.resize(60, 4);
     try embedded.input("GoSecond line<Esc>");
-    try embedded.command("write");
+    // The pane's Close button uses the same input as a guarded :q. It must
+    // keep an unwritten speaker-notes draft alive, including at compact size.
+    try embedded.input("<Esc>:q<CR>");
+    try io.sleep(.fromMilliseconds(100), .awake);
+    if (embedded.shouldClose()) return error.DirtyFieldQuitDiscardedDraft;
+    try expectNoApply(io, embedded);
+    // On a four-row grid the unsaved-change error needs a hit-enter acknowledgement.
+    try embedded.input("<CR>:w<CR>");
     try expectApply(io, embedded, 175, "First line\nSecond line", 176);
     try io.sleep(.fromMilliseconds(50), .awake);
     try embedded.command("quit");

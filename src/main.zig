@@ -62,6 +62,9 @@ const cli_help =
     \\  --diagnostics                    Show the diagnostics HUD
     \\  --diagnostics-command-palette    Open Studio with Commands visible
     \\  --diagnostics-neovim-editor      Open Studio's embedded source editor
+    \\  --diagnostics-notes-pane         Show private notes below the slide
+    \\  --diagnostics-neovim-notes       Open the speaker-notes field editor
+    \\  --diagnostics-hidden             Capture without showing a window (requires capture + exit)
     \\  --diagnostics-goto-slide         Open with the go-to-slide picker visible
     \\  --diagnostics-file-browser       Open Studio with the deck file chooser visible
     \\  --diagnostics-command-tooltip    Show deterministic command hover help
@@ -3300,6 +3303,9 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_enabled = false;
     var diagnostics_command_palette = false;
     var diagnostics_neovim_editor = false;
+    var diagnostics_notes_pane = false;
+    var diagnostics_neovim_notes = false;
+    var diagnostics_hidden = false;
     var diagnostics_goto_slide = false;
     var diagnostics_file_browser = false;
     var diagnostics_command_tooltip = false;
@@ -3404,6 +3410,15 @@ pub fn main(init: std.process.Init) anyerror!void {
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-command-palette")) {
                 diagnostics_enabled = true;
                 diagnostics_command_palette = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-hidden")) {
+                diagnostics_hidden = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-notes-pane")) {
+                diagnostics_notes_pane = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-neovim-notes")) {
+                diagnostics_notes_pane = true;
+                diagnostics_neovim_notes = true;
                 launch_studio = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-neovim-editor")) {
                 diagnostics_enabled = true;
@@ -3607,6 +3622,8 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     if ((diagnostics_report_path != null or diagnostics_exit_after_capture) and diagnostics_capture_path == null)
         return error.DiagnosticCapturePathRequired;
+    if (diagnostics_hidden and (diagnostics_capture_path == null or !diagnostics_exit_after_capture))
+        return error.HiddenDiagnosticsRequireCaptureAndExit;
     if (diagnostics_presentation_capture) {
         if (slideshow_to_load == null or diagnostics_window_size == null or diagnostics_capture_path == null or
             !diagnostics_presenter_session)
@@ -3636,7 +3653,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     rl.setConfigFlags(.{
         .window_resizable = true,
         .vsync_hint = true,
-        .window_hidden = showtime_report_path != null or portable_show_path != null,
+        .window_hidden = diagnostics_hidden or showtime_report_path != null or portable_show_path != null,
     });
     rl.initWindow(screenWidth, screenHeight, "rayslides");
     rl.setWindowMinSize(900, 506);
@@ -3720,6 +3737,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_library_definition_pending = diagnostics_library_definition_name;
     var diagnostics_command_palette_pending = diagnostics_command_palette;
     var diagnostics_neovim_editor_pending = diagnostics_neovim_editor;
+    var diagnostics_neovim_notes_pending = diagnostics_neovim_notes;
     var diagnostics_file_browser_pending = diagnostics_file_browser;
     var diagnostics_precision_view_pending = diagnostics_precision_view;
     var diagnostics_grid_settings_pending = diagnostics_grid_settings;
@@ -3745,6 +3763,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var remote_drawing_slide = G.current_slide;
     var studio_mode: studio.Studio = .{
         .enabled = starts_in_studio,
+        .notes_visible = diagnostics_notes_pane,
         .dirty = slideshow_to_load == null,
         .ui_font = G.studio_ui_font,
     };
@@ -3838,6 +3857,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     if (diagnostics_display_picker) display_picker.visible = true;
     var window_close_seen = false;
     var studio_was_capturing_input = false;
+    var hide_notes_on_editor_close = false;
 
     // Dev/docs helper: RAYSLIDES_PILL_SHOT=SECONDS[:PATH] keeps the video
     // controls visible (see processVideoOverlay) and exports the frame shown
@@ -3866,9 +3886,21 @@ pub fn main(init: std.process.Init) anyerror!void {
         var neovim_source_changed_this_frame = false;
         var neovim_field_apply: ?nvim_editor.Apply = null;
         var neovim_apply_message_buffer: [512]u8 = undefined;
-        const neovim_outer = nvim_editor.overlayRect(screenWidth, screenHeight);
+        studio_mode.field_editor_visible = embedded_editor.fieldPane();
+        const editor_frame = studio_mode.layoutFrame(.{ .x = 0, .y = 0, .width = @floatFromInt(rl.getScreenWidth()), .height = @floatFromInt(rl.getScreenHeight()) });
+        const neovim_outer = if (studio_mode.field_editor_visible) editor_frame.chrome.field_editor else nvim_editor.overlayRect(screenWidth, screenHeight);
+        if (embedded_editor.active() and embedded_editor.fieldPane() and studio_mode.notes_visible and
+            rl.isMouseButtonPressed(.left) and rl.checkCollisionPointRec(rl.getMousePosition(), studio.uiLayout(editor_frame.viewport).notes_toggle))
+        {
+            hide_notes_on_editor_close = true;
+            embedded_editor.requestClose();
+        }
         const neovim_closed_this_frame = embedded_editor.update(neovim_outer);
-        if (neovim_closed_this_frame) pending_neovim_semantic_command = null;
+        if (neovim_closed_this_frame) {
+            pending_neovim_semantic_command = null;
+            if (hide_notes_on_editor_close) studio_mode.notes_visible = false;
+            hide_notes_on_editor_close = false;
+        }
         if (embedded_editor.takeApply()) |apply| {
             switch (apply.kind) {
                 .field => neovim_field_apply = apply,
@@ -3929,6 +3961,12 @@ pub fn main(init: std.process.Init) anyerror!void {
             diagnostics_neovim_editor_pending = false;
             if (embedded_editor.beginSourceClean(G.editor_memory[0..G.source_len], G.source_revision) != .started)
                 return error.DiagnosticNeovimEditorUnavailable;
+        }
+        if (diagnostics_neovim_notes_pending and G.source_len > 0 and G.slideshow.slides.items.len > 0 and !embedded_editor.active()) {
+            diagnostics_neovim_notes_pending = false;
+            if (embedded_editor.beginField(.speaker_notes, notesForSlide(G.slideshow, G.current_slide), G.source_revision) != .started)
+                return error.DiagnosticNeovimEditorUnavailable;
+            pending_neovim_semantic_command = .{ .edit_speaker_notes = {} };
         }
         // Window managers may tile a just-launched diagnostic process while
         // moving it to the requested QA workspace. Baseline capture is the
@@ -4384,6 +4422,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 studio_bounds.clearRetainingCapacity();
                 studio_mode = .{
                     .enabled = launch_studio or studio_was_enabled,
+                    .notes_visible = studio_mode.notes_visible,
                     .ui_font = G.studio_ui_font,
                 };
                 invalidateShowtimeForDocumentReplacement(&showtime_overlay, &showtime_report);
@@ -4676,6 +4715,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 .visible = true,
                 .slides = studio_workspace_cache.slide_summaries.items,
                 .current_slide = if (G.current_slide >= 0) @intCast(G.current_slide) else 0,
+                .speaker_notes = if (current_slide) |slide| slide.speaker_notes orelse "" else "",
                 .library = studio_workspace_cache.library_entries.items,
                 .library_visuals = studio_library_gallery_cache.visuals.items,
                 .morph_states = studio_workspace_cache.morph_summaries.items,
@@ -5203,6 +5243,8 @@ pub fn main(init: std.process.Init) anyerror!void {
                         }
                     },
                     .edit_speaker_notes => {
+                        studio_mode.notes_visible = true;
+                        studio_mode.focus_canvas = false;
                         const initial_notes = if (current_slide) |slide| slide.speaker_notes orelse "" else "";
                         if (embedded_editor.beginField(
                             .speaker_notes,
@@ -5990,6 +6032,7 @@ pub fn main(init: std.process.Init) anyerror!void {
             // otherwise put the overlay into the PDF and the screenshot.
             if (!export_controller.running and !screenshot_poster_render_pending)
                 frame_diagnostics.draw(G.studio_ui_font, beast_mode, frameDiagnosticsPlacement(studio_viewport, slide_tl));
+            if (!export_controller.running) studio_mode.drawNotesPane(studio_viewport, if (current_slide) |slide| slide.speaker_notes orelse "" else "", (std.math.cast(usize, G.current_slide) orelse 0) + 1);
             property_prompt.draw(window_size, G.studio_ui_font, true);
             studio_file_browser.draw(window_size, G.studio_ui_font);
             if (!export_controller.running) {
@@ -6019,15 +6062,22 @@ pub fn main(init: std.process.Init) anyerror!void {
                 std.math.cast(usize, G.current_slide) orelse 0,
                 G.slideshow.slides.items.len,
             );
-            // The editor pane slides in from the right edge and leaves the
-            // same way, with the backdrop scrim following its presence.
+            // Source editing slides in from the right with a backdrop scrim.
+            // Field editing rises into the reserved pane below the slide.
             // `update` keeps receiving the settled rect so Neovim's grid is
             // sized once, not on every frame of the glide.
             const neovim_reveal = studio_motion.reveal(.neovim);
             neovim_reveal.setOpen(embedded_editor.active());
             if (neovim_reveal.visible()) {
                 const presence = neovim_reveal.presence();
-                const pane = studio_motion.slideFromRight(neovim_outer, presence, @floatFromInt(screenWidth));
+                const pane = if (embedded_editor.fieldPane()) blk: {
+                    var field_studio = studio_mode;
+                    field_studio.field_editor_visible = true;
+                    const frame = field_studio.layoutFrame(.{ .x = 0, .y = 0, .width = window_size.x, .height = window_size.y });
+                    var rect = frame.chrome.field_editor;
+                    rect.y += (1 - presence) * (window_size.y - rect.y);
+                    break :blk rect;
+                } else studio_motion.slideFromRight(neovim_outer, presence, @floatFromInt(screenWidth));
                 embedded_editor.draw(pane, presence);
             } else if (embedded_editor.hasAfterimage()) {
                 embedded_editor.releaseAfterimage();
@@ -6279,7 +6329,7 @@ pub fn main(init: std.process.Init) anyerror!void {
                 const capture_ready = is_pre_rendered and
                     diagnosticCaptureGateIsOpen(io, diagnostics_capture_gate_path) and
                     diagnostics_incremental_edit_pending == null and
-                    (!diagnostics_neovim_editor or embedded_editor.readyForCapture()) and
+                    (!(diagnostics_neovim_editor or diagnostics_neovim_notes) or embedded_editor.readyForCapture()) and
                     frame_diagnostics.pre_render_count >= expected_rebuild_events and
                     !source_graph_reparsed_this_frame;
                 if (capture_ready) {

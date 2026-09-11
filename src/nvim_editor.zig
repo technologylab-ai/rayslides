@@ -56,6 +56,10 @@ const DisabledController = struct {
         return .{};
     }
     pub fn deinit(_: *DisabledController) void {}
+    pub fn fieldPane(_: *const DisabledController) bool {
+        return false;
+    }
+    pub fn requestClose(_: *DisabledController) void {}
     pub fn active(_: *const DisabledController) bool {
         return false;
     }
@@ -359,6 +363,16 @@ const EnabledController = struct {
         return if (saw_non_missing_failure) .start_failed else .executable_missing;
     }
 
+    pub fn fieldPane(self: *const EnabledController) bool {
+        return if (self.active()) self.buffer_kind == .field else self.afterimage != null and self.afterimage_kind == .field;
+    }
+
+    /// Use Neovim's normal quit guard: an unapplied draft keeps the editor open.
+    pub fn requestClose(self: *EnabledController) void {
+        const embedded = self.embedded orelse return;
+        embedded.input("<Esc>:q<CR>") catch {};
+    }
+
     /// Updates transport and input. Returns true exactly on an overlay-close
     /// transition, including :q/:q!, BufWinLeave, EOF, and child failure.
     pub fn update(self: *EnabledController, outer: rl.Rectangle) bool {
@@ -369,6 +383,9 @@ const EnabledController = struct {
             .height = @floatFromInt(rl.getScreenHeight()),
         });
         self.font_size = self.base_font_size * self.ui_scale;
+        // Keep at least four grid rows, including Neovim's command line,
+        // visible in the compact field pane even with a large configured font.
+        if (self.fieldPane()) self.font_size = @min(self.font_size, @max(10 * self.ui_scale, @floor((outer.height - 40 * self.ui_scale) / 4) / 1.2));
         self.cell_width = @max(8 * self.ui_scale, rl.measureTextEx(self.font, "M", self.font_size, 0).x);
         self.cell_height = @ceil(self.font_size * 1.2);
         const embedded = self.embedded orelse return false;
@@ -449,7 +466,9 @@ const EnabledController = struct {
                 self.last_focus = focused;
             }
             if (focused) {
-                self.forwardInput(embedded, content);
+                if (rl.isMouseButtonPressed(.left) and rl.checkCollisionPointRec(rl.getMousePosition(), closeButton(outer, self.ui_scale))) {
+                    self.requestClose();
+                } else self.forwardInput(embedded, content);
                 if (self.embedded == null) return true;
             }
         }
@@ -500,7 +519,7 @@ const EnabledController = struct {
     pub fn draw(self: *const EnabledController, outer: rl.Rectangle, presence: f32) void {
         const live = self.embedded != null;
         if (!live and self.afterimage == null) return;
-        const scrim_alpha: f32 = 220 * std.math.clamp(presence, 0, 1);
+        const scrim_alpha: f32 = if (self.fieldPane()) 0 else 220 * std.math.clamp(presence, 0, 1);
         rl.drawRectangleRec(.{
             .x = 0,
             .y = 0,
@@ -522,17 +541,23 @@ const EnabledController = struct {
                 .speaker_notes => "EDIT SPEAKER NOTES · NEOVIM",
             },
         };
+        const close = closeButton(outer, scale);
+        rl.drawRectangleRec(close, .{ .r = 38, .g = 46, .b = 60, .a = 255 });
+        rl.drawTextEx(self.font, "Close", .{ .x = close.x + 8 * scale, .y = close.y + 5 * scale }, 14 * scale, 0, .{ .r = 226, .g = 232, .b = 240, .a = 255 });
+        rl.beginScissorMode(@intFromFloat(header.x), @intFromFloat(header.y), @intFromFloat(@max(0, close.x - header.x - 8 * scale)), @intFromFloat(header.height));
+        const label_size = rl.measureTextEx(self.font, label, 17 * scale, 0);
         rl.drawTextEx(self.font, label, .{ .x = header.x + 14 * scale, .y = header.y + 9 * scale }, 17 * scale, 0, .{ .r = 226, .g = 232, .b = 240, .a = 255 });
         const status_text: [:0]const u8 = self.status[0..self.status_len :0];
         const status_size = rl.measureTextEx(self.font, status_text, 14 * scale, 0);
-        rl.drawTextEx(
+        if (label_size.x + status_size.x + 42 * scale < close.x - header.x) rl.drawTextEx(
             self.font,
             status_text,
-            .{ .x = header.x + header.width - status_size.x - 14 * scale, .y = header.y + 11 * scale },
+            .{ .x = close.x - status_size.x - 14 * scale, .y = header.y + 11 * scale },
             14 * scale,
             0,
             .{ .r = 151, .g = 163, .b = 184, .a = 255 },
         );
+        rl.endScissorMode();
 
         const content = contentRect(outer, self.ui_scale);
         const snapshot = if (live)
@@ -780,6 +805,10 @@ pub fn overlayRect(screen_width: i32, screen_height: i32) rl.Rectangle {
         .width = @as(f32, @floatFromInt(screen_width)) - margin * 2,
         .height = @as(f32, @floatFromInt(screen_height)) - margin * 2,
     };
+}
+
+fn closeButton(outer: rl.Rectangle, scale: f32) rl.Rectangle {
+    return .{ .x = outer.x + outer.width - 70 * scale, .y = outer.y + 5 * scale, .width = 62 * scale, .height = 28 * scale };
 }
 
 fn headerRect(outer: rl.Rectangle, scale: f32) rl.Rectangle {
