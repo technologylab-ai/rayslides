@@ -153,11 +153,7 @@ const EnabledController = struct {
                 "../share/rayslides/fonts/JetBrainsMono-Regular.ttf",
                 "../Resources/fonts/JetBrainsMono-Regular.ttf",
             }) |relative| {
-                const candidate = std.fmt.bufPrintZ(
-                    &candidate_buffer,
-                    "{s}/{s}",
-                    .{ executable_dir[0..executable_dir_len], relative },
-                ) catch continue;
+                const candidate = std.mem.printSentinel(&candidate_buffer, "{s}/{s}", .{ executable_dir[0..executable_dir_len], relative }, 0) catch continue;
                 if (loadEditorFont(candidate, editor_fontchars, font_load_size)) |loaded| {
                     font = loaded;
                     owns_font = true;
@@ -314,11 +310,7 @@ const EnabledController = struct {
                 ".local/share/mise/shims/nvim",
                 ".asdf/shims/nvim",
             }, 0..) |relative, index| {
-                const candidate = std.fmt.bufPrintZ(
-                    &home_candidate_buffers[index],
-                    "{s}/{s}",
-                    .{ home, relative },
-                ) catch continue;
+                const candidate = std.mem.printSentinel(&home_candidate_buffers[index], "{s}/{s}", .{ home, relative }, 0) catch continue;
                 candidates[candidate_count] = candidate;
                 candidate_count += 1;
             }
@@ -734,7 +726,7 @@ const EnabledController = struct {
         if (!ctrl and !alt and !super) return;
         var index: usize = 0;
         while (index < 26) : (index += 1) {
-            const key: rl.KeyboardKey = @enumFromInt(@intFromEnum(rl.KeyboardKey.a) + @as(c_int, @intCast(index)));
+            const key: rl.KeyboardKey = @fromBackingInt(@intCast(@backingInt(rl.KeyboardKey.a) + @as(c_int, @intCast(index))));
             if (!keyTriggered(key)) continue;
             var name = [_]u8{0};
             name[0] = @as(u8, 'a') + @as(u8, @intCast(index));

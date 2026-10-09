@@ -47,9 +47,9 @@ pub const ParserErrorContext = struct {
             return txt.ptr;
         }
         if (self.message) |msg| {
-            self.formatted = try std.fmt.allocPrintZ(allocator, "line {d}: {s} ({s})", .{ self.line_number, self.parser_error, msg });
+            self.formatted = try std.fmt.allocPrintSentinel(allocator, "line {d}: {s} ({s})", .{ self.line_number, self.parser_error, msg }, 0);
         } else {
-            self.formatted = try std.fmt.allocPrintZ(allocator, "line {d}: {s}", .{ self.line_number, self.parser_error });
+            self.formatted = try std.fmt.allocPrintSentinel(allocator, "line {d}: {s}", .{ self.line_number, self.parser_error }, 0);
         }
 
         return self.formatted.?.ptr;
@@ -509,7 +509,7 @@ pub fn constructSlidesFromBuf(input: []const u8, slideshow: *slides.SlideShow, a
     var context: *ParserContext = try ParserContext.new(allocator);
     context.slideshow = slideshow;
 
-    context.input = try allocator.dupeZ(u8, input);
+    context.input = try allocator.dupeSentinel(u8, input, 0);
     log.info("input len: {d}, context.input len: {d}", .{ input.len, context.input.len });
     // log.info("input is: {s}", .{context.input});
 

@@ -87,7 +87,7 @@ const Entry = struct {
 /// Single-line editable text used for the location field and the type-ahead
 /// filter. Codepoint-aware so Backspace never leaves half a UTF-8 sequence.
 const TextField = struct {
-    buffer: [max_field_bytes + 1]u8 = [_]u8{0} ** (max_field_bytes + 1),
+    buffer: [max_field_bytes + 1]u8 = @splat(0),
     len: usize = 0,
     cursor: usize = 0,
 
@@ -173,8 +173,8 @@ pub const Browser = struct {
     last_click_time: f64 = -1,
     last_click_row: ?usize = null,
     /// Session memory so a second Browse reopens where the first one ended.
-    remembered: [@typeInfo(Purpose).@"enum".fields.len][max_path_bytes]u8 = undefined,
-    remembered_len: [@typeInfo(Purpose).@"enum".fields.len]usize = [_]usize{0} ** @typeInfo(Purpose).@"enum".fields.len,
+    remembered: [@typeInfo(Purpose).@"enum".field_names.len][max_path_bytes]u8 = undefined,
+    remembered_len: [@typeInfo(Purpose).@"enum".field_names.len]usize = @splat(0),
 
     /// Opens the chooser in the remembered directory for this purpose, else in
     /// `initial_directory`, else in the process working directory. Missing
@@ -191,7 +191,7 @@ pub const Browser = struct {
         self.selected = null;
         self.scroll_row = 0;
 
-        const slot = @intFromEnum(purpose);
+        const slot = @backingInt(purpose);
         if (self.remembered_len[slot] > 0 and self.navigateTo(self.remembered[slot][0..self.remembered_len[slot]])) return;
         if (initial_directory.len > 0 and self.navigateTo(initial_directory)) return;
         var cwd_buffer: [max_path_bytes]u8 = undefined;
@@ -239,7 +239,7 @@ pub const Browser = struct {
         self.scroll_row = 0;
         self.last_click_row = null;
         self.applyFilters();
-        const slot = @intFromEnum(self.purpose);
+        const slot = @backingInt(self.purpose);
         @memcpy(self.remembered[slot][0..canonical_len], canonical_buffer[0..canonical_len]);
         self.remembered_len[slot] = canonical_len;
         return true;
@@ -720,11 +720,11 @@ pub const Browser = struct {
             rl.drawTextEx(ui_font, message, .{ .x = panel.x + 24, .y = footer_y }, 16, 0, theme.warning);
         } else if (self.filter.len > 0) {
             var filter_buffer: [96]u8 = undefined;
-            const shown = std.fmt.bufPrintZ(&filter_buffer, "Filter: {s}  ·  Esc clears", .{fitTail(self.filter.text(), 64)}) catch "Filter";
+            const shown = std.mem.printSentinel(&filter_buffer, "Filter: {s}  ·  Esc clears", .{fitTail(self.filter.text(), 64)}, 0) catch "Filter";
             rl.drawTextEx(ui_font, shown, .{ .x = panel.x + 24, .y = footer_y }, 16, 0, theme.accent_bright);
         } else {
             var count_buffer: [64]u8 = undefined;
-            const count = std.fmt.bufPrintZ(&count_buffer, "{d} item{s}", .{ self.visible_count, if (self.visible_count == 1) "" else "s" }) catch "";
+            const count = std.mem.printSentinel(&count_buffer, "{d} item{s}", .{ self.visible_count, if (self.visible_count == 1) "" else "s" }, 0) catch "";
             rl.drawTextEx(ui_font, count, .{ .x = panel.x + 24, .y = footer_y }, 16, 0, theme.text_muted);
         }
     }

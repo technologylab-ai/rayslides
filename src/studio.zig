@@ -1701,11 +1701,11 @@ pub const PropertyOverrideSet = struct {
     }
 
     pub fn set(self: *PropertyOverrideSet, property: AuthoredProperty) void {
-        self.bits |= @as(u32, 1) << @intCast(@intFromEnum(property));
+        self.bits |= @as(u32, 1) << @intCast(@backingInt(property));
     }
 
     pub fn contains(self: PropertyOverrideSet, property: AuthoredProperty) bool {
-        return self.bits & (@as(u32, 1) << @intCast(@intFromEnum(property))) != 0;
+        return self.bits & (@as(u32, 1) << @intCast(@backingInt(property))) != 0;
     }
 
     pub fn empty(self: PropertyOverrideSet) bool {
@@ -1866,7 +1866,7 @@ pub const StateChangeSummary = struct {
     label: []const u8 = "",
     kind: StateChangeKind,
     /// Attribute keys of the effective `@set/@show/@hide` line, e.g. "x, y".
-    keys: [48]u8 = [_]u8{0} ** 48,
+    keys: [48]u8 = @splat(0),
     keys_len: u8 = 0,
     /// The renderer cross-fades this object instead of interpolating it.
     cross_fades: bool = false,
@@ -2072,7 +2072,7 @@ pub const LibraryVisualItem = struct {
 pub const LibraryVisual = struct {
     available: bool = false,
     content_bounds: rl.Rectangle = .{ .x = 0, .y = 0, .width = 1920, .height = 1080 },
-    items: [max_library_visual_items]LibraryVisualItem = [_]LibraryVisualItem{.{}} ** max_library_visual_items,
+    items: [max_library_visual_items]LibraryVisualItem = @splat(.{}),
     item_count: usize = 0,
     total_item_count: usize = 0,
 };
@@ -2264,7 +2264,7 @@ pub const UiLayout = struct {
     duplicate_item: rl.Rectangle,
     delete_item: rl.Rectangle,
     promote: rl.Rectangle,
-    geometry_fields: [4]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 4,
+    geometry_fields: [4]rl.Rectangle = @splat(empty_ui_rectangle),
     foreground_swatches: [palette.len]rl.Rectangle,
     custom_foreground: rl.Rectangle = empty_ui_rectangle,
     background_swatches: [palette.len]rl.Rectangle,
@@ -2273,12 +2273,12 @@ pub const UiLayout = struct {
     font_size: rl.Rectangle = empty_ui_rectangle,
     rotation: rl.Rectangle = empty_ui_rectangle,
     opacity: rl.Rectangle = empty_ui_rectangle,
-    media_fit_buttons: [3]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 3,
+    media_fit_buttons: [3]rl.Rectangle = @splat(empty_ui_rectangle),
     /// Layout-mode media scalars share one row in source order: focus X,
     /// focus Y, rotation, opacity. Keeping all four cells equal prevents the
     /// focal values from being squeezed inside the ordinary three-column
     /// font/rotation/opacity layout.
-    media_scalar_fields: [4]rl.Rectangle = [_]rl.Rectangle{empty_ui_rectangle} ** 4,
+    media_scalar_fields: [4]rl.Rectangle = @splat(empty_ui_rectangle),
     inline_error: rl.Rectangle = empty_ui_rectangle,
     align_buttons: [6]rl.Rectangle,
     distribute_buttons: [2]rl.Rectangle,
@@ -2290,7 +2290,7 @@ fn emptyUiLayout(scale: f32) UiLayout {
     return .{
         .scale = scale,
         .toolbar = empty_ui_rectangle,
-        .tool_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 8,
+        .tool_buttons = @splat(empty_ui_rectangle),
         .new_slide = empty_ui_rectangle,
         .grid_toggle = empty_ui_rectangle,
         .grid_settings_toggle = empty_ui_rectangle,
@@ -2302,12 +2302,12 @@ fn emptyUiLayout(scale: f32) UiLayout {
         .duplicate_item = empty_ui_rectangle,
         .delete_item = empty_ui_rectangle,
         .promote = empty_ui_rectangle,
-        .foreground_swatches = [_]rl.Rectangle{empty_ui_rectangle} ** palette.len,
-        .background_swatches = [_]rl.Rectangle{empty_ui_rectangle} ** palette.len,
+        .foreground_swatches = @splat(empty_ui_rectangle),
+        .background_swatches = @splat(empty_ui_rectangle),
         .clear_background = empty_ui_rectangle,
-        .align_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 6,
-        .distribute_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 2,
-        .layer_buttons = [_]rl.Rectangle{empty_ui_rectangle} ** 4,
+        .align_buttons = @splat(empty_ui_rectangle),
+        .distribute_buttons = @splat(empty_ui_rectangle),
+        .layer_buttons = @splat(empty_ui_rectangle),
         .lock_item = empty_ui_rectangle,
     };
 }
@@ -2420,7 +2420,7 @@ fn emptyWorkspaceLayout() WorkspaceLayout {
         .scale = 1,
         .sidebar = empty_frame_rectangle,
         .organizer = empty_frame_rectangle,
-        .organizer_actions = [_]rl.Rectangle{empty_frame_rectangle} ** organizer_action_count,
+        .organizer_actions = @splat(empty_frame_rectangle),
         .slide_cards_clip = empty_frame_rectangle,
         .slide_page_status = empty_frame_rectangle,
         .slide_page_previous = empty_frame_rectangle,
@@ -2898,7 +2898,7 @@ fn emptyObjectsLayout() ObjectsLayout {
         .objects_tab = empty_frame_rectangle,
         .properties_tab = empty_frame_rectangle,
         .motion_tab = empty_frame_rectangle,
-        .layer_actions = [_]rl.Rectangle{empty_frame_rectangle} ** 4,
+        .layer_actions = @splat(empty_frame_rectangle),
         .rows_clip = empty_frame_rectangle,
         .page_status = empty_frame_rectangle,
         .page_previous = empty_frame_rectangle,
@@ -3042,12 +3042,12 @@ pub const MotionLayout = struct {
     panel: rl.Rectangle = empty_frame_rectangle,
     /// Context line: "REVEAL · Direct" / "Select an object".
     context: rl.Rectangle = empty_frame_rectangle,
-    trigger: [motion_trigger_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_trigger_count,
-    effect: [motion_effect_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_effect_count,
-    grouping: [motion_choice_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_choice_count,
+    trigger: [motion_trigger_count]rl.Rectangle = @splat(empty_frame_rectangle),
+    effect: [motion_effect_count]rl.Rectangle = @splat(empty_frame_rectangle),
+    grouping: [motion_choice_count]rl.Rectangle = @splat(empty_frame_rectangle),
     /// DELAY, AFTER, DUR inline fields.
-    fields: [3]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 3,
-    easing: [motion_choice_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_choice_count,
+    fields: [3]rl.Rectangle = @splat(empty_frame_rectangle),
+    easing: [motion_choice_count]rl.Rectangle = @splat(empty_frame_rectangle),
     build_bullets: rl.Rectangle = empty_frame_rectangle,
     remove_reveal: rl.Rectangle = empty_frame_rectangle,
     summary: rl.Rectangle = empty_frame_rectangle,
@@ -3057,22 +3057,22 @@ pub const MotionLayout = struct {
     /// State section (drawn instead of the reveal section in a morph scene):
     /// LABEL, AFTER, DUR fields; Click/Auto strip; easing strip; object info
     /// line; Reset + Exit L/R/U/D; change rows.
-    state_fields: [3]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 3,
-    state_trigger: [2]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 2,
-    state_easing: [motion_choice_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_choice_count,
+    state_fields: [3]rl.Rectangle = @splat(empty_frame_rectangle),
+    state_trigger: [2]rl.Rectangle = @splat(empty_frame_rectangle),
+    state_easing: [motion_choice_count]rl.Rectangle = @splat(empty_frame_rectangle),
     state_object_info: rl.Rectangle = empty_frame_rectangle,
-    state_actions: [5]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 5,
+    state_actions: [5]rl.Rectangle = @splat(empty_frame_rectangle),
     state_changes_heading: rl.Rectangle = empty_frame_rectangle,
-    state_change_rows: [max_state_change_rows]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** max_state_change_rows,
+    state_change_rows: [max_state_change_rows]rl.Rectangle = @splat(empty_frame_rectangle),
     state_change_row_count: usize = 0,
     /// Transition section (base scene, nothing selected): Inherit + None +
     /// six effects in a 3x3 grid, DUR field, easing strip, deck default row.
-    transition_effects: [8]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 8,
+    transition_effects: [8]rl.Rectangle = @splat(empty_frame_rectangle),
     transition_duration: rl.Rectangle = empty_frame_rectangle,
-    transition_easing: [motion_choice_count]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** motion_choice_count,
+    transition_easing: [motion_choice_count]rl.Rectangle = @splat(empty_frame_rectangle),
     transition_info: rl.Rectangle = empty_frame_rectangle,
     transition_deck_info: rl.Rectangle = empty_frame_rectangle,
-    transition_deck_actions: [2]rl.Rectangle = [_]rl.Rectangle{empty_frame_rectangle} ** 2,
+    transition_deck_actions: [2]rl.Rectangle = @splat(empty_frame_rectangle),
 };
 
 pub const max_state_change_rows: usize = 8;
@@ -4014,7 +4014,7 @@ pub fn morphTimelineLayout(viewport: Viewport) MorphTimelineLayout {
         .scale = 1,
         .panel = empty_frame_rectangle,
         .cards_clip = empty_frame_rectangle,
-        .actions = [_]rl.Rectangle{empty_frame_rectangle} ** morph_timeline_action_count,
+        .actions = @splat(empty_frame_rectangle),
         .card_width = 0,
         .card_gap = 0,
         .compact = true,
@@ -4206,7 +4206,7 @@ pub fn morphTimelineCardRect(layout: MorphTimelineLayout, visible_slot: usize) ?
 /// A testable input snapshot. `updateFromRaylib` is the convenient runtime
 /// adapter; tests and other frontends can call `update` directly.
 pub const FrameInput = struct {
-    inline_chars: [256]u8 = [_]u8{0} ** 256,
+    inline_chars: [256]u8 = @splat(0),
     inline_chars_len: usize = 0,
     inline_paste: ?[]const u8 = null,
     inline_backspace_pressed: bool = false,
@@ -4481,7 +4481,7 @@ const DefinitionModeState = struct {
     workspace_index: usize,
     kind: LibraryEntryKind,
     use_count: usize,
-    name: [max_definition_name_bytes + 1]u8 = [_]u8{0} ** (max_definition_name_bytes + 1),
+    name: [max_definition_name_bytes + 1]u8 = @splat(0),
     name_len: usize = 0,
     return_selected_identity: ?usize = null,
     return_selected_source: ?slides.SourceRef = null,
@@ -4493,11 +4493,8 @@ const DefinitionModeState = struct {
     return_canvas_center: rl.Vector2 = .{ .x = default_logical_size.x / 2, .y = default_logical_size.y / 2 },
     return_active_dock: DockPanel = .slides,
     return_inspector_panel: InspectorPanel = .objects,
-    pending_selection_ids: [max_selection_items][max_definition_selection_id_bytes + 1]u8 =
-        [_][max_definition_selection_id_bytes + 1]u8{
-            [_]u8{0} ** (max_definition_selection_id_bytes + 1),
-        } ** max_selection_items,
-    pending_selection_lengths: [max_selection_items]usize = [_]usize{0} ** max_selection_items,
+    pending_selection_ids: [max_selection_items][max_definition_selection_id_bytes + 1]u8 = @splat(@splat(0)),
+    pending_selection_lengths: [max_selection_items]usize = @splat(0),
     pending_selection_count: usize = 0,
     /// ITEM definitions project exactly one editable object. Select it once
     /// when the detached scene first arrives so Properties is immediately
@@ -4556,8 +4553,8 @@ const InlineEditor = struct {
     field: InlineField = .x,
     target: CommandTarget = .{ .item_identity = 0, .source = .{} },
     targets: ItemBatchCommand = .{},
-    buffer: [max_inline_input_bytes + 1]u8 = [_]u8{0} ** (max_inline_input_bytes + 1),
-    opening_buffer: [max_inline_input_bytes + 1]u8 = [_]u8{0} ** (max_inline_input_bytes + 1),
+    buffer: [max_inline_input_bytes + 1]u8 = @splat(0),
+    opening_buffer: [max_inline_input_bytes + 1]u8 = @splat(0),
     len: usize = 0,
     opening_len: usize = 0,
     cursor: usize = 0,
@@ -4615,7 +4612,7 @@ const StatusRevealState = struct {
 
 const CommandPaletteState = struct {
     active: bool = false,
-    query: [max_command_query_bytes + 1]u8 = [_]u8{0} ** (max_command_query_bytes + 1),
+    query: [max_command_query_bytes + 1]u8 = @splat(0),
     len: usize = 0,
     selected_result: usize = 0,
     first_visible: usize = 0,
@@ -4632,7 +4629,7 @@ const SearchPanel = enum {
 };
 
 const PanelSearchState = struct {
-    query: [max_panel_search_bytes + 1]u8 = [_]u8{0} ** (max_panel_search_bytes + 1),
+    query: [max_panel_search_bytes + 1]u8 = @splat(0),
     len: usize = 0,
     select_all: bool = false,
     selected_result: usize = 0,
@@ -5358,7 +5355,7 @@ pub const Studio = struct {
 
         for (settings.appearance_buttons, 0..) |button, index| {
             if (!pointInRectangle(input.pointer_screen, button)) continue;
-            self.grid_appearance = @enumFromInt(index);
+            self.grid_appearance = @fromBackingInt(@intCast(index));
             self.grid_snapping = true;
             self.snap_guides = .{};
             return true;
@@ -5370,7 +5367,7 @@ pub const Studio = struct {
         }
         for (settings.style_buttons, 0..) |button, index| {
             if (!pointInRectangle(input.pointer_screen, button)) continue;
-            self.grid_style = @enumFromInt(index);
+            self.grid_style = @fromBackingInt(@intCast(index));
             self.grid_snapping = true;
             self.snap_guides = .{};
             return true;
@@ -10962,7 +10959,7 @@ pub const Studio = struct {
             if (self.inspector_panel == .objects) {
                 for (inspector.layer_actions, 0..) |button, index| {
                     if (pointInRectangle(pointer, button))
-                        return self.emitLayerCommand(items, @enumFromInt(index));
+                        return self.emitLayerCommand(items, @fromBackingInt(@intCast(index)));
                 }
                 if (pointInRectangle(pointer, inspector.page_status)) {
                     self.activatePanelSearch(.objects);
@@ -11061,9 +11058,9 @@ pub const Studio = struct {
         for (layout.geometry_fields, 0..) |button, index| {
             if (pointInRectangle(pointer, button))
                 return if (inline_properties)
-                    self.beginInlineEdit(items, resolved_bounds, @enumFromInt(index + 1), allow_shared_edit)
+                    self.beginInlineEdit(items, resolved_bounds, @fromBackingInt(@intCast(index + 1)), allow_shared_edit)
                 else
-                    self.emitPropertyRequest(items, allow_shared_edit, .{ .numeric_geometry = @enumFromInt(index) });
+                    self.emitPropertyRequest(items, allow_shared_edit, .{ .numeric_geometry = @fromBackingInt(@intCast(index)) });
         }
         if (selected_media) {
             if (selected_item.?.kind == .vid and pointInRectangle(pointer, mediaPageToggleRect(layout))) {
@@ -11202,16 +11199,16 @@ pub const Studio = struct {
                 if (selected_line) return true;
                 if (self.selectionAllTextboxes(items)) {
                     const change: TextAlignmentChange = if (index < 3)
-                        .{ .horizontal = @enumFromInt(index) }
+                        .{ .horizontal = @fromBackingInt(@intCast(index)) }
                     else
-                        .{ .vertical = @enumFromInt(index - 3) };
+                        .{ .vertical = @fromBackingInt(@intCast(index - 3)) };
                     return self.emitTextAlignment(items, allow_shared_edit, change);
                 }
                 self.pending_geometry_command = self.alignSelected(
                     items,
                     resolved_bounds,
                     viewport.logical_size,
-                    @enumFromInt(index),
+                    @fromBackingInt(@intCast(index)),
                     allow_shared_edit,
                 );
                 return true;
@@ -11222,7 +11219,7 @@ pub const Studio = struct {
                 self.distributeSelected(
                     items,
                     resolved_bounds,
-                    @enumFromInt(index),
+                    @fromBackingInt(@intCast(index)),
                     allow_shared_edit,
                 );
                 return true;
@@ -11230,7 +11227,7 @@ pub const Studio = struct {
         }
         for (layout.layer_buttons, 0..) |button, index| {
             if (pointInRectangle(pointer, button))
-                return self.emitLayerCommand(items, @enumFromInt(index));
+                return self.emitLayerCommand(items, @fromBackingInt(@intCast(index)));
         }
         if (pointInRectangle(pointer, layout.lock_item))
             return self.emitSelectedLockCommand(items, allow_shared_edit);
@@ -12961,9 +12958,9 @@ pub const Studio = struct {
             const rect = geometryToScreenRect(viewport, itemGeometry(item, resolved_bounds)) orelse continue;
             var text_buffer: [24]u8 = undefined;
             const text: [:0]const u8 = if (build.step_count == 1)
-                std.fmt.bufPrintZ(&text_buffer, "{d}", .{build.first_step}) catch "?"
+                std.mem.printSentinel(&text_buffer, "{d}", .{build.first_step}, 0) catch "?"
             else
-                std.fmt.bufPrintZ(&text_buffer, "{d}-{d}", .{ build.first_step, build.lastStep() }) catch "?";
+                std.mem.printSentinel(&text_buffer, "{d}-{d}", .{ build.first_step, build.lastStep() }, 0) catch "?";
             const text_width = self.measureUiText(text, badge_font);
             const padding = 6 * scale;
             const height = @as(f32, @floatFromInt(badge_font)) + 6 * scale;
@@ -13066,18 +13063,18 @@ pub const Studio = struct {
             const active = if (index == 0)
                 !any_reveal
             else
-                trigger != null and @intFromEnum(trigger.?) == index - 1;
+                trigger != null and @backingInt(trigger.?) == index - 1;
             const fitted_label: [:0]const u8 = if (index == 3 and layout.compact) "Clk>Auto" else label;
             drawToggleButton(self, cell, fitted_label, active);
         }
         for (layout.effect, motion_effect_labels, 0..) |cell, label, index| {
-            const active = common != null and @intFromEnum(common.?.effect) == index + 1;
+            const active = common != null and @backingInt(common.?.effect) == index + 1;
             drawToggleButton(self, cell, label, active);
         }
         const grouping_applies = selection_count == 1 and primary.kind == .textbox and primary.text != null;
         for (layout.grouping, motion_grouping_labels, 0..) |cell, label, index| {
             if (grouping_applies) {
-                drawToggleButton(self, cell, label, common != null and @intFromEnum(common.?.by) == index);
+                drawToggleButton(self, cell, label, common != null and @backingInt(common.?.by) == index);
             } else {
                 drawDisabledBadge(self, cell, label);
             }
@@ -13098,7 +13095,7 @@ pub const Studio = struct {
         }
         for (layout.easing, motion_easing_labels, 0..) |cell, label, index| {
             if (any_reveal) {
-                drawToggleButton(self, cell, label, common != null and @intFromEnum(common.?.easing) == index);
+                drawToggleButton(self, cell, label, common != null and @backingInt(common.?.easing) == index);
             } else {
                 drawDisabledBadge(self, cell, label);
             }
@@ -13200,7 +13197,7 @@ pub const Studio = struct {
             const value = if (active) self.inline_editor.text() else self.sceneInitialValue(.transition_duration, &scalar_buffer);
             self.drawInlineField(layout.transition_duration, "DUR", value, active, active and self.inline_editor.error_value != null, false, false, false, false, viewport);
             for (layout.transition_easing, motion_easing_labels, 0..) |cell, label, index| {
-                drawToggleButton(self, cell, label, @intFromEnum(summary.transition.easing) == index);
+                drawToggleButton(self, cell, label, @backingInt(summary.transition.easing) == index);
             }
         } else {
             drawDisabledBadge(self, layout.transition_duration, "DUR");
@@ -13277,7 +13274,7 @@ pub const Studio = struct {
                 self.notice = .property_unavailable;
                 return true;
             }
-            const easing: animation.Easing = @enumFromInt(index);
+            const easing: animation.Easing = @fromBackingInt(@intCast(index));
             if (summary.transition.easing != easing) {
                 self.cancelInlineEdit();
                 self.pending_semantic_command = .{ .set_slide_transition = .{ .easing = easing, .shared = allow_shared_edit } };
@@ -13339,7 +13336,7 @@ pub const Studio = struct {
         drawToggleButton(self, layout.state_trigger[0], state_trigger_labels[0], !automatic);
         drawToggleButton(self, layout.state_trigger[1], state_trigger_labels[1], automatic);
         for (layout.state_easing, motion_easing_labels, 0..) |cell, label, index| {
-            drawToggleButton(self, cell, label, summary != null and @intFromEnum(summary.?.easing) == index);
+            drawToggleButton(self, cell, label, summary != null and @backingInt(summary.?.easing) == index);
         }
 
         var info_buffer: [128]u8 = undefined;
@@ -13438,7 +13435,7 @@ pub const Studio = struct {
         }
         for (layout.state_easing, 0..) |cell, index| {
             if (!pointInRectangle(pointer, cell)) continue;
-            const easing: animation.Easing = @enumFromInt(index);
+            const easing: animation.Easing = @fromBackingInt(@intCast(index));
             if (summary != null and summary.?.easing != easing) {
                 self.cancelInlineEdit();
                 self.pending_semantic_command = .{ .set_morph_state_timing = .{ .state_index = state_index, .easing = easing } };
@@ -13489,12 +13486,12 @@ pub const Studio = struct {
         for (layout.trigger, 0..) |cell, index| {
             if (!pointInRectangle(pointer, cell)) continue;
             if (index == 0) return self.emitRevealCommand(items, .{ .action = .remove }, allow_shared_edit);
-            const trigger: RevealTrigger = @enumFromInt(index - 1);
+            const trigger: RevealTrigger = @fromBackingInt(@intCast(index - 1));
             return self.emitRevealCommand(items, .{ .patch = .{ .trigger = trigger }, .template = template }, allow_shared_edit);
         }
         for (layout.effect, 0..) |cell, index| {
             if (!pointInRectangle(pointer, cell)) continue;
-            const effect: animation.Effect = @enumFromInt(index + 1);
+            const effect: animation.Effect = @fromBackingInt(@intCast(index + 1));
             return self.emitRevealCommand(items, .{ .patch = .{ .effect = effect }, .template = template }, allow_shared_edit);
         }
         const primary_index = self.selectedIndex(items) orelse return true;
@@ -13506,7 +13503,7 @@ pub const Studio = struct {
                 self.notice = .property_unavailable;
                 return true;
             }
-            const by: animation.Grouping = @enumFromInt(index);
+            const by: animation.Grouping = @fromBackingInt(@intCast(index));
             return self.emitRevealCommand(items, .{ .patch = .{ .by = by }, .template = template }, allow_shared_edit);
         }
         if (motionFieldAtPoint(layout, pointer)) |field| {
@@ -13524,7 +13521,7 @@ pub const Studio = struct {
                 self.notice = .property_unavailable;
                 return true;
             }
-            const easing: animation.Easing = @enumFromInt(index);
+            const easing: animation.Easing = @fromBackingInt(@intCast(index));
             return self.emitRevealCommand(items, .{ .patch = .{ .easing = easing }, .template = template }, allow_shared_edit);
         }
         if (pointInRectangle(pointer, layout.build_bullets)) return self.emitBuildBullets(items, allow_shared_edit);
@@ -13696,7 +13693,7 @@ pub const Studio = struct {
         rl.drawRectangleLinesEx(left, 1, .{ .r = 80, .g = 215, .b = 255, .a = 145 });
         rl.drawRectangleRec(.{ .x = corner.x, .y = corner.y, .width = 3 * scale, .height = corner.height }, .{ .r = 255, .g = 92, .b = 198, .a = 255 });
         var zoom_buffer: [16]u8 = undefined;
-        const zoom_label = std.fmt.bufPrintZ(&zoom_buffer, "{d:.1}×", .{self.canvas_zoom}) catch "×";
+        const zoom_label = std.mem.printSentinel(&zoom_buffer, "{d:.1}×", .{self.canvas_zoom}, 0) catch "×";
         self.drawUiText(
             zoom_label,
             .{ .x = corner.x + 5 * scale, .y = corner.y + (corner.height - @as(f32, @floatFromInt(scaledUiFont(scale, UiTypography.compact)))) / 2 },
@@ -13760,7 +13757,7 @@ pub const Studio = struct {
         self.drawDistanceMeasurement(viewport, .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height }, .{ .x = rect.x + rect.width / 2, .y = slide_rect.y + slide_rect.height }, viewport.logical_size.y - geometry.position.y - geometry.size.y, cyan);
 
         var size_buffer: [64]u8 = undefined;
-        const size_text = std.fmt.bufPrintZ(&size_buffer, "{d:.0} × {d:.0}", .{ geometry.size.x, geometry.size.y }) catch return;
+        const size_text = std.mem.printSentinel(&size_buffer, "{d:.0} × {d:.0}", .{ geometry.size.x, geometry.size.y }, 0) catch return;
         self.drawMeasurementPill(viewport, .{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 }, size_text, magenta);
     }
 
@@ -13776,7 +13773,7 @@ pub const Studio = struct {
             rl.drawLineEx(.{ .x = end.x - 4, .y = end.y }, .{ .x = end.x + 4, .y = end.y }, 1.25, color);
         }
         var buffer: [32]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buffer, "{d:.0}", .{value}) catch return;
+        const text = std.mem.printSentinel(&buffer, "{d:.0}", .{value}, 0) catch return;
         self.drawMeasurementPill(viewport, .{ .x = (start.x + end.x) / 2, .y = (start.y + end.y) / 2 }, text, color);
     }
 
@@ -13821,11 +13818,7 @@ pub const Studio = struct {
 
     fn drawGeometryHud(self: Studio, viewport: Viewport, item_rect: rl.Rectangle, geometry: Geometry) void {
         var buffer: [128]u8 = undefined;
-        const text = std.fmt.bufPrintZ(
-            &buffer,
-            "x {d:.1}  y {d:.1}  w {d:.1}  h {d:.1}",
-            .{ geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
-        ) catch return;
+        const text = std.mem.printSentinel(&buffer, "x {d:.1}  y {d:.1}  w {d:.1}  h {d:.1}", .{ geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y }, 0) catch return;
         const scale = uiScale(viewport);
         const font_size = scaledUiFont(scale, UiTypography.body);
         const padding: f32 = 8 * scale;
@@ -14135,11 +14128,7 @@ pub const Studio = struct {
             self.organizer_first_visible;
         var slide_progress_buffer: [64]u8 = undefined;
         const current_summary = currentSlideOrdinal(workspace);
-        const slide_progress = std.fmt.bufPrintZ(
-            &slide_progress_buffer,
-            "{d} / {d}  Find",
-            .{ current_summary, workspace.slides.len },
-        ) catch "slides";
+        const slide_progress = std.mem.printSentinel(&slide_progress_buffer, "{d} / {d}  Find", .{ current_summary, workspace.slides.len }, 0) catch "slides";
         self.drawPanelSearchField(
             layout.slide_page_status,
             self.slide_search,
@@ -14189,24 +14178,16 @@ pub const Studio = struct {
                 .height = card.height - 4 * font_scale,
             });
             var line_buffer: [96]u8 = undefined;
-            const slide_number = std.fmt.bufPrintZ(&line_buffer, "SLIDE {d}", .{summary.index + 1}) catch "SLIDE";
+            const slide_number = std.mem.printSentinel(&line_buffer, "SLIDE {d}", .{summary.index + 1}, 0) catch "SLIDE";
             self.drawUiText(slide_number, .{ .x = text_x, .y = card.y + 6 * font_scale }, compact_font, if (summary.hidden) theme.text_disabled else if (active) theme.accent_bright else theme.text_muted);
             var title_buffer: [96]u8 = undefined;
             const title = self.fitUiText(&title_buffer, if (summary.title.len == 0) "Untitled" else summary.title, body_font, text_width);
             self.drawUiText(title, .{ .x = text_x, .y = card.y + 23 * font_scale }, body_font, if (summary.hidden) theme.text_muted else theme.text);
             var metadata_buffer: [96]u8 = undefined;
             const metadata = if (summary.transition_effect != .none)
-                std.fmt.bufPrintZ(
-                    &metadata_buffer,
-                    "{d} items · {d} states · {s}",
-                    .{ summary.item_count, summary.morph_count, animation.effectLiteral(summary.transition_effect) },
-                ) catch "slide details"
+                std.mem.printSentinel(&metadata_buffer, "{d} items · {d} states · {s}", .{ summary.item_count, summary.morph_count, animation.effectLiteral(summary.transition_effect) }, 0) catch "slide details"
             else
-                std.fmt.bufPrintZ(
-                    &metadata_buffer,
-                    "{d} items · {d} states",
-                    .{ summary.item_count, summary.morph_count },
-                ) catch "slide details";
+                std.mem.printSentinel(&metadata_buffer, "{d} items · {d} states", .{ summary.item_count, summary.morph_count }, 0) catch "slide details";
             var fitted_metadata_buffer: [96]u8 = undefined;
             const fitted_metadata = self.fitUiText(&fitted_metadata_buffer, metadata, compact_font, text_width);
             self.drawUiText(fitted_metadata, .{ .x = text_x, .y = card.y + 45 * font_scale }, compact_font, theme.text_muted);
@@ -14235,11 +14216,7 @@ pub const Studio = struct {
         var library_progress_buffer: [64]u8 = undefined;
         const library_first = if (library_result_count == 0) 0 else library_first_visible + 1;
         const library_last = @min(library_result_count, library_first_visible + libraryRowCapacity(layout));
-        const library_progress = std.fmt.bufPrintZ(
-            &library_progress_buffer,
-            "{d}–{d} / {d}  Find",
-            .{ library_first, library_last, library_result_count },
-        ) catch "Find reusable";
+        const library_progress = std.mem.printSentinel(&library_progress_buffer, "{d}–{d} / {d}  Find", .{ library_first, library_last, library_result_count }, 0) catch "Find reusable";
         self.drawPanelSearchField(
             layout.library_page_status,
             self.library_search,
@@ -14319,7 +14296,7 @@ pub const Studio = struct {
             const usage: [:0]const u8 = if (entry.use_count == 0)
                 "unused"
             else
-                std.fmt.bufPrintZ(&usage_buffer, "{d} use{s}", .{ entry.use_count, if (entry.use_count == 1) "" else "s" }) catch "used";
+                std.mem.printSentinel(&usage_buffer, "{d} use{s}", .{ entry.use_count, if (entry.use_count == 1) "" else "s" }, 0) catch "used";
             self.drawUiText(usage, .{
                 .x = text_x,
                 .y = row.y + row.height - @as(f32, @floatFromInt(compact_font)) - 5 * font_scale,
@@ -14376,11 +14353,7 @@ pub const Studio = struct {
             .slide_template => "SLIDE",
         };
         var title_buffer: [192]u8 = undefined;
-        const title = std.fmt.bufPrintZ(
-            &title_buffer,
-            "LIBRARY PREVIEW · {s} · {s}",
-            .{ kind, entry.name },
-        ) catch "LIBRARY PREVIEW";
+        const title = std.mem.printSentinel(&title_buffer, "LIBRARY PREVIEW · {s} · {s}", .{ kind, entry.name }, 0) catch "LIBRARY PREVIEW";
         var fitted_buffer: [192]u8 = undefined;
         const heading_font = scaledUiFont(scale, UiTypography.heading);
         const fitted = self.fitUiText(
@@ -14480,21 +14453,17 @@ pub const Studio = struct {
             .slide_template => "SLIDE",
         };
         var title_buffer: [192]u8 = undefined;
-        const title = std.fmt.bufPrintZ(&title_buffer, "DEFINITION · {s} · {s}", .{ kind, mode.nameSlice() }) catch "DEFINITION";
+        const title = std.mem.printSentinel(&title_buffer, "DEFINITION · {s} · {s}", .{ kind, mode.nameSlice() }, 0) catch "DEFINITION";
         var fitted_buffer: [192]u8 = undefined;
         const heading_font = scaledUiFont(scale, UiTypography.heading);
         const fitted = self.fitUiText(&fitted_buffer, title, heading_font, @max(0, card.width - 28 * scale));
         self.drawUiText(fitted, .{ .x = card.x + 14 * scale, .y = card.y + 10 * scale }, heading_font, theme.text);
         var detail_buffer: [160]u8 = undefined;
-        const detail = std.fmt.bufPrintZ(
-            &detail_buffer,
-            "SHARED · affects {d} use{s} · {s} edit the definition",
-            .{
-                mode.use_count,
-                if (mode.use_count == 1) "" else "s",
-                if (mode.kind == .element) "properties" else "structure + properties",
-            },
-        ) catch "SHARED · edits update the definition";
+        const detail = std.mem.printSentinel(&detail_buffer, "SHARED · affects {d} use{s} · {s} edit the definition", .{
+            mode.use_count,
+            if (mode.use_count == 1) "" else "s",
+            if (mode.kind == .element) "properties" else "structure + properties",
+        }, 0) catch "SHARED · edits update the definition";
         self.drawUiText(
             self.fitUiText(&fitted_buffer, detail, scaledUiFont(scale, UiTypography.compact), @max(0, card.width - 28 * scale)),
             .{ .x = card.x + 14 * scale, .y = card.y + 36 * scale },
@@ -14612,11 +14581,7 @@ pub const Studio = struct {
             line_y += layout.line_height;
 
             var view_buffer: [192]u8 = undefined;
-            const view_help = std.fmt.bufPrintZ(
-                &view_buffer,
-                "VIEW {d:.0}% · Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit",
-                .{self.canvasZoomPercent()},
-            ) catch "Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit";
+            const view_help = std.mem.printSentinel(&view_buffer, "VIEW {d:.0}% · Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit", .{self.canvasZoomPercent()}, 0) catch "Cmd/Ctrl +/- zoom · Space/middle drag pan · Cmd/Ctrl-0 fit";
             var view_fitted: [192]u8 = undefined;
             self.drawUiText(
                 self.fitUiText(&view_fitted, view_help, compact_font, text_width),
@@ -14780,11 +14745,11 @@ pub const Studio = struct {
         self.drawUiText("GRID APPEARANCE", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 12 * scale }, body_font, theme.text_heading);
         const appearance_labels = [_][:0]const u8{ "AUTO", "DARK", "LIGHT" };
         for (layout.appearance_buttons, appearance_labels, 0..) |button, label, index|
-            drawToggleButton(self, button, label, @intFromEnum(self.grid_appearance) == index);
+            drawToggleButton(self, button, label, @backingInt(self.grid_appearance) == index);
 
         self.drawUiText("CONTRAST", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 79 * scale }, compact_font, muted);
         var contrast_buffer: [16]u8 = undefined;
-        const contrast_label = std.fmt.bufPrintZ(&contrast_buffer, "{d:.0}%", .{self.grid_contrast * 100}) catch "";
+        const contrast_label = std.mem.printSentinel(&contrast_buffer, "{d:.0}%", .{self.grid_contrast * 100}, 0) catch "";
         const contrast_width = self.measureUiText(contrast_label, compact_font);
         self.drawUiText(contrast_label, .{
             .x = layout.panel.x + layout.panel.width - 14 * scale - contrast_width,
@@ -14808,7 +14773,7 @@ pub const Studio = struct {
         self.drawUiText("STYLE", .{ .x = layout.panel.x + 14 * scale, .y = layout.panel.y + 139 * scale }, compact_font, muted);
         const style_labels = [_][:0]const u8{ "LINES", "DOTS" };
         for (layout.style_buttons, style_labels, 0..) |button, label, index|
-            drawToggleButton(self, button, label, @intFromEnum(self.grid_style) == index);
+            drawToggleButton(self, button, label, @backingInt(self.grid_style) == index);
     }
 
     /// The search line for a floating overlay: magnifier glyph, query text, a
@@ -14964,19 +14929,15 @@ pub const Studio = struct {
 
             var detail_buffer: [192]u8 = undefined;
             const detail = if (entry.available)
-                std.fmt.bufPrintZ(
-                    &detail_buffer,
-                    "{s} · {d} use{s}",
-                    .{
-                        switch (entry.kind) {
-                            .element => "Place on the canvas",
-                            .group => "Insert the complete group",
-                            .slide_template => "Create a slide from this template",
-                        },
-                        entry.use_count,
-                        if (entry.use_count == 1) "" else "s",
+                std.mem.printSentinel(&detail_buffer, "{s} · {d} use{s}", .{
+                    switch (entry.kind) {
+                        .element => "Place on the canvas",
+                        .group => "Insert the complete group",
+                        .slide_template => "Create a slide from this template",
                     },
-                ) catch "Reusable definition"
+                    entry.use_count,
+                    if (entry.use_count == 1) "" else "s",
+                }, 0) catch "Reusable definition"
             else
                 "Unavailable in this source context";
             const detail_x = text_x + name_width + 10 * scale;
@@ -15438,9 +15399,9 @@ pub const Studio = struct {
         const readout: [:0]const u8 = if (!preview_status.available)
             "--"
         else if (preview_status.active())
-            std.fmt.bufPrintZ(&readout_buffer, "{d:.1}/{d:.1}s", .{ preview_status.time, preview_status.total }) catch "--"
+            std.mem.printSentinel(&readout_buffer, "{d:.1}/{d:.1}s", .{ preview_status.time, preview_status.total }, 0) catch "--"
         else
-            std.fmt.bufPrintZ(&readout_buffer, "{d:.1}s", .{preview_status.total}) catch "--";
+            std.mem.printSentinel(&readout_buffer, "{d:.1}s", .{preview_status.total}, 0) catch "--";
         drawButtonLabel(self, layout.transport_readout, readout, compact_font, if (preview_status.active()) theme.text else theme.text_muted);
     }
 
@@ -15509,7 +15470,7 @@ pub const Studio = struct {
             drawStarterPreview(self, preview, preset, colors);
 
             var shortcut_buffer: [4]u8 = undefined;
-            const shortcut = std.fmt.bufPrintZ(&shortcut_buffer, "{d}", .{index + 1}) catch "";
+            const shortcut = std.mem.printSentinel(&shortcut_buffer, "{d}", .{index + 1}, 0) catch "";
             const shortcut_rect: rl.Rectangle = .{
                 .x = card.x + card.width - 29,
                 .y = card.y + 9,
@@ -15722,7 +15683,7 @@ pub const Studio = struct {
         var page_buffer: [64]u8 = undefined;
         const first = if (count == 0) 0 else first_visible + 1;
         const last = @min(count, first_visible + objectRowCapacity(layout));
-        const page_text = std.fmt.bufPrintZ(&page_buffer, "{d}–{d} / {d}  Find", .{ first, last, count }) catch "Find objects";
+        const page_text = std.mem.printSentinel(&page_buffer, "{d}–{d} / {d}  Find", .{ first, last, count }, 0) catch "Find objects";
         self.drawPanelSearchField(
             layout.page_status,
             self.objects_search,
@@ -15852,7 +15813,7 @@ pub const Studio = struct {
         drawStudioPanel(panel);
         const edit = notesEditButton(panel, scale);
         var heading: [96]u8 = undefined;
-        const title = std.fmt.bufPrintZ(&heading, "SPEAKER NOTES · SLIDE {d}", .{slide_number}) catch "SPEAKER NOTES";
+        const title = std.mem.printSentinel(&heading, "SPEAKER NOTES · SLIDE {d}", .{slide_number}, 0) catch "SPEAKER NOTES";
         self.drawUiText(title, .{ .x = panel.x + 12 * scale, .y = panel.y + 12 * scale }, scaledUiFont(scale, UiTypography.compact), theme.text_heading);
         if (self.definition_mode == null) drawActionButton(self, edit, "Edit") else drawDisabledBadge(self, edit, "Edit");
         if (layout.max_scroll > 0) {
@@ -15899,8 +15860,8 @@ pub const Studio = struct {
         var scene_buffer: [32]u8 = undefined;
         const active_scene = self.activeTimelineScene();
         const scene_label: [:0]const u8 = switch (self.timelineSceneAt(active_scene)) {
-            .state => |state| std.fmt.bufPrintZ(&scene_buffer, "STATE {d}/{d}", .{ state + 1, self.morph_state_count }) catch "MORPH",
-            .build => |build| std.fmt.bufPrintZ(&scene_buffer, "BUILD {d}/{d}", .{ build + 1, self.build_count }) catch "BUILD",
+            .state => |state| std.mem.printSentinel(&scene_buffer, "STATE {d}/{d}", .{ state + 1, self.morph_state_count }, 0) catch "MORPH",
+            .build => |build| std.mem.printSentinel(&scene_buffer, "BUILD {d}/{d}", .{ build + 1, self.build_count }, 0) catch "BUILD",
             .base => "BASE",
         };
         drawActionButton(self, layout.scene_label, scene_label);
@@ -16376,41 +16337,29 @@ pub const Studio = struct {
                 .group => "GROUP",
                 .slide_template => "SLIDE",
             };
-            return std.fmt.bufPrintZ(
-                buffer,
-                "{s} definition · edits shared source",
-                .{kind},
-            ) catch null;
+            return std.mem.printSentinel(buffer, "{s} definition · edits shared source", .{kind}, 0) catch null;
         }
         if (self.selectionCount() > 1)
-            return std.fmt.bufPrintZ(buffer, "Selected group · Reuse creates one source-native component", .{}) catch null;
+            return std.mem.printSentinel(buffer, "Selected group · Reuse creates one source-native component", .{}, 0) catch null;
         const item_index = self.selectedIndex(items) orelse return null;
         const item = items[item_index];
         const context = self.compositionContextForSelection(items) orelse {
             return switch (item.source.scope) {
-                .component_instance => std.fmt.bufPrintZ(buffer, "Component instance · waiting for safe detach details", .{}) catch null,
-                .group_instance_member => std.fmt.bufPrintZ(buffer, "Group instance member · composition details pending", .{}) catch null,
-                .slide_template => std.fmt.bufPrintZ(buffer, "Template instance · waiting for ownership details", .{}) catch null,
-                else => std.fmt.bufPrintZ(buffer, "Direct item · properties belong to this slide", .{}) catch null,
+                .component_instance => std.mem.printSentinel(buffer, "Component instance · waiting for safe detach details", .{}, 0) catch null,
+                .group_instance_member => std.mem.printSentinel(buffer, "Group instance member · composition details pending", .{}, 0) catch null,
+                .slide_template => std.mem.printSentinel(buffer, "Template instance · waiting for ownership details", .{}, 0) catch null,
+                else => std.mem.printSentinel(buffer, "Direct item · properties belong to this slide", .{}, 0) catch null,
             };
         };
         const kind = compositionKindLabel(context.kind);
         if (!context.local_overrides.empty()) {
             var fields_buffer: [96]u8 = undefined;
             const fields = formatOverrideFields(&fields_buffer, context.local_overrides);
-            return std.fmt.bufPrintZ(
-                buffer,
-                "{s} · local {s} · {s}",
-                .{ kind, fields, if (context.reset_target != null) "R resets one" else "local source is read-only" },
-            ) catch null;
+            return std.mem.printSentinel(buffer, "{s} · local {s} · {s}", .{ kind, fields, if (context.reset_target != null) "R resets one" else "local source is read-only" }, 0) catch null;
         }
         if (context.detach_target != null)
-            return std.fmt.bufPrintZ(buffer, "{s} · inherited · Detach makes local boxes", .{kind}) catch null;
-        return std.fmt.bufPrintZ(
-            buffer,
-            "{s} · inherited · {s}",
-            .{ kind, compositionBlockLabel(context.detach_block) },
-        ) catch null;
+            return std.mem.printSentinel(buffer, "{s} · inherited · Detach makes local boxes", .{kind}, 0) catch null;
+        return std.mem.printSentinel(buffer, "{s} · inherited · {s}", .{ kind, compositionBlockLabel(context.detach_block) }, 0) catch null;
     }
 
     fn drawInlineProperties(
@@ -16522,43 +16471,23 @@ pub const Studio = struct {
             var metadata_buffer: [96]u8 = undefined;
             const metadata: [:0]const u8 = if (resolved) |value| metadata: {
                 if (value.media_availability != .ready)
-                    break :metadata std.fmt.bufPrintZ(
-                        &metadata_buffer,
-                        "{s}",
-                        .{mediaAvailabilityInspectorLabel(value.media_availability)},
-                    ) catch "MEDIA UNAVAILABLE";
+                    break :metadata std.mem.printSentinel(&metadata_buffer, "{s}", .{mediaAvailabilityInspectorLabel(value.media_availability)}, 0) catch "MEDIA UNAVAILABLE";
                 if (selected_video_playback) {
                     // A live camera has neither duration nor an audio stream by
                     // definition, so reporting their absence would flag normal
                     // state as a problem. It reports what it is capturing.
                     if (item.vid_is_camera)
-                        break :metadata std.fmt.bufPrintZ(
-                            &metadata_buffer,
-                            "LIVE CAMERA · {d:.0}×{d:.0}",
-                            .{ value.natural_size.x, value.natural_size.y },
-                        ) catch "LIVE CAMERA";
+                        break :metadata std.mem.printSentinel(&metadata_buffer, "LIVE CAMERA · {d:.0}×{d:.0}", .{ value.natural_size.x, value.natural_size.y }, 0) catch "LIVE CAMERA";
                     if (value.media_duration <= 0) break :metadata "DURATION UNAVAILABLE";
                     break :metadata if (value.media_audio == .unavailable)
-                        std.fmt.bufPrintZ(
-                            &metadata_buffer,
-                            "DURATION {d:.1}s · {d:.0}×{d:.0} · NO AUDIO STREAM",
-                            .{ value.media_duration, value.natural_size.x, value.natural_size.y },
-                        ) catch "VIDEO METADATA"
+                        std.mem.printSentinel(&metadata_buffer, "DURATION {d:.1}s · {d:.0}×{d:.0} · NO AUDIO STREAM", .{ value.media_duration, value.natural_size.x, value.natural_size.y }, 0) catch "VIDEO METADATA"
                     else
-                        std.fmt.bufPrintZ(
-                            &metadata_buffer,
-                            "DURATION {d:.1}s · {d:.0}×{d:.0}",
-                            .{ value.media_duration, value.natural_size.x, value.natural_size.y },
-                        ) catch "VIDEO METADATA";
+                        std.mem.printSentinel(&metadata_buffer, "DURATION {d:.1}s · {d:.0}×{d:.0}", .{ value.media_duration, value.natural_size.x, value.natural_size.y }, 0) catch "VIDEO METADATA";
                 }
                 break :metadata if (value.natural_size.x > 0 and value.natural_size.y > 0)
-                    std.fmt.bufPrintZ(
-                        &metadata_buffer,
-                        "NATURAL {d:.0}×{d:.0} · BOX {d:.0}×{d:.0}",
-                        .{ value.natural_size.x, value.natural_size.y, value.size.x, value.size.y },
-                    ) catch "MEDIA DIMENSIONS"
+                    std.mem.printSentinel(&metadata_buffer, "NATURAL {d:.0}×{d:.0} · BOX {d:.0}×{d:.0}", .{ value.natural_size.x, value.natural_size.y, value.size.x, value.size.y }, 0) catch "MEDIA DIMENSIONS"
                 else
-                    std.fmt.bufPrintZ(&metadata_buffer, "BOX {d:.0}×{d:.0}", .{ value.size.x, value.size.y }) catch "MEDIA DIMENSIONS";
+                    std.mem.printSentinel(&metadata_buffer, "BOX {d:.0}×{d:.0}", .{ value.size.x, value.size.y }, 0) catch "MEDIA DIMENSIONS";
             } else if (selected_video_playback)
                 "VIDEO METADATA UNAVAILABLE"
             else
@@ -16629,7 +16558,7 @@ pub const Studio = struct {
                 );
                 if (camera_item) {
                     var format_buffer: [32]u8 = undefined;
-                    const format_label = std.fmt.bufPrintZ(&format_buffer, "FORMAT  {s}", .{item.vid_camera_format.label()}) catch "FORMAT";
+                    const format_label = std.mem.printSentinel(&format_buffer, "FORMAT  {s}", .{item.vid_camera_format.label()}, 0) catch "FORMAT";
                     const format_override = if (composition) |context| context.local_overrides.contains(.camera_format) else false;
                     const format_resettable = if (composition) |context|
                         context.reset_target != null and context.resettable_overrides.contains(.camera_format)
@@ -16819,9 +16748,9 @@ pub const Studio = struct {
                         false;
                     for (layout.align_buttons, align_labels, 0..) |button, label, index| {
                         const active = if (index < 3)
-                            horizontal_homogeneous and @intFromEnum(primary.text_alignment) == index
+                            horizontal_homogeneous and @backingInt(primary.text_alignment) == index
                         else
-                            vertical_homogeneous and @intFromEnum(primary.text_vertical_alignment) == index - 3;
+                            vertical_homogeneous and @backingInt(primary.text_vertical_alignment) == index - 3;
                         drawPropertyToggleButton(
                             self,
                             button,
@@ -16884,22 +16813,22 @@ pub const Studio = struct {
         const geometry_fallbacks = [_][:0]const u8{ "X --", "Y --", "W --", "H --" };
         for (layout.geometry_fields, 0..) |button, index| {
             const label = if (selected_geometry) |geometry| blk: {
-                const value = switch (@as(GeometryField, @enumFromInt(index))) {
+                const value = switch (@as(GeometryField, @fromBackingInt(@intCast(index)))) {
                     .x => geometry.position.x,
                     .y => geometry.position.y,
                     .width => geometry.size.x,
                     .height => geometry.size.y,
                 };
-                const prefix: []const u8 = switch (@as(GeometryField, @enumFromInt(index))) {
+                const prefix: []const u8 = switch (@as(GeometryField, @fromBackingInt(@intCast(index)))) {
                     .x => "X",
                     .y => "Y",
                     .width => "W",
                     .height => "H",
                 };
                 break :blk if (layout.compact_properties)
-                    std.fmt.bufPrintZ(&geometry_buffers[index], "{s} {d:.0}", .{ prefix, value }) catch geometry_fallbacks[index]
+                    std.mem.printSentinel(&geometry_buffers[index], "{s} {d:.0}", .{ prefix, value }, 0) catch geometry_fallbacks[index]
                 else
-                    std.fmt.bufPrintZ(&geometry_buffers[index], "{s} {d:.1}", .{ prefix, value }) catch geometry_fallbacks[index];
+                    std.mem.printSentinel(&geometry_buffers[index], "{s} {d:.1}", .{ prefix, value }, 0) catch geometry_fallbacks[index];
             } else geometry_fallbacks[index];
             drawActionButton(self, button, label);
         }
@@ -16916,7 +16845,7 @@ pub const Studio = struct {
         var font_buffer: [32]u8 = undefined;
         const font_label: [:0]const u8 = if (selected_item) |item|
             if (item.kind == .textbox and item.fontSize != null)
-                std.fmt.bufPrintZ(&font_buffer, "Font {d}", .{item.fontSize.?}) catch "Font"
+                std.mem.printSentinel(&font_buffer, "Font {d}", .{item.fontSize.?}, 0) catch "Font"
             else
                 "Font --"
         else
@@ -16925,7 +16854,7 @@ pub const Studio = struct {
         var rotation_buffer: [32]u8 = undefined;
         const rotation_label: [:0]const u8 = if (selected_item) |item|
             if (inlineFieldApplies(.rotation, item))
-                std.fmt.bufPrintZ(&rotation_buffer, "Rot {d:.0}°", .{item.rotation}) catch "Rot"
+                std.mem.printSentinel(&rotation_buffer, "Rot {d:.0}°", .{item.rotation}, 0) catch "Rot"
             else
                 "Rot --"
         else
@@ -16934,9 +16863,9 @@ pub const Studio = struct {
         var opacity_buffer: [32]u8 = undefined;
         const opacity_label: [:0]const u8 = if (selected_item) |item|
             if (layout.minimal_properties)
-                std.fmt.bufPrintZ(&opacity_buffer, "Op {d:.0}%", .{item.opacity * 100}) catch "Opacity"
+                std.mem.printSentinel(&opacity_buffer, "Op {d:.0}%", .{item.opacity * 100}, 0) catch "Opacity"
             else
-                std.fmt.bufPrintZ(&opacity_buffer, "Opacity {d:.0}%", .{item.opacity * 100}) catch "Opacity"
+                std.mem.printSentinel(&opacity_buffer, "Opacity {d:.0}%", .{item.opacity * 100}, 0) catch "Opacity"
         else if (layout.minimal_properties) "Op --" else "Opacity --";
         drawActionButton(self, layout.opacity, opacity_label);
 
@@ -16980,11 +16909,7 @@ pub const Studio = struct {
                 self.groupDestinationLabel()
             else
                 self.editDestinationLabel(item);
-            return std.fmt.bufPrintZ(
-                buffer,
-                "STUDIO{s} · {d} selected · primary #{d} · {s}, line {d} · x {d:.0} y {d:.0} w {d:.0} h {d:.0}",
-                .{ if (self.dirty) " *" else "", self.selectionCount(), identity, destination_label, source.line_number, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y },
-            ) catch "STUDIO · selected item";
+            return std.mem.printSentinel(buffer, "STUDIO{s} · {d} selected · primary #{d} · {s}, line {d} · x {d:.0} y {d:.0} w {d:.0} h {d:.0}", .{ if (self.dirty) " *" else "", self.selectionCount(), identity, destination_label, source.line_number, geometry.position.x, geometry.position.y, geometry.size.x, geometry.size.y }, 0) catch "STUDIO · selected item";
         }
         return if (self.dirty) "STUDIO * · click an item to select it" else "STUDIO · click an item to select it";
     }
@@ -17033,20 +16958,12 @@ pub const Studio = struct {
             .library_name_conflict => "That library name is already defined",
             .library_entry_in_use => "Cannot delete: later source instances still use this reusable",
             .library_delete_unsupported => "Slide-template deletion is not source-safe yet",
-            .library_cleanup_ready => std.fmt.bufPrintZ(
-                buffer,
-                "Cleanup preview: {d} safe to remove · {d} blocked · click Apply",
-                .{ self.library_cleanup_preview_count, self.library_cleanup_blocked_count },
-            ) catch "Cleanup preview ready - click Apply",
+            .library_cleanup_ready => std.mem.printSentinel(buffer, "Cleanup preview: {d} safe to remove · {d} blocked · click Apply", .{ self.library_cleanup_preview_count, self.library_cleanup_blocked_count }, 0) catch "Cleanup preview ready - click Apply",
             .library_cleanup_empty => "Library cleanup found no safely unreachable definitions",
-            .library_cleanup_blocked => std.fmt.bufPrintZ(
-                buffer,
-                "Library cleanup: {d} unreachable definition{s} blocked by source context",
-                .{
-                    self.library_cleanup_blocked_count,
-                    if (self.library_cleanup_blocked_count == 1) "" else "s",
-                },
-            ) catch "Unused definitions need manual cleanup",
+            .library_cleanup_blocked => std.mem.printSentinel(buffer, "Library cleanup: {d} unreachable definition{s} blocked by source context", .{
+                self.library_cleanup_blocked_count,
+                if (self.library_cleanup_blocked_count == 1) "" else "s",
+            }, 0) catch "Unused definitions need manual cleanup",
             .slide_template_promotion_locked => "This slide cannot be promoted without changing its source semantics",
             .group_reusable_needs_source_support => "Group reusable needs explicit component-group source-format support",
             .override_reset_unsupported => "That local property cannot be reset safely; no source change was made",
@@ -17166,10 +17083,10 @@ fn rulerLabel(buffer: []u8, value: f32) [:0]const u8 {
     if (@abs(value) >= 1000) {
         const thousands = value / 1000;
         if (@abs(thousands - @round(thousands)) < 0.01)
-            return std.fmt.bufPrintZ(buffer, "{d:.0}k", .{thousands}) catch "";
-        return std.fmt.bufPrintZ(buffer, "{d:.1}k", .{thousands}) catch "";
+            return std.mem.printSentinel(buffer, "{d:.0}k", .{thousands}, 0) catch "";
+        return std.mem.printSentinel(buffer, "{d:.1}k", .{thousands}, 0) catch "";
     }
-    return std.fmt.bufPrintZ(buffer, "{d:.0}", .{value}) catch "";
+    return std.mem.printSentinel(buffer, "{d:.0}", .{value}, 0) catch "";
 }
 
 fn toolLabel(tool: Tool) [:0]const u8 {
@@ -18076,7 +17993,7 @@ test "grid settings popover applies appearance contrast and style" {
     try std.testing.expect(!studio.grid_snapping);
 
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = rectangleCenter(settings.appearance_buttons[@intFromEnum(GridAppearance.dark)]),
+        .pointer_screen = rectangleCenter(settings.appearance_buttons[@backingInt(GridAppearance.dark)]),
         .pointer_pressed = true,
     });
     try std.testing.expectEqual(GridAppearance.dark, studio.grid_appearance);
@@ -18103,7 +18020,7 @@ test "grid settings popover applies appearance contrast and style" {
     try std.testing.expectApproxEqAbs(maximum_grid_contrast * 0.25, studio.grid_contrast, 0.0001);
 
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = rectangleCenter(settings.style_buttons[@intFromEnum(GridStyle.dots)]),
+        .pointer_screen = rectangleCenter(settings.style_buttons[@backingInt(GridStyle.dots)]),
         .pointer_pressed = true,
     });
     try std.testing.expectEqual(GridStyle.dots, studio.grid_style);
@@ -19721,7 +19638,7 @@ test "property hit targets emit delete and color commands" {
         else => return error.UnexpectedSemanticCommand,
     }
 
-    const cyan_index = @intFromEnum(PaletteColor.cyan);
+    const cyan_index = @backingInt(PaletteColor.cyan);
     _ = studio.update(&items, &.{}, viewport, .{
         .pointer_screen = rectangleCenter(layout.foreground_swatches[cyan_index]),
         .pointer_pressed = true,
@@ -20602,7 +20519,7 @@ test "panel search rejects oversized replacement without losing the visible quer
     studio.activatePanelSearch(.slides);
     studio.appendPanelSearchQuery(.slides, "architecture");
     studio.slide_search.select_all = true;
-    const oversized = [_]u8{'x'} ** (max_panel_search_bytes + 1);
+    const oversized: [max_panel_search_bytes + 1]u8 = @splat('x');
     studio.appendPanelSearchQuery(.slides, &oversized);
     try std.testing.expectEqualStrings("architecture", studio.slide_search.text());
     try std.testing.expect(studio.slide_search.select_all);
@@ -21477,7 +21394,7 @@ test "precise property controls emit field-specific single-item intentions" {
     var studio: Studio = .{ .enabled = true, .selected_identity = 301 };
 
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = rectangleCenter(layout.geometry_fields[@intFromEnum(GeometryField.width)]),
+        .pointer_screen = rectangleCenter(layout.geometry_fields[@backingInt(GeometryField.width)]),
         .pointer_pressed = true,
     });
     switch (studio.takeSemanticCommand().?) {
@@ -21532,7 +21449,7 @@ test "property requests honor local shared lock group and item-kind guards" {
     var studio: Studio = .{ .enabled = true, .selected_identity = 302 };
 
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = rectangleCenter(layout.geometry_fields[@intFromEnum(GeometryField.x)]),
+        .pointer_screen = rectangleCenter(layout.geometry_fields[@backingInt(GeometryField.x)]),
         .pointer_pressed = true,
     });
     switch (studio.takeSemanticCommand().?) {
@@ -21540,7 +21457,7 @@ test "property requests honor local shared lock group and item-kind guards" {
         else => return error.UnexpectedSemanticCommand,
     }
     _ = studio.update(&items, &.{}, viewport, .{
-        .pointer_screen = rectangleCenter(layout.geometry_fields[@intFromEnum(GeometryField.x)]),
+        .pointer_screen = rectangleCenter(layout.geometry_fields[@backingInt(GeometryField.x)]),
         .pointer_pressed = true,
         .allow_shared_edit = true,
     });
@@ -22664,7 +22581,7 @@ test "pristine inline click away reaches the intended palette action" {
     });
     try std.testing.expect(studio.inlineEditActive());
 
-    const cyan_index = @intFromEnum(PaletteColor.cyan);
+    const cyan_index = @backingInt(PaletteColor.cyan);
     _ = studio.update(&items, &.{}, frame.viewport, .{
         .pointer_screen = rectangleCenter(layout.foreground_swatches[cyan_index]),
         .pointer_pressed = true,
@@ -24868,7 +24785,9 @@ test "notes preview wheel, paging, and scrollbar drag stay inside the notes pane
     var editor: Studio = .{ .enabled = true, .notes_visible = true };
     var items = [_]slides.SlideItem{};
     const summaries = [_]SlideSummary{ .{ .index = 0 }, .{ .index = 1 } };
-    var workspace: Workspace = .{ .visible = true, .slides = &summaries, .speaker_notes = "A line of speaker notes.\n" ** 40 };
+    const notes_line = "A line of speaker notes.\n";
+    const notes_storage: [40][notes_line.len]u8 = @splat(notes_line.*);
+    var workspace: Workspace = .{ .visible = true, .slides = &summaries, .speaker_notes = std.mem.asBytes(&notes_storage) };
     const frame = editor.layoutFrame(.{ .x = 0, .y = 0, .width = 1600, .height = 900 });
     var layout = editor.notesPreviewLayout(frame.viewport, workspace.speaker_notes, 0);
     try std.testing.expect(layout.max_scroll > 0);

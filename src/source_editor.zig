@@ -5389,8 +5389,8 @@ fn setPropertyOverride(overrides: *InheritedPropertyOverrides, property: Inherit
 }
 
 fn propertyForKey(key: []const u8) ?InheritedProperty {
-    inline for (std.meta.fields(InheritedProperty)) |field| {
-        const property: InheritedProperty = @enumFromInt(field.value);
+    inline for (@typeInfo(InheritedProperty).@"enum".field_names) |name| {
+        const property: InheritedProperty = @field(InheritedProperty, name);
         if (std.mem.eql(u8, key, propertyKey(property))) return property;
     }
     return null;
@@ -5422,8 +5422,8 @@ fn propertyOverridesOnDirective(
 }
 
 fn mergePropertyOverrides(target: *InheritedPropertyOverrides, source: InheritedPropertyOverrides) void {
-    inline for (std.meta.fields(InheritedProperty)) |field| {
-        const property: InheritedProperty = @enumFromInt(field.value);
+    inline for (@typeInfo(InheritedProperty).@"enum".field_names) |name| {
+        const property: InheritedProperty = @field(InheritedProperty, name);
         if (source.contains(property)) setPropertyOverride(target, property);
     }
 }

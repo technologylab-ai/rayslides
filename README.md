@@ -32,7 +32,7 @@ With Rayslides, you can:
 
 ## Get started
 
-Rayslides requires Zig 0.16.x. The minimum version is Zig 0.16.0.
+Rayslides requires exact Zig 0.17.0 (see `.zig-version`).
 
 ```sh
 zig build -Doptimize=ReleaseSafe
@@ -72,6 +72,16 @@ zig-out/bin/rayslides --portable-show=talk-portable talk.sld
 Blockers make either command exit nonzero. The portable command refuses an
 existing destination, rewrites copied asset references under `assets/`, then
 re-opens and preflights the copy before it succeeds.
+
+The correctness harness needs Python 3 and Pillow (`python3 -m pip install Pillow`).
+Run correctness checks in both modes. Repeat with `-Dneovim=true` to qualify
+its optional C bindings, protocol, and editor modules:
+
+```sh
+zig build verify -Doptimize=debug
+zig build verify -Doptimize=safe
+zig build -Dneovim=true neovim-probe neovim-runtime-test
+```
 
 During development, use `zig build run -- talk.sld`. On macOS,
 `zig build -Doptimize=ReleaseSafe macos-app` also creates
@@ -175,6 +185,7 @@ every mode above `640x480`.
 
 ## Project status
 
+- [Read the Zig 0.17 migration evidence and platform limits](docs/ZIG_0_17_MIGRATION.md)
 - [Read the unreleased four-topic release notes](RELEASE_NOTES.md)
 - [Follow the active product roadmap](ROADMAP.md)
 

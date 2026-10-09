@@ -52,7 +52,7 @@ pub const CursorStyle = struct {
 };
 
 pub const Cell = struct {
-    bytes: [max_cell_text_bytes]u8 = [_]u8{0} ** max_cell_text_bytes,
+    bytes: [max_cell_text_bytes]u8 = @splat(0),
     len: u8 = 1,
     highlight_id: u64 = 0,
     replaced_oversized_text: bool = false,
@@ -100,7 +100,7 @@ pub const Model = struct {
     cursor_col: usize = 0,
     cursor_visible: bool = true,
     cursor_style: CursorStyle = .{},
-    mode_name: [32]u8 = [_]u8{0} ** 32,
+    mode_name: [32]u8 = @splat(0),
     mode_name_len: u8 = 0,
     mode_styles: std.ArrayList(CursorStyle) = .empty,
     mouse_enabled: bool = false,

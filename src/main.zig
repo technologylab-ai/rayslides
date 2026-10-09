@@ -3,9 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const rl = @import("raylib");
 const rg = @import("raygui");
-const c = @cImport({
-    @cInclude("pdfgen.h");
-});
+const c = @import("pdfgen_c");
 
 const fonts = @import("fonts.zig");
 const parser = @import("parser.zig");
@@ -1306,7 +1304,7 @@ fn syncWindowTitle(dirty: bool) void {
     const title: [:0]const u8 = if (name.len == 0)
         "Rayslides"
     else
-        std.fmt.bufPrintZ(&buffer, "{s}{s} - Rayslides", .{ name, if (dirty) " *" else "" }) catch "Rayslides";
+        std.mem.printSentinel(&buffer, "{s}{s} - Rayslides", .{ name, if (dirty) " *" else "" }, 0) catch "Rayslides";
     if (cache.primed and std.mem.eql(u8, cache.last[0..cache.last_len], title)) return;
     @memcpy(cache.last[0..title.len], title);
     cache.last_len = title.len;
@@ -1723,21 +1721,17 @@ fn drawPresenterPairingOverlay(
         }
 
         var address_buffer: [320:0]u8 = @splat(0);
-        const address = std.fmt.bufPrintZ(&address_buffer, "Local address: {s}", .{runtime.base_url.slice()}) catch "Local address is too long";
+        const address = std.mem.printSentinel(&address_buffer, "Local address: {s}", .{runtime.base_url.slice()}, 0) catch "Local address is too long";
         const address_y = @min(screen_height - presenterOverlayPx(150, scale), top + rendered_side + presenterOverlayPx(14, scale));
         drawCenteredPresenterText(font, address, address_y, 22 * scale, .{ .r = 223, .g = 233, .b = 244, .a = 255 }, screen_width);
 
         var network_buffer: [192:0]u8 = @splat(0);
-        const network_label = std.fmt.bufPrintZ(
-            &network_buffer,
-            "{s} · {s} · address {d}/{d}",
-            .{
-                network.selected.interface_name.slice(),
-                network.selected.kind.label(),
-                network.selected_index + 1,
-                @max(@as(usize, 1), network.discovery.len),
-            },
-        ) catch "Network details unavailable";
+        const network_label = std.mem.printSentinel(&network_buffer, "{s} · {s} · address {d}/{d}", .{
+            network.selected.interface_name.slice(),
+            network.selected.kind.label(),
+            network.selected_index + 1,
+            @max(@as(usize, 1), network.discovery.len),
+        }, 0) catch "Network details unavailable";
         drawCenteredPresenterText(
             font,
             network_label,
@@ -1747,11 +1741,7 @@ fn drawPresenterPairingOverlay(
             screen_width,
         );
         var guidance_buffer: [192:0]u8 = @splat(0);
-        const guidance = std.fmt.bufPrintZ(
-            &guidance_buffer,
-            "{s}",
-            .{network.selected.kind.guidance()},
-        ) catch "Verify that the phone can reach this address";
+        const guidance = std.mem.printSentinel(&guidance_buffer, "{s}", .{network.selected.kind.guidance()}, 0) catch "Verify that the phone can reach this address";
         drawCenteredPresenterText(
             font,
             guidance,
@@ -1925,7 +1915,7 @@ fn drawDisplayPickerOverlay(
 
     var title_buffer: [96:0]u8 = @splat(0);
     const title: [:0]const u8 = if (picker.identified_monitor) |monitor|
-        std.fmt.bufPrintZ(&title_buffer, "DISPLAY {d} IDENTIFIED HERE", .{monitor + 1}) catch "IDENTIFY PRESENTATION DISPLAY"
+        std.mem.printSentinel(&title_buffer, "DISPLAY {d} IDENTIFIED HERE", .{monitor + 1}, 0) catch "IDENTIFY PRESENTATION DISPLAY"
     else
         "CHOOSE PRESENTATION DISPLAY";
     drawCenteredPresenterText(font, title, presenterOverlayPx(20, scale), 34 * scale, .{ .r = 97, .g = 218, .b = 251, .a = 255 }, screen_width);
@@ -1974,11 +1964,7 @@ fn drawDisplayPickerOverlay(
         );
 
         var name_buffer: [256:0]u8 = @splat(0);
-        const name = std.fmt.bufPrintZ(
-            &name_buffer,
-            "{s}  DISPLAY {d} · {s}",
-            .{ if (candidate) ">" else " ", monitor + 1, rl.getMonitorName(monitor) },
-        ) catch "Display name unavailable";
+        const name = std.mem.printSentinel(&name_buffer, "{s}  DISPLAY {d} · {s}", .{ if (candidate) ">" else " ", monitor + 1, rl.getMonitorName(monitor) }, 0) catch "Display name unavailable";
         rl.drawTextEx(
             font,
             name,
@@ -1990,19 +1976,15 @@ fn drawDisplayPickerOverlay(
 
         const position = rl.getMonitorPosition(monitor);
         var detail_buffer: [256:0]u8 = @splat(0);
-        const detail = std.fmt.bufPrintZ(
-            &detail_buffer,
-            "{d} × {d} · {d} Hz · position {d}, {d}{s}{s}",
-            .{
-                rl.getMonitorWidth(monitor),
-                rl.getMonitorHeight(monitor),
-                rl.getMonitorRefreshRate(monitor),
-                @as(i32, @intFromFloat(position.x)),
-                @as(i32, @intFromFloat(position.y)),
-                if (confirmed) " · SELECTED" else "",
-                if (window_here) " · WINDOW HERE" else "",
-            },
-        ) catch "Display details unavailable";
+        const detail = std.mem.printSentinel(&detail_buffer, "{d} × {d} · {d} Hz · position {d}, {d}{s}{s}", .{
+            rl.getMonitorWidth(monitor),
+            rl.getMonitorHeight(monitor),
+            rl.getMonitorRefreshRate(monitor),
+            @as(i32, @intFromFloat(position.x)),
+            @as(i32, @intFromFloat(position.y)),
+            if (confirmed) " · SELECTED" else "",
+            if (window_here) " · WINDOW HERE" else "",
+        }, 0) catch "Display details unavailable";
         rl.drawTextEx(
             font,
             detail,
@@ -2017,11 +1999,7 @@ fn drawDisplayPickerOverlay(
     const page: [:0]const u8 = if (count == 1)
         "One active display detected"
     else
-        std.fmt.bufPrintZ(
-            &page_buffer,
-            "Display {d} of {d} selected",
-            .{ picker.candidate_monitor + 1, count },
-        ) catch "Display selection";
+        std.mem.printSentinel(&page_buffer, "Display {d} of {d} selected", .{ picker.candidate_monitor + 1, count }, 0) catch "Display selection";
     drawCenteredPresenterText(
         font,
         page,
@@ -2186,22 +2164,18 @@ fn drawShowtimeOverlay(
 
     var title_buffer: [160:0]u8 = @splat(0);
     const title: [:0]const u8 = if (report.ready())
-        std.fmt.bufPrintZ(&title_buffer, "READY FOR SHOW  ·  {d} SLIDES  ·  {d} SCENES", .{ report.summary.slides, report.summary.scenes }) catch "SHOWTIME PREFLIGHT"
+        std.mem.printSentinel(&title_buffer, "READY FOR SHOW  ·  {d} SLIDES  ·  {d} SCENES", .{ report.summary.slides, report.summary.scenes }, 0) catch "SHOWTIME PREFLIGHT"
     else
-        std.fmt.bufPrintZ(&title_buffer, "SHOWTIME  ·  {d} BLOCKERS  ·  {d} WARNINGS", .{ report.summary.errors, report.summary.warnings }) catch "SHOWTIME PREFLIGHT";
+        std.mem.printSentinel(&title_buffer, "SHOWTIME  ·  {d} BLOCKERS  ·  {d} WARNINGS", .{ report.summary.errors, report.summary.warnings }, 0) catch "SHOWTIME PREFLIGHT";
     rl.drawTextEx(font, title, .{ .x = layout.panel.x + 20 * scale, .y = layout.panel.y + 15 * scale }, 28 * scale, 0, if (report.ready()) .{ .r = 130, .g = 230, .b = 174, .a = 255 } else .{ .r = 255, .g = 181, .b = 71, .a = 255 });
     rl.drawTextEx(font, "Exact parser + renderer + venue state · no playback, history, selection, or source mutation", .{ .x = layout.panel.x + 20 * scale, .y = layout.panel.y + 48 * scale }, 15 * scale, 0, .{ .r = 151, .g = 170, .b = 193, .a = 255 });
 
     rl.drawRectangleRounded(layout.summary, 0.10, 8, .{ .r = 14, .g = 28, .b = 47, .a = 255 });
     var summary_buffer: [384:0]u8 = @splat(0);
-    const summary_text = std.fmt.bufPrintZ(
-        &summary_buffer,
-        "DECK {d} slides / {d} endpoints     RENDER {d} fragments     ASSETS {d}     DEFINITIONS {d}",
-        .{ report.summary.slides, report.summary.reveal_endpoints, report.summary.render_fragments, report.summary.assets, report.summary.reusable_definitions },
-    ) catch "Showtime summary";
+    const summary_text = std.mem.printSentinel(&summary_buffer, "DECK {d} slides / {d} endpoints     RENDER {d} fragments     ASSETS {d}     DEFINITIONS {d}", .{ report.summary.slides, report.summary.reveal_endpoints, report.summary.render_fragments, report.summary.assets, report.summary.reusable_definitions }, 0) catch "Showtime summary";
     rl.drawTextEx(font, summary_text, .{ .x = layout.summary.x + 16 * scale, .y = layout.summary.y + 12 * scale }, 18 * scale, 0, .{ .r = 232, .g = 241, .b = 250, .a = 255 });
     var counts_buffer: [256:0]u8 = @splat(0);
-    const counts = std.fmt.bufPrintZ(&counts_buffer, "{d} errors   ·   {d} warnings   ·   {d} notes{s}", .{ report.summary.errors, report.summary.warnings, report.summary.info, if (report.truncated) "   ·   result limit reached" else "" }) catch "Readiness counts";
+    const counts = std.mem.printSentinel(&counts_buffer, "{d} errors   ·   {d} warnings   ·   {d} notes{s}", .{ report.summary.errors, report.summary.warnings, report.summary.info, if (report.truncated) "   ·   result limit reached" else "" }, 0) catch "Readiness counts";
     rl.drawTextEx(font, counts, .{ .x = layout.summary.x + 16 * scale, .y = layout.summary.y + 39 * scale }, 15 * scale, 0, if (report.summary.errors > 0) showtimeSeverityColor(.error_) else if (report.summary.warnings > 0) showtimeSeverityColor(.warning) else .{ .r = 130, .g = 230, .b = 174, .a = 255 });
 
     if (report.findings.items.len == 0) {
@@ -2217,21 +2191,21 @@ fn drawShowtimeOverlay(
             rl.drawRectangle(@intFromFloat(row.x), @intFromFloat(row.y), @max(@as(i32, 3), @as(i32, @intFromFloat(5 * scale))), @intFromFloat(row.height), showtimeSeverityColor(finding.severity));
             var location_buffer: [64:0]u8 = @splat(0);
             const location: [:0]const u8 = if (finding.slide_index) |slide_index|
-                std.fmt.bufPrintZ(&location_buffer, "  ·  slide {d}", .{slide_index + 1}) catch ""
+                std.mem.printSentinel(&location_buffer, "  ·  slide {d}", .{slide_index + 1}, 0) catch ""
             else if (finding.source_line) |line|
-                std.fmt.bufPrintZ(&location_buffer, "  ·  line {d}", .{line}) catch ""
+                std.mem.printSentinel(&location_buffer, "  ·  line {d}", .{line}, 0) catch ""
             else
                 "";
             var row_title_buffer: [512:0]u8 = @splat(0);
-            const row_title = std.fmt.bufPrintZ(&row_title_buffer, "{s}  {s}{s}{s}", .{
+            const row_title = std.mem.printSentinel(&row_title_buffer, "{s}  {s}{s}{s}", .{
                 @tagName(finding.category),
                 finding.title,
                 location,
                 if (finding.morph_state != null) "  ·  morph" else "",
-            }) catch "Showtime finding";
+            }, 0) catch "Showtime finding";
             rl.drawTextEx(font, row_title, .{ .x = row.x + 17 * scale, .y = row.y + 9 * scale }, 18 * scale, 0, .{ .r = 238, .g = 246, .b = 255, .a = 255 });
             var detail_buffer: [640:0]u8 = @splat(0);
-            const detail = std.fmt.bufPrintZ(&detail_buffer, "{s}", .{finding.detail}) catch "See source for details";
+            const detail = std.mem.printSentinel(&detail_buffer, "{s}", .{finding.detail}, 0) catch "See source for details";
             rl.drawTextEx(font, detail, .{ .x = row.x + 17 * scale, .y = row.y + 37 * scale }, 14 * scale, 0, .{ .r = 151, .g = 170, .b = 193, .a = 255 });
         }
     }
@@ -2240,7 +2214,7 @@ fn drawShowtimeOverlay(
     const page = if (report.findings.items.len == 0)
         "R rerun  ·  P portable folder  ·  Esc close"
     else
-        std.fmt.bufPrintZ(&page_buffer, "↑/↓ review  ·  Enter open slide/source  ·  R rerun  ·  P portable folder  ·  Esc close   ({d}/{d})", .{ overlay.selected + 1, report.findings.items.len }) catch "Showtime controls";
+        std.mem.printSentinel(&page_buffer, "↑/↓ review  ·  Enter open slide/source  ·  R rerun  ·  P portable folder  ·  Esc close   ({d}/{d})", .{ overlay.selected + 1, report.findings.items.len }, 0) catch "Showtime controls";
     rl.drawTextEx(font, page, .{ .x = layout.footer.x, .y = layout.footer.y + 10 * scale }, 15 * scale, 0, .{ .r = 139, .g = 158, .b = 179, .a = 255 });
 }
 
@@ -2383,7 +2357,7 @@ const ExportController = struct {
         defer self.gpa.free(pdf_name);
 
         var info: c.pdf_info = .{};
-        _ = try std.fmt.bufPrintZ(&info.producer, "{s}", .{"rayslides"});
+        _ = try std.mem.printSentinel(&info.producer, "{s}", .{"rayslides"}, 0);
 
         if (c.pdf_create(1920, 1080, &info)) |pdf| {
             defer c.pdf_destroy(pdf);
@@ -2966,47 +2940,35 @@ const FrameDiagnostics = struct {
         var frame_buffer: [192]u8 = undefined;
         var graph_buffer: [192]u8 = undefined;
         var input_buffer: [192]u8 = undefined;
-        const frame_text = std.fmt.bufPrintZ(
-            &frame_buffer,
-            "FRAME {d:.1} ms   PEAK {d:.1} ms   SLOW {d}/s   {s}",
-            .{ self.latest_frame_ms, self.sampled_peak_ms, self.sampled_slow_frames, if (beast_mode) "UNCAPPED" else "VSYNC" },
-        ) catch return;
-        const graph_text = std.fmt.bufPrintZ(
-            &graph_buffer,
-            "REBUILD {d:.1} ms   {s} {d}/{d}   F/P/N {d}/{d}/{d}   ARENA {d:.1} KiB",
-            .{
-                self.last_pre_render_ms,
-                @tagName(self.last_rebuild_mode),
-                self.last_rebuilt_slide_count,
-                self.last_rebuild_total_slide_count,
-                self.full_rebuild_count,
-                self.partial_rebuild_count,
-                self.unchanged_rebuild_count,
-                @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0,
-            },
-        ) catch return;
+        const frame_text = std.mem.printSentinel(&frame_buffer, "FRAME {d:.1} ms   PEAK {d:.1} ms   SLOW {d}/s   {s}", .{ self.latest_frame_ms, self.sampled_peak_ms, self.sampled_slow_frames, if (beast_mode) "UNCAPPED" else "VSYNC" }, 0) catch return;
+        const graph_text = std.mem.printSentinel(&graph_buffer, "REBUILD {d:.1} ms   {s} {d}/{d}   F/P/N {d}/{d}/{d}   ARENA {d:.1} KiB", .{
+            self.last_pre_render_ms,
+            @tagName(self.last_rebuild_mode),
+            self.last_rebuilt_slide_count,
+            self.last_rebuild_total_slide_count,
+            self.full_rebuild_count,
+            self.partial_rebuild_count,
+            self.unchanged_rebuild_count,
+            @as(f64, @floatFromInt(self.slideshow_arena_bytes)) / 1024.0,
+        }, 0) catch return;
         const mouse = rl.getMousePosition();
-        const input_text = std.fmt.bufPrintZ(
-            &input_buffer,
-            "STUDIO {d:.2} ms   CACHE {d}/{d}/{d}/{d}{s}   GALLERY {d}/{d}   DECK {d}   ITEMS {d}/{d}   MOUSE {d:.0}, {d:.0}   WINDOW {d} x {d}",
-            .{
-                self.last_studio_prepare_ms,
-                self.studio_document_cache_builds,
-                self.studio_scene_cache_builds,
-                self.studio_composition_cache_builds,
-                self.studio_gallery_cache_builds,
-                if (self.studio_cache_rebuilt) "*" else "",
-                self.studio_gallery_projected_count,
-                self.studio_gallery_placeholder_count,
-                self.studio_slide_count,
-                self.studio_item_count,
-                self.studio_render_fragment_count,
-                mouse.x,
-                mouse.y,
-                rl.getScreenWidth(),
-                rl.getScreenHeight(),
-            },
-        ) catch return;
+        const input_text = std.mem.printSentinel(&input_buffer, "STUDIO {d:.2} ms   CACHE {d}/{d}/{d}/{d}{s}   GALLERY {d}/{d}   DECK {d}   ITEMS {d}/{d}   MOUSE {d:.0}, {d:.0}   WINDOW {d} x {d}", .{
+            self.last_studio_prepare_ms,
+            self.studio_document_cache_builds,
+            self.studio_scene_cache_builds,
+            self.studio_composition_cache_builds,
+            self.studio_gallery_cache_builds,
+            if (self.studio_cache_rebuilt) "*" else "",
+            self.studio_gallery_projected_count,
+            self.studio_gallery_placeholder_count,
+            self.studio_slide_count,
+            self.studio_item_count,
+            self.studio_render_fragment_count,
+            mouse.x,
+            mouse.y,
+            rl.getScreenWidth(),
+            rl.getScreenHeight(),
+        }, 0) catch return;
         switch (placement) {
             .hidden => return,
             .overlay => |origin| {
@@ -3033,46 +2995,34 @@ const FrameDiagnostics = struct {
                 const compact_frame = if (roomy)
                     frame_text
                 else
-                    std.fmt.bufPrintZ(
-                        &compact_frame_buffer,
-                        "FRAME {d:.1}   PEAK {d:.1}   SLOW {d}/s",
-                        .{ self.latest_frame_ms, self.sampled_peak_ms, self.sampled_slow_frames },
-                    ) catch return;
+                    std.mem.printSentinel(&compact_frame_buffer, "FRAME {d:.1}   PEAK {d:.1}   SLOW {d}/s", .{ self.latest_frame_ms, self.sampled_peak_ms, self.sampled_slow_frames }, 0) catch return;
                 const compact_graph = if (roomy)
-                    std.fmt.bufPrintZ(
-                        &compact_graph_buffer,
-                        "BUILD {d:.1} ms {s} {d}/{d}   PREP {d:.2} ms   CACHE {d}/{d}/{d}/{d}{s}   GAL {d}/{d}   DECK {d}   ITEMS {d}/{d}",
-                        .{
-                            self.last_pre_render_ms,
-                            @tagName(self.last_rebuild_mode),
-                            self.last_rebuilt_slide_count,
-                            self.last_rebuild_total_slide_count,
-                            self.last_studio_prepare_ms,
-                            self.studio_document_cache_builds,
-                            self.studio_scene_cache_builds,
-                            self.studio_composition_cache_builds,
-                            self.studio_gallery_cache_builds,
-                            if (self.studio_cache_rebuilt) "*" else "",
-                            self.studio_gallery_projected_count,
-                            self.studio_gallery_placeholder_count,
-                            self.studio_slide_count,
-                            self.studio_item_count,
-                            self.studio_render_fragment_count,
-                        },
-                    ) catch return
+                    std.mem.printSentinel(&compact_graph_buffer, "BUILD {d:.1} ms {s} {d}/{d}   PREP {d:.2} ms   CACHE {d}/{d}/{d}/{d}{s}   GAL {d}/{d}   DECK {d}   ITEMS {d}/{d}", .{
+                        self.last_pre_render_ms,
+                        @tagName(self.last_rebuild_mode),
+                        self.last_rebuilt_slide_count,
+                        self.last_rebuild_total_slide_count,
+                        self.last_studio_prepare_ms,
+                        self.studio_document_cache_builds,
+                        self.studio_scene_cache_builds,
+                        self.studio_composition_cache_builds,
+                        self.studio_gallery_cache_builds,
+                        if (self.studio_cache_rebuilt) "*" else "",
+                        self.studio_gallery_projected_count,
+                        self.studio_gallery_placeholder_count,
+                        self.studio_slide_count,
+                        self.studio_item_count,
+                        self.studio_render_fragment_count,
+                    }, 0) catch return
                 else
-                    std.fmt.bufPrintZ(
-                        &compact_graph_buffer,
-                        "{s} {d}/{d}   {d:.0} ms   #{d}   {s}",
-                        .{
-                            @tagName(self.last_rebuild_mode),
-                            self.last_rebuilt_slide_count,
-                            self.last_rebuild_total_slide_count,
-                            self.last_pre_render_ms,
-                            self.pre_render_count,
-                            if (beast_mode) "UNCAPPED" else "VSYNC",
-                        },
-                    ) catch return;
+                    std.mem.printSentinel(&compact_graph_buffer, "{s} {d}/{d}   {d:.0} ms   #{d}   {s}", .{
+                        @tagName(self.last_rebuild_mode),
+                        self.last_rebuilt_slide_count,
+                        self.last_rebuild_total_slide_count,
+                        self.last_pre_render_ms,
+                        self.pre_render_count,
+                        if (beast_mode) "UNCAPPED" else "VSYNC",
+                    }, 0) catch return;
                 rl.drawRectangleRec(panel, .{ .r = 5, .g = 11, .b = 22, .a = 235 });
                 rl.drawRectangleLinesEx(panel, @max(@as(f32, 1), scale), .{ .r = 119, .g = 226, .b = 255, .a = 185 });
                 rl.drawRectangleRec(.{ .x = panel.x, .y = panel.y, .width = 3 * scale, .height = panel.height }, .{ .r = 239, .g = 69, .b = 154, .a = 255 });
@@ -3123,11 +3073,9 @@ fn validDiagnosticScenarioName(name: []const u8) bool {
     return true;
 }
 
-fn captureDiagnosticScreenshot(path: []const u8, logical_size: ?WindowDimensions) !WindowDimensions {
+fn writeDiagnosticScreenshot(image: *rl.Image, path: []const u8, logical_size: ?WindowDimensions) !WindowDimensions {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const sentinel_path = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{path});
-    var image = try rl.loadImageFromScreen();
-    defer rl.unloadImage(image);
+    const sentinel_path = try std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0);
     if (logical_size) |size| {
         if (image.width != size.width or image.height != size.height) image.resize(size.width, size.height);
     }
@@ -3652,10 +3600,16 @@ pub fn main(init: std.process.Init) anyerror!void {
     MacOpenDocuments.install();
     rl.setConfigFlags(.{
         .window_resizable = true,
+        // Cocoa drawable pixels and logical window coordinates must stay
+        // coherent when a Retina framebuffer is resized.
+        .window_highdpi = builtin.os.tag == .macos,
         .vsync_hint = true,
         .window_hidden = diagnostics_hidden or showtime_report_path != null or portable_show_path != null,
     });
     rl.initWindow(screenWidth, screenHeight, "rayslides");
+    // Failed display initialization is an ordinary startup error. GLFW window
+    // operations and CloseWindow both require a successfully created window.
+    if (!rl.isWindowReady()) return error.WindowInitializationFailed;
     rl.setWindowMinSize(900, 506);
     if (starts_in_studio or diagnostics_presentation_capture) {
         const monitor = rl.getCurrentMonitor();
@@ -3871,7 +3825,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         var spec_it = std.mem.splitScalar(u8, spec, ':');
         pill_shot_at = std.fmt.parseFloat(f64, spec_it.next() orelse "") catch null;
         if (spec_it.rest().len > 0) {
-            pill_shot_path = std.fmt.bufPrintZ(&pill_shot_path_buffer, "{s}", .{spec_it.rest()}) catch pill_shot_path;
+            pill_shot_path = std.mem.printSentinel(&pill_shot_path_buffer, "{s}", .{spec_it.rest()}, 0) catch pill_shot_path;
         }
         if (pill_shot_at == null) log.err("RAYSLIDES_PILL_SHOT wants SECONDS[:PATH], got {s}", .{spec});
     }
@@ -5869,6 +5823,8 @@ pub fn main(init: std.process.Init) anyerror!void {
         // ready prevents a partially held back buffer from presenting as a
         // redraw flash on macOS.
         var video_overlay_consumed_click = false;
+        var diagnostics_frame_image: ?rl.Image = null;
+        defer if (diagnostics_frame_image) |image| rl.unloadImage(image);
         {
             // Chrome motion ticks once per frame regardless of which surface
             // owns input, so a closing palette keeps folding while a prompt
@@ -6012,7 +5968,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             if (beast_mode) rl.drawFPS(20, 20);
 
             if (export_controller.final_messagebox_message) |msg| {
-                if (rg.messageBox(.{ .x = @floatFromInt(@divTrunc(screenWidth - 400, 2)), .y = 300, .width = 400, .height = 100 }, "Slideshow Export", msg, "OK") >= 0) {
+                // raygui now reports activation separately from its button index.
+                // Dismiss only an actual close/OK press; RESULT_NONE is zero.
+                var active_button: i32 = -1;
+                if (rg.messageBox(.{ .x = @floatFromInt(@divTrunc(screenWidth - 400, 2)), .y = 300, .width = 400, .height = 100 }, "Slideshow Export", msg, "OK", &active_button) == @backingInt(rg.Result.pressed)) {
                     gpa.free(msg);
                     export_controller.final_messagebox_message = null;
                 }
@@ -6081,6 +6040,15 @@ pub fn main(init: std.process.Init) anyerror!void {
                 embedded_editor.draw(pane, presence);
             } else if (embedded_editor.hasAfterimage()) {
                 embedded_editor.releaseAfterimage();
+            }
+            if (diagnostics_capture_path != null and !diagnostics_capture_complete and
+                diagnostics_capture_stable_frames >= diagnostics_capture_settle_frames -| 1)
+            {
+                // EndDrawing swaps the back buffer; its pixels are then undefined.
+                // Read this completed draw before that swap, and retain the owned
+                // CPU image until the post-edit readiness gate below accepts it.
+                rl.gl.rlDrawRenderBatchActive();
+                diagnostics_frame_image = try rl.loadImageFromScreen();
             }
         }
         if (screenshot_poster_render_pending) {
@@ -6338,7 +6306,10 @@ pub fn main(init: std.process.Init) anyerror!void {
                     diagnostics_capture_stable_frames = 0;
                 }
                 if (diagnostics_capture_stable_frames >= diagnostics_capture_settle_frames) {
-                    const capture_size = try captureDiagnosticScreenshot(capture_path, diagnostics_window_size);
+                    const capture_size = if (diagnostics_frame_image) |*image|
+                        try writeDiagnosticScreenshot(image, capture_path, diagnostics_window_size)
+                    else
+                        return error.DiagnosticFramebufferNotCaptured;
                     if (diagnostics_report_path) |report_path| {
                         try writeDiagnosticCaptureReport(
                             io,

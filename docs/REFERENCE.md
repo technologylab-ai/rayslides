@@ -1608,7 +1608,7 @@ Bullet list:
 
 # Building it
 
-Requires Zig 0.16.x (minimum 0.16.0). Just `zig build`; see
+Requires exact Zig 0.17.0 (see `.zig-version`). Just `zig build`; see
 [`build.zig.zon`](../build.zig.zon) for the minimum required Zig version.
 
 ```console

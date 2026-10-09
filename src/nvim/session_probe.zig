@@ -363,7 +363,7 @@ fn runHostShutdownProbe(io: std.Io, allocator: std.mem.Allocator, executable: []
 }
 
 fn processExists(process_id: std.process.Child.Id) !bool {
-    std.posix.kill(process_id, @enumFromInt(0)) catch |err| switch (err) {
+    std.posix.kill(process_id, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
         error.ProcessNotFound => return false,
         error.PermissionDenied => return true,
         else => return err,

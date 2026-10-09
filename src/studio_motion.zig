@@ -169,7 +169,7 @@ pub const Reveal = struct {
     }
 };
 
-const reveal_count = @typeInfo(RevealKind).@"enum".fields.len;
+const reveal_count = @typeInfo(RevealKind).@"enum".field_names.len;
 
 var reveals: [reveal_count]Reveal = defaultReveals();
 
@@ -177,7 +177,7 @@ fn defaultReveals() [reveal_count]Reveal {
     var result: [reveal_count]Reveal = undefined;
     for (&result, 0..) |*entry, index| {
         entry.* = .{};
-        switch (@as(RevealKind, @enumFromInt(index))) {
+        switch (@as(RevealKind, @fromBackingInt(@intCast(index)))) {
             .neovim => {
                 entry.open_seconds = 0.24;
                 entry.close_seconds = 0.18;
@@ -203,7 +203,7 @@ fn defaultReveals() [reveal_count]Reveal {
 }
 
 pub fn reveal(kind: RevealKind) *Reveal {
-    return &reveals[@intFromEnum(kind)];
+    return &reveals[@backingInt(kind)];
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +641,7 @@ const Glide = struct {
     last_frame: f64 = -1,
 };
 
-const glide_count = @typeInfo(GlideSlot).@"enum".fields.len;
+const glide_count = @typeInfo(GlideSlot).@"enum".field_names.len;
 var glides: [glide_count]Glide = @splat(.{});
 
 pub const glide_seconds: f32 = 0.16;
@@ -656,7 +656,7 @@ pub const GlideResult = struct {
 };
 
 pub fn glide(slot: GlideSlot, target: rl.Rectangle) GlideResult {
-    const entry = &glides[@intFromEnum(slot)];
+    const entry = &glides[@backingInt(slot)];
     const key = rectKey(target);
     var retargeted = false;
     if (!entry.initialized or !enabled) {
