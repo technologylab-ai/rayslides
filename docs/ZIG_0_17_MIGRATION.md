@@ -82,6 +82,27 @@ zig build verify neovim-probe neovim-runtime-test -Doptimize=debug -Dneovim=true
 zig build verify neovim-probe neovim-runtime-test macos-app -Doptimize=safe -Dneovim=true -j2 --summary all
 ```
 
+## Neovim probe ordering and compatibility
+
+The first hosted Ubuntu job installed Neovim 0.9.5. Its default and embedded
+unit suites passed, but a live probe returned the correct revision with the
+original source instead of a just-queued edit. The
+[exact 0.9.5 API documentation](https://github.com/neovim/neovim/blob/v0.9.5/runtime/doc/api.txt#L1046)
+specifies asynchronous processing for `nvim_input`. Sending an independent
+`nvim_command("write")` or `"wq"` immediately afterward did not establish that
+the edit had run. This was a probe-ordering defect, not evidence of source
+encoding loss or a Zig compiler regression.
+
+The probes now queue edits and their typed `:w`, `:wq`, `:x`, `ZZ`, and dirty
+`:qa` commands through the same input stream. Literal expected source and
+revision assertions remain unchanged. Typed rejected writes can display a
+hit-enter prompt, so the dirty-quit and forced-discard probes acknowledge it
+before their next typed command, as the existing compact field-editor probe
+already did. The child-failure probe uses `vim.uv or vim.loop` for the renamed
+libuv namespace. No production editor code or supported minimum version was
+changed. Corrected live probes pass on the local Mac in Debug and Safe; hosted
+Linux results qualify the older version separately.
+
 ## Graphics and startup boundaries
 
 The Mac console was locked (`CGSSessionScreenIsLocked=Yes`). GLFW excludes
