@@ -136,10 +136,17 @@ sleep/wake, Android, latency, or real-projector checklist item.
       margins, diagnostics HUD, cursor, laser drawing, or geometry preview.
 - [ ] Cancel or finish export, return to the original slide/step, then edit and
       Undo/Redo once to verify GPU/parser ownership is still sound.
-- [ ] Press <kbd>Q</kbd> and <kbd>Esc</kbd> repeatedly in windowed, borderless,
-      and exclusive fullscreen presentation. Neither key ends the app. Quit
+- [ ] Press <kbd>Q</kbd> and <kbd>Esc</kbd> repeatedly in windowed and borderless
+      fullscreen presentation. On macOS, <kbd>F</kbd> and <kbd>Shift</kbd> +
+      <kbd>F</kbd> both select borderless fullscreen. Neither Q nor Esc ends the app. Quit
       through the palette's **Quit Rayslides** and through the window's close
       button; both run the recovery-copy path above.
+- [ ] On a Retina display, run `rayslides --diagnostics-fullscreen-check=exclusive
+      --diagnostics-window=900x506 --diagnostics-report=/tmp/fullscreen.json`.
+      Require `passed: true`, effective mode `borderless`, consistent
+      logical/render/DPI geometry, pointer coordinates, and clipping for every
+      stage, including display-picker confirm/cancel and restored window size.
+      Repeat with `--diagnostics-fullscreen-check=borderless`.
 
 ## 6. Embedded Neovim (enabled build)
 

@@ -79,6 +79,7 @@ that check is not an application performance claim.
 | CLI | Real executable version/help exit successfully |
 | macOS app bundles | Built-in and embedded editor packages build with Safe |
 | Actual application framebuffers | Hidden 900×506 Studio and Neovim captures pass nonblank, 4-slide render-state, and clean-exit checks; actual Safe bundle passes too |
+| Retina fullscreen transitions | Exclusive requests use effective borderless mode on macOS; geometry, scissor and input checks pass through entry, picker confirmation/cancellation and window restoration |
 | Historical compact visual reference | Obsolete UI reference; capture succeeds and comparison is recorded separately below |
 
 Run the local correctness matrix with the exact compiler and Python Pillow on
@@ -172,6 +173,25 @@ geometry and nonblank capture. The actual application and its Safe bundle now
 pass 900×506 Studio and real embedded-Neovim framebuffer checks on the Apple M3
 Max GPU, with clean exit. The screenshot is normalized from Retina backing
 pixels to the requested logical dimensions.
+
+Independent PR review then found that raylib's macOS exclusive-fullscreen path
+reports DPI 1 while retaining a Retina framebuffer. A native reproduction drew
+the corner markers correctly but clipped the lower-right scissor marker away.
+On macOS, requested exclusive fullscreen now selects and records effective
+borderless mode, keeping drawing, mouse and scissor coordinates coherent.
+Shift+F and display-picker restoration use that same policy. Linux and Windows
+retain exclusive fullscreen. The reference and macOS release QA document the
+platform behavior.
+
+The bounded in-app diagnostic qualifies both exclusive and borderless requests
+on the M3 Max with a 2× LG HDR 4K display. Five stages pass: windowed, fullscreen,
+picker confirmation, picker cancellation and restored window. Logical dimensions
+are 900×506 windowed and 3840×2160 fullscreen; backing framebuffers are 1800×1012
+and 7680×4320, with DPI 2 throughout. Geometry, input coordinates and clipped
+drawings pass, and an independent nine-pixel PNG oracle checks corner colors,
+the scissor marker and four pixels outside the clip. The owned window restores
+and exits cleanly. Debug and Safe verification still pass all 632 application
+tests; the existing Studio framebuffer smoke also passes after the change.
 
 The checked-in `compact-properties` image is an obsolete UI reference. It was
 last refreshed by `682ad87` on 2026-08-25, before `630948d` added the Notes UI on

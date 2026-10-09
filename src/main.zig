@@ -75,6 +75,8 @@ const cli_help =
     \\                                    Capture a presentation-size framebuffer
     \\  --diagnostics-display-picker     Show the presentation display picker
     \\  --diagnostics-confirm-display=N  Confirm active display N (1-based) before QA
+    \\  --diagnostics-fullscreen-check=MODE
+    \\                                    Check borderless/exclusive geometry, clipping, and restore; exit
     \\  --diagnostics-showtime           Open the Showtime readiness overlay
     \\  --diagnostics-large-deck=N       Generate an N-slide stress deck (1-200)
     \\  --diagnostics-incremental-edit=N Edit slide N after the initial render
@@ -585,6 +587,13 @@ const FullscreenMode = enum {
     exclusive,
 };
 
+fn effectivePresentationFullscreen(desired: FullscreenMode) FullscreenMode {
+    // The pinned Cocoa backend's exclusive path reports DPI=1 while its
+    // framebuffer is Retina-sized and its cursor coordinates remain points.
+    // Keep drawing, input, and scissor coordinates in the windowed point space.
+    return if (builtin.os.tag == .macos and desired == .exclusive) .borderless else desired;
+}
+
 const DisplayPicker = struct {
     visible: bool = false,
     candidate_monitor: i32 = 0,
@@ -708,12 +717,13 @@ fn enterPresentationFullscreen(
     rl.setWindowSize(rl.getMonitorWidth(monitor), rl.getMonitorHeight(monitor));
     screen_width.* = rl.getMonitorWidth(monitor);
     screen_height.* = rl.getMonitorHeight(monitor);
-    switch (desired) {
+    const effective = effectivePresentationFullscreen(desired);
+    switch (effective) {
         .windowed => unreachable,
         .borderless => rl.toggleBorderlessWindowed(),
         .exclusive => rl.toggleFullscreen(),
     }
-    mode.* = desired;
+    mode.* = effective;
 }
 
 fn parseDiagnosticWindowSize(value: []const u8) ?WindowDimensions {
@@ -1861,6 +1871,129 @@ fn closeDisplayPicker(
         screen_width,
         screen_height,
     );
+}
+
+const FullscreenCheckFrame = struct {
+    stage: []const u8,
+    mode: FullscreenMode,
+    screen: WindowDimensions,
+    render: WindowDimensions,
+    dpi: rl.Vector2,
+    mouse: rl.Vector2,
+    geometry_ok: bool,
+    clipping_ok: bool,
+    input_ok: bool,
+};
+
+fn checkFullscreenFrame(
+    stage: []const u8,
+    mode: FullscreenMode,
+    width: i32,
+    height: i32,
+    capture_path: ?[]const u8,
+) !FullscreenCheckFrame {
+    if (width <= 0 or height <= 0 or width > 16384 or height > 16384)
+        return error.FullscreenDiagnosticDimensionsOutOfRange;
+    const mouse_x = @divTrunc(width * 7, 8);
+    const mouse_y = @divTrunc(height * 7, 8);
+    rl.setMousePosition(mouse_x, mouse_y);
+    // Settle native resize/input callbacks, then read our own framebuffer
+    // before swapping. The markers distinguish point/pixel scale errors from
+    // a nonblank frame; the magenta patch must occupy only the scissor region.
+    for (0..24) |frame| {
+        rl.beginDrawing();
+        rl.clearBackground(.black);
+        rl.drawRectangle(0, 0, @divTrunc(width, 4), @divTrunc(height, 4), .red);
+        rl.drawRectangle(@divTrunc(width * 3, 4), 0, @divTrunc(width, 4), @divTrunc(height, 4), .green);
+        rl.drawRectangle(0, @divTrunc(height * 3, 4), @divTrunc(width, 4), @divTrunc(height, 4), .blue);
+        rl.drawRectangle(@divTrunc(width * 3, 4), @divTrunc(height * 3, 4), @divTrunc(width, 4), @divTrunc(height, 4), .yellow);
+        rl.beginScissorMode(@divTrunc(width, 2), @divTrunc(height, 2), @divTrunc(width, 4), @divTrunc(height, 4));
+        rl.drawRectangle(0, 0, width, height, .magenta);
+        rl.endScissorMode();
+        defer rl.endDrawing();
+        if (frame != 23) continue;
+        rl.gl.rlDrawRenderBatchActive();
+        const image = try rl.loadImageFromScreen();
+        defer rl.unloadImage(image);
+        if (capture_path) |path| {
+            var path_buffer: [std.fs.max_path_bytes:0]u8 = undefined;
+            const path_z = try std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{path}, 0);
+            if (!image.exportToFile(path_z)) return error.DiagnosticImageExportFailed;
+        }
+        const samples = .{
+            .{ 1, 1, rl.Color.red },     .{ 7, 1, rl.Color.green },
+            .{ 1, 7, rl.Color.blue },    .{ 7, 7, rl.Color.yellow },
+            .{ 5, 5, rl.Color.magenta }, .{ 7, 5, rl.Color.black },
+            .{ 5, 7, rl.Color.black },   .{ 3, 5, rl.Color.black },
+            .{ 5, 3, rl.Color.black },
+        };
+        var clipping_ok = true;
+        inline for (samples) |sample| {
+            const color = image.getColor(@divTrunc(image.width * sample[0], 8), @divTrunc(image.height * sample[1], 8));
+            clipping_ok = clipping_ok and color.r == sample[2].r and color.g == sample[2].g and color.b == sample[2].b;
+        }
+        const dpi = rl.getWindowScaleDPI();
+        const mouse = rl.getMousePosition();
+        const screen = WindowDimensions{ .width = rl.getScreenWidth(), .height = rl.getScreenHeight() };
+        const render = WindowDimensions{ .width = rl.getRenderWidth(), .height = rl.getRenderHeight() };
+        const geometry_ok = screen.width == width and screen.height == height and
+            @abs(@as(f32, @floatFromInt(render.width)) - @as(f32, @floatFromInt(width)) * dpi.x) <= 1 and
+            @abs(@as(f32, @floatFromInt(render.height)) - @as(f32, @floatFromInt(height)) * dpi.y) <= 1 and
+            rl.isWindowFullscreen() == (mode == .exclusive) and
+            rl.isWindowState(.{ .borderless_windowed_mode = true }) == (mode == .borderless);
+        return .{
+            .stage = stage,
+            .mode = mode,
+            .screen = screen,
+            .render = render,
+            .dpi = dpi,
+            .mouse = mouse,
+            .geometry_ok = geometry_ok,
+            .clipping_ok = clipping_ok,
+            .input_ok = @abs(mouse.x - @as(f32, @floatFromInt(mouse_x))) <= 1 and
+                @abs(mouse.y - @as(f32, @floatFromInt(mouse_y))) <= 1,
+        };
+    }
+    unreachable;
+}
+
+fn checkPresentationFullscreen(io: std.Io, desired: FullscreenMode, capture_path: ?[]const u8, report_path: ?[]const u8) !void {
+    var mode: FullscreenMode = .windowed;
+    var screen_width = rl.getScreenWidth();
+    var screen_height = rl.getScreenHeight();
+    var windowed_width = screen_width;
+    var windowed_height = screen_height;
+    const initial_size = WindowDimensions{ .width = screen_width, .height = screen_height };
+    const initial_mouse = rl.getMousePosition();
+    var picker = DisplayPicker.init();
+    defer {
+        leavePresentationFullscreen(&mode, picker.confirmed_monitor, initial_size.width, initial_size.height, &screen_width, &screen_height);
+        rl.setMousePosition(@intFromFloat(initial_mouse.x), @intFromFloat(initial_mouse.y));
+    }
+    var frames: [5]FullscreenCheckFrame = undefined;
+    frames[0] = try checkFullscreenFrame("windowed", mode, screen_width, screen_height, null);
+    enterPresentationFullscreen(&mode, desired, picker.confirmed_monitor, &windowed_width, &windowed_height, &screen_width, &screen_height);
+    frames[1] = try checkFullscreenFrame("fullscreen", mode, screen_width, screen_height, capture_path);
+    openDisplayPicker(&picker, &mode, windowed_width, windowed_height, &screen_width, &screen_height);
+    closeDisplayPicker(&picker, true, &mode, &windowed_width, &windowed_height, &screen_width, &screen_height);
+    frames[2] = try checkFullscreenFrame("picker_confirm", mode, screen_width, screen_height, null);
+    openDisplayPicker(&picker, &mode, windowed_width, windowed_height, &screen_width, &screen_height);
+    closeDisplayPicker(&picker, false, &mode, &windowed_width, &windowed_height, &screen_width, &screen_height);
+    frames[3] = try checkFullscreenFrame("picker_cancel", mode, screen_width, screen_height, null);
+    leavePresentationFullscreen(&mode, picker.confirmed_monitor, windowed_width, windowed_height, &screen_width, &screen_height);
+    frames[4] = try checkFullscreenFrame("restored", mode, screen_width, screen_height, null);
+    var passed = screen_width == initial_size.width and screen_height == initial_size.height;
+    for (frames) |frame| passed = passed and frame.geometry_ok and frame.clipping_ok and frame.input_ok;
+    const report = try std.json.Stringify.valueAlloc(std.heap.page_allocator, .{
+        .requested = desired,
+        .effective = effectivePresentationFullscreen(desired),
+        .passed = passed,
+        .frames = frames,
+    }, .{ .whitespace = .indent_2 });
+    defer std.heap.page_allocator.free(report);
+    if (report_path) |path| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = report });
+    try std.Io.File.stdout().writeStreamingAll(io, report);
+    if (!passed) return error.FullscreenDiagnosticFailed;
 }
 
 const DisplayPickerLayout = struct {
@@ -3271,6 +3404,7 @@ pub fn main(init: std.process.Init) anyerror!void {
     var diagnostics_presentation_capture = false;
     var diagnostics_display_picker = false;
     var diagnostics_confirm_display: ?i32 = null;
+    var diagnostics_fullscreen_check: ?FullscreenMode = null;
     var diagnostics_showtime = false;
     var diagnostics_large_deck_count: ?usize = null;
     var diagnostics_incremental_edit_slide: ?usize = null;
@@ -3411,6 +3545,10 @@ pub fn main(init: std.process.Init) anyerror!void {
                 diagnostics_presentation_capture = true;
             } else if (!positional_only and std.mem.eql(u8, arg, "--diagnostics-display-picker")) {
                 diagnostics_display_picker = true;
+                launch_studio = true;
+            } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-fullscreen-check=")) {
+                const value = arg["--diagnostics-fullscreen-check=".len..];
+                diagnostics_fullscreen_check = if (std.mem.eql(u8, value, "borderless")) .borderless else if (std.mem.eql(u8, value, "exclusive")) .exclusive else return error.InvalidDiagnosticFullscreenMode;
                 launch_studio = true;
             } else if (!positional_only and std.mem.startsWith(u8, arg, "--diagnostics-confirm-display=")) {
                 diagnostics_confirm_display = parseDiagnosticDisplayNumber(arg["--diagnostics-confirm-display=".len..]) orelse
@@ -3574,10 +3712,14 @@ pub fn main(init: std.process.Init) anyerror!void {
         break :blk try std.fmt.bufPrint(&G.slideshow_filp_to_load_buffer, "{s}", .{selected});
     };
 
-    if ((diagnostics_report_path != null or diagnostics_exit_after_capture) and diagnostics_capture_path == null)
+    if ((diagnostics_report_path != null or diagnostics_exit_after_capture) and diagnostics_capture_path == null and diagnostics_fullscreen_check == null)
         return error.DiagnosticCapturePathRequired;
     if (diagnostics_hidden and (diagnostics_capture_path == null or !diagnostics_exit_after_capture))
         return error.HiddenDiagnosticsRequireCaptureAndExit;
+    if (diagnostics_fullscreen_check != null and diagnostics_hidden)
+        return error.FullscreenDiagnosticsRequireVisibleWindow;
+    if (diagnostics_fullscreen_check != null and (showtime_report_path != null or portable_show_path != null))
+        return error.FullscreenDiagnosticsOutputModesConflict;
     if (diagnostics_presentation_capture) {
         if (slideshow_to_load == null or diagnostics_window_size == null or diagnostics_capture_path == null or
             !diagnostics_presenter_session)
@@ -3636,6 +3778,10 @@ pub fn main(init: std.process.Init) anyerror!void {
     // Raylib from closing the process before the frame can consume the key.
     rl.setExitKey(.null);
     defer rl.closeWindow(); // Close window and OpenGL context
+
+    if (diagnostics_fullscreen_check) |desired| {
+        return checkPresentationFullscreen(io, desired, diagnostics_capture_path, diagnostics_report_path);
+    }
 
     // Video sound arrives as raw PCM chunks streamed into an AudioStream.
     rl.setAudioStreamBufferSizeDefault(videoplayer.audio_stream_buffer_frames);

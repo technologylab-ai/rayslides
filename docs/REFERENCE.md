@@ -86,7 +86,8 @@ See the next section for keyboard shortcuts for slideshow control and slide navi
 | -------- | ----------- |
 | <kbd>S</kbd> | Screen-Shot current slide  to PNG |
 | <kbd>SHIFT</kbd> + <kbd>S</kbd> | Screen-Shot and export slideshow to PDF |
-| <kbd>F</kbd> | Toggle fullscreen |
+| <kbd>F</kbd> | Toggle borderless fullscreen |
+| <kbd>SHIFT</kbd> + <kbd>F</kbd> | Toggle exclusive fullscreen on Linux/Windows; borderless fullscreen on macOS |
 | <kbd>D</kbd> | Identify and choose the presentation display |
 | <kbd>L</kbd> | Toggle laserpointer |
 | <kbd>SHIFT</kbd> + <kbd>L</kbd> | Iterate laserpointer sizes |
@@ -574,6 +575,15 @@ frame. Pair it with `--diagnostics-display-picker` to capture the selected and
 current monitor labels, or with `--diagnostics-showtime` to preflight the exact
 confirmed display. This is a diagnostics-only venue harness; ordinary users
 still identify and confirm displays interactively.
+`--diagnostics-fullscreen-check=borderless` or
+`--diagnostics-fullscreen-check=exclusive` opens one visible window, checks
+logical/render/DPI geometry, pointer coordinates, and a clipped drawing pattern
+in fullscreen and after display-picker confirm/cancel, restores its original
+window size, and exits. On macOS the requested exclusive mode uses borderless.
+Add `--diagnostics-report=JSON` for the five-stage result and optionally
+`--diagnostics-capture=PNG` for the fullscreen pattern. This check uses its own
+framebuffer and does not capture the desktop. It cannot run with
+`--diagnostics-hidden`.
 `--diagnostics-presenter-session` starts Presenter with the private pairing
 screen, then automatically hides setup and enters normal presentation after an
 authenticated client begins polling. It is a browser-QA harness that exercises
@@ -973,6 +983,11 @@ second time confirms it. If the picker was opened from fullscreen, confirm or
 cancel restores the same borderless or exclusive fullscreen mode on the chosen
 or previous display. A disconnected choice is clamped to an active display,
 and the window is aspect-preservingly reduced if it would not fit.
+
+On macOS, both <kbd>F</kbd> and <kbd>Shift</kbd> + <kbd>F</kbd> use borderless
+fullscreen. This keeps Retina drawing, pointer input, and clipped overlays in
+the same logical coordinates. Linux and Windows retain exclusive fullscreen
+with <kbd>Shift</kbd> + <kbd>F</kbd>.
 
 Phone navigation enters the same main-thread playback functions as keyboard,
 mouse, and clicker input, preserving reveal animations, reversal, transitions,
