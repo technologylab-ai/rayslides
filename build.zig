@@ -201,7 +201,7 @@ pub fn build(b: *std.Build) !void {
         exe_mod.linkFramework("AppKit", .{});
         exe_mod.linkFramework("Foundation", .{});
     } else if (target.result.os.tag == .windows) {
-        exe_mod.linkSystemLibrary("iphlpapi", .{});
+        exe_mod.linkSystemLibrary("iphlpapi", .{ .use_pkg_config = .no });
     } else if (native_linux) {
         addNativeSystemPaths(b, exe_mod);
     }

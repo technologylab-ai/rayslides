@@ -155,6 +155,7 @@ fn expectApply(
             if (apply.opening_revision != expected_revision or
                 !std.mem.eql(u8, apply.source, expected_source))
             {
+                std.debug.print("session probe apply mismatch: expected revision={}, actual revision={}, expected source={s}, actual source={s}\n", .{ expected_revision, apply.opening_revision, expected_source, apply.source });
                 try embedded.rejectApply("unexpected session probe source");
                 return error.UnexpectedApplySource;
             }
