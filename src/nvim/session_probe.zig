@@ -199,12 +199,14 @@ fn runRejectedWriteProbe(
     result.rejected_wq_stayed_open = !embedded.shouldClose();
     if (!result.rejected_wq_stayed_open) return error.RejectedWriteClosedOverlay;
 
-    try embedded.command("quit");
+    // A typed failed write can leave a hit-enter prompt. Acknowledge it
+    // before exercising dirty :q, then acknowledge that refusal before :q!.
+    try embedded.input("<CR>:q<CR>");
     try io.sleep(.fromMilliseconds(100), .awake);
     result.dirty_q_stayed_open = !embedded.shouldClose();
     if (!result.dirty_q_stayed_open) return error.DirtyQuitClosedOverlay;
 
-    try embedded.command("quit!");
+    try embedded.input("<CR>:q!<CR>");
     try waitForClose(io, embedded);
     result.forced_quit_closed_overlay = true;
 }
@@ -259,7 +261,7 @@ fn runQuitAllProbe(
         try io.sleep(.fromMilliseconds(100), .awake);
         result.dirty_qa_stayed_open = !embedded.shouldClose();
         if (!result.dirty_qa_stayed_open) return error.DirtyQuitAllClosedOverlay;
-        try embedded.command("qa!");
+        try embedded.input("<CR>:qa!<CR>");
         try waitForClose(io, embedded);
         try expectNoApply(io, embedded);
         result.forced_qa_closed = true;
