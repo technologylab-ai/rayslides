@@ -74,8 +74,9 @@ fn runBasicProbe(
     if (!result.rendered) return error.SessionDidNotRender;
     if (!result.initial_cursor_line) return error.SessionDidNotPositionCursor;
 
-    try embedded.input("Go@text changed<Esc>");
-    try embedded.command("write");
+    // nvim_input queues asynchronously. Keep the edit and its write in the
+    // same input stream so an independent RPC command cannot overtake it.
+    try embedded.input("Go@text changed<Esc>:w<CR>");
     try expectApply(io, embedded, 73, "@slide\n@text hello\n@text changed\n", 74);
     result.write_round_trip = true;
 
@@ -155,6 +156,7 @@ fn expectApply(
             if (apply.opening_revision != expected_revision or
                 !std.mem.eql(u8, apply.source, expected_source))
             {
+                std.debug.print("session probe apply mismatch: expected revision={}, actual revision={}, expected source={s}, actual source={s}\n", .{ expected_revision, apply.opening_revision, expected_source, apply.source });
                 try embedded.rejectApply("unexpected session probe source");
                 return error.UnexpectedApplySource;
             }
@@ -184,8 +186,7 @@ fn runRejectedWriteProbe(
 ) !void {
     const embedded = try openProbe(io, allocator, executable, "@slide\n", 91, 44, 10);
     defer embedded.deinit();
-    try embedded.input("Go@definitely-invalid-probe<Esc>");
-    try embedded.command("wq");
+    try embedded.input("Go@definitely-invalid-probe<Esc>:wq<CR>");
 
     for (0..wait_iterations) |_| {
         if (embedded.takeApply()) |_| {
@@ -198,12 +199,14 @@ fn runRejectedWriteProbe(
     result.rejected_wq_stayed_open = !embedded.shouldClose();
     if (!result.rejected_wq_stayed_open) return error.RejectedWriteClosedOverlay;
 
-    try embedded.command("quit");
+    // A typed failed write can leave a hit-enter prompt. Acknowledge it
+    // before exercising dirty :q, then acknowledge that refusal before :q!.
+    try embedded.input("<CR>:q<CR>");
     try io.sleep(.fromMilliseconds(100), .awake);
     result.dirty_q_stayed_open = !embedded.shouldClose();
     if (!result.dirty_q_stayed_open) return error.DirtyQuitClosedOverlay;
 
-    try embedded.command("quit!");
+    try embedded.input("<CR>:q!<CR>");
     try waitForClose(io, embedded);
     result.forced_quit_closed_overlay = true;
 }
@@ -219,12 +222,11 @@ fn runApplyAndCloseProbe(
 ) !bool {
     const embedded = try openProbe(io, allocator, executable, "@slide\n", revision, 40, 9);
     defer embedded.deinit();
-    try embedded.input("Go@text applied<Esc>");
-    switch (kind) {
-        .wq => try embedded.command("wq"),
-        .xit => try embedded.command("xit"),
-        .zz => try embedded.input("ZZ"),
-    }
+    try embedded.input(switch (kind) {
+        .wq => "Go@text applied<Esc>:wq<CR>",
+        .xit => "Go@text applied<Esc>:x<CR>",
+        .zz => "Go@text applied<Esc>ZZ",
+    });
     try expectApply(io, embedded, revision, "@slide\n@text applied\n", revision + 1);
     try waitForClose(io, embedded);
     return true;
@@ -255,12 +257,11 @@ fn runQuitAllProbe(
     {
         const embedded = try openProbe(io, allocator, executable, "@slide\n", 121, 40, 9);
         defer embedded.deinit();
-        try embedded.input("Go@text dirty<Esc>");
-        try embedded.command("qa");
+        try embedded.input("Go@text dirty<Esc>:qa<CR>");
         try io.sleep(.fromMilliseconds(100), .awake);
         result.dirty_qa_stayed_open = !embedded.shouldClose();
         if (!result.dirty_qa_stayed_open) return error.DirtyQuitAllClosedOverlay;
-        try embedded.command("qa!");
+        try embedded.input("<CR>:qa!<CR>");
         try waitForClose(io, embedded);
         try expectNoApply(io, embedded);
         result.forced_qa_closed = true;
@@ -278,7 +279,7 @@ fn runBufferCloseProbe(io: std.Io, allocator: std.mem.Allocator, executable: []c
 fn runChildFailureProbe(io: std.Io, allocator: std.mem.Allocator, executable: []const u8) !bool {
     const embedded = try openProbe(io, allocator, executable, "@slide\n", 140, 40, 9);
     defer embedded.deinit();
-    try embedded.command("lua vim.uv.kill(vim.fn.getpid(), 9)");
+    try embedded.command("lua (vim.uv or vim.loop).kill(vim.fn.getpid(), 9)");
     try waitForClose(io, embedded);
     return embedded.state() == .closed or embedded.state() == .failed;
 }
@@ -287,13 +288,11 @@ fn runRepeatedWriteProbe(io: std.Io, allocator: std.mem.Allocator, executable: [
     const embedded = try openProbe(io, allocator, executable, "@slide\n", 150, 40, 9);
     defer embedded.deinit();
 
-    try embedded.input("Go@text one<Esc>");
-    try embedded.command("write");
+    try embedded.input("Go@text one<Esc>:w<CR>");
     try expectApply(io, embedded, 150, "@slide\n@text one\n", 151);
     try io.sleep(.fromMilliseconds(50), .awake);
 
-    try embedded.input("Go@text two<Esc>");
-    try embedded.command("write");
+    try embedded.input("Go@text two<Esc>:w<CR>");
     try expectApply(io, embedded, 151, "@slide\n@text one\n@text two\n", 152);
     try io.sleep(.fromMilliseconds(50), .awake);
 
@@ -363,7 +362,7 @@ fn runHostShutdownProbe(io: std.Io, allocator: std.mem.Allocator, executable: []
 }
 
 fn processExists(process_id: std.process.Child.Id) !bool {
-    std.posix.kill(process_id, @enumFromInt(0)) catch |err| switch (err) {
+    std.posix.kill(process_id, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
         error.ProcessNotFound => return false,
         error.PermissionDenied => return true,
         else => return err,

@@ -1,9 +1,7 @@
 const std = @import("std");
 const rl = @import("raylib");
 const pathRelativeTo = @import("utils.zig").pathRelativeTo;
-const svg = @cImport({
-    @cInclude("svg_rasterizer.h");
-});
+const svg = @import("svg_rasterizer_c");
 
 allocator: std.mem.Allocator,
 /// Optional only for renderer unit tests. The app supplies its I/O backend so
@@ -55,7 +53,7 @@ pub fn getImageTexture(
     // box-aware 2x resolution, so Studio zoom, HiDPI presentation, and export
     // do not depend on an external converter or a tiny intrinsic bitmap.
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const zpath = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{realpath});
+    const zpath = try std.mem.printSentinel(&path_buffer, "{s}", .{realpath}, 0);
     const result: TextureWithDimensions = if (is_svg) svg_result: {
         var raster: svg.RayslidesSvgImage = std.mem.zeroes(svg.RayslidesSvgImage);
         if (svg.rayslides_svg_rasterize_file(zpath.ptr, requested_width, requested_height, &raster) != 0 or

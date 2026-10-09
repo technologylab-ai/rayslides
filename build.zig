@@ -2,6 +2,27 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_zon = @embedFile("build.zig.zon");
 
+comptime {
+    if (builtin.zig_version.order(.{ .major = 0, .minor = 17, .patch = 0 }) != .eq)
+        @compileError("Rayslides requires exact Zig 0.17.0 (see .zig-version)");
+}
+
+fn addCBinding(
+    b: *std.Build,
+    module: *std.Build.Module,
+    name: []const u8,
+    header: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+) void {
+    const translated = b.addTranslateC(.{
+        .root_source_file = b.path(header),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport(name, translated.createModule());
+}
+
 const default_target: std.Target.Query = switch (builtin.os.tag) {
     // Native Zig otherwise records the exact host macOS version as the
     // deployment floor. Keep local CLI builds and the non-notarized .app
@@ -76,10 +97,12 @@ fn dirExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{ .default_target = default_target });
 
     const optimize = b.standardOptimizeOption(.{});
+    const python = b.option([]const u8, "python", "Python 3 interpreter for development tooling") orelse
+        if (builtin.os.tag == .windows) "python" else "python3";
     const neovim_supported = switch (target.result.os.tag) {
         .linux, .macos => true,
         else => false,
@@ -119,9 +142,17 @@ pub fn build(b: *std.Build) void {
         .link_libc = if (enable_neovim) true else null,
     });
     if (enable_neovim) {
-        if (b.lazyDependency("mpack", .{})) |mpack_dep| {
+        {
+            const mpack_dep = try b.dependencyLazy("mpack", .{});
             neovim_mpack_license_path = mpack_dep.path("LICENSE");
             neovim_mod.addIncludePath(mpack_dep.path("src/mpack"));
+            const mpack_bindings = b.addTranslateC(.{
+                .root_source_file = b.path("src/nvim/mpack_bindings.h"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mpack_bindings.addIncludePath(mpack_dep.path("src/mpack"));
+            neovim_mod.addImport("mpack_c", mpack_bindings.createModule());
             neovim_mod.addCMacro("MPACK_EXTENSIONS", "1");
             neovim_mod.addCSourceFiles(.{
                 .root = mpack_dep.path("src/mpack"),
@@ -136,18 +167,25 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{"-std=c99"},
             });
         }
-        if (b.lazyDependency("jetbrains_mono", .{})) |font_dep| {
+        {
+            const font_dep = try b.dependencyLazy("jetbrains_mono", .{});
             neovim_font_path = font_dep.path("fonts/ttf/JetBrainsMono-Regular.ttf");
             neovim_font_license_path = font_dep.path("OFL.txt");
         }
     }
-    build_options.addOption(
-        []const u8,
-        "neovim_font_development_path",
-        if (neovim_font_path) |path| path.getPath(b) else "",
-    );
+    if (neovim_font_path) |path| {
+        build_options.addOptionPath("neovim_font_development_path", path);
+    } else {
+        build_options.addOption([]const u8, "neovim_font_development_path", "");
+    }
     exe_mod.addImport("neovim", neovim_mod);
 
+    addCBinding(b, exe_mod, "pdfgen_c", "src/pdf/pdfgen.h", target, optimize);
+    addCBinding(b, exe_mod, "qrcodegen_c", "src/qr/qrcodegen.h", target, optimize);
+    addCBinding(b, exe_mod, "svg_rasterizer_c", "src/svg_rasterizer.h", target, optimize);
+    if (target.result.os.tag != .windows) {
+        addCBinding(b, exe_mod, "network_c", "src/presenter_network.h", target, optimize);
+    }
     exe_mod.addCSourceFile(.{ .file = b.path("src/pdf/pdfgen.c") });
     exe_mod.addIncludePath(b.path("src/pdf"));
     exe_mod.addCSourceFile(.{ .file = b.path("src/qr/qrcodegen.c") });
@@ -165,7 +203,7 @@ pub fn build(b: *std.Build) void {
         exe_mod.linkFramework("AppKit", .{});
         exe_mod.linkFramework("Foundation", .{});
     } else if (target.result.os.tag == .windows) {
-        exe_mod.linkSystemLibrary("iphlpapi", .{});
+        exe_mod.linkSystemLibrary("iphlpapi", .{ .use_pkg_config = .no });
     } else if (native_linux) {
         addNativeSystemPaths(b, exe_mod);
     }
@@ -184,11 +222,14 @@ pub fn build(b: *std.Build) void {
         .use_lld = if (native_linux) false else null,
     });
 
-    const raylib_dep = b.dependency("raylib_zig", .{
+    const raylib_dep = try b.dependencyLazy("raylib_zig", .{
         .target = target,
         .optimize = optimize,
     });
 
+    // raylib-zig can need a transitive lazy SDK dependency before exporting
+    // modules. Let the build runner fetch it and retry configuration first.
+    if (b.graph.needed_lazy_dependencies.count() != 0) return error.LazyDependencyNeeded;
     const raylib = raylib_dep.module("raylib"); // main raylib module
     const raygui = raylib_dep.module("raygui"); // raygui module
     const raylib_artifact = raylib_dep.artifact("raylib"); // raylib C library
@@ -234,9 +275,7 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
@@ -288,32 +327,32 @@ pub fn build(b: *std.Build) void {
     const neovim_runtime_test_step = b.step("neovim-runtime-test", "Test the bundled .sld Neovim runtime");
     neovim_runtime_test_step.dependOn(&neovim_runtime_test_cmd.step);
 
-    const baseline_self_test_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "self-test" });
+    const baseline_self_test_cmd = b.addSystemCommand(&.{ python, "tools/studio_baseline.py", "self-test" });
     const baseline_self_test_step = b.step("studio-baseline-test", "Test the Studio visual/performance baseline harness");
     baseline_self_test_step.dependOn(&baseline_self_test_cmd.step);
 
-    const baseline_check_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "check", "--binary" });
+    const baseline_check_cmd = b.addSystemCommand(&.{ python, "tools/studio_baseline.py", "check", "--binary" });
     baseline_check_cmd.addArtifactArg(exe);
-    if (b.args) |args| baseline_check_cmd.addArgs(args);
+    baseline_check_cmd.addPassthruArgs();
     const baseline_check_step = b.step("studio-baselines", "Capture and compare opt-in Studio visual/performance baselines");
     baseline_check_step.dependOn(&baseline_check_cmd.step);
 
-    const baseline_update_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "update", "--binary" });
+    const baseline_update_cmd = b.addSystemCommand(&.{ python, "tools/studio_baseline.py", "update", "--binary" });
     baseline_update_cmd.addArtifactArg(exe);
-    if (b.args) |args| baseline_update_cmd.addArgs(args);
+    baseline_update_cmd.addPassthruArgs();
     const baseline_update_step = b.step("studio-baselines-update", "Capture and replace Studio visual/performance baselines");
     baseline_update_step.dependOn(&baseline_update_cmd.step);
 
     if (enable_neovim) {
         const neovim_baseline_check_cmd = b.addSystemCommand(&.{
-            "python3",
+            python,
             "tools/studio_baseline.py",
             "check",
             "--suite=neovim",
             "--binary",
         });
         neovim_baseline_check_cmd.addArtifactArg(exe);
-        if (b.args) |args| neovim_baseline_check_cmd.addArgs(args);
+        neovim_baseline_check_cmd.addPassthruArgs();
         const neovim_baseline_check_step = b.step(
             "neovim-baselines",
             "Capture and compare the embedded Neovim overlay baselines",
@@ -321,14 +360,14 @@ pub fn build(b: *std.Build) void {
         neovim_baseline_check_step.dependOn(&neovim_baseline_check_cmd.step);
 
         const neovim_baseline_update_cmd = b.addSystemCommand(&.{
-            "python3",
+            python,
             "tools/studio_baseline.py",
             "update",
             "--suite=neovim",
             "--binary",
         });
         neovim_baseline_update_cmd.addArtifactArg(exe);
-        if (b.args) |args| neovim_baseline_update_cmd.addArgs(args);
+        neovim_baseline_update_cmd.addPassthruArgs();
         const neovim_baseline_update_step = b.step(
             "neovim-baselines-update",
             "Capture and replace the embedded Neovim overlay baselines",
@@ -340,16 +379,22 @@ pub fn build(b: *std.Build) void {
     release_confidence_step.dependOn(test_step);
     release_confidence_step.dependOn(baseline_self_test_step);
 
+    const verify_step = b.step("verify", "Build the application and run correctness and harness tests");
+    verify_step.dependOn(b.getInstallStep());
+    verify_step.dependOn(release_confidence_step);
+    const fmt_check = b.addFmt(.{ .paths = b.pathList(&.{ "build.zig", "build.zig.zon", "src" }), .check = true });
+    verify_step.dependOn(&fmt_check.step);
+
     const macos_release_qa_step = b.step("macos-release-qa", "Run automated macOS Studio baseline gates; see docs/MACOS_RELEASE_QA.md");
     macos_release_qa_step.dependOn(baseline_check_step);
 
     if (target.result.os.tag == .macos) {
-        const package_cmd = b.addSystemCommand(&.{"python3"});
+        const package_cmd = b.addSystemCommand(&.{python});
         package_cmd.addFileArg(b.path("tools/package_macos_app.py"));
         package_cmd.addArg("--binary");
         package_cmd.addArtifactArg(exe);
         package_cmd.addArg("--output");
-        const packaged_app = package_cmd.addOutputDirectoryArg("Rayslides.app");
+        const packaged_app = package_cmd.addOutputDirectoryArg2("Rayslides.app", .{ .make_absolute = true });
         package_cmd.addArgs(&.{ "--version", packageVersion(), "--icon" });
         package_cmd.addFileArg(b.path("src/assets/rayslides-app-icon.png"));
         if (enable_neovim) {

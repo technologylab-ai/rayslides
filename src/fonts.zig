@@ -292,7 +292,7 @@ pub const AvailableFonts = struct {
         var temp_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (fontConfig.normal) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
-            const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
+            const path = try std.mem.printSentinel(&temp_buf, "{s}", .{realpath}, 0);
             const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.normal);
             self.normal = replacement;
@@ -301,7 +301,7 @@ pub const AvailableFonts = struct {
 
         if (fontConfig.bold) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
-            const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
+            const path = try std.mem.printSentinel(&temp_buf, "{s}", .{realpath}, 0);
             const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.bold);
             self.bold = replacement;
@@ -309,7 +309,7 @@ pub const AvailableFonts = struct {
 
         if (fontConfig.italic) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
-            const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
+            const path = try std.mem.printSentinel(&temp_buf, "{s}", .{realpath}, 0);
             const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.italic);
             self.italic = replacement;
@@ -317,7 +317,7 @@ pub const AvailableFonts = struct {
 
         if (fontConfig.bolditalic) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
-            const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
+            const path = try std.mem.printSentinel(&temp_buf, "{s}", .{realpath}, 0);
             const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.bolditalic);
             self.bolditalic = replacement;
@@ -325,7 +325,7 @@ pub const AvailableFonts = struct {
 
         if (fontConfig.zig) |fontfile| {
             const realpath = try pathRelativeTo(fontfile.ttf_filn, slideshow_filp);
-            const path = try std.fmt.bufPrintZ(&temp_buf, "{s}", .{realpath});
+            const path = try std.mem.printSentinel(&temp_buf, "{s}", .{realpath}, 0);
             const replacement = try loadSdfFontFile(path, fontConfig.opts.fontSize, fontConfig.opts.fontChars);
             rl.unloadFont(self.zig);
             self.zig = replacement;

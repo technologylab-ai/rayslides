@@ -202,6 +202,7 @@ const RenderFingerprinter = struct {
     }
 
     fn addF32(self: *RenderFingerprinter, value: f32) void {
+        // Scalar IEEE-754 value bits; no array lanes or memory-byte conversion.
         self.addScalar(@as(u32, @bitCast(value)));
     }
 
@@ -235,8 +236,8 @@ const RenderFingerprinter = struct {
     fn addItemAnimation(self: *RenderFingerprinter, value: ?animation.ItemSpec) void {
         self.addBool(value != null);
         if (value) |spec| {
-            self.addScalar(@as(u8, @intFromEnum(spec.effect)));
-            self.addScalar(@as(u8, @intFromEnum(spec.by)));
+            self.addScalar(@as(u8, @backingInt(spec.effect)));
+            self.addScalar(@as(u8, @backingInt(spec.by)));
             self.addOptionalF32(spec.after);
             self.addF32(spec.duration);
         }
@@ -245,7 +246,7 @@ const RenderFingerprinter = struct {
     fn addMorphSpec(self: *RenderFingerprinter, spec: animation.MorphSpec) void {
         self.addOptionalF32(spec.after);
         self.addF32(spec.duration);
-        self.addScalar(@as(u8, @intFromEnum(spec.easing)));
+        self.addScalar(@as(u8, @backingInt(spec.easing)));
     }
 
     fn addTextShadow(self: *RenderFingerprinter, value: ?slides.TextShadow) void {
@@ -260,7 +261,7 @@ const RenderFingerprinter = struct {
     fn addCrowd(self: *RenderFingerprinter, value: ?slides.CrowdSpec) void {
         self.addBool(value != null);
         if (value) |crowd| {
-            self.addScalar(@as(u8, @intFromEnum(crowd.kind)));
+            self.addScalar(@as(u8, @backingInt(crowd.kind)));
             self.addString(crowd.id);
             self.addString(crowd.prompt);
             self.addScalar(crowd.choices.len);
@@ -271,15 +272,15 @@ const RenderFingerprinter = struct {
 
     fn addItem(self: *RenderFingerprinter, item: slides.SlideItem) void {
         self.addScalar(item.identity);
-        self.addScalar(@as(u8, @intFromEnum(item.kind)));
+        self.addScalar(@as(u8, @backingInt(item.kind)));
         self.addOptionalString(item.text);
         self.addOptionalI32(item.fontSize);
         self.addOptionalF32(item.line_height_factor);
-        self.addScalar(@as(u8, @intFromEnum(item.text_alignment)));
-        self.addScalar(@as(u8, @intFromEnum(item.text_vertical_alignment)));
+        self.addScalar(@as(u8, @backingInt(item.text_alignment)));
+        self.addScalar(@as(u8, @backingInt(item.text_vertical_alignment)));
         self.addF32(item.corner_radius);
         self.addF32(item.line_width);
-        self.addScalar(@as(u8, @intFromEnum(item.line_direction)));
+        self.addScalar(@as(u8, @backingInt(item.line_direction)));
         self.addBool(item.line_arrow_start);
         self.addBool(item.line_arrow_end);
         self.addF32(item.rotation);
@@ -289,14 +290,14 @@ const RenderFingerprinter = struct {
         self.addOptionalString(item.vid_path);
         self.addBool(item.vid_is_camera);
         self.addVector(item.vid_camera_size);
-        self.addScalar(@as(u8, @intFromEnum(item.vid_camera_format)));
+        self.addScalar(@as(u8, @backingInt(item.vid_camera_format)));
         self.addOptionalString(item.vid_camera_poster);
         self.addBool(item.vid_autoplay);
         self.addBool(item.vid_loop);
         self.addOptionalF32(item.vid_poster);
         self.addF32(item.vid_volume);
         self.addBool(item.vid_muted);
-        self.addScalar(@as(u8, @intFromEnum(item.media_fit)));
+        self.addScalar(@as(u8, @backingInt(item.media_fit)));
         self.addVector(item.media_focus);
         self.addVector(item.position);
         self.addVector(item.size);
@@ -320,7 +321,7 @@ const RenderFingerprinter = struct {
 fn renderInputFingerprint(slide: *const slides.Slide, slideshow_filp: []const u8) u64 {
     var hash = RenderFingerprinter{};
     hash.addString(slideshow_filp);
-    hash.addScalar(@as(u8, @intFromEnum(slide.transition.effect)));
+    hash.addScalar(@as(u8, @backingInt(slide.transition.effect)));
     hash.addF32(slide.transition.duration);
     if (slide.items) |items| {
         hash.addScalar(items.items.len);
@@ -457,7 +458,7 @@ const VideoOverlayUi = struct {
 
 fn formatPlayerTime(buf: []u8, seconds: f64) [:0]const u8 {
     const total: u64 = @intFromFloat(@max(0, seconds));
-    return std.fmt.bufPrintZ(buf, "{d}:{d:0>2}", .{ total / 60, total % 60 }) catch "0:00";
+    return std.mem.printSentinel(buf, "{d}:{d:0>2}", .{ total / 60, total % 60 }, 0) catch "0:00";
 }
 
 pub const SlideshowRenderer = struct {
@@ -513,7 +514,7 @@ pub const SlideshowRenderer = struct {
     }
 
     fn ownRenderedText(self: *SlideshowRenderer, render_slide: *RenderedSlide, text: []const u8) ![:0]const u8 {
-        const owned = try self.allocator.dupeZ(u8, text);
+        const owned = try self.allocator.dupeSentinel(u8, text, 0);
         errdefer self.allocator.free(owned);
         try render_slide.owned_text.append(self.allocator, owned);
         return owned;
@@ -2671,7 +2672,7 @@ pub const SlideshowRenderer = struct {
         rl.drawRectangleRounded(panel, 0.04, 16, colorWithOpacity(.{ .r = 10, .g = 13, .b = 27, .a = 242 }, opacity));
         rl.drawRectangleRoundedLinesEx(panel, 0.04, 16, @max(1.0, 2.0 * scale), colorWithOpacity(.{ .r = 105, .g = 112, .b = 255, .a = 110 }, opacity));
 
-        const connected_text = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{d} live", .{snapshot.connected}) catch return;
+        const connected_text = std.mem.printSentinel(&crowd_text_buffer_a, "{d} live", .{snapshot.connected}, 0) catch return;
         const pulse = @as(f32, 0.72) + @as(f32, 0.28) * std.math.sin(@as(f32, @floatCast(rl.getTime())) * 3.0);
         rl.drawCircleV(.{ .x = panel.x + panel.width - 194 * scale, .y = panel.y + 54 * scale }, (7.0 + pulse * 2.0) * scale, colorWithOpacity(.{ .r = 77, .g = 255, .b = 181, .a = 255 }, opacity));
         drawCrowdText(self.fonts, self.fonts.bold, connected_text, .{ .x = panel.x + panel.width - 172 * scale, .y = panel.y + 35 * scale }, 30 * scale, colorWithOpacity(.{ .r = 205, .g = 255, .b = 232, .a = 255 }, opacity));
@@ -2685,7 +2686,7 @@ pub const SlideshowRenderer = struct {
     fn renderCrowdJoin(self: *SlideshowRenderer, spec: slides.CrowdSpec, snapshot: crowdplay.Snapshot, crowd_url: []const u8, panel: rl.Rectangle, scale: f32, opacity: f32) void {
         const eyebrow = "CROWDPLAY\x00";
         drawCrowdText(self.fonts, self.fonts.bold, eyebrow, .{ .x = panel.x + 72 * scale, .y = panel.y + 52 * scale }, 24 * scale, colorWithOpacity(.{ .r = 147, .g = 156, .b = 255, .a = 255 }, opacity));
-        const prompt = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{s}", .{spec.prompt}) catch return;
+        const prompt = std.mem.printSentinel(&crowd_text_buffer_b, "{s}", .{spec.prompt}, 0) catch return;
         drawCrowdTextFitted(self.fonts, self.fonts.bold, prompt, .{ .x = panel.x + 72 * scale, .y = panel.y + 116 * scale }, 62 * scale, panel.width - 144 * scale, colorWithOpacity(.white, opacity));
         drawCrowdText(self.fonts, self.fonts.normal, "Open this address on your phone\x00", .{ .x = panel.x + 74 * scale, .y = panel.y + 214 * scale }, 28 * scale, colorWithOpacity(.{ .r = 177, .g = 185, .b = 214, .a = 255 }, opacity));
 
@@ -2698,7 +2699,7 @@ pub const SlideshowRenderer = struct {
         };
         const url_panel = rl.Rectangle{ .x = panel.x + 72 * scale, .y = panel.y + 278 * scale, .width = panel.width - qr_side - 190 * scale, .height = 116 * scale };
         rl.drawRectangleRounded(url_panel, 0.16, 12, colorWithOpacity(.{ .r = 24, .g = 29, .b = 54, .a = 255 }, opacity));
-        const url = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{if (crowd_url.len > 0) crowd_url else "Crowdplay server unavailable"}) catch return;
+        const url = std.mem.printSentinel(&crowd_text_buffer_a, "{s}", .{if (crowd_url.len > 0) crowd_url else "Crowdplay server unavailable"}, 0) catch return;
         drawCrowdTextFitted(self.fonts, self.fonts.bold, url, .{ .x = url_panel.x + 34 * scale, .y = url_panel.y + 34 * scale }, 34 * scale, url_panel.width - 68 * scale, colorWithOpacity(.{ .r = 113, .g = 242, .b = 255, .a = 255 }, opacity));
         if (crowd_url.len > 0 and self.qr_code.ensure(crowd_url)) drawQrCode(&self.qr_code, qr_region, opacity);
 
@@ -2708,7 +2709,7 @@ pub const SlideshowRenderer = struct {
             .width = panel.width * 0.34,
             .height = panel.height * 0.22,
         }, scale, opacity);
-        const people = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d} {s} in the room", .{ snapshot.connected, if (snapshot.connected == 1) "person" else "people" }) catch return;
+        const people = std.mem.printSentinel(&crowd_text_buffer_b, "{d} {s} in the room", .{ snapshot.connected, if (snapshot.connected == 1) "person" else "people" }, 0) catch return;
         const measured = self.fonts.measureTextWithFallback(self.fonts.bold, people, 34 * scale, 0);
         drawCrowdText(self.fonts, self.fonts.bold, people, .{ .x = panel.x + (panel.width - measured.x) / 2, .y = panel.y + panel.height - 92 * scale }, 34 * scale, colorWithOpacity(.{ .r = 205, .g = 211, .b = 239, .a = 255 }, opacity));
     }
@@ -2725,10 +2726,10 @@ pub const SlideshowRenderer = struct {
 
         const poll_label = if (!available) "POLL OFFLINE\x00" else if (open) "LIVE POLL\x00" else "POLL LOCKED\x00";
         drawCrowdText(self.fonts, self.fonts.bold, poll_label, .{ .x = panel.x + 64 * scale, .y = panel.y + 42 * scale }, 23 * scale, colorWithOpacity(if (!available) .{ .r = 255, .g = 107, .b = 133, .a = 255 } else if (open) .{ .r = 77, .g = 255, .b = 181, .a = 255 } else .{ .r = 255, .g = 178, .b = 87, .a = 255 }, opacity));
-        const question = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{spec.prompt}) catch return;
+        const question = std.mem.printSentinel(&crowd_text_buffer_a, "{s}", .{spec.prompt}, 0) catch return;
         drawCrowdTextFitted(self.fonts, self.fonts.bold, question, .{ .x = panel.x + 64 * scale, .y = panel.y + 92 * scale }, 48 * scale, panel.width - 128 * scale, colorWithOpacity(.white, opacity));
 
-        const total_text = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d} {s}", .{ total, if (total == 1) "vote" else "votes" }) catch return;
+        const total_text = std.mem.printSentinel(&crowd_text_buffer_b, "{d} {s}", .{ total, if (total == 1) "vote" else "votes" }, 0) catch return;
         drawCrowdText(self.fonts, self.fonts.normal, total_text, .{ .x = panel.x + 66 * scale, .y = panel.y + 160 * scale }, 24 * scale, colorWithOpacity(.{ .r = 173, .g = 180, .b = 211, .a = 255 }, opacity));
 
         const count: usize = @min(spec.choices.len, crowdplay.max_choices);
@@ -2755,12 +2756,12 @@ pub const SlideshowRenderer = struct {
                 rl.drawRectangleRounded(fill, 0.14, 10, colorWithOpacity(accent, opacity * 0.42));
             }
             rl.drawRectangleRoundedLinesEx(card, 0.14, 10, @max(1.0, 1.5 * scale), colorWithOpacity(accent, opacity * 0.52));
-            const choice = std.fmt.bufPrintZ(&crowd_text_buffer_a, "{s}", .{choice_label}) catch continue;
+            const choice = std.mem.printSentinel(&crowd_text_buffer_a, "{s}", .{choice_label}, 0) catch continue;
             const label_width = card.width - (if (revealed) 245 * scale else 54 * scale);
             drawCrowdTextFitted(self.fonts, self.fonts.bold, choice, .{ .x = card.x + 27 * scale, .y = card.y + (card.height - 30 * scale) / 2 }, 28 * scale, label_width, colorWithOpacity(.white, opacity));
             if (revealed) {
                 const percent: u32 = if (total > 0) @intFromFloat(@round(fraction * 100.0)) else 0;
-                const result = std.fmt.bufPrintZ(&crowd_text_buffer_b, "{d}%  ·  {d}", .{ percent, votes }) catch continue;
+                const result = std.mem.printSentinel(&crowd_text_buffer_b, "{d}%  ·  {d}", .{ percent, votes }, 0) catch continue;
                 const measured = self.fonts.measureTextWithFallback(self.fonts.bold, result, 27 * scale, 0);
                 drawCrowdText(self.fonts, self.fonts.bold, result, .{ .x = card.x + card.width - measured.x - 26 * scale, .y = card.y + (card.height - 29 * scale) / 2 }, 27 * scale, colorWithOpacity(accent, opacity));
             }
@@ -3820,7 +3821,7 @@ test "repeated preRender releases slides morph scenes plans and owned text" {
         try std.testing.expectEqual(@as(usize, 1), rendered_slide.morph_scenes.items.len);
         try std.testing.expectEqual(@as(usize, 1), rendered_slide.steps.items.len);
         _ = try renderer.ownRenderedText(rendered_slide, "owned base text");
-        const scene_text = try allocator.dupeZ(u8, "owned morph text");
+        const scene_text = try allocator.dupeSentinel(u8, "owned morph text", 0);
         errdefer allocator.free(scene_text);
         try rendered_slide.morph_scenes.items[0].owned_text.append(allocator, scene_text);
     }
@@ -4842,4 +4843,14 @@ test "reveal transforms clamp opacity for overshooting easings" {
     try std.testing.expect(overshoot.opacity <= 1.0);
     const done = itemAnimationTransform(.fade, 1.0, size, size);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), done.opacity, 0.0001);
+}
+
+test "render fingerprints retain literal IEEE-754 scalar bits" {
+    var actual: RenderFingerprinter = .{};
+    var expected: RenderFingerprinter = .{};
+    actual.addF32(1.0);
+    actual.addF32(-0.0);
+    expected.addScalar(@as(u32, 0x3f800000));
+    expected.addScalar(@as(u32, 0x80000000));
+    try std.testing.expectEqual(expected.value, actual.value);
 }

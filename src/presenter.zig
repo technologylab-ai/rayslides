@@ -2,11 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const slides = @import("slides.zig");
 
-const network_c = if (builtin.os.tag == .windows) struct {} else @cImport({
-    @cInclude("ifaddrs.h");
-    @cInclude("net/if.h");
-    @cInclude("netinet/in.h");
-});
+const network_c = if (builtin.os.tag == .windows) struct {} else @import("network_c");
 
 const WindowsNetwork = struct {
     const windows = std.os.windows;

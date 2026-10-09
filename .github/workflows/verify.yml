@@ -1,0 +1,87 @@
+name: Native correctness
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rayslides-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Native ${{ matrix.os }} / ${{ matrix.optimize }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        optimize: [debug, safe]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install exact checksum-verified Zig
+        run: python .github/install-zig.py
+      - name: Install isolated Python harness dependencies
+        run: python .github/setup-python-env.py
+      - name: Install Linux graphics and editor dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libasound2-dev xvfb neovim
+      - name: Install macOS editor
+        if: runner.os == 'macOS'
+        run: brew install neovim
+      - name: Record native environment
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/rayslides-ci"
+          { git rev-parse HEAD; zig version; python --version; } > "$RUNNER_TEMP/rayslides-ci/environment.log"
+          python -c 'import platform; print(platform.platform()); print(platform.machine())' >> "$RUNNER_TEMP/rayslides-ci/environment.log"
+          if [ "${{ runner.os }}" != "Windows" ]; then nvim --version >> "$RUNNER_TEMP/rayslides-ci/environment.log"; fi
+      - name: Build and verify built-in editor
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build verify -Doptimize=${{ matrix.optimize }} -Dneovim=false -j2 --summary all 2>&1 | tee "$RUNNER_TEMP/rayslides-ci/default.log"
+      - name: CLI smoke
+        shell: bash
+        run: python tools/zig_port_smoke.py --binary zig-out/bin/rayslides${{ runner.os == 'Windows' && '.exe' || '' }} --output "$RUNNER_TEMP/rayslides-ci/cli" --cli-only
+      - name: Build and verify embedded editor
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build verify neovim-probe neovim-runtime-test -Doptimize=${{ matrix.optimize }} -Dneovim=true -j2 --summary all 2>&1 | tee "$RUNNER_TEMP/rayslides-ci/neovim.log"
+      - name: Linux no-display startup behavior
+        if: runner.os == 'Linux' && matrix.optimize == 'safe'
+        shell: bash
+        run: python tools/zig_port_smoke.py --binary zig-out/bin/rayslides --output "$RUNNER_TEMP/rayslides-ci/no-display" --no-display
+      - name: Linux software-rendered framebuffer smoke
+        if: runner.os == 'Linux' && matrix.optimize == 'safe'
+        shell: bash
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: xvfb-run -a python tools/zig_port_smoke.py --binary zig-out/bin/rayslides --output "$RUNNER_TEMP/rayslides-ci/render" --neovim
+      - name: Build macOS application bundle
+        if: runner.os == 'macOS' && matrix.optimize == 'safe'
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build macos-app -Doptimize=safe -Dneovim=true -j2 --summary all 2>&1 | tee "$RUNNER_TEMP/rayslides-ci/package.log"
+          test -f zig-out/Rayslides.app/Contents/MacOS/rayslides
+      - name: Upload native verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rayslides-${{ matrix.os }}-${{ matrix.optimize }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rayslides-ci
+          if-no-files-found: warn
+          retention-days: 14

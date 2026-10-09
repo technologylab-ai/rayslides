@@ -196,7 +196,7 @@ pub const Picker = struct {
         }, value_size, if (shown.len > 0) theme.text else theme.text_muted);
 
         var count_buffer: [48]u8 = undefined;
-        const count_text = std.fmt.bufPrintZ(&count_buffer, "/ {d}", .{slide_count}) catch "/ ?";
+        const count_text = std.mem.printSentinel(&count_buffer, "/ {d}", .{slide_count}, 0) catch "/ ?";
         const count_width = measureText(font, count_text, heading_size);
         drawText(font, count_text, .{
             .x = placement.input.x + placement.input.width - count_width,
@@ -227,9 +227,9 @@ pub const Picker = struct {
 
         var status_buffer: [96]u8 = undefined;
         const status: [:0]const u8 = switch (shown.failure) {
-            .none => std.fmt.bufPrintZ(&status_buffer, "Current slide {d}", .{current_slide + 1}) catch "Current slide",
+            .none => std.mem.printSentinel(&status_buffer, "Current slide {d}", .{current_slide + 1}, 0) catch "Current slide",
             .empty => "Enter a slide number",
-            .out_of_bounds => std.fmt.bufPrintZ(&status_buffer, "Choose a slide from 1 to {d}", .{slide_count}) catch "Slide is out of range",
+            .out_of_bounds => std.mem.printSentinel(&status_buffer, "Choose a slide from 1 to {d}", .{slide_count}, 0) catch "Slide is out of range",
         };
         drawText(font, status, .{
             .x = placement.footer.x,

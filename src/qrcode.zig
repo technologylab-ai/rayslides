@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("qrcodegen.h");
-});
+const c = @import("qrcodegen_c");
 
 pub const Code = struct {
     temp: [c.qrcodegen_BUFFER_LEN_MAX]u8 = @splat(0),
