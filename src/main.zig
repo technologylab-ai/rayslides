@@ -137,9 +137,15 @@ fn studioMediaPathFromSelection(
     deck_path: ?[]const u8,
     selected_path: []const u8,
 ) ![]u8 {
-    const deck_dir = if (deck_path) |path| std.fs.path.dirname(path) orelse "." else return allocator.dupe(u8, selected_path);
-    return std.fs.path.relative(allocator, cwd, null, deck_dir, selected_path) catch
-        allocator.dupe(u8, selected_path);
+    const result = if (deck_path) |path|
+        std.fs.path.relative(allocator, cwd, null, std.fs.path.dirname(path) orelse ".", selected_path) catch
+            try allocator.dupe(u8, selected_path)
+    else
+        try allocator.dupe(u8, selected_path);
+    // Authored .sld paths travel with the deck. Windows accepts forward
+    // slashes too; do not encode its native separator into portable source.
+    if (builtin.os.tag == .windows) std.mem.replaceScalar(u8, result, '\\', '/');
+    return result;
 }
 
 fn studioMediaDirective(
@@ -7805,13 +7811,21 @@ fn writeNewSourceFile(
     path: []const u8,
     source: []const u8,
 ) !void {
-    const reservation = try dir.createFile(io, path, .{ .exclusive = true });
-    errdefer dir.deleteFile(io, path) catch {};
+    // fileStatWindows queries FILE_ALL_INFORMATION, which needs read access
+    // to attributes. The reservation's identity is required for atomic save.
+    const reservation = try dir.createFile(io, path, .{ .exclusive = true, .read = true });
+    var remove_reservation_on_error = true;
+    errdefer if (remove_reservation_on_error) dir.deleteFile(io, path) catch {};
     const reserved_stat = blk: {
         defer reservation.close(io);
         break :blk try reservation.stat(io);
     };
-    try writeSourceAtomically(allocator, io, dir, path, source, reserved_stat);
+    writeSourceAtomically(allocator, io, dir, path, source, reserved_stat) catch |err| {
+        // A detected replacement belongs to another writer. Keep its bytes;
+        // the atomic writer already discards its own temporary on this path.
+        if (err == error.SourceChangedOnDisk) remove_reservation_on_error = false;
+        return err;
+    };
 }
 
 fn saveUntitledEditorSourceAs(raw_path: []const u8) !void {
@@ -7886,6 +7900,68 @@ test "untitled Save As removes its reservation when the atomic writer fails" {
     ));
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "retryable.sld", .{}));
+}
+
+test "untitled Save As preserves an external replacement after a detected conflict" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ReplacingAllocator = struct {
+        backing: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        fired: bool = false,
+        io_error: ?anyerror = null,
+
+        fn getAllocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+
+        fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!self.fired) {
+                self.fired = true;
+                self.replaceReservation() catch |err| {
+                    self.io_error = err;
+                    return null;
+                };
+            }
+            return self.backing.rawAlloc(len, alignment, return_address);
+        }
+
+        fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.backing.rawFree(memory, alignment, return_address);
+        }
+
+        fn replaceReservation(self: *@This()) !void {
+            // The writer's first allocation occurs after reservation close
+            // and before its final identity check. Replace the actual file,
+            // rather than mocking the reported conflict or cleanup result.
+            try self.dir.writeFile(self.io, .{ .sub_path = "external.sld", .data = "@slide\n@text external editor\n" });
+            try self.dir.rename("external.sld", self.dir, "conflicted.sld", self.io);
+        }
+    };
+    var replacing: ReplacingAllocator = .{ .backing = allocator, .io = io, .dir = tmp.dir };
+    try std.testing.expectError(error.SourceChangedOnDisk, writeNewSourceFile(
+        replacing.getAllocator(),
+        io,
+        tmp.dir,
+        "conflicted.sld",
+        "@slide\n@text application draft\n",
+    ));
+    try std.testing.expect(replacing.fired);
+    try std.testing.expectEqual(@as(?anyerror, null), replacing.io_error);
+    const preserved = try tmp.dir.readFileAlloc(io, "conflicted.sld", allocator, .unlimited);
+    defer allocator.free(preserved);
+    try std.testing.expectEqualStrings("@slide\n@text external editor\n", preserved);
 }
 
 test "recovery copies are unique and preserve every source byte" {

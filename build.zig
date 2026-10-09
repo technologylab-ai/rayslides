@@ -101,6 +101,8 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{ .default_target = default_target });
 
     const optimize = b.standardOptimizeOption(.{});
+    const python = b.option([]const u8, "python", "Python 3 interpreter for development tooling") orelse
+        if (builtin.os.tag == .windows) "python" else "python3";
     const neovim_supported = switch (target.result.os.tag) {
         .linux, .macos => true,
         else => false,
@@ -325,17 +327,17 @@ pub fn build(b: *std.Build) !void {
     const neovim_runtime_test_step = b.step("neovim-runtime-test", "Test the bundled .sld Neovim runtime");
     neovim_runtime_test_step.dependOn(&neovim_runtime_test_cmd.step);
 
-    const baseline_self_test_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "self-test" });
+    const baseline_self_test_cmd = b.addSystemCommand(&.{ python, "tools/studio_baseline.py", "self-test" });
     const baseline_self_test_step = b.step("studio-baseline-test", "Test the Studio visual/performance baseline harness");
     baseline_self_test_step.dependOn(&baseline_self_test_cmd.step);
 
-    const baseline_check_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "check", "--binary" });
+    const baseline_check_cmd = b.addSystemCommand(&.{ python, "tools/studio_baseline.py", "check", "--binary" });
     baseline_check_cmd.addArtifactArg(exe);
     baseline_check_cmd.addPassthruArgs();
     const baseline_check_step = b.step("studio-baselines", "Capture and compare opt-in Studio visual/performance baselines");
     baseline_check_step.dependOn(&baseline_check_cmd.step);
 
-    const baseline_update_cmd = b.addSystemCommand(&.{ "python3", "tools/studio_baseline.py", "update", "--binary" });
+    const baseline_update_cmd = b.addSystemCommand(&.{ python, "tools/studio_baseline.py", "update", "--binary" });
     baseline_update_cmd.addArtifactArg(exe);
     baseline_update_cmd.addPassthruArgs();
     const baseline_update_step = b.step("studio-baselines-update", "Capture and replace Studio visual/performance baselines");
@@ -343,7 +345,7 @@ pub fn build(b: *std.Build) !void {
 
     if (enable_neovim) {
         const neovim_baseline_check_cmd = b.addSystemCommand(&.{
-            "python3",
+            python,
             "tools/studio_baseline.py",
             "check",
             "--suite=neovim",
@@ -358,7 +360,7 @@ pub fn build(b: *std.Build) !void {
         neovim_baseline_check_step.dependOn(&neovim_baseline_check_cmd.step);
 
         const neovim_baseline_update_cmd = b.addSystemCommand(&.{
-            "python3",
+            python,
             "tools/studio_baseline.py",
             "update",
             "--suite=neovim",
@@ -387,7 +389,7 @@ pub fn build(b: *std.Build) !void {
     macos_release_qa_step.dependOn(baseline_check_step);
 
     if (target.result.os.tag == .macos) {
-        const package_cmd = b.addSystemCommand(&.{"python3"});
+        const package_cmd = b.addSystemCommand(&.{python});
         package_cmd.addFileArg(b.path("tools/package_macos_app.py"));
         package_cmd.addArg("--binary");
         package_cmd.addArtifactArg(exe);

@@ -1,7 +1,7 @@
 # Zig 0.17.0 migration evidence
 
-Rayslides now requires exact Zig 0.17.0 and consumes the official immutable
-raylib-zig 0.17 port. The complete application, built-in editor, optional embedded
+Rayslides now requires exact Zig 0.17.0 and consumes an immutable relay of the
+official raylib-zig 0.17 port with a minimal upstream Windows SDK build fix. The complete application, built-in editor, optional embedded
 Neovim editor, and macOS packaging compile with safety checks enabled. Native
 macOS test, Neovim protocol, and actual application framebuffer gates pass.
 The Retina startup fix restores correct Studio and editor geometry. Framebuffer
@@ -10,15 +10,24 @@ qualification remains separate from compilation and headless protocol evidence.
 ## Source graph and representation audit
 
 The application baseline is `630948d4bce9139679832a95dbdc229b597d51a1`.
-The new raylib-zig pin is
-[`50d450099da664bedd7dcc6ed40204ab0bb861a5`](https://github.com/raylib-zig/raylib-zig/commit/50d450099da664bedd7dcc6ed40204ab0bb861a5),
-with package hash `raylib_zig-6.0.0-KE8REDSmBQAbyUv_Fh71wgvhQSP2zsmVxtPRLzCgIXWK`.
-Its C implementation identifies itself as raylib 6.1-dev, although its Zig
-package version remains 6.0.0. It pins raylib
-`2dee47282ae75d241759cc35f22e4768dcd092be` and raygui
+The official raylib-zig 0.17 baseline is
+[`50d450099da664bedd7dcc6ed40204ab0bb861a5`](https://github.com/raylib-zig/raylib-zig/commit/50d450099da664bedd7dcc6ed40204ab0bb861a5).
+The final wrapper pin is the manifest-only relay
+[`5e4bf359bcf958884289ec165fd89261937d8f1b`](https://github.com/renerocksai/raylib-zig/commit/5e4bf359bcf958884289ec165fd89261937d8f1b),
+with hash `raylib_zig-6.0.0-KE8REDimBQDOsYOJkaDz88hsBpTsBb1DRENZ2OU_yKua`.
+It selects the C raylib SDK-link fix
+[`89f86afe0fef6f2d0f684313fd58af0c85ce7a4c`](https://github.com/renerocksai/raylib/commit/89f86afe0fef6f2d0f684313fd58af0c85ce7a4c)
+(hash `raylib-6.0.0-whq8uCmfNwWMzHMDK29Wxfg0cSg1myyFGFDJakT1fQv_`), based on
+official `2dee47282ae75d241759cc35f22e4768dcd092be`.
+That owning-dependency change disables pkg-config for four native Windows SDK
+libraries; no runtime or binding code changes. Upstream review is tracked in
+[raylib #6242](https://github.com/raysan5/raylib/pull/6242) and the
+[wrapper relay #363](https://github.com/raylib-zig/raylib-zig/pull/363).
+The C implementation identifies itself as raylib 6.1-dev, although its Zig
+package version remains 6.0.0. Raygui remains pinned to
 `9cb5cfa73290ba920d071f57c1d06a4daee22f52`.
 The existing MPack 1.1.1 and JetBrains Mono 2.304 commits and hashes are retained.
-No upstream dependency source is patched by this application.
+Dependency fixes remain in their owning repositories; this application consumes their immutable hashes.
 
 The exact compiler source defines the port; the
 [wiki migration guide](https://github.com/technologylab-ai/zigllmwiki/blob/main/docs/zig-0.16-to-0.17-migration.md)
@@ -62,8 +71,8 @@ that check is not an application performance claim.
 
 | Gate | Observed result |
 | --- | --- |
-| Complete application + built-in editor, Debug/Safe | 631 application tests and 1 stub test pass |
-| Complete application + embedded editor, Debug/Safe | 631 application tests and 23 editor tests pass |
+| Complete application + built-in editor, Debug/Safe | 632 application tests and 1 stub test pass |
+| Complete application + embedded editor, Debug/Safe | 632 application tests and 23 editor tests pass |
 | Live Neovim embed/session probes, Debug/Safe | Grid rendering protocol, edits, quit/apply fidelity, child failure and host reaping pass |
 | Neovim syntax runtime | 26 real decks pass |
 | Studio baseline harness | Comparator/schema self-test passes |
@@ -81,6 +90,30 @@ zig build verify -Doptimize=safe -Dneovim=false -j2 --summary all
 zig build verify neovim-probe neovim-runtime-test -Doptimize=debug -Dneovim=true -j2 --summary all
 zig build verify neovim-probe neovim-runtime-test macos-app -Doptimize=safe -Dneovim=true -j2 --summary all
 ```
+
+## Windows SDK, tooling, paths, and save ownership
+
+The first native Windows gate passed 626 application tests and exposed five
+failures: three path-fixture mismatches and two Save As failures. Native SDK
+links now bypass pkg-config in both the application and the owning C dependency,
+so Strawberry Perl's broken batch wrapper is not involved. Windows development
+tooling uses the selected `python` interpreter, keeping Pillow in the same
+isolated environment; `-Dpython` permits an explicit Python 3 path.
+
+Authored Windows media references use portable forward slashes in `.sld`
+source, while browser filesystem fixtures compare native separators. The
+exclusive Save As reservation requests read access so exact Zig 0.17's Windows
+`FILE_ALL_INFORMATION` stat query can inspect its identity. Exclusivity and the
+identity/version checks remain intact.
+
+Review also found a pre-existing data-preservation defect: after the atomic
+writer detected a changed source, outer error cleanup deleted the now-foreign
+pathname. The detected-conflict path now retains it. A deterministic regression
+replaces the actual closed reservation during the writer's first allocation,
+requires `SourceChangedOnDisk`, and verifies the external replacement bytes
+remain. Ordinary allocation failure still removes an unchanged reservation.
+This protects detected conflicts; the existing compare/rename gap does not
+provide atomic isolation from every uncooperative concurrent writer.
 
 ## Neovim probe ordering and compatibility
 

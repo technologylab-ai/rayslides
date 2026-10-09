@@ -1098,7 +1098,11 @@ fn testBrowser() *Browser {
 }
 
 fn joinedTestPath(buffer: []u8, root: []const u8, tail: []const u8) []const u8 {
-    return joinPath(buffer, root, tail).?;
+    const path = @constCast(joinPath(buffer, root, tail).?);
+    // realPath returns native separators for every component, including
+    // nested fixture directories such as Talks/archive.
+    if (std.fs.path.sep == '\\') std.mem.replaceScalar(u8, path, '/', '\\');
+    return path;
 }
 
 test "deck purpose lists folders first and only .sld files, hiding dotfiles" {
@@ -1285,9 +1289,13 @@ test "entry ordering is folders first then case-insensitive names" {
 
 test "joinPath never doubles separators and fitTail respects UTF-8" {
     var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("/a/b", joinPath(&buffer, "/a", "b").?);
-    try std.testing.expectEqualStrings("/b", joinPath(&buffer, "/", "b").?);
-    try std.testing.expectEqualStrings("/a", joinPath(&buffer, "/a", "").?);
+    const directory = if (std.fs.path.sep == '\\') "C:\\a" else "/a";
+    const root = if (std.fs.path.sep == '\\') "C:\\" else "/";
+    const child = if (std.fs.path.sep == '\\') "C:\\a\\b" else "/a/b";
+    const root_child = if (std.fs.path.sep == '\\') "C:\\b" else "/b";
+    try std.testing.expectEqualStrings(child, joinPath(&buffer, directory, "b").?);
+    try std.testing.expectEqualStrings(root_child, joinPath(&buffer, root, "b").?);
+    try std.testing.expectEqualStrings(directory, joinPath(&buffer, directory, "").?);
     try std.testing.expectEqualStrings("€b", fitTail("a€b", 4));
     try std.testing.expectEqualStrings("b", fitTail("a€b", 3));
 }
