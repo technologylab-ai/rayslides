@@ -45,6 +45,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/rayslides-ci"
           { git rev-parse HEAD; zig version; python --version; } > "$RUNNER_TEMP/rayslides-ci/environment.log"
           python -c 'import platform; print(platform.platform()); print(platform.machine())' >> "$RUNNER_TEMP/rayslides-ci/environment.log"
+          if [ "${{ runner.os }}" != "Windows" ]; then nvim --version >> "$RUNNER_TEMP/rayslides-ci/environment.log"; fi
       - name: Build and verify built-in editor
         shell: bash
         run: |
