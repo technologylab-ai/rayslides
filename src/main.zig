@@ -7676,14 +7676,16 @@ test "atomic Studio writer replaces expected source and rejects a conflict" {
     try std.testing.expectEqualStrings("Studio source\n", written);
 
     const studio_version = try tmp.dir.statFile(io, "deck.sld", .{});
-    try tmp.dir.writeFile(io, .{ .sub_path = "deck.sld", .data = "external edit\n" });
+    // Metadata is the conflict contract. Make its size differ explicitly;
+    // consecutive same-sized writes need not get distinct Windows times.
+    try tmp.dir.writeFile(io, .{ .sub_path = "deck.sld", .data = "external edit with a different length\n" });
     try std.testing.expectError(
         error.SourceChangedOnDisk,
         writeSourceAtomically(allocator, io, tmp.dir, "deck.sld", "must not win\n", studio_version),
     );
     const preserved = try tmp.dir.readFileAlloc(io, "deck.sld", allocator, .unlimited);
     defer allocator.free(preserved);
-    try std.testing.expectEqualStrings("external edit\n", preserved);
+    try std.testing.expectEqualStrings("external edit with a different length\n", preserved);
 }
 
 fn saveEditorSource() !void {

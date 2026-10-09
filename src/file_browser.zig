@@ -406,6 +406,8 @@ pub const Browser = struct {
     fn choose(self: *Browser, directory_path: []const u8, name: []const u8) Outcome {
         const chosen = joinPath(&self.chosen_buffer, directory_path, name) orelse return .none;
         self.chosen_len = chosen.len;
+        if (builtin.os.tag == .windows)
+            std.mem.replaceScalar(u8, self.chosen_buffer[0..self.chosen_len], '/', '\\');
         self.active = false;
         return .chosen;
     }
