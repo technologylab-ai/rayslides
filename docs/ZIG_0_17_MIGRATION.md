@@ -79,7 +79,7 @@ that check is not an application performance claim.
 | CLI | Real executable version/help exit successfully |
 | macOS app bundles | Built-in and embedded editor packages build with Safe |
 | Actual application framebuffers | Hidden 900×506 Studio and Neovim captures pass nonblank, 4-slide render-state, and clean-exit checks; actual Safe bundle passes too |
-| Historical compact visual reference | Capture succeeds; pixel comparison fails (details below), references retained |
+| Historical compact visual reference | Obsolete UI reference; capture succeeds and comparison is recorded separately below |
 
 Run the local correctness matrix with the exact compiler and Python Pillow on
 `PATH`:
@@ -173,13 +173,17 @@ pass 900×506 Studio and real embedded-Neovim framebuffer checks on the Apple M3
 Max GPU, with clean exit. The screenshot is normalized from Retina backing
 pixels to the requested logical dimensions.
 
-The existing `compact-properties` reference comparison remains a failed,
-separately scoped gate: mean channel delta 2.082, RMS 9.557, and 5.32% changed
-pixels (3% limit). The current frame includes the Notes toolbar control absent
-from that older reference and uses Retina rasterization. The complete geometry
-was visually inspected, but the references and thresholds were not changed.
-Passing nonblank/current-frame checks does not claim a pixel match to that
-historical image. Full historical visual-suite requalification remains pending.
+The checked-in `compact-properties` image is an obsolete UI reference. It was
+last refreshed by `682ad87` on 2026-08-25, before `630948d` added the Notes UI on
+2026-09-11, while the application still used Zig 0.16. The Notes toolbar control
+shifts the existing controls; the current Retina capture also differs in text
+and edge rasterization. Comparing against that historical image reports mean
+channel delta 2.082, RMS 9.557, and 5.32% changed pixels (3% limit). That result
+records disagreement with the old reference rather than establishing a port
+regression. The complete current geometry was visually inspected and the named
+framebuffer checks above pass. Historical references and thresholds are retained;
+refreshing the visual suite requires reviewing each affected current scene before
+promoting new images, as described in `tests/studio_baselines/README.md`.
 
 The native CI matrix builds and tests Debug/Safe on Linux, macOS, and Windows,
 with the optional editor on Linux/macOS. Its Safe Linux Xvfb gate exercises a
